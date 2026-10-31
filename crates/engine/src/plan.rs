@@ -788,6 +788,11 @@ pub(crate) fn sheet(
     Ok(result)
 }
 
+/// One level's presentation sheet as SVG text, for live views (Trigon Studio's plan view).
+pub fn sheet_svg_text(doc: &Document, level: usize, view: View) -> Result<String> {
+    sheet_svg(doc, level, view, 0.0, None, "")
+}
+
 fn svg(prims: &[Prim], f: &Frame, background: Option<&[u8]>, title: &str) -> Result<String> {
     let mut out = String::new();
     let _ = writeln!(out, r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">"#, w = f.w, h = f.h);

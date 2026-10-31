@@ -21,6 +21,11 @@ mod rooms;
 mod time;
 
 pub use commands::{CommandSpec, commands};
+/// For live views (Trigon Studio): one level's presentation plan as SVG text, the drawings' SVG
+/// parser and the renderer they use, so a view rasterizes exactly what the sheets show.
+pub use plan::sheet_svg_text as plan_sheet_svg;
+pub use plan_output::parse_svg;
+pub use resvg;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

@@ -53,6 +53,14 @@ fn parse(svg: &str, opt: &usvg::Options<'_>, blocked: &AtomicBool) -> Result<usv
     Ok(tree)
 }
 
+/// Parse SVG text as the drawings are parsed (bundled font, embedded images only, bounded size),
+/// for live views that render it themselves (Trigon Studio's plan view).
+pub fn parse_svg(svg: &str) -> Result<usvg::Tree> {
+    let blocked = Arc::new(AtomicBool::new(false));
+    let opt = options(Arc::clone(&blocked));
+    parse(svg, &opt, &blocked)
+}
+
 /// Render the generated SVG with the bundled font. The returned bytes form a complete PNG.
 pub(crate) fn png(svg: &str) -> Result<Vec<u8>> {
     let blocked = Arc::new(AtomicBool::new(false));
