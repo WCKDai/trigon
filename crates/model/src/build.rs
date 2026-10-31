@@ -287,10 +287,29 @@ pub fn build(doc: &Document) -> Result<Vec<Built>> {
 
 /// Builds every building as seen in a phase view.
 pub fn build_view(doc: &Document, view: View) -> Result<Vec<Built>> {
+    build_cut(doc, view, None)
+}
+
+/// Builds every building as seen in a phase view, cut off at height `cut` (mm above the
+/// terrain) when given: a 3D plan cut. Walls are closed exactly at the cut; what lies above it
+/// (upper storeys, the roof) is left out and what crosses it is clipped.
+pub fn build_cut(doc: &Document, view: View, cut: Option<f64>) -> Result<Vec<Built>> {
     if view.phase >= doc.phases.len().max(1) {
         return Err(ModelError::Invalid(format!("phase {} doesn't exist", view.phase)));
     }
-    doc.buildings.iter().map(|b| build_building(doc, b, view)).collect()
+    if let Some(z) = cut {
+        crate::checked("cut height", z, -50_000.0, 500_000.0)?;
+    }
+    doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect()
+}
+
+fn clip_element(mut e: BuiltElement, cut: Option<f64>) -> BuiltElement {
+    if let Some(z) = cut {
+        for (_, m) in &mut e.parts {
+            *m = m.below(z);
+        }
+    }
+    e
 }
 
 /// The inner wall line: each footprint vertex moved inward by `d` along the mitre of its two
@@ -498,7 +517,9 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
     Ok(out)
 }
 
-fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
+fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) -> Result<Built> {
+    let above = |z: f64| cut.is_some_and(|c| z >= c - 1.0);
+    let top_at = |z: f64| cut.map_or(z, |c| z.min(c));
     let h = b.height();
     let n = b.footprint.len();
     let levels = b.storeys.len();
@@ -535,11 +556,18 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             let (Some(&qs), Some(&qe), Some(&(z0, z1))) = (inner.get(f.edge), inner.get((f.edge + 1) % n), heights.get(l)) else {
                 return Err(ModelError::Invalid(format!("facade {} has no inner line", f.id)));
             };
-            spans.push(Span { level: l, thickness: b.edge_thickness(f.edge, l), z0, z1, in0: along(qs), in1: along(qe), qs, qe });
+            if above(z0) {
+                continue;
+            }
+            spans.push(Span { level: l, thickness: b.edge_thickness(f.edge, l), z0, z1: top_at(z1), in0: along(qs), in1: along(qe), qs, qe });
+        }
+        if spans.is_empty() {
+            continue;
         }
         let all = resolve_facade(doc, b, f)?;
         // What this view shows, with each element's status.
-        let shown: Vec<(&Resolved, Status)> = all.iter().filter_map(|r| view.status(r.lifetime).map(|s| (r, s))).collect();
+        let shown: Vec<(&Resolved, Status)> =
+            all.iter().filter(|r| !above(r.rect.v0)).filter_map(|r| view.status(r.lifetime).map(|s| (r, s))).collect();
         let resolved: Vec<(&Resolved, Status)> = shown.iter().filter(|(r, _)| r.is_opening()).copied().collect();
         let holes: Vec<Rect> = resolved.iter().map(|(r, _)| r.rect).collect();
         let unbuildable = || ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id));
@@ -554,7 +582,12 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             .iter()
             .map(|(r, status)| {
                 let id = format!("{}.L{}.B{}", f.id, r.placement.level, r.placement.bay);
-                component(&fr, &id, r, elevation_of(r), *status)
+                let mut o = component(&fr, &id, r, elevation_of(r), *status);
+                if cut.is_some() {
+                    o.fill = clip_element(o.fill, cut);
+                    o.attached = o.attached.into_iter().map(|e| clip_element(e, cut)).collect();
+                }
+                o
             })
             .collect();
         let attachments = shown
@@ -562,11 +595,17 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             .filter(|(r, _)| !r.is_opening())
             .flat_map(|(r, status)| {
                 let id = format!("{}.L{}.B{}.balcony", f.id, r.placement.level, r.placement.bay);
-                attachment(&fr, &id, r, elevation_of(r), *status)
+                attachment(&fr, &id, r, elevation_of(r), *status).into_iter().map(|e| clip_element(e, cut)).collect::<Vec<_>>()
             })
             .collect();
         let plinth = match (&b.plinth, &plinth_line) {
-            (Some(p), Some(line)) => plinth_piece(&fr, f, (a, e), line, p, &holes).ok_or_else(unbuildable)?,
+            (Some(p), Some(line)) => {
+                let m = plinth_piece(&fr, f, (a, e), line, p, &holes).ok_or_else(unbuildable)?;
+                match cut {
+                    Some(z) => m.below(z),
+                    None => m,
+                }
+            }
             _ => Mesh::default(),
         };
         walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, height: h, bottom: zb, mesh, segments, plinth, openings, attachments });
@@ -579,6 +618,9 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     for (i, s) in b.storeys.iter().enumerate() {
         let inner = inners.get(i).cloned().unwrap_or_default();
         let z0 = s.elevation - FLOOR_SLAB;
+        if above(z0) {
+            continue;
+        }
         let holes = match i.checked_sub(1) {
             Some(l) => openings(l)?,
             None => Vec::new(),
@@ -598,6 +640,7 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     let top_level = levels.saturating_sub(1);
     let top_inner = inners.get(top_level).cloned().unwrap_or_default();
     let roof = match &b.roof {
+        _ if above(h - FLOOR_SLAB) => None,
         crate::roof::Roof::Flat => {
             let (outline, holes) = slab_shape(&b.footprint, openings(top_level)?)?;
             slabs.push(BuiltSlab {
@@ -652,9 +695,10 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     let mut interior = Vec::new();
     for (level, s) in b.storeys.iter().enumerate() {
         let on: Vec<(usize, &crate::doc::InteriorWall)> = b.interior_walls.iter().enumerate().filter(|(_, w)| w.levels.contains(&level)).collect();
-        if on.is_empty() {
+        if on.is_empty() || above(s.elevation) {
             continue;
         }
+        let wall_height = top_at(s.elevation + s.height - FLOOR_SLAB) - s.elevation;
         let axes: Vec<Axis> = on.iter().map(|(_, w)| Axis { a: w.a, b: w.b, thickness: w.thickness }).collect();
         let joined = crate::joins::join(&axes, inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
         for ((k, iw), j) in on.iter().zip(joined) {
@@ -662,7 +706,12 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
                 continue;
             }
             let id = if iw.id.is_empty() { format!("{}.iw{k}", b.id) } else { iw.id.clone() };
-            if let Some(w) = interior_wall(iw, &format!("{id}.L{level}"), level, &j, (s.elevation, s.height - FLOOR_SLAB)) {
+            if let Some(mut w) = interior_wall(iw, &format!("{id}.L{level}"), level, &j, (s.elevation, wall_height)) {
+                if cut.is_some() {
+                    for d in &mut w.doors {
+                        d.fill = clip_element(d.fill.clone(), cut);
+                    }
+                }
                 interior.push(w);
             }
         }
@@ -672,13 +721,15 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
         for &level in &st.levels {
             let Some(s) = b.storeys.get(level) else { continue };
             let id = if st.id.is_empty() { format!("{}.stair{k}", b.id) } else { st.id.clone() };
-            stairs.push(BuiltStair {
-                id: format!("{id}.L{level}"),
-                level,
-                kind: st.kind,
-                winding: st.winders.is_some(),
-                mesh: crate::stair::mesh(st, s.elevation, s.height)?,
-            });
+            if above(s.elevation) {
+                continue;
+            }
+            let mesh = crate::stair::mesh(st, s.elevation, s.height)?;
+            let mesh = match cut {
+                Some(z) => mesh.below(z),
+                None => mesh,
+            };
+            stairs.push(BuiltStair { id: format!("{id}.L{level}"), level, kind: st.kind, winding: st.winders.is_some(), mesh });
         }
     }
     Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
@@ -730,7 +781,9 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
         if u1 - u0 < 300.0 {
             continue;
         }
-        let rect = Rect { u0, u1, v0: z0, v1: z0 + door.height.min(height - 50.0) };
+        // A wall cut lower than the door (a 3D plan cut) leaves the door open through the top.
+        let top = if door.height + 50.0 > height { height + 10.0 } else { door.height };
+        let rect = Rect { u0, u1, v0: z0, v1: z0 + top };
         let (fw, leaf) = (DOOR_FRAME.min((u1 - u0) / 4.0), DOOR_LEAF.min(d / 2.0));
         let mut frame = fbox(&fr, (u0, u0 + fw), (0.0, d), (rect.v0, rect.v1));
         frame.append(&fbox(&fr, (u1 - fw, u1), (0.0, d), (rect.v0, rect.v1)));

@@ -114,7 +114,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables), (Material::Steel, &r.gutters)]);
         }
         for iw in &b.interior {
-            add(&mut w, &iw.id, &[(Material::Slab, &iw.mesh)]);
+            add(&mut w, &iw.id, &[(Material::Plaster, &iw.mesh)]);
             for d in &iw.doors {
                 let parts: Vec<(Material, &Mesh)> = d.fill.parts.iter().map(|(m, mesh)| (*m, mesh)).collect();
                 add(&mut w, &d.fill.id, &parts);

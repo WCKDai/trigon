@@ -917,3 +917,37 @@ fn plinth_and_roof_build_up_are_part_of_the_model() {
     }
     assert!(s.execute("building.set_roof", json!({"kind": "pitched", "pitch_deg": 40, "overhang_mm": -1})).is_err());
 }
+
+#[test]
+fn a_3d_plan_cut_closes_the_walls_at_the_cut_and_leaves_out_what_is_above() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [{"id": "w", "levels": [0, 1, 2], "a": [-3000, 0], "b": [3000, 0], "thickness": 120, "doors": [{"at": 3000, "width": 900}]}]}),
+    )
+    .unwrap();
+    let b = &s.doc.buildings[0];
+    let z = b.storeys[1].elevation + 1200.0;
+    let view = trigon_model::build::View::latest(&s.doc);
+    let cut = trigon_model::build::build_cut(&s.doc, view, Some(z)).unwrap();
+    let top = |m: &trigon_model::Mesh| m.bounds().map_or(f64::MIN, |(_, hi)| hi[2]);
+    assert!(cut[0].roof.is_none());
+    assert!(cut[0].walls.iter().all(|w| w.segments.iter().all(|g| g.level <= 1 && g.z1 <= z + 1e-6) && top(&w.mesh) <= z + 1e-6));
+    assert!(cut[0].slabs.iter().all(|sl| sl.level <= 1));
+    let wall = cut[0].interior.iter().find(|w| w.id == "w.L1").unwrap();
+    assert!((top(&wall.mesh) - z).abs() < 1e-6 && wall.doors.len() == 1);
+    assert!(!cut[0].interior.iter().any(|w| w.id == "w.L2"));
+    // The door stays open through the cut.
+    assert!(wall.doors[0].rect.v1 > z);
+    // Exported; refused with a storey that doesn't exist or a height without a storey.
+    let path = std::env::temp_dir().join(format!("trigon-cut-{}.glb", std::process::id()));
+    assert!(s.execute("export.gltf", json!({"path": path, "cut_level": 1})).is_ok());
+    let _ = std::fs::remove_file(path);
+    for bad in [
+        json!({"path": "x.glb", "cut_level": 99}),
+        json!({"path": "x.glb", "cut_mm": 1200}),
+        json!({"path": "x.glb", "cut_level": 1, "cut_mm": f64::MAX}),
+    ] {
+        assert!(s.execute("export.gltf", bad.clone()).is_err(), "{bad}");
+    }
+}

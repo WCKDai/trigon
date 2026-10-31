@@ -1094,16 +1094,27 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "export.gltf",
         summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up. `phase` and `filter` choose the view (default: the \
-                  active phase, complete); demolished elements are translucent red.",
+                  active phase, complete); demolished elements are translucent red. `cut_level` makes a 3D plan cut: everything \
+                  above `cut_mm` (default 1200) over that storey's floor is left out, walls are closed at the cut, so the \
+                  storey's rooms, doors and stairs can be seen from above.",
         mutates: false,
         journaled: false,
-        schema: schema::<ExportParams>,
+        schema: schema::<ExportGltf>,
         run: |s, v| {
-            let p: ExportParams = parse("export.gltf", v)?;
+            let p: ExportGltf = parse("export.gltf", v)?;
             let path = checked_path(&p.path, "glb")?;
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let refs = reference_meshes(&s.doc)?;
-            let bytes = trigon_io::glb::write(&trigon_model::build::build_view(&s.doc, view)?, &refs);
+            let cut = match p.cut_level {
+                Some(level) => {
+                    let b = s.doc.building(None)?;
+                    let storey = b.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("level {level} doesn't exist")))?;
+                    Some(storey.elevation + trigon_model::checked("cut_mm", p.cut_mm.unwrap_or(1200.0), 100.0, storey.height)?)
+                }
+                None if p.cut_mm.is_some() => return Err(ModelError::Invalid("cut_mm needs cut_level".into()).into()),
+                None => None,
+            };
+            let bytes = trigon_io::glb::write(&trigon_model::build::build_cut(&s.doc, view, cut)?, &refs);
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
@@ -1560,6 +1571,19 @@ struct SetRoof {
 struct SetWallThickness {
     building: Option<String>,
     thickness: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExportGltf {
+    /// .glb file to write.
+    path: String,
+    phase: Option<String>,
+    filter: Option<String>,
+    /// Cut the model above this storey (a 3D plan cut).
+    cut_level: Option<usize>,
+    /// Height of the cut above that storey's floor, mm (default 1200).
+    cut_mm: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]

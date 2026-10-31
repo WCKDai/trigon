@@ -23,10 +23,12 @@ pub enum Material {
     Demolished,
     /// Rendered or concrete plinth (sokkel) at the foot of the facade.
     Plinth,
+    /// Plastered interior walls.
+    Plaster,
 }
 
 impl Material {
-    pub const ALL: [Material; 13] = [
+    pub const ALL: [Material; 14] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -40,6 +42,7 @@ impl Material {
         Material::Deck,
         Material::Demolished,
         Material::Plinth,
+        Material::Plaster,
     ];
 
     pub fn name(self) -> &'static str {
@@ -57,6 +60,7 @@ impl Material {
             Material::Deck => "deck",
             Material::Demolished => "demolished",
             Material::Plinth => "plinth",
+            Material::Plaster => "plaster",
         }
     }
 
@@ -76,6 +80,7 @@ impl Material {
             Material::Deck => [0.55, 0.33, 0.18, 1.0],
             Material::Demolished => [0.90, 0.10, 0.10, 0.45],
             Material::Plinth => [0.42, 0.42, 0.41, 1.0],
+            Material::Plaster => [0.93, 0.92, 0.89, 1.0],
         }
     }
 }
@@ -133,6 +138,47 @@ impl Mesh {
         self.positions.extend(all.iter().map(|&p| to3d(p)));
         self.triangles.extend(idx.as_chunks::<3>().0.iter().map(|t| [base + t[0] as u32, base + t[1] as u32, base + t[2] as u32]));
         true
+    }
+
+    /// The part of the mesh at or below height `z` (triangles crossing it are clipped; no caps).
+    pub fn below(&self, z: f64) -> Mesh {
+        let mut out = Mesh::default();
+        for t in &self.triangles {
+            let pts: Vec<[f64; 3]> = t.iter().filter_map(|&i| self.positions.get(i as usize).copied()).collect();
+            if pts.len() != 3 {
+                continue;
+            }
+            if pts.iter().all(|p| p[2] <= z) {
+                let base = out.positions.len() as u32;
+                out.positions.extend_from_slice(&pts);
+                out.triangles.push([base, base + 1, base + 2]);
+                continue;
+            }
+            if pts.iter().all(|p| p[2] > z) {
+                continue;
+            }
+            // Sutherland–Hodgman against the half-space below z, then a fan.
+            let mut poly: Vec<[f64; 3]> = Vec::with_capacity(4);
+            for k in 0..3 {
+                let (a, b) = (pts[k], pts[(k + 1) % 3]);
+                if a[2] <= z {
+                    poly.push(a);
+                }
+                if (a[2] <= z) != (b[2] <= z) {
+                    let s = (z - a[2]) / (b[2] - a[2]);
+                    poly.push([a[0] + (b[0] - a[0]) * s, a[1] + (b[1] - a[1]) * s, z]);
+                }
+            }
+            if poly.len() < 3 {
+                continue;
+            }
+            let base = out.positions.len() as u32;
+            out.positions.extend_from_slice(&poly);
+            for k in 1..poly.len() as u32 - 1 {
+                out.triangles.push([base, base + k, base + k + 1]);
+            }
+        }
+        out
     }
 
     /// Bounding box `(min, max)`, or `None` if empty.
