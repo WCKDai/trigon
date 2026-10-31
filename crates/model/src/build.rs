@@ -201,6 +201,18 @@ pub struct BuiltSlab {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BuiltInterior {
+    pub id: String,
+    pub level: usize,
+    /// Plan outline (4 corners, site mm).
+    pub outline: [[f64; 2]; 4],
+    pub z_bottom: f64,
+    pub height: f64,
+    pub load_bearing: bool,
+    pub mesh: Mesh,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BuiltRoof {
     pub id: String,
     /// The roof surface.
@@ -221,6 +233,7 @@ pub struct Built {
     pub slabs: Vec<BuiltSlab>,
     /// A pitched roof; a flat roof is a slab in `slabs`.
     pub roof: Option<BuiltRoof>,
+    pub interior: Vec<BuiltInterior>,
 }
 
 /// Builds every building as it stands at the end of the last phase.
@@ -511,7 +524,31 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             Some(BuiltRoof { id: format!("{}.roof", b.id), cover: r.cover, gables: r.gables, eaves: h, ridge: r.ridge, pitch_deg: *pitch_deg })
         }
     };
-    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof })
+    let mut interior = Vec::new();
+    for (k, iw) in b.interior_walls.iter().enumerate() {
+        let (dx, dy) = (iw.b[0] - iw.a[0], iw.b[1] - iw.a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if !(len > 1.0) {
+            continue;
+        }
+        let (nx, ny) = (-dy / len * iw.thickness / 2.0, dx / len * iw.thickness / 2.0);
+        let outline = [[iw.a[0] + nx, iw.a[1] + ny], [iw.b[0] + nx, iw.b[1] + ny], [iw.b[0] - nx, iw.b[1] - ny], [iw.a[0] - nx, iw.a[1] - ny]];
+        let ccw = if crate::footprint::signed_area2(&outline) < 0.0 { [outline[3], outline[2], outline[1], outline[0]] } else { outline };
+        for &level in &iw.levels {
+            let Some(s) = b.storeys.get(level) else { continue };
+            let id = if iw.id.is_empty() { format!("{}.iw{k}", b.id) } else { iw.id.clone() };
+            interior.push(BuiltInterior {
+                id: format!("{id}.L{level}"),
+                level,
+                outline: ccw,
+                z_bottom: s.elevation,
+                height: s.height - FLOOR_SLAB,
+                load_bearing: iw.load_bearing,
+                mesh: prism(&ccw, s.elevation, s.height - FLOOR_SLAB),
+            });
+        }
+    }
+    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior })
 }
 
 /// A vertical prism on a counter-clockwise polygon.

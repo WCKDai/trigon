@@ -439,6 +439,174 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "drawing.trace_walls",
+        summary: "Read candidate interior walls off a registered plan for one storey: dark bands as thick as walls (min_mm to \
+                  max_mm, default 70–450) running at least min_len (default 600) along the building's wall directions, inside \
+                  the outer walls. Returns them; `add: true` also adds them for the given `levels` (default: the traced storey).",
+        mutates: true,
+        journaled: true,
+        schema: schema::<TraceWalls>,
+        run: |s, v| {
+            let p: TraceWalls = parse("drawing.trace_walls", v)?;
+            let dark = trigon_model::checked("contrast", p.contrast.unwrap_or(60.0), 5.0, 250.0)?;
+            let (mn, mx) = (
+                trigon_model::checked("min_mm", p.min_mm.unwrap_or(70.0), 30.0, 500.0)?,
+                trigon_model::checked("max_mm", p.max_mm.unwrap_or(450.0), 60.0, 1500.0)?,
+            );
+            let min_len = trigon_model::checked("min_len", p.min_len.unwrap_or(600.0), 200.0, 10_000.0)?;
+            let mut walls = crate::drawings::trace_walls(s, &p.name, p.level, dark, mn, mx, min_len)?;
+            let total_m: f64 = walls.iter().map(|w| ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt()).sum::<f64>() / 1000.0;
+            let summary = json!({
+                "walls": walls.len(),
+                "load_bearing": walls.iter().filter(|w| w.load_bearing).count(),
+                "total_length_m": total_m.round(),
+            });
+            if p.add.unwrap_or(false) {
+                let levels = p.levels.clone().unwrap_or_else(|| vec![p.level]);
+                let b = s.doc.building_mut(None)?;
+                let start = b.interior_walls.len();
+                for (k, w) in walls.iter_mut().enumerate() {
+                    w.levels = levels.clone();
+                    w.id = format!("{}.iw{}", b.id, start + k);
+                    w.validate(b.storeys.len())?;
+                }
+                b.interior_walls.extend(walls);
+                return Ok(json!({"traced": summary, "added": b.interior_walls.len() - start}));
+            }
+            Ok(json!({"traced": summary, "walls": walls}))
+        },
+    },
+    CommandSpec {
+        id: "interior.add_walls",
+        summary: "Add interior walls: centre line a–b (site mm), thickness, storeys, load-bearing or partition. Leave gaps for \
+                  doors. Use drawing.trace_walls to read candidates off a registered plan.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddWalls>,
+        run: |s, v| {
+            let p: AddWalls = parse("interior.add_walls", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let n = b.storeys.len();
+            if p.walls.len() > 5000 {
+                return Err(ModelError::Invalid("at most 5000 walls at a time".into()).into());
+            }
+            for w in &p.walls {
+                w.validate(n)?;
+            }
+            let start = b.interior_walls.len();
+            for (k, mut w) in p.walls.into_iter().enumerate() {
+                if w.id.is_empty() {
+                    w.id = format!("{}.iw{}", b.id, start + k);
+                }
+                b.interior_walls.push(w);
+            }
+            Ok(json!({"added": b.interior_walls.len() - start, "interior_walls": b.interior_walls.len()}))
+        },
+    },
+    CommandSpec {
+        id: "interior.add_stairs",
+        summary: "Add staircases: outline polygon (site mm) on the listed storeys, drawn with treads in plans.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddStairs>,
+        run: |s, v| {
+            let p: AddStairs = parse("interior.add_stairs", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let n = b.storeys.len();
+            let start = b.stairs.len();
+            for (k, mut st) in p.stairs.into_iter().enumerate() {
+                if st.outline.len() < 3
+                    || st.outline.len() > 64
+                    || st.outline.iter().flatten().any(|v| !v.is_finite())
+                    || st.levels.iter().any(|l| *l >= n)
+                {
+                    return Err(ModelError::Invalid(format!("stair {k}: give 3 to 64 finite corners and storeys below {n}")).into());
+                }
+                if st.id.is_empty() {
+                    st.id = format!("{}.stair{}", b.id, start + k);
+                }
+                b.stairs.push(st);
+            }
+            Ok(json!({"stairs": b.stairs.len()}))
+        },
+    },
+    CommandSpec {
+        id: "interior.add_rooms",
+        summary: "Add rooms: a name and a polygon (site mm) on the listed storeys; plans label them with name and area.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddRooms>,
+        run: |s, v| {
+            let p: AddRooms = parse("interior.add_rooms", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let n = b.storeys.len();
+            let start = b.rooms.len();
+            for (k, mut r) in p.rooms.into_iter().enumerate() {
+                if r.polygon.len() < 3
+                    || r.polygon.len() > 256
+                    || r.polygon.iter().flatten().any(|v| !v.is_finite())
+                    || r.levels.iter().any(|l| *l >= n)
+                {
+                    return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
+                }
+                if r.id.is_empty() {
+                    r.id = format!("{}.room{}", b.id, start + k);
+                }
+                b.rooms.push(r);
+            }
+            Ok(json!({"rooms": b.rooms.len()}))
+        },
+    },
+    CommandSpec {
+        id: "interior.clear",
+        summary: "Remove interior walls, stairs and rooms (`what`: walls, stairs, rooms or all; default all).",
+        mutates: true,
+        journaled: true,
+        schema: schema::<InteriorClear>,
+        run: |s, v| {
+            let p: InteriorClear = parse("interior.clear", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let what = p.what.as_deref().unwrap_or("all");
+            if !matches!(what, "all" | "walls" | "stairs" | "rooms") {
+                return Err(ModelError::Invalid(format!("what {what}: use walls, stairs, rooms or all")).into());
+            }
+            if matches!(what, "all" | "walls") {
+                b.interior_walls.clear();
+            }
+            if matches!(what, "all" | "stairs") {
+                b.stairs.clear();
+            }
+            if matches!(what, "all" | "rooms") {
+                b.rooms.clear();
+            }
+            Ok(json!({"cleared": what}))
+        },
+    },
+    CommandSpec {
+        id: "interior.list",
+        summary: "Count the interior walls (load-bearing and partitions), stairs and rooms per storey, with room areas.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<BuildingParam>,
+        run: |s, v| {
+            let p: BuildingParam = parse("interior.list", v)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let per: Vec<Value> = (0..b.storeys.len())
+                .map(|l| {
+                    let walls: Vec<&trigon_model::InteriorWall> = b.interior_walls.iter().filter(|w| w.levels.contains(&l)).collect();
+                    json!({
+                        "level": l,
+                        "load_bearing": walls.iter().filter(|w| w.load_bearing).count(),
+                        "partitions": walls.iter().filter(|w| !w.load_bearing).count(),
+                        "stairs": b.stairs.iter().filter(|x| x.levels.contains(&l)).count(),
+                        "rooms": b.rooms.iter().filter(|r| r.levels.contains(&l)).map(|r| json!({"name": r.name, "area_m2": (trigon_model::doc::polygon_area(&r.polygon) / 1e4).round() / 100.0})).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(json!(per))
+        },
+    },
+    CommandSpec {
         id: "building.outline",
         summary: "The building's outline corners in site mm (x east, y north of the site origin) with the facades meeting at each, \
                   for tying drawings to the site.",
@@ -680,6 +848,50 @@ struct DrawingRegister {
     x_end: f64,
     /// Two [drawing y in pixels, height above the terrain in mm] pairs, for example the eaves and a floor line.
     y_levels: [[f64; 2]; 2],
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TraceWalls {
+    name: String,
+    level: usize,
+    /// How much darker than the surrounding paper a pixel must be to count as wall (0–255, default 60).
+    contrast: Option<f64>,
+    min_mm: Option<f64>,
+    max_mm: Option<f64>,
+    min_len: Option<f64>,
+    /// Add the traced walls to the model.
+    add: Option<bool>,
+    /// Storeys the added walls stand on (default: the traced one).
+    levels: Option<Vec<usize>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddWalls {
+    building: Option<String>,
+    walls: Vec<trigon_model::InteriorWall>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddStairs {
+    building: Option<String>,
+    stairs: Vec<trigon_model::Stair>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddRooms {
+    building: Option<String>,
+    rooms: Vec<trigon_model::Room>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InteriorClear {
+    building: Option<String>,
+    what: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1427,6 +1639,9 @@ fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f
         if let Some(r) = &b.roof {
             add(&r.id, vec![&r.cover]);
             add(&format!("{}.gables", r.id), vec![&r.gables]);
+        }
+        for iw in &b.interior {
+            add(&iw.id, vec![&iw.mesh]);
         }
     }
     Ok(out)

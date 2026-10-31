@@ -300,6 +300,71 @@ pub struct Building {
     pub attributes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub roof: crate::roof::Roof,
+    /// Walls inside the outer walls, per storey.
+    #[serde(default)]
+    pub interior_walls: Vec<InteriorWall>,
+    #[serde(default)]
+    pub stairs: Vec<Stair>,
+    #[serde(default)]
+    pub rooms: Vec<Room>,
+}
+
+/// A straight interior wall, centre line `a`–`b` in site mm, on the listed storeys (full storey height).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InteriorWall {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub thickness: f64,
+    #[serde(default)]
+    pub load_bearing: bool,
+}
+
+/// A staircase: its outline in plan (site mm) and the direction it climbs (unit vector), on the listed storeys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Stair {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub outline: Vec<[f64; 2]>,
+    /// Tread depth, mm (default 250).
+    #[serde(default)]
+    pub tread: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Room {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub name: String,
+    pub polygon: Vec<[f64; 2]>,
+}
+
+impl InteriorWall {
+    pub fn validate(&self, storeys: usize) -> Result<()> {
+        let pts = [self.a[0], self.a[1], self.b[0], self.b[1]];
+        if pts.iter().any(|v| !v.is_finite() || v.abs() > 1e8) {
+            return Err(ModelError::Invalid("wall ends must be finite site coordinates".into()));
+        }
+        let len = ((self.b[0] - self.a[0]).powi(2) + (self.b[1] - self.a[1]).powi(2)).sqrt();
+        checked("wall length", len, 100.0, 200_000.0)?;
+        checked("wall thickness", self.thickness, 40.0, 1000.0)?;
+        if self.levels.is_empty() || self.levels.iter().any(|l| *l >= storeys) {
+            return Err(ModelError::Invalid(format!("wall levels must be storey indices below {storeys}")));
+        }
+        Ok(())
+    }
+}
+
+/// Area of a simple polygon, mm².
+pub fn polygon_area(p: &[[f64; 2]]) -> f64 {
+    crate::footprint::signed_area2(p).abs() / 2.0
 }
 
 pub const MIN_WALL: f64 = 100.0;
@@ -321,6 +386,9 @@ impl Building {
             evidence: Vec::new(),
             attributes: Default::default(),
             roof: Default::default(),
+            interior_walls: Vec::new(),
+            stairs: Vec::new(),
+            rooms: Vec::new(),
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())

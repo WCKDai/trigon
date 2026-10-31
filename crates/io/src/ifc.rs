@@ -300,6 +300,25 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
             }
         }
 
+        for iw in &b.interior {
+            let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(iw.level)));
+            let outline = w.polyline(&iw.outline);
+            let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
+            let base = w.point3([0.0, 0.0, iw.z_bottom]);
+            let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
+            let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(iw.height)));
+            let shape = w.shape(body, "SweptSolid", &[solid]);
+            let kind = if iw.load_bearing { ".SOLIDWALL." } else { ".PARTITIONING." };
+            let id = w.add(format!(
+                "IFCWALL({},$,{},$,$,#{lp},#{shape},{},{kind})",
+                string(&guid(&format!("trigon:{}", iw.id))),
+                string(if iw.load_bearing { "Interior wall (load-bearing)" } else { "Partition" }),
+                string(&iw.id)
+            ));
+            if let Some(c) = contained.get_mut(iw.level) {
+                c.push(id);
+            }
+        }
         if let Some(r) = &b.roof {
             let top = contained.len().saturating_sub(1);
             let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(top)));

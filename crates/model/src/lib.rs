@@ -15,8 +15,8 @@ pub mod roof;
 pub use build::{Built, BuiltElement, BuiltOpening, BuiltSlab, BuiltWall, ElementClass, FacadeFrame, Rect, SlabKind, build};
 pub use component::{ComponentKind, ComponentType, default_types};
 pub use doc::{
-    Building, Document, Drawing, Evidence, FORMAT, Facade, FacadeKind, FacadeRegistration, GeoPoint, Phase, Placement, PlanRegistration, Reference,
-    Site, Storey,
+    Building, Document, Drawing, Evidence, FORMAT, Facade, FacadeKind, FacadeRegistration, GeoPoint, InteriorWall, Phase, Placement,
+    PlanRegistration, Reference, Room, Site, Stair, Storey,
 };
 pub use mesh::{Material, Mesh};
 pub use roof::Roof;

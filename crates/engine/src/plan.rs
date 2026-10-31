@@ -13,7 +13,8 @@ use crate::facade_image::write_png;
 use crate::{EngineError, Result, Session};
 
 const CUT: f64 = 1000.0;
-const WALL: [u8; 3] = [70, 70, 70];
+const WALL: [u8; 3] = [25, 25, 25];
+const PARTITION: [u8; 3] = [110, 110, 110];
 const LINE: [u8; 3] = [30, 30, 30];
 const NEW: [u8; 3] = [40, 150, 30];
 const DEMOLISHED: [u8; 3] = [220, 30, 30];
@@ -115,6 +116,52 @@ fn scene(doc: &Document, level: usize, view: View) -> Result<(Vec<Prim>, String)
                     prims.push(Prim::Text { at: label_at, text: format!("Ca. {:.0} x {:.0}", depth, r.ty.width), color, size: 280.0 });
                 }
             }
+        }
+    }
+    // Interior: walls cut at this storey, stairs with treads, room names and areas.
+    for b in &doc.buildings {
+        for w in &b.interior_walls {
+            if !w.levels.contains(&level) {
+                continue;
+            }
+            let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
+            let len = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let (nx, ny) = (-dy / len * w.thickness / 2.0, dx / len * w.thickness / 2.0);
+            let pts = vec![[w.a[0] + nx, w.a[1] + ny], [w.b[0] + nx, w.b[1] + ny], [w.b[0] - nx, w.b[1] - ny], [w.a[0] - nx, w.a[1] - ny]];
+            prims.push(Prim::Poly { pts, fill: if w.load_bearing { WALL } else { PARTITION } });
+        }
+        for st in &b.stairs {
+            if !st.levels.contains(&level) {
+                continue;
+            }
+            let o = &st.outline;
+            for k in 0..o.len() {
+                prims.push(Prim::Line { a: o[k], b: o[(k + 1) % o.len()], color: LINE, width: 15.0, dashed: false });
+            }
+            // Treads across the outline's longer direction (its first edge or the next).
+            if o.len() >= 4 {
+                let (e0, e1) = ([o[1][0] - o[0][0], o[1][1] - o[0][1]], [o[2][0] - o[1][0], o[2][1] - o[1][1]]);
+                let l0 = (e0[0] * e0[0] + e0[1] * e0[1]).sqrt();
+                let l1 = (e1[0] * e1[0] + e1[1] * e1[1]).sqrt();
+                let (start, run, across, len) = if l0 >= l1 { (o[0], e0, e1, l0) } else { (o[1], e1, [o[0][0] - o[1][0], o[0][1] - o[1][1]], l1) };
+                let tread = st.tread.unwrap_or(250.0).clamp(150.0, 400.0);
+                let n = (len / tread).floor() as usize;
+                for k in 1..n.min(80) {
+                    let t = k as f64 * tread / len;
+                    let a = [start[0] + run[0] * t, start[1] + run[1] * t];
+                    prims.push(Prim::Line { a, b: [a[0] + across[0], a[1] + across[1]], color: LINE, width: 8.0, dashed: false });
+                }
+            }
+        }
+        for r in &b.rooms {
+            if !r.levels.contains(&level) || r.polygon.is_empty() {
+                continue;
+            }
+            let n = r.polygon.len() as f64;
+            let c = r.polygon.iter().fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n]);
+            let area = trigon_model::doc::polygon_area(&r.polygon) / 1e6;
+            prims.push(Prim::Text { at: [c[0], c[1] + 250.0], text: r.name.clone(), color: LINE, size: 260.0 });
+            prims.push(Prim::Text { at: [c[0], c[1] - 150.0], text: format!("{area:.1} m²"), color: LINE, size: 220.0 });
         }
     }
     Ok((prims, title))
@@ -377,7 +424,7 @@ pub(crate) fn render(
         }
         _ => return Err(EngineError::Io(format!("{}: the file name must end in .png or .svg", path.display()))),
     }
-    let balconies = prims.iter().filter(|p| matches!(p, Prim::Text { .. })).count();
+    let balconies = prims.iter().filter(|p| matches!(p, Prim::Text { text, .. } if text.starts_with("Ca. "))).count();
     let mut out = json!({
         "title": title,
         "underlay": used,

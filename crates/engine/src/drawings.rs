@@ -293,3 +293,237 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// Candidate interior walls read off a registered plan: dark bands between `min_mm` and `max_mm`
+/// thick that run at least `min_len` along one of the building's wall directions, inside the outer
+/// walls. Returns site-mm centre lines; nothing is added to the model.
+pub(crate) fn trace_walls(
+    s: &mut Session,
+    name: &str,
+    level: usize,
+    dark: f64,
+    min_mm: f64,
+    max_mm: f64,
+    min_len: f64,
+) -> Result<Vec<trigon_model::InteriorWall>> {
+    let d = find(s, name)?.clone();
+    let reg = d
+        .plans
+        .iter()
+        .find(|p| p.levels.contains(&level))
+        .cloned()
+        .ok_or_else(|| ModelError::NotFound(format!("drawing {name} has no plan registered for level {level}; run drawing.register_plan")))?;
+    let img = image(s, &d.path, d.page, d.rotate)?;
+    // Paper brightness per 48 px block (about 0.4 m at 1:100), so lighter parts of a sheet read the same.
+    let bg = img.background(48, 0.8);
+    let b = s.doc.building(None)?.clone();
+    let inside = trigon_model::build::inner_ring(&b.footprint, b.wall_thickness + 60.0);
+    // Wall directions: the long facade edges' directions, merged within 3°, plus their perpendiculars.
+    let n = b.footprint.len();
+    let mut dirs: Vec<f64> = Vec::new();
+    for i in 0..n {
+        let (p, q) = (b.footprint[i], b.footprint[(i + 1) % n]);
+        let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+        if (dx * dx + dy * dy).sqrt() < 8000.0 {
+            continue;
+        }
+        for t in [dy.atan2(dx), dy.atan2(dx) + std::f64::consts::FRAC_PI_2] {
+            let t = t.rem_euclid(std::f64::consts::PI);
+            if !dirs.iter().any(|o| {
+                let diff = (o - t).abs();
+                diff.min(std::f64::consts::PI - diff) < 3f64.to_radians()
+            }) {
+                dirs.push(t);
+            }
+        }
+    }
+    let contains = |p: [f64; 2]| {
+        let mut c = false;
+        for i in 0..inside.len() {
+            let (a, e) = (inside[i], inside[(i + inside.len() - 1) % inside.len()]);
+            if (a[1] > p[1]) != (e[1] > p[1]) && p[0] < (e[0] - a[0]) * (p[1] - a[1]) / (e[1] - a[1]) + a[0] {
+                c = !c;
+            }
+        }
+        c
+    };
+    let step = 25.0;
+    // Bridge breaks along a wall up to this many cells (scan noise, crossing lines); doors are wider.
+    const GAP_CELLS: usize = 6;
+    let (lo, hi) = b
+        .footprint
+        .iter()
+        .fold(([f64::MAX; 2], [f64::MIN; 2]), |(lo, hi), p| ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])]));
+    let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+    let half = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt() / 2.0 + 1000.0;
+    let cells = (2.0 * half / step).ceil() as usize;
+    if cells > 8000 {
+        return Err(ModelError::Invalid("the building is too large to trace at 25 mm".into()).into());
+    }
+    let (min_c, max_c) = ((min_mm / step).round().max(2.0) as usize, (max_mm / step).round() as usize);
+    let mut walls = Vec::new();
+    for &t in &dirs {
+        let (ux, uy) = (t.cos(), t.sin());
+        let (vx, vy) = (-uy, ux);
+        let site = |i: usize, j: usize| {
+            let (u, v) = (-half + (i as f64 + 0.5) * step, -half + (j as f64 + 0.5) * step);
+            [centre[0] + u * ux + v * vx, centre[1] + u * uy + v * vy]
+        };
+        // runs[i] = (centre j, thickness in cells) of wall-thick dark runs across column i.
+        let mut open: Vec<(f64, f64, usize, usize)> = Vec::new(); // (centre j, thickness, first i, last i)
+        let mut done: Vec<(f64, f64, usize, usize)> = Vec::new();
+        for i in 0..cells {
+            let is_dark = |p: [f64; 2]| {
+                contains(p) && {
+                    let [x, y] = reg.to_drawing(p);
+                    let paper = bg.sample(x / 48.0, y / 48.0).map_or(200.0, f64::from);
+                    img.sample(x, y).is_some_and(|g| f64::from(g) < (paper - dark).min(paper * 0.75))
+                }
+            };
+            // All dark runs across this column: (first cell, length).
+            let mut all: Vec<(usize, usize)> = Vec::new();
+            let mut j = 0;
+            while j < cells {
+                if is_dark(site(i, j)) {
+                    let s0 = j;
+                    while j < cells && is_dark(site(i, j)) {
+                        j += 1;
+                    }
+                    all.push((s0, j - s0));
+                } else {
+                    j += 1;
+                }
+            }
+            // Filled walls: one run as thick as a wall. Outlined walls: two thin lines a wall's thickness apart.
+            let mut runs: Vec<(f64, f64)> = Vec::new();
+            for (k, &(s0, len)) in all.iter().enumerate() {
+                if len >= min_c && len <= max_c {
+                    runs.push(((s0 + s0 + len - 1) as f64 / 2.0, len as f64));
+                } else if len <= 3
+                    && let Some(&(s1, len1)) = all.get(k + 1)
+                {
+                    let span = s1 + len1 - s0;
+                    if len1 <= 3 && s1 > s0 + len && span >= min_c && span <= max_c {
+                        runs.push(((s0 + s0 + span - 1) as f64 / 2.0, -(span as f64)));
+                    }
+                }
+            }
+            let mut next = Vec::new();
+            for (c, th, first, last) in open.drain(..) {
+                if let Some(k) =
+                    runs.iter().position(|(rc, rt)| (rc - c).abs() <= 1.0 && (rt.abs() - th.abs()).abs() <= 2.0 && (rt.signum() == th.signum()))
+                {
+                    let (rc, rt) = runs.remove(k);
+                    let span = (i - first + 1) as f64;
+                    next.push(((c * (span - 1.0) + rc) / span, (th * (span - 1.0) + rt) / span, first, i));
+                } else if i - last <= GAP_CELLS {
+                    next.push((c, th, first, last));
+                } else {
+                    done.push((c, th, first, last));
+                }
+            }
+            next.extend(runs.into_iter().map(|(c, th)| (c, th, i, i)));
+            open = next;
+        }
+        done.extend(open);
+        for (c, th, first, last) in done {
+            let len = (last - first + 1) as f64 * step;
+            // Outlined walls (negative thickness) need more length: stair treads and fixtures are short pairs of lines.
+            if len < min_len || (th < 0.0 && len < min_len.max(1500.0)) {
+                continue;
+            }
+            let th = th.abs();
+            let v = -half + (c + 0.5) * step;
+            let (u0, u1) = (-half + first as f64 * step, -half + (last + 1) as f64 * step);
+            let p = |u: f64| [centre[0] + u * ux + v * vx, centre[1] + u * uy + v * vy];
+            let thickness = (th * step).round();
+            walls.push(trigon_model::InteriorWall {
+                id: String::new(),
+                levels: vec![level],
+                a: p(u0),
+                b: p(u1),
+                thickness,
+                load_bearing: thickness >= 200.0,
+            });
+        }
+    }
+    Ok(clean_walls(walls, &b.footprint))
+}
+
+/// Cleans traced walls: keeps each only where its direction matches the nearest long facade (so
+/// one wing's grid isn't read into another), merges collinear overlapping pieces, and drops thin
+/// short bits (text, treads, fixtures).
+fn clean_walls(walls: Vec<trigon_model::InteriorWall>, footprint: &[[f64; 2]]) -> Vec<trigon_model::InteriorWall> {
+    let n = footprint.len();
+    let long: Vec<([f64; 2], [f64; 2])> = (0..n)
+        .map(|i| (footprint[i], footprint[(i + 1) % n]))
+        .filter(|(p, q)| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() >= 8000.0)
+        .collect();
+    let dir = |a: [f64; 2], b: [f64; 2]| (b[1] - a[1]).atan2(b[0] - a[0]).rem_euclid(std::f64::consts::PI);
+    let square = |t1: f64, t2: f64| {
+        let d = (t1 - t2).rem_euclid(std::f64::consts::FRAC_PI_2);
+        d.min(std::f64::consts::FRAC_PI_2 - d) < 3f64.to_radians()
+    };
+    let seg_dist = |p: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let l2 = (dx * dx + dy * dy).max(1e-9);
+        let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0);
+        ((a[0] + t * dx - p[0]).powi(2) + (a[1] + t * dy - p[1]).powi(2)).sqrt()
+    };
+    let mut kept: Vec<trigon_model::InteriorWall> = walls
+        .into_iter()
+        .filter(|w| {
+            let m = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
+            let len = ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt();
+            let near = long.iter().min_by(|x, y| seg_dist(m, x.0, x.1).total_cmp(&seg_dist(m, y.0, y.1)));
+            let aligned = near.is_none_or(|(p, q)| square(dir(w.a, w.b), dir(*p, *q)));
+            aligned && (len >= 1000.0 || w.thickness >= 200.0)
+        })
+        .collect();
+    // Merge collinear overlapping or touching pieces (same direction, centre lines closer than their half thicknesses).
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'outer: for i in 0..kept.len() {
+            for j in i + 1..kept.len() {
+                let (a, b) = (&kept[i], &kept[j]);
+                let (ta, tb) = (dir(a.a, a.b), dir(b.a, b.b));
+                let dt = (ta - tb).abs().min(std::f64::consts::PI - (ta - tb).abs());
+                if dt > 2f64.to_radians() {
+                    continue;
+                }
+                let (ux, uy) = (ta.cos(), ta.sin());
+                let off = |p: [f64; 2]| -(p[0] - a.a[0]) * uy + (p[1] - a.a[1]) * ux;
+                if off(b.a).abs().max(off(b.b).abs()) > (a.thickness + b.thickness) / 2.0 {
+                    continue;
+                }
+                let along = |p: [f64; 2]| (p[0] - a.a[0]) * ux + (p[1] - a.a[1]) * uy;
+                let (a0, a1) = (along(a.a).min(along(a.b)), along(a.a).max(along(a.b)));
+                let (b0, b1) = (along(b.a).min(along(b.b)), along(b.a).max(along(b.b)));
+                if b0 > a1 + 150.0 || a0 > b1 + 150.0 {
+                    continue;
+                }
+                let (s0, s1) = (a0.min(b0), a1.max(b1));
+                let (la, lb) = (a1 - a0, b1 - b0);
+                let o = (off(b.a) + off(b.b)) / 2.0 * lb / (la + lb);
+                // The merged centre line: a's line moved by the length-weighted offset along the normal (−uy, ux).
+                let base = [a.a[0] - o * uy, a.a[1] + o * ux];
+                let p = |t: f64| [base[0] + t * ux, base[1] + t * uy];
+                let thickness = if la >= lb { a.thickness } else { b.thickness }.max(a.thickness.min(b.thickness));
+                let w = trigon_model::InteriorWall {
+                    id: String::new(),
+                    levels: a.levels.clone(),
+                    a: p(s0),
+                    b: p(s1),
+                    thickness,
+                    load_bearing: a.load_bearing || b.load_bearing,
+                };
+                kept.remove(j);
+                kept[i] = w;
+                merged = true;
+                break 'outer;
+            }
+        }
+    }
+    kept
+}

@@ -485,3 +485,80 @@ fn floor_plans_from_a_registered_sheet() {
     assert!(s.execute("drawing.register_plan", json!({"name": sheet, "levels": [1], "points": [{"px": 1, "py": 1, "x": 0.0, "y": 0.0}]})).is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn interior_walls_traced_from_a_plan_sheet() {
+    let mut s = session();
+    // A 1:100 plan at 100 px/m, north up: site (x, y) mm ↔ pixel (1500 + x/10, 1200 − y/10).
+    let (w, h) = (3000u32, 2400u32);
+    let mut data = vec![215u8; (w * h) as usize];
+    // A 200 mm wall along x at y = 0 from x = −8 m to +8 m, drawn with a 1 px step half way (as scans do), and a 100 mm
+    // partition along y at x = 4 m.
+    for x in 700..2300 {
+        let shift = if x < 1500 { 0 } else { 1 };
+        for y in 1190 + shift..1210 + shift {
+            data[(y * w + x) as usize] = 30;
+        }
+    }
+    for y in 700..1190 {
+        for x in 1895..1905 {
+            data[(y * w + x) as usize] = 40;
+        }
+    }
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "plan".into(),
+        path: "/virtual/plan.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: w,
+        height: h,
+        note: String::new(),
+        facades: Vec::new(),
+        plans: Vec::new(),
+    });
+    s.drawing_cache = Some((("/virtual/plan.pdf".into(), 1, 0), std::sync::Arc::new(trigon_drawing::Gray { width: w, height: h, data })));
+    s.execute(
+        "drawing.register_plan",
+        json!({"name": "plan", "levels": [1, 2], "points": [{"px": 300, "py": 1800, "x": -12000.0, "y": -6000.0}, {"px": 2700, "py": 1800, "x": 12000.0, "y": -6000.0}]}),
+    )
+    .unwrap();
+    let v = s.execute("drawing.trace_walls", json!({"name": "plan", "level": 1})).unwrap();
+    let walls = v["walls"].as_array().unwrap();
+    let main = walls.iter().find(|w| w["thickness"].as_f64().unwrap() >= 150.0).expect("the 200 mm wall");
+    let (a, b) = (main["a"].as_array().unwrap(), main["b"].as_array().unwrap());
+    let len = ((b[0].as_f64().unwrap() - a[0].as_f64().unwrap()).powi(2) + (b[1].as_f64().unwrap() - a[1].as_f64().unwrap()).powi(2)).sqrt();
+    assert!((len - 16000.0).abs() < 200.0, "length {len}");
+    assert!(a[1].as_f64().unwrap().abs() < 30.0 && b[1].as_f64().unwrap().abs() < 30.0, "on y = 0 after merging the stepped pieces: {main}");
+    assert_eq!(main["load_bearing"], true);
+    assert!(walls.iter().any(|w| (w["thickness"].as_f64().unwrap() - 100.0).abs() <= 30.0), "the partition: {v}");
+    // Add them on two storeys; they export as IfcWall and draw in the plan.
+    let v = s.execute("drawing.trace_walls", json!({"name": "plan", "level": 1, "add": true, "levels": [1, 2]})).unwrap();
+    assert!(v["added"].as_u64().unwrap() >= 2);
+    let list = s.execute("interior.list", json!({})).unwrap();
+    assert!(list[1]["load_bearing"].as_u64().unwrap() >= 1 && list[2]["partitions"].as_u64().unwrap() >= 1);
+    s.execute(
+        "interior.add_rooms",
+        json!({"rooms": [{"levels": [1], "name": "Stue", "polygon": [[-8000.0, 0.0], [4000.0, 0.0], [4000.0, 5000.0], [-8000.0, 5000.0]]}]}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs": [{"levels": [1, 2], "outline": [[5000.0, 500.0], [8000.0, 500.0], [8000.0, 2700.0], [5000.0, 2700.0]]}]}),
+    )
+    .unwrap();
+    assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["rooms"][0]["area_m2"], 60.0);
+    let dir = std::env::temp_dir().join(format!("trigon-interior-{}", std::process::id()));
+    s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();
+    let ifc = std::fs::read_to_string(dir.join("m.ifc")).unwrap();
+    assert!(ifc.contains(".PARTITIONING.") && ifc.contains("Interior wall (load-bearing)"));
+    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg")})).unwrap();
+    let text = std::fs::read_to_string(svg["written"].as_str().unwrap()).unwrap();
+    assert!(text.contains(">Stue<") && text.contains("60.0 m²"));
+    // Bad input is refused.
+    assert!(s.execute("interior.add_walls", json!({"walls": [{"levels": [9], "a": [0.0, 0.0], "b": [1000.0, 0.0], "thickness": 100.0}]})).is_err());
+    assert!(s.execute("interior.add_walls", json!({"walls": [{"levels": [1], "a": [0.0, 0.0], "b": [0.0, 0.0], "thickness": 100.0}]})).is_err());
+    assert!(s.execute("drawing.trace_walls", json!({"name": "plan", "level": 3})).is_err(), "no plan registered for level 3");
+    s.execute("interior.clear", json!({})).unwrap();
+    assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["load_bearing"], 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
