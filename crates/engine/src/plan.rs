@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use trigon_model::build::{FacadeFrame, Status, View, build_view};
 use trigon_model::{ComponentKind, Document, ModelError};
 
+use crate::sheet::{Fill, Halo, Layer, MM_PER_PX, PAGE_MM, Scene, Stroke, Text, Viewport, dxf, scale_text, sheet_scale, svg};
 use crate::{EngineError, Result, Session};
 
 const CUT: f64 = 1000.0;
@@ -577,30 +578,47 @@ fn sheet_frame(doc: &Document, region: Option<&[[f64; 2]]>, rotation: f64) -> Re
         return Err(ModelError::Invalid("sheet region needs a nonzero width and height".into()).into());
     }
     let margin = if region.is_some() { 0.0 } else { 2000.0 };
-    f.mm = ((hi[0] - lo[0] + 2.0 * margin) / 1440.0).max((hi[1] - lo[1] + 2.0 * margin) / 650.0);
+    let fit = ((hi[0] - lo[0] + 2.0 * margin) / 1440.0).max((hi[1] - lo[1] + 2.0 * margin) / 650.0);
+    // At a standard scale when one fits well, so the sheet can say which.
+    f.mm = sheet_scale(fit / MM_PER_PX) * MM_PER_PX;
     f.x0 = (lo[0] + hi[0]) / 2.0 - 800.0 * f.mm;
     f.y1 = (lo[1] + hi[1]) / 2.0 + 465.0 * f.mm;
     Ok(f)
 }
 
-fn path_data(contours: &[Vec<[f64; 2]>], f: &Frame) -> String {
-    let mut d = String::new();
-    for ring in contours {
-        for (k, p) in ring.iter().enumerate() {
-            let q = f.px(*p);
-            let _ = write!(d, "{} {:.3} {:.3} ", if k == 0 { 'M' } else { 'L' }, q[0], q[1]);
-        }
-        d.push_str("Z ");
+/// The layer a presentation plan line belongs to, from the widths `scene` draws each family with:
+/// door leaves 45, balcony outlines 30, window lines 25 and 15, rails and decks 14, boards 7,
+/// dimension lines 10 and ticks 18.
+fn line_layer(width: f64) -> Layer {
+    match width.round() as i64 {
+        40.. => Layer::Door,
+        28..=39 => Layer::Balcony,
+        20..=27 | 15 | 16 => Layer::Glazing,
+        13 | 14 | ..=9 => Layer::Balcony,
+        _ => Layer::Annotation,
     }
-    d
 }
 
-fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<String> {
+/// A presentation plan: the scene in drawing mm (site mm turned by the sheet rotation about the
+/// site origin; unturned, site coordinates), and how it sits on the sheet.
+struct PlanSheet {
+    scene: Scene,
+    vp: Viewport,
+    /// Sheet px `[x, y, w, h]`.
+    clip: [f64; 4],
+    floor: String,
+    project: String,
+    caption: String,
+    note: Option<String>,
+}
+
+fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<PlanSheet> {
     let (prims, _) = scene(doc, level, view, true)?;
     let f = sheet_frame(doc, region, rotation)?;
-    let floor = doc.buildings.first().and_then(|b| b.storeys.get(level)).map(|s| s.name.as_str()).unwrap_or_default();
-    let project = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
-    let caption = if caption.is_empty() { project } else { caption };
+    let vp = Viewport { x0: f.x0, y1: f.y1, mm: f.mm };
+    let floor = doc.buildings.first().and_then(|b| b.storeys.get(level)).map(|s| s.name.clone()).unwrap_or_default();
+    let project = doc.buildings.first().map(|b| b.name.clone()).unwrap_or_default();
+    let caption = if caption.is_empty() { project.clone() } else { caption.to_string() };
     let clip = if let Some(region) = region {
         let mut lo = [f64::INFINITY; 2];
         let mut hi = [f64::NEG_INFINITY; 2];
@@ -611,36 +629,13 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
                 hi[k] = hi[k].max(q[k]);
             }
         }
-        let pad = 0.0;
-        let x = (lo[0] - pad).max(70.0);
-        let y = (lo[1] - pad).max(130.0);
-        [x, y, (hi[0] + pad).min(1530.0) - x, (hi[1] + pad).min(800.0) - y]
+        let x = lo[0].max(70.0);
+        let y = lo[1].max(130.0);
+        [x, y, hi[0].min(1530.0) - x, hi[1].min(800.0) - y]
     } else {
         [70.0, 130.0, 1460.0, 670.0]
     };
-    let mut out = String::from(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
-<rect width="1600" height="900" fill="white"/>
-<defs>
-<pattern id="masonry" width="7" height="7" patternUnits="userSpaceOnUse"><rect width="7" height="7" fill="white"/><path d="M-2 2 L2 -2 M0 7 L7 0 M5 9 L9 5" fill="none" stroke="#777" stroke-width="0.65"/></pattern>
-<pattern id="stair" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="#fafafa"/><circle cx="2" cy="2" r="0.6" fill="#aaa"/></pattern>
-</defs>
-<g font-family="Liberation Sans, Helvetica, Arial, sans-serif" fill="#242424">
-"##,
-    );
-    let _ = writeln!(
-        out,
-        r#"<defs><clipPath id="viewport"><rect x="{}" y="{}" width="{}" height="{}"/></clipPath></defs>"#,
-        clip[0], clip[1], clip[2], clip[3]
-    );
-    let title_width = (floor.chars().count() as f64 * 23.0 + 44.0).max(160.0);
-    let _ = writeln!(
-        out,
-        r##"<rect x="80" y="42" width="{title_width:.1}" height="70" fill="white" stroke="#999" stroke-width="0.8"/><text x="102" y="91" font-size="40">{}</text><text x="1520" y="72" text-anchor="end" font-size="18">{}</text>"##,
-        escape(floor),
-        escape(project)
-    );
-    out.push_str("<g clip-path=\"url(#viewport)\">\n");
+    let mut sc = Scene::new(vp.scale());
     // Union each family before stroking: no rectangles' internal seams or doubled junction edges.
     for surface in [Surface::Stair, Surface::Interior, Surface::Exterior] {
         let polys: Vec<_> = prims
@@ -650,17 +645,14 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
                 _ => None,
             })
             .collect();
-        let fill = match surface {
-            Surface::Exterior => "url(#masonry)",
-            Surface::Interior => "#d6d6d6",
-            Surface::Stair => "url(#stair)",
+        let (layer, fill, pen) = match surface {
+            Surface::Exterior => (Layer::WallCut, Fill::Masonry, 0.35),
+            Surface::Interior => (Layer::WallCut, Fill::Solid([0xd6, 0xd6, 0xd6]), 0.35),
+            Surface::Stair => (Layer::Stair, Fill::Dots, 0.25),
         };
         for shape in trigon_model::footprint::union(&polys)? {
-            let _ = writeln!(
-                out,
-                r##"<path d="{}" fill="{fill}" fill-rule="evenodd" stroke="#333" stroke-width="1.1" stroke-linejoin="miter"/>"##,
-                path_data(&shape, &f)
-            );
+            let rings = shape.iter().map(|ring| ring.iter().map(|p| f.rot(*p)).collect()).collect();
+            sc.polygon(layer, rings, Some(fill), Some(Stroke { pen, colour: [0x33, 0x33, 0x33], dashed: false }));
         }
     }
     let mut labels: Vec<Label> = Vec::new();
@@ -668,21 +660,15 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
         match p {
             Prim::Poly { .. } => {}
             Prim::Line { a, b, width, dashed, color } => {
-                let (a, b) = (f.px(*a), f.px(*b));
-                let stroke = if *dashed || *color == DEMOLISHED { "#bd3030" } else { "#333" };
-                let dash = if *dashed { " stroke-dasharray=\"8 5\"" } else { "" };
-                let weight = if *width >= 25.0 {
-                    1.15
+                let colour = if *dashed || *color == DEMOLISHED { [0xbd, 0x30, 0x30] } else { [0x33, 0x33, 0x33] };
+                let pen = if *width >= 25.0 {
+                    0.25
                 } else if *width >= 14.0 {
-                    0.8
+                    0.18
                 } else {
-                    0.55
+                    0.13
                 };
-                let _ = writeln!(
-                    out,
-                    r#"<line x1="{:.3}" y1="{:.3}" x2="{:.3}" y2="{:.3}" stroke="{stroke}" stroke-width="{weight}"{dash}/>"#,
-                    a[0], a[1], b[0], b[1]
-                );
+                sc.line(line_layer(*width), f.rot(*a), f.rot(*b), Stroke { pen, colour, dashed: *dashed });
             }
             Prim::Text { at, text, size, angle, away, .. } => {
                 let p = f.px(*at);
@@ -727,37 +713,17 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
             _ => crowded |= l.balcony,
         }
     }
-    if !crowded {
-        sizes.clear();
-    }
     for l in placed.iter().filter(|l| !(crowded && l.balcony)) {
-        let _ = writeln!(
-            out,
-            r##"<text x="{:.3}" y="{:.3}" text-anchor="middle" dominant-baseline="middle" font-size="{}" transform="rotate({:.3} {:.3} {:.3})" paint-order="stroke fill" stroke="white" stroke-width="4" stroke-linejoin="round">{}</text>"##,
-            l.at[0],
-            l.at[1],
-            l.fs,
-            l.deg,
-            l.at[0],
-            l.at[1],
-            escape(&l.text)
-        );
+        let mut t = Text::new(Layer::Annotation, vp.at(l.at), l.text.clone(), l.fs * MM_PER_PX);
+        t.deg = -l.deg;
+        t.halo = Halo::Outline;
+        sc.text(t);
     }
-    out.push_str("</g>\n");
-    if !sizes.is_empty() {
-        let list: Vec<String> = sizes.iter().map(|(t, n)| format!("{n} stk. {t}")).collect();
-        let _ = writeln!(out, r##"<text x="80" y="812" font-size="15">Altaner: {}</text>"##, escape(&list.join(", ")));
-    }
-    let _ = writeln!(
-        out,
-        r##"<text x="800" y="847" text-anchor="middle" font-size="28">{}</text><text x="80" y="886" font-size="12" fill="#777">Mål og tegninger er vejledende</text><text x="1520" y="886" text-anchor="end" font-size="12" fill="#777">Trigon · {}</text></g></svg>"##,
-        escape(caption),
-        escape(floor)
-    );
-    Ok(out)
+    let note = crowded.then(|| format!("Altaner: {}", sizes.iter().map(|(t, n)| format!("{n} stk. {t}")).collect::<Vec<_>>().join(", ")));
+    Ok(PlanSheet { scene: sc, vp, clip, floor, project, caption, note })
 }
 
-/// A presentation drawing set: vector PDF pages, or one matching SVG/PNG sheet.
+/// A presentation drawing set: vector PDF pages, or one matching SVG/PNG sheet or DXF drawing.
 pub(crate) fn sheet(
     doc: &Document,
     levels: &[usize],
@@ -771,17 +737,34 @@ pub(crate) fn sheet(
         return Err(ModelError::Invalid("a drawing set needs 1 to 100 levels and a caption of at most 500 bytes".into()).into());
     }
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
-    if !matches!(ext, "png" | "svg" | "pdf") || (ext != "pdf" && levels.len() != 1) {
-        return Err(ModelError::Invalid("use .pdf for a drawing set, or .png/.svg for a single sheet".into()).into());
+    if !matches!(ext, "png" | "svg" | "pdf" | "dxf") || (ext != "pdf" && levels.len() != 1) {
+        return Err(ModelError::Invalid("use .pdf for a drawing set, or .png/.svg/.dxf for a single sheet".into()).into());
     }
-    let pages: Vec<String> = levels.iter().map(|level| sheet_svg(doc, *level, view, rotation, region, caption)).collect::<Result<_>>()?;
-    let bytes = match ext {
-        "pdf" => crate::plan_output::pdf(&pages, [338.666_666_7, 190.5])?,
-        "png" => crate::plan_output::png(&pages[0])?,
-        _ => pages[0].as_bytes().to_vec(),
+    let sheets: Vec<PlanSheet> = levels.iter().map(|level| sheet_scene(doc, *level, view, rotation, region, caption)).collect::<Result<_>>()?;
+    let pages: Vec<String> = sheets
+        .iter()
+        .filter(|_| ext != "dxf")
+        .map(|s| {
+            let frame = svg::Frame { title: &s.floor, project: &s.project, caption: &s.caption, footer: &s.floor, note: s.note.clone() };
+            svg::sheet(&frame, &s.scene, &s.vp, s.clip)
+        })
+        .collect();
+    let mut result = json!({"written": path, "pages": levels.len(), "width_px": 1600, "height_px": 900, "underlay": null, "style": "presentation"});
+    let bytes = match (ext, sheets.first(), pages.first()) {
+        ("pdf", _, _) => crate::plan_output::pdf(&pages, PAGE_MM)?,
+        ("png", _, Some(page)) => crate::plan_output::png(page)?,
+        ("svg", _, Some(page)) => page.as_bytes().to_vec(),
+        ("dxf", Some(s), _) => {
+            let text = dxf::write(&s.scene, &dxf::TitleBlock { title: &s.floor, project: &s.project, caption: &s.caption, note: s.note.clone() });
+            result["dxf"] = dxf::summary(&text);
+            dxf::bytes(&text)
+        }
+        _ => return Err(EngineError::Io("nothing to write".into())),
     };
     write_output(&path, &bytes)?;
-    let mut result = json!({"written": path, "pages": levels.len(), "width_px": 1600, "height_px": 900, "underlay": null, "style": "presentation"});
+    if let Some(s) = sheets.first() {
+        result["scale"] = json!(scale_text(s.scene.scale));
+    }
     if ext == "png" {
         result["image_path"] = json!(path);
     }

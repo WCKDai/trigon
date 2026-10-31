@@ -1857,6 +1857,8 @@ dependencies = [
 name = "trigon-engine"
 version = "0.1.0"
 dependencies = [
+ "earcutr 0.5.0",
+ "i_overlay",
  "krilla",
  "krilla-svg",
  "lopdf",
