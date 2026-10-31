@@ -372,6 +372,26 @@ pub struct InteriorWall {
     pub thickness: f64,
     #[serde(default)]
     pub load_bearing: bool,
+    /// Doors in the wall, on every storey it stands on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doors: Vec<WallDoor>,
+}
+
+/// A door in an interior wall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WallDoor {
+    /// The opening's centre, mm along the wall from its start `a`.
+    pub at: f64,
+    /// Clear width of the opening, mm.
+    pub width: f64,
+    /// Height of the opening above the floor, mm (default 2100).
+    #[serde(default = "door_height")]
+    pub height: f64,
+}
+
+pub fn door_height() -> f64 {
+    2100.0
 }
 
 /// A staircase: its outline in plan (site mm) and the direction it climbs (unit vector), on the listed storeys.
@@ -441,6 +461,22 @@ impl InteriorWall {
         let len = ((self.b[0] - self.a[0]).powi(2) + (self.b[1] - self.a[1]).powi(2)).sqrt();
         checked("wall length", len, 100.0, 200_000.0)?;
         checked("wall thickness", self.thickness, 40.0, 1000.0)?;
+        if self.doors.len() > 50 {
+            return Err(ModelError::Invalid("at most 50 doors in one wall".into()));
+        }
+        let mut spans: Vec<(f64, f64)> = Vec::with_capacity(self.doors.len());
+        for d in &self.doors {
+            checked("door width", d.width, 300.0, 4000.0)?;
+            checked("door height", d.height, 1000.0, 4000.0)?;
+            let (lo, hi) = (d.at - d.width / 2.0, d.at + d.width / 2.0);
+            if !d.at.is_finite() || lo < -1.0 || hi > len + 1.0 {
+                return Err(ModelError::Invalid(format!("a {:.0} mm door at {:.0} mm doesn't fit the {len:.0} mm wall", d.width, d.at)));
+            }
+            if spans.iter().any(|&(a, b)| lo < b && a < hi) {
+                return Err(ModelError::Invalid("doors in a wall may not overlap".into()));
+            }
+            spans.push((lo, hi));
+        }
         if self.levels.is_empty() || self.levels.iter().any(|l| *l >= storeys) {
             return Err(ModelError::Invalid(format!("wall levels must be storey indices below {storeys}")));
         }

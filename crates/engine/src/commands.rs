@@ -662,6 +662,44 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "interior.doors_from_gaps",
+        summary: "Turn door-sized gaps in interior walls into doors (traced plans show doors as gaps): two collinear pieces \
+                  of one wall either side of a `min_mm`–`max_mm` gap (default 600–1300) become one wall with a door, and a \
+                  wall that stops a door's width short of another wall runs on to it with the door at its end. Gaps \
+                  crossed by another wall stay. Doors are drawn as a closed leaf (no swing) and exported as doors in their \
+                  wall. `levels` limits it to walls on those storeys. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<DoorsFromGaps>,
+        run: |s, v| {
+            let p: DoorsFromGaps = parse("interior.doors_from_gaps", v)?;
+            let rules = trigon_model::doors::Rules {
+                min: trigon_model::checked("min_mm", p.min_mm.unwrap_or(600.0), 300.0, 4000.0)?,
+                max: trigon_model::checked("max_mm", p.max_mm.unwrap_or(1300.0), 300.0, 4000.0)?,
+                height: trigon_model::checked("height_mm", p.height_mm.unwrap_or(trigon_model::doc::door_height()), 1000.0, 4000.0)?,
+            };
+            if rules.max < rules.min {
+                return Err(ModelError::Invalid("max_mm must be at least min_mm".into()).into());
+            }
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let storeys = b.storeys.len();
+            let before = b.interior_walls.len();
+            let found = trigon_model::doors::doors_from_gaps(&mut b.interior_walls, p.levels.as_deref(), &rules);
+            for w in &b.interior_walls {
+                w.validate(storeys)?;
+            }
+            let doors: usize = b.interior_walls.iter().map(|w| w.doors.len()).sum();
+            trigon_model::build(&s.doc)?;
+            Ok(json!({
+                "doors_between_pieces": found.between,
+                "doors_at_wall_ends": found.at_ends,
+                "walls_before": before,
+                "walls_after": s.doc.building(p.building.as_deref())?.interior_walls.len(),
+                "doors_in_walls": doors,
+            }))
+        },
+    },
+    CommandSpec {
         id: "interior.regularize",
         summary: "Straighten measured interior walls onto explicit building axes, co-align fragments, merge duplicates and \
                   repair small junction gaps. Preserves door-size gaps and storey boundaries. Undoable; refresh derived room \
@@ -1488,6 +1526,20 @@ struct SetRoof {
 struct SetWallThickness {
     building: Option<String>,
     thickness: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DoorsFromGaps {
+    building: Option<String>,
+    /// Only walls standing on one of these storeys.
+    levels: Option<Vec<usize>>,
+    /// Narrowest gap taken for a door, mm (default 600).
+    min_mm: Option<f64>,
+    /// Widest gap taken for a door, mm (default 1300).
+    max_mm: Option<f64>,
+    /// Door height, mm (default 2100).
+    height_mm: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]

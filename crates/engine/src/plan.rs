@@ -277,7 +277,14 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
     // treads, room names and areas.
     for built in &built {
         for w in built.interior.iter().filter(|w| w.level == level) {
-            prims.push(Prim::Poly { pts: w.outline.to_vec(), fill: if w.load_bearing { WALL } else { PARTITION }, surface: Surface::Interior });
+            for pts in &w.cut {
+                prims.push(Prim::Poly { pts: pts.clone(), fill: if w.load_bearing { WALL } else { PARTITION }, surface: Surface::Interior });
+            }
+            // Doors as a closed leaf across the opening: no swing, no opening direction.
+            for d in &w.doors {
+                let mid = w.thickness / 2.0;
+                prims.push(Prim::Line { a: pt(&w.frame, d.rect.u0, mid), b: pt(&w.frame, d.rect.u1, mid), color: LINE, width: 30.0, dashed: false });
+            }
         }
     }
     for b in &doc.buildings {

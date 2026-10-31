@@ -230,6 +230,12 @@ pub struct BuiltInterior {
     pub outline: [[f64; 2]; 4],
     /// What the ends at `axis[0]` and `axis[1]` join.
     pub ends: [Option<Join>; 2],
+    /// The wall's own frame: `u` along its right side from the start, `w` across into the wall.
+    pub frame: FacadeFrame,
+    /// Doors, as openings in the wall's frame.
+    pub doors: Vec<BuiltOpening>,
+    /// The plan as cut 1 m above the floor: the outline with the doors left open.
+    pub cut: Vec<Vec<[f64; 2]>>,
     pub z_bottom: f64,
     pub height: f64,
     pub load_bearing: bool,
@@ -630,18 +636,9 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
                 continue;
             }
             let id = if iw.id.is_empty() { format!("{}.iw{k}", b.id) } else { iw.id.clone() };
-            interior.push(BuiltInterior {
-                id: format!("{id}.L{level}"),
-                level,
-                axis: [j.a, j.b],
-                thickness: iw.thickness,
-                outline: j.outline,
-                ends: j.ends,
-                z_bottom: s.elevation,
-                height: s.height - FLOOR_SLAB,
-                load_bearing: iw.load_bearing,
-                mesh: prism(&j.outline, s.elevation, s.height - FLOOR_SLAB),
-            });
+            if let Some(w) = interior_wall(iw, &format!("{id}.L{level}"), level, &j, (s.elevation, s.height - FLOOR_SLAB)) {
+                interior.push(w);
+            }
         }
     }
     let mut stairs = Vec::new();
@@ -659,6 +656,84 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
         }
     }
     Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
+}
+
+/// Door frame (karm) width, mm.
+const DOOR_FRAME: f64 = 45.0;
+/// Door leaf thickness, mm.
+const DOOR_LEAF: f64 = 40.0;
+
+/// An interior wall on one storey after joining: a closed prism with its doors cut out, a
+/// frame and a closed leaf in each door, and the plan cut with the doors left open. `None` if
+/// the wall is degenerate.
+fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crate::joins::Joined, (z0, height): (f64, f64)) -> Option<BuiltInterior> {
+    let [r0, r1, l1, l0] = j.outline;
+    let fr = FacadeFrame::new(r0, r1)?;
+    let d = iw.thickness;
+    let along = |q: [f64; 2]| (q[0] - r0[0]) * fr.t[0] + (q[1] - r0[1]) * fr.t[1];
+    // Door positions are measured from the wall's drawn start; the frame starts at the joined right side.
+    let shift = (r0[0] - iw.a[0]) * fr.t[0] + (r0[1] - iw.a[1]) * fr.t[1];
+    let span = Span { level, thickness: d, z0, z1: z0 + height, in0: along(l0), in1: along(l1), qs: l0, qe: l1 };
+    let mut doors = Vec::with_capacity(iw.doors.len());
+    for (k, door) in iw.doors.iter().enumerate() {
+        let (u0, u1) = ((door.at - door.width / 2.0 - shift).max(0.0), (door.at + door.width / 2.0 - shift).min(fr.length));
+        if u1 - u0 < 300.0 {
+            continue;
+        }
+        let rect = Rect { u0, u1, v0: z0, v1: z0 + door.height.min(height - 50.0) };
+        let (fw, leaf) = (DOOR_FRAME.min((u1 - u0) / 4.0), DOOR_LEAF.min(d / 2.0));
+        let mut frame = fbox(&fr, (u0, u0 + fw), (0.0, d), (rect.v0, rect.v1));
+        frame.append(&fbox(&fr, (u1 - fw, u1), (0.0, d), (rect.v0, rect.v1)));
+        frame.append(&fbox(&fr, (u0 + fw, u1 - fw), (0.0, d), (rect.v1 - fw, rect.v1)));
+        let panel = fbox(&fr, (u0 + fw, u1 - fw), ((d - leaf) / 2.0, (d + leaf) / 2.0), (rect.v0 + 10.0, rect.v1 - fw));
+        let door_id = format!("{id}.D{k}");
+        let fill = BuiltElement {
+            id: door_id.clone(),
+            name: "Dør".into(),
+            class: ElementClass::Door,
+            type_id: "door.interior".into(),
+            level,
+            width: u1 - u0,
+            height: rect.v1 - rect.v0,
+            parts: vec![(Material::Frame, frame), (Material::Door, panel)],
+            status: Status::Existing,
+        };
+        doors.push(BuiltOpening { id: door_id, level, rect, fill, attached: Vec::new(), status: Status::Existing });
+    }
+    let holes: Vec<Rect> = doors.iter().map(|o| o.rect).collect();
+    let mesh = crate::walls::segment(&fr, id, &span, &holes).map_or_else(|| prism(&j.outline, z0, height), |s| s.mesh);
+    let footprints: Vec<Vec<[f64; 2]>> = holes
+        .iter()
+        .map(|r| {
+            [(r.u0, -5.0), (r.u1, -5.0), (r.u1, d + 5.0), (r.u0, d + 5.0)]
+                .iter()
+                .map(|&(u, w)| {
+                    let p = fr.point(u, w, 0.0);
+                    [p[0], p[1]]
+                })
+                .collect()
+        })
+        .collect();
+    let cut = if footprints.is_empty() {
+        vec![j.outline.to_vec()]
+    } else {
+        crate::walls::cut(&j.outline, &footprints).into_iter().filter_map(|shape| shape.into_iter().next()).collect()
+    };
+    Some(BuiltInterior {
+        id: id.to_string(),
+        level,
+        axis: [j.a, j.b],
+        thickness: d,
+        outline: j.outline,
+        ends: j.ends,
+        frame: fr,
+        doors,
+        cut,
+        z_bottom: z0,
+        height,
+        load_bearing: iw.load_bearing,
+        mesh,
+    })
 }
 
 /// A facade's inner wall line must keep every edge pointing the way its outer edge does: a wall

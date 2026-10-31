@@ -562,6 +562,7 @@ pub(crate) fn trace_walls(
                 b: pb,
                 thickness,
                 load_bearing: thickness >= 200.0,
+                doors: Vec::new(),
             });
         }
     }
@@ -673,6 +674,7 @@ fn clean_walls(walls: Vec<trigon_model::InteriorWall>, grids: &[f64]) -> Vec<tri
                     b: p(s1),
                     thickness,
                     load_bearing: a.load_bearing || b.load_bearing,
+                    doors: Vec::new(),
                 };
                 kept.remove(j);
                 kept[i] = w;

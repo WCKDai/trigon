@@ -842,3 +842,41 @@ fn masonry_walls_step_inside_at_every_floor_and_interior_walls_join_them() {
     }
     assert_eq!(s.doc, before);
 }
+
+#[test]
+fn door_gaps_become_doors_in_one_wall() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [
+            {"id": "w1", "levels": [1], "a": [-4000, 0], "b": [-400, 0], "thickness": 120},
+            {"id": "w2", "levels": [1], "a": [400, 0], "b": [4000, 0], "thickness": 120}
+        ]}),
+    )
+    .unwrap();
+    let v = s.execute("interior.doors_from_gaps", json!({})).unwrap();
+    assert_eq!(v["doors_between_pieces"], 1, "{v}");
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.len(), 1);
+    assert_eq!(walls[0].doors.len(), 1);
+    assert!((walls[0].doors[0].width - 800.0).abs() < 1e-6 && (walls[0].doors[0].at - 4000.0).abs() < 1e-6);
+
+    // Built: one wall with a door (frame and leaf), the plan cut left open at the door.
+    let built = trigon_model::build(&s.doc).unwrap();
+    let w = built[0].interior.iter().find(|w| w.id == "w1.L1").unwrap();
+    assert_eq!(w.doors.len(), 1);
+    assert_eq!(w.cut.len(), 2, "the cut plan is two pieces either side of the door");
+    assert_eq!(w.doors[0].fill.class, trigon_model::ElementClass::Door);
+    assert!(s.execute("plan.image", json!({"level": 1, "path": std::env::temp_dir().join("trigon-doors.svg")})).is_ok());
+
+    // Undo restores the two pieces; a second run finds nothing more.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc.buildings[0].interior_walls.len(), 2);
+    s.execute("edit.redo", json!({})).unwrap();
+    let again = s.execute("interior.doors_from_gaps", json!({})).unwrap();
+    assert_eq!(again["doors_between_pieces"], 0);
+    // Refused: max below min, hostile numbers.
+    for bad in [json!({"min_mm": 900, "max_mm": 700}), json!({"min_mm": f64::MAX}), json!({"height_mm": -1})] {
+        assert!(s.execute("interior.doors_from_gaps", bad.clone()).is_err(), "{bad}");
+    }
+}

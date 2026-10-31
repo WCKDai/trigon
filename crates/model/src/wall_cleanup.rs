@@ -349,7 +349,7 @@ mod tests {
     use super::*;
 
     fn wall(id: &str, a: [f64; 2], b: [f64; 2]) -> InteriorWall {
-        InteriorWall { id: id.into(), levels: vec![1], a, b, thickness: 100.0, load_bearing: false }
+        InteriorWall { id: id.into(), levels: vec![1], a, b, thickness: 100.0, load_bearing: false, doors: Vec::new() }
     }
 
     fn clean(w: &[InteriorWall]) -> Vec<InteriorWall> {
