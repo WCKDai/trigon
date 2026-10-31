@@ -201,12 +201,26 @@ pub struct BuiltSlab {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct BuiltRoof {
+    pub id: String,
+    /// The roof surface.
+    pub cover: Mesh,
+    /// Vertical gable triangles above gable walls.
+    pub gables: Mesh,
+    pub eaves: f64,
+    pub ridge: f64,
+    pub pitch_deg: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Built {
     pub building_id: String,
     pub name: String,
     pub storeys: Vec<Storey>,
     pub walls: Vec<BuiltWall>,
     pub slabs: Vec<BuiltSlab>,
+    /// A pitched roof; a flat roof is a slab in `slabs`.
+    pub roof: Option<BuiltRoof>,
 }
 
 /// Builds every building as it stands at the end of the last phase.
@@ -457,16 +471,37 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             mesh: prism(&inner, z0, FLOOR_SLAB),
         });
     }
-    slabs.push(BuiltSlab {
-        id: format!("{}.roof", b.id),
-        kind: SlabKind::Roof,
-        level: b.storeys.len().saturating_sub(1),
-        polygon: b.footprint.clone(),
-        z_bottom: h,
-        thickness: ROOF_SLAB,
-        mesh: prism(&b.footprint, h, ROOF_SLAB),
-    });
-    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs })
+    let top_level = b.storeys.len().saturating_sub(1);
+    let roof = match &b.roof {
+        crate::roof::Roof::Flat => {
+            slabs.push(BuiltSlab {
+                id: format!("{}.roof", b.id),
+                kind: SlabKind::Roof,
+                level: top_level,
+                polygon: b.footprint.clone(),
+                z_bottom: h,
+                thickness: ROOF_SLAB,
+                mesh: prism(&b.footprint, h, ROOF_SLAB),
+            });
+            None
+        }
+        crate::roof::Roof::Pitched { pitch_deg, gables } => {
+            // The attic floor closes the top storey; the roof rises from the eaves above it.
+            slabs.push(BuiltSlab {
+                id: format!("{}.attic", b.id),
+                kind: SlabKind::Floor,
+                level: top_level,
+                polygon: inner.clone(),
+                z_bottom: h - FLOOR_SLAB,
+                thickness: FLOOR_SLAB,
+                mesh: prism(&inner, h - FLOOR_SLAB, FLOOR_SLAB),
+            });
+            let edges: Vec<usize> = gables.iter().map(|g| b.facade(g).map(|f| f.edge)).collect::<Result<_>>()?;
+            let r = crate::roof::pitched(&b.footprint, h, *pitch_deg, &edges)?;
+            Some(BuiltRoof { id: format!("{}.roof", b.id), cover: r.cover, gables: r.gables, eaves: h, ridge: r.ridge, pitch_deg: *pitch_deg })
+        }
+    };
+    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof })
 }
 
 /// A vertical prism on a counter-clockwise polygon.

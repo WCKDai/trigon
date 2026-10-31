@@ -239,6 +239,8 @@ pub struct Building {
     /// Facts from registers (BBR: year built, use, wall and roof material, areas).
     #[serde(default)]
     pub attributes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub roof: crate::roof::Roof,
 }
 
 pub const MIN_WALL: f64 = 100.0;
@@ -259,6 +261,7 @@ impl Building {
             facades: Vec::new(),
             evidence: Vec::new(),
             attributes: Default::default(),
+            roof: Default::default(),
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())

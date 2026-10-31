@@ -429,6 +429,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "geo-straight-skeleton"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa81297af607f4dfc27767c772b82022282574b739bcf126751a568ff50db56"
+
+[[package]]
 name = "geometry-predicates"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1487,6 +1493,7 @@ name = "trigon-model"
 version = "0.1.0"
 dependencies = [
  "earcutr 0.5.0",
+ "geo-straight-skeleton",
  "schemars",
  "serde",
  "serde_json",

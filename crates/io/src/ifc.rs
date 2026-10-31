@@ -299,6 +299,33 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
             }
         }
 
+        if let Some(r) = &b.roof {
+            let top = contained.len().saturating_sub(1);
+            let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(top)));
+            if let Some(fs) = w.faceset(&r.cover) {
+                let shape = w.shape(body, "Tessellation", &[fs]);
+                let id = w.add(format!(
+                    "IFCSLAB({},$,{},$,$,#{lp},#{shape},{},.ROOF.)",
+                    string(&guid(&format!("trigon:{}", r.id))),
+                    string(&format!("Roof {:.0} deg", r.pitch_deg)),
+                    string(&r.id)
+                ));
+                if let Some(c) = contained.get_mut(top) {
+                    c.push(id);
+                }
+            }
+            if let Some(fs) = w.faceset(&r.gables) {
+                let shape = w.shape(body, "Tessellation", &[fs]);
+                let id = w.add(format!(
+                    "IFCWALL({},$,'Gables',$,$,#{lp},#{shape},{},.SOLIDWALL.)",
+                    string(&guid(&format!("trigon:{}.gables", r.id))),
+                    string(&format!("{}.gables", r.id))
+                ));
+                if let Some(c) = contained.get_mut(top) {
+                    c.push(id);
+                }
+            }
+        }
         w.add(format!("IFCRELAGGREGATES({},$,$,$,#{building},({}))", string(&guid(&format!("trigon:{}.storeys", b.building_id))), refs(&storeys)));
         for (i, (storey, elems)) in storeys.iter().zip(&contained).enumerate() {
             if !elems.is_empty() {

@@ -170,6 +170,16 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.set_roof",
+        summary: "Set the roof: flat, or pitched from the eaves (the top of the walls) at `pitch_deg`, or at the pitch that puts \
+                  the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
+                  gable (wing ends, walls against neighbours). `source` records where the values came from.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetRoof>,
+        run: |s, v| set_roof(s, parse("building.set_roof", v)?),
+    },
+    CommandSpec {
         id: "building.set_wall_thickness",
         summary: "Set the outer wall thickness (mm).",
         mutates: true,
@@ -687,6 +697,22 @@ struct SetLevels {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SetRoof {
+    building: Option<String>,
+    /// flat or pitched.
+    kind: String,
+    /// Roof pitch in degrees.
+    pitch_deg: Option<f64>,
+    /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
+    ridge: Option<f64>,
+    /// Facades that end in a gable.
+    gables: Option<Vec<String>>,
+    source: Option<String>,
+    attribution: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetWallThickness {
     building: Option<String>,
     thickness: f64,
@@ -953,6 +979,46 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 }
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
+fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+    let b = s.doc.building_mut(p.building.as_deref())?;
+    let roof = match p.kind.as_str() {
+        "flat" => trigon_model::Roof::Flat,
+        "pitched" => {
+            let gables = p.gables.unwrap_or_default();
+            for g in &gables {
+                b.facade(g)?;
+            }
+            let pitch = match (p.pitch_deg, p.ridge) {
+                (Some(d), None) => d,
+                (None, Some(ridge)) => {
+                    let eaves = b.height();
+                    let depth = trigon_model::roof::max_depth(&b.footprint)?;
+                    let rise = trigon_model::checked("ridge", ridge, eaves + 500.0, eaves + 30_000.0)? - eaves;
+                    (rise / depth).atan().to_degrees()
+                }
+                _ => {
+                    return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
+                }
+            };
+            trigon_model::Roof::Pitched { pitch_deg: pitch, gables }
+        }
+        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
+    };
+    b.roof = roof;
+    if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
+        b.evidence.push(trigon_model::Evidence { source: src, supplies: "roof".into(), attribution: p.attribution.unwrap_or_default() });
+    }
+    let id = b.id.clone();
+    let built = trigon_model::build(&s.doc)?;
+    let r = built.iter().find(|x| x.building_id == id).and_then(|x| x.roof.as_ref());
+    Ok(json!({
+        "roof": s.doc.building(Some(&id))?.roof,
+        "eaves_mm": r.map(|r| r.eaves.round()),
+        "ridge_mm": r.map(|r| r.ridge.round()),
+        "pitch_deg": r.map(|r| (r.pitch_deg * 10.0).round() / 10.0),
+    }))
+}
+
 fn phase_list(doc: &Document) -> Value {
     let active = doc.active_index();
     let mut built = vec![0usize; doc.phases.len()];
@@ -1199,6 +1265,10 @@ fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f
         }
         for s in &b.slabs {
             add(&s.id, vec![&s.mesh]);
+        }
+        if let Some(r) = &b.roof {
+            add(&r.id, vec![&r.cover]);
+            add(&format!("{}.gables", r.id), vec![&r.gables]);
         }
     }
     Ok(out)

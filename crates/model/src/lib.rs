@@ -10,6 +10,7 @@ pub mod component;
 pub mod doc;
 pub mod footprint;
 pub mod mesh;
+pub mod roof;
 
 pub use build::{Built, BuiltElement, BuiltOpening, BuiltSlab, BuiltWall, ElementClass, FacadeFrame, Rect, SlabKind, build};
 pub use component::{ComponentKind, ComponentType, default_types};
@@ -17,6 +18,7 @@ pub use doc::{
     Building, Document, Drawing, Evidence, FORMAT, Facade, FacadeKind, FacadeRegistration, GeoPoint, Phase, Placement, Reference, Site, Storey,
 };
 pub use mesh::{Material, Mesh};
+pub use roof::Roof;
 
 /// Model errors. Every message names the thing that is wrong and what is allowed.
 #[derive(Debug, thiserror::Error, PartialEq)]
