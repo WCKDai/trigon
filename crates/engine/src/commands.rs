@@ -44,6 +44,46 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "edit.move",
+        summary: "Move selected walls, stairs, rooms or facade instances by a precise [dx,dy,dz] offset in mm. Studio ids select one storey; wall:<id>, stair:<id>, room:<id> select all its storeys. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::Move>,
+        run: |s, v| crate::edit::move_elements(s, parse("edit.move", v)?),
+    },
+    CommandSpec {
+        id: "edit.copy",
+        summary: "Copy selected elements at a precise offset, optionally as an array (count 1–100). Every copy has a distinct id; originals stay in place. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::Copy>,
+        run: |s, v| crate::edit::copy_elements(s, parse("edit.copy", v)?),
+    },
+    CommandSpec {
+        id: "edit.copy_to_levels",
+        summary: "Copy selected geometry onto destination storeys, keeping its position in plan or along the facade. Source storeys are skipped. replace copies over matching destination geometry/slots; otherwise a collision is an error. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::CopyToLevels>,
+        run: |s, v| crate::edit::copy_to_levels(s, parse("edit.copy_to_levels", v)?),
+    },
+    CommandSpec {
+        id: "edit.align",
+        summary: "Align selected elements' start, centre or end to a coordinate, reference element or arbitrary plan line. X/Y are site axes, U is along a facade, Z is absolute opening height. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::Align>,
+        run: |s, v| crate::edit::align(s, parse("edit.align", v)?),
+    },
+    CommandSpec {
+        id: "edit.delete",
+        summary: "Delete selected source elements or just the picked storey instances, preserving their other storeys. This removes them from every phase; use facade.demolish for phased demolition. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::Selection>,
+        run: |s, v| crate::edit::delete(s, parse("edit.delete", v)?),
+    },
+    CommandSpec {
         id: "document.info",
         summary: "Summarise the document: site, buildings, storeys, facades, placements and the component types.",
         mutates: false,
@@ -2267,8 +2307,12 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
     if f.bays.is_empty() {
         return Err(ModelError::Invalid(format!("facade {} has no bays yet; run facade.set_bays first", p.facade)).into());
     }
-    let level_list: Vec<usize> = p.levels.clone().unwrap_or_else(|| (0..levels).collect());
-    let bay_list: Vec<usize> = p.bays.clone().unwrap_or_else(|| (0..f.bays.len()).collect());
+    let mut level_list: Vec<usize> = p.levels.clone().unwrap_or_else(|| (0..levels).collect());
+    let mut bay_list: Vec<usize> = p.bays.clone().unwrap_or_else(|| (0..f.bays.len()).collect());
+    level_list.sort_unstable();
+    level_list.dedup();
+    bay_list.sort_unstable();
+    bay_list.dedup();
     for &l in &level_list {
         if l >= levels {
             return Err(ModelError::Invalid(format!("level {l} doesn't exist (the building has {levels} storeys)")).into());
@@ -2296,6 +2340,7 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
             }
             f.placements = keep;
             f.placements.push(Placement {
+                u: None,
                 level,
                 bay,
                 type_id: p.type_id.clone(),

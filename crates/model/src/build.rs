@@ -448,7 +448,8 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
         let lifetime = doc.lifetime(p).map_err(|e| ModelError::Invalid(format!("{slot}: {e}")))?;
         let ty = doc.component(&p.type_id)?.clone();
         let storey = b.storeys.get(p.level).ok_or_else(|| ModelError::Invalid(format!("{slot}: the building has {} storeys", b.storeys.len())))?;
-        let c = *f.bays.get(p.bay).ok_or_else(|| ModelError::Invalid(format!("{slot}: the facade has {} bays", f.bays.len())))?;
+        let bay_centre = *f.bays.get(p.bay).ok_or_else(|| ModelError::Invalid(format!("{slot}: the facade has {} bays", f.bays.len())))?;
+        let c = crate::checked("placement u", p.u.unwrap_or(bay_centre), -1e8, 1e8)?;
         let mut ty_eff = ty.clone();
         ty_eff.width = p.width.unwrap_or(ty.width);
         ty_eff.height = p.height.unwrap_or(ty.height);
@@ -1635,6 +1636,7 @@ mod tests {
                     _ => "window.casement.2",
                 };
                 f.placements.push(Placement {
+                    u: None,
                     level,
                     bay,
                     type_id: ty.into(),
@@ -1717,6 +1719,7 @@ mod tests {
         f.placements.clear();
         // A landing window: 2580 mm above the ground storey's floor, 950 high, crosses the floor above.
         let landing = Placement {
+            u: None,
             level: 0,
             bay: 5,
             type_id: "window.fixed".into(),
@@ -1735,6 +1738,7 @@ mod tests {
         assert_eq!(built[0].walls[0].openings[0].rect.v0, 900.0 + 2580.0);
         // A door down to the courtyard: below the floor is fine, below the terrain is not.
         let door = Placement {
+            u: None,
             level: 0,
             bay: 0,
             type_id: "door.french".into(),
@@ -1753,6 +1757,7 @@ mod tests {
 
     fn put(doc: &mut Document, level: usize, bay: usize, ty: &str, created: Option<&str>, demolished: Option<&str>) {
         doc.buildings[0].facades[0].placements.push(Placement {
+            u: None,
             level,
             bay,
             type_id: ty.into(),
