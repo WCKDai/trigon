@@ -341,6 +341,150 @@ fn repeated_facade_indices_place_each_slot_once() {
     assert_eq!(s.doc.buildings[0].facade(&facade).unwrap().placements.len(), 4);
 }
 
+fn editing_wall(s: &mut Session, levels: &[usize]) {
+    s.execute("interior.add_walls", json!({"walls":[{"id":"shared","levels":levels,"a":[-4000,0],"b":[-2000,0],"thickness":120}]})).unwrap();
+}
+
+#[test]
+fn editing_one_storey_preserves_the_other_instances_and_undo() {
+    let mut s = session();
+    editing_wall(&mut s, &[0, 1]);
+    let before = s.doc.clone();
+    let out = s.execute("edit.move", json!({"targets":["shared.L1"],"delta":[0,125.5,0]})).unwrap();
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.len(), 2);
+    assert!(walls.iter().any(|w| w.id == "shared" && w.levels == [0] && w.a == [-4000.0, 0.0]));
+    assert!(walls.iter().any(|w| w.levels == [1] && w.a == [-4000.0, 125.5]));
+    assert_eq!(out["targets"].as_array().unwrap().len(), 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc.buildings[0].interior_walls.len(), 2);
+}
+
+#[test]
+fn editing_copies_arrays_aligns_to_a_line_and_copies_over_storeys() {
+    let mut s = session();
+    editing_wall(&mut s, &[0]);
+    let out = s.execute("edit.copy", json!({"targets":["wall:shared"],"delta":[0,1000,0],"count":2})).unwrap();
+    assert_eq!(out["targets"].as_array().unwrap().len(), 2);
+    assert_eq!(s.doc.buildings[0].interior_walls.len(), 3);
+    s.execute("edit.align", json!({"targets":[out["targets"][0]],"line":[[0,2500],[10000,2500]],"anchor":"center"})).unwrap();
+    assert!(s.doc.buildings[0].interior_walls.iter().any(|w| w.a[1] == 2500.0 && w.b[1] == 2500.0));
+    let copied = s.execute("edit.copy_to_levels", json!({"targets":["wall:shared"],"levels":[0,1,1,2]})).unwrap();
+    assert_eq!(copied["targets"].as_array().unwrap().len(), 2);
+    for level in 0..=2 {
+        assert!(s.doc.buildings[0].interior_walls.iter().any(|w| w.levels == [level] && w.a[1] == 0.0));
+    }
+    let before = s.doc.clone();
+    assert!(s.execute("edit.copy_to_levels", json!({"targets":["wall:shared"],"levels":[1]})).is_err());
+    assert_eq!(s.doc, before);
+    s.execute("edit.copy_to_levels", json!({"targets":["wall:shared"],"levels":[1],"replace":true})).unwrap();
+    assert_eq!(s.doc.buildings[0].interior_walls.iter().filter(|w| w.levels == [1] && w.a[1] == 0.0).count(), 1);
+}
+
+#[test]
+fn editing_facade_instances_keeps_the_grid_and_other_storeys_fixed() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade":facade,"count":3})).unwrap();
+    s.execute("facade.place", json!({"facade":facade,"type":"window.casement.2","levels":[0,1],"bays":[0]})).unwrap();
+    let b = &s.doc.buildings[0];
+    let f = b.facade(&facade).unwrap();
+    let grid = f.bays.clone();
+    let edge = b.edge(f.edge).unwrap();
+    let frame = trigon_model::build::FacadeFrame::new(edge.0, edge.1).unwrap();
+    let target = format!("{facade}.L1.B0");
+    s.execute("edit.move", json!({"targets":[target],"delta":[frame.t[0]*125.5,frame.t[1]*125.5,50]})).unwrap();
+    let f = s.doc.buildings[0].facade(&facade).unwrap();
+    assert_eq!(f.bays, grid);
+    assert_eq!(f.placements.iter().find(|p| p.level == 0).unwrap().u, None);
+    assert_eq!(f.placements.iter().find(|p| p.level == 1).unwrap().u, Some(grid[0] + 125.5));
+    s.execute("edit.align", json!({"targets":[target],"axis":"u","coordinate":8000,"anchor":"center"})).unwrap();
+    assert_eq!(s.doc.buildings[0].facade(&facade).unwrap().placements.iter().find(|p| p.level == 1).unwrap().u, Some(8000.0));
+    let out =
+        s.execute("edit.copy", json!({"targets":[format!("{facade}.L0.B0")],"delta":[frame.t[0]*3000.0,frame.t[1]*3000.0,0],"count":2})).unwrap();
+    let ids = out["targets"].as_array().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    let round_trip: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&s.doc).unwrap()).unwrap();
+    assert_eq!(s.doc, round_trip);
+    trigon_model::build(&round_trip).unwrap();
+}
+
+#[test]
+fn editing_errors_are_atomic_and_level_deletion_preserves_other_storeys() {
+    let mut s = session();
+    editing_wall(&mut s, &[0, 1, 2]);
+    let before = s.doc.clone();
+    let cases = [
+        ("edit.move", json!({"targets":["shared.L0","missing"],"delta":[0,100,0]})),
+        ("edit.move", json!({"targets":["shared.L0"],"delta":[1e300,0,0]})),
+        ("edit.copy", json!({"targets":["wall:shared"],"delta":[0,100,0],"count":usize::MAX})),
+        ("edit.copy", json!({"targets":[],"delta":[0,100,0]})),
+        ("edit.align", json!({"targets":["wall:shared"],"line":[[0,0],[0,0]]})),
+        ("edit.copy_to_levels", json!({"targets":["wall:shared"],"levels":[usize::MAX]})),
+        ("edit.delete", json!({"targets":["wall:shared","shared.L1"]})),
+    ];
+    for (command, params) in cases {
+        let err = s.execute(command, params).unwrap_err();
+        assert!(!matches!(err, EngineError::Internal(_)), "{err}");
+        assert_eq!(s.doc, before, "{command}");
+    }
+    s.execute("edit.delete", json!({"targets":["shared.L1"]})).unwrap();
+    assert_eq!(s.doc.buildings[0].interior_walls[0].levels, vec![0, 2]);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn old_placements_default_to_the_bay_centre() {
+    let old = json!({"level":0,"bay":0,"type":"window.casement.2"});
+    let placement: trigon_model::Placement = serde_json::from_value(old).unwrap();
+    assert_eq!(placement.u, None);
+    assert!(serde_json::to_value(&placement).unwrap().get("u").is_none());
+}
+
+#[test]
+fn copying_over_a_facade_preserves_the_previous_phase() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade":facade,"count":3})).unwrap();
+    s.execute("facade.place", json!({"facade":facade,"type":"window.casement.2","levels":[0,1],"bays":[0]})).unwrap();
+    s.execute("phase.set", json!({"phases":[{"id":"old","name":"Existing"},{"id":"new","name":"Proposal"}]})).unwrap();
+    s.execute("edit.copy_to_levels", json!({"targets":[format!("{facade}.L0.B0")],"levels":[1],"replace":true})).unwrap();
+    let b = &s.doc.buildings[0];
+    let f = b.facade(&facade).unwrap();
+    let previous = trigon_model::build::View { phase: 0, filter: trigon_model::build::PhaseFilter::Complete };
+    let built = trigon_model::build::build_view(&s.doc, previous).unwrap();
+    assert_eq!(built[0].walls.iter().find(|w| w.id == facade).unwrap().openings.len(), 2);
+    assert_eq!(f.placements.iter().filter(|p| p.level == 1).count(), 2);
+}
+
+#[test]
+fn editing_stairs_and_rooms_and_aligning_to_reference_elements() {
+    let mut s = session();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs":[{"id":"flight","levels":[0],"outline":[[-8000,-3000],[-5000,-3000],[-5000,-1000],[-8000,-1000]]}]}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_rooms",
+        json!({"rooms":[{"id":"space","name":"Room","levels":[0,1],"polygon":[[2000,0],[4000,0],[4000,2000],[2000,2000]]}]}),
+    )
+    .unwrap();
+    let out = s.execute("edit.copy", json!({"targets":["stair:flight"],"delta":[0,3500,0]})).unwrap();
+    assert_eq!(s.doc.buildings[0].stairs.len(), 2);
+    s.execute("edit.delete", json!({"targets":out["targets"]})).unwrap();
+    assert_eq!(s.doc.buildings[0].stairs.len(), 1);
+    s.execute("edit.move", json!({"targets":["space.L1"],"delta":[500,500,0]})).unwrap();
+    assert!(s.doc.buildings[0].rooms.iter().any(|r| r.id == "space" && r.levels == [0] && r.polygon[0] == [2000.0, 0.0]));
+    editing_wall(&mut s, &[0]);
+    s.execute("edit.align", json!({"targets":["wall:shared"],"axis":"y","reference":"room:space","anchor":"end"})).unwrap();
+    assert_eq!(s.doc.buildings[0].interior_walls[0].a[1], 1940.0, "the 120 mm wall's upper face meets the room's upper edge");
+}
+
 fn exported(s: &mut Session, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let south = first_facade_facing(s, "S");
     s.execute("facade.set_bays", json!({"facade": south, "count": 7})).unwrap();

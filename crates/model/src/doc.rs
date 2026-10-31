@@ -344,6 +344,10 @@ fn band_projection() -> f64 {
 pub struct Placement {
     pub level: usize,
     pub bay: usize,
+    /// Exact centre along the facade, mm; the bay centre when unset. Moving one instance
+    /// must not move the bay grid or the instances on other storeys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub u: Option<f64>,
     #[serde(rename = "type")]
     pub type_id: String,
     /// Overrides of the type's width, height and sill for this slot, mm.

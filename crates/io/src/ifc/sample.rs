@@ -15,6 +15,7 @@ use trigon_model::{
 fn put<'b>(b: &'b mut Building, facade: usize, level: usize, bay: usize, ty: &str) -> Option<&'b mut Placement> {
     let f = b.facades.get_mut(facade)?;
     f.placements.push(Placement {
+        u: None,
         level,
         bay,
         type_id: ty.into(),
