@@ -613,6 +613,9 @@ fn elevation_sheets_project_the_model_and_label_balconies() {
     let svg = std::fs::read_to_string(dir.join("e.svg")).unwrap();
     assert!(svg.contains("Ca. 1200 × 3000") && svg.contains("Gårdfacade") && !svg.contains("data:image"));
     s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.pdf")})).unwrap();
+    // Square-on to a line instead of a facade (a stepped street front): south of the building, looking north.
+    let along = s.execute("elevation.sheet", json!({"along": [[-60000., -60000.], [60000., -60000.]], "path": dir.join("s.svg")})).unwrap();
+    assert!(along["triangles"].as_u64().unwrap() > 10, "{along}");
     assert_eq!(lopdf::Document::load(dir.join("e.pdf")).unwrap().get_pages().len(), 1);
     assert_eq!(s.doc, before);
     for request in [
@@ -620,6 +623,10 @@ fn elevation_sheets_project_the_model_and_label_balconies() {
         json!({"facade": facade, "path": dir.join("bad.svg"), "from_mm": 500.0, "to_mm": 600.0}),
         json!({"facade": facade, "path": dir.join("bad.svg"), "from_mm": f64::MAX}),
         json!({"facade": facade, "path": dir.join("bad.txt")}),
+        json!({"path": dir.join("bad.svg")}),
+        json!({"facade": facade, "along": [[0., 0.], [5000., 0.]], "path": dir.join("bad.svg")}),
+        json!({"along": [[0., 0.], [0., 0.]], "path": dir.join("bad.svg")}),
+        json!({"along": [[0., 0.], [f64::MAX, 0.]], "path": dir.join("bad.svg")}),
     ] {
         assert!(s.execute("elevation.sheet", request).is_err());
     }

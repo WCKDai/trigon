@@ -98,7 +98,7 @@ fn pt(fr: &FacadeFrame, u: f64, w: f64) -> [f64; 2] {
 
 /// Distance along the ray from `from` in direction `dir` (unit) to the first footprint edge it
 /// crosses.
-fn facade_crossing(ring: &[[f64; 2]], from: [f64; 2], dir: [f64; 2]) -> Option<f64> {
+pub(crate) fn facade_crossing(ring: &[[f64; 2]], from: [f64; 2], dir: [f64; 2]) -> Option<f64> {
     let n = ring.len();
     (0..n)
         .filter_map(|i| {

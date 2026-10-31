@@ -960,16 +960,22 @@ static COMMANDS: &[CommandSpec] = &[
         id: "elevation.sheet",
         summary: "Draw a facade elevation as a presentation sheet: the model seen square-on to one facade (walls, windows, doors, \
                   balconies, roof behind the eaves), each balcony labelled with its size (\"Ca. depth x width\") and each staircase \
-                  with its entrance (\"TV 7 TH\", mirrored when seen from behind). from_mm/to_mm crop along the facade. .pdf, .png or .svg.",
+                  with its entrance (\"TV 7 TH\", mirrored when seen from behind). Give `facade`, or `along` (two site points) for a \
+                  stepped front. from_mm/to_mm crop along it. .pdf, .png or .svg.",
         mutates: false,
         journaled: false,
         schema: schema::<ElevationSheet>,
         run: |s, v| {
             let p: ElevationSheet = parse("elevation.sheet", v)?;
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            let side = match (&p.facade, p.along) {
+                (Some(f), None) => crate::elevation::Side::Facade(f),
+                (None, Some(line)) => crate::elevation::Side::Along(line),
+                _ => return Err(ModelError::Invalid("give either `facade` or `along`".into()).into()),
+            };
             crate::elevation::sheet(
                 &s.doc,
-                &p.facade,
+                side,
                 view,
                 (p.from_mm, p.to_mm),
                 p.title.as_deref().unwrap_or("Facade"),
@@ -1315,7 +1321,9 @@ struct PlanSheet {
 #[serde(deny_unknown_fields)]
 struct ElevationSheet {
     /// Facade id, e.g. "b1.f31".
-    facade: String,
+    facade: Option<String>,
+    /// Or a line along a stepped front, from a to b in site mm with the outside on the right: the view is square-on to it.
+    along: Option<[[f64; 2]; 2]>,
     /// .pdf, .png or .svg.
     path: String,
     /// Start and end along the facade, mm from its start (default: all of it plus 1.5 m either side).

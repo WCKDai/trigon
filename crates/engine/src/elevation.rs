@@ -84,11 +84,18 @@ fn project(out: &mut Vec<Tri>, mesh: &Mesh, m: Material, fr: &FacadeFrame, u_ran
     }
 }
 
-/// An elevation sheet of facade `facade`, between `from` and `to` mm along it (default: all of it).
+/// Where an elevation looks from: square-on to one facade, or to a line along a stepped front
+/// (from `a` to `b`, the outside on the right as on a counter-clockwise footprint).
+pub(crate) enum Side<'a> {
+    Facade(&'a str),
+    Along([[f64; 2]; 2]),
+}
+
+/// An elevation sheet seen from `side`, between `from` and `to` mm along it (default: all of it).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sheet(
     doc: &Document,
-    facade: &str,
+    side: Side<'_>,
     view: View,
     range: (Option<f64>, Option<f64>),
     title: &str,
@@ -103,11 +110,19 @@ pub(crate) fn sheet(
         return Err(ModelError::Invalid("use .pdf, .png or .svg for an elevation".into()).into());
     }
     let built = build_view(doc, view)?;
-    let (b, wall) = built
-        .iter()
-        .find_map(|b| b.walls.iter().find(|w| w.id == facade).map(|w| (b, w)))
-        .ok_or_else(|| ModelError::Invalid(format!("facade {facade} doesn't exist")))?;
-    let fr = wall.frame;
+    let (b, fr) = match side {
+        Side::Facade(facade) => built
+            .iter()
+            .find_map(|b| b.walls.iter().find(|w| w.id == facade).map(|w| (b, w.frame)))
+            .ok_or_else(|| ModelError::Invalid(format!("facade {facade} doesn't exist")))?,
+        Side::Along([a, e]) => {
+            if [a, e].iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) || (e[0] - a[0]).hypot(e[1] - a[1]) < 1000.0 {
+                return Err(ModelError::Invalid("`along` needs two finite site points at least 1 m apart".into()).into());
+            }
+            let b = built.first().ok_or_else(|| ModelError::Invalid("there is no building to draw".into()))?;
+            (b, FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid("`along` needs two distinct points".into()))?)
+        }
+    };
     let (from, to) = (range.0.unwrap_or(-1500.0), range.1.unwrap_or(fr.length + 1500.0));
     for (name, v) in [("from_mm", from), ("to_mm", to)] {
         trigon_model::checked(name, v, -100_000.0, 1_000_000.0)?;
@@ -181,8 +196,19 @@ pub(crate) fn sheet(
     // neighbour's drops one line.
     let mut labels: Vec<Label> = Vec::new();
     let mut ticks = Vec::new();
-    for mb in doc.buildings.iter().filter(|x| x.id == b.building_id) {
-        let Ok(f) = mb.facade(facade) else { continue };
+    // Balconies on every facade turned towards the viewer, placed along this view.
+    let depth_of = |p: [f64; 2]| (p[0] - fr.origin[0]) * fr.n[0] + (p[1] - fr.origin[1]) * fr.n[1];
+    let facing: Vec<(&str, FacadeFrame)> = b
+        .walls
+        .iter()
+        .filter(|w| {
+            let mid = w.frame.point(w.frame.length / 2.0, 0.0, 0.0);
+            w.frame.n[0] * fr.n[0] + w.frame.n[1] * fr.n[1] > 0.7 && (-4000.0..=NEAR).contains(&depth_of([mid[0], mid[1]]))
+        })
+        .map(|w| (w.id.as_str(), w.frame))
+        .collect();
+    for (mb, (id, wf)) in doc.buildings.iter().filter(|x| x.id == b.building_id).flat_map(|mb| facing.iter().map(move |f| (mb, f))) {
+        let Ok(f) = mb.facade(id) else { continue };
         for r in resolve_facade(doc, mb, f)? {
             let Some(depth) = r.ty.kind.depth() else { continue };
             if !matches!(view.status(r.lifetime), Some(Status::Existing | Status::New)) {
@@ -192,7 +218,8 @@ pub(crate) fn sheet(
                 ComponentKind::Balcony { slab_width, .. } => slab_width,
                 _ => r.ty.width,
             };
-            let c = (r.rect.u0 + r.rect.u1) / 2.0;
+            let p = wf.point((r.rect.u0 + r.rect.u1) / 2.0, 0.0, 0.0);
+            let c = (p[0] - fr.origin[0]) * fr.t[0] + (p[1] - fr.origin[1]) * fr.t[1];
             if !(from..=to).contains(&c) {
                 continue;
             }
@@ -221,7 +248,16 @@ pub(crate) fn sheet(
         if !(from + 500.0..=to - 500.0).contains(&u) || !(-WING..=0.0).contains(&behind) {
             continue;
         }
-        let front = (e.point[0] - fr.origin[0]) * fr.n[0] + (e.point[1] - fr.origin[1]) * fr.n[1] > -3000.0;
+        // Seen from the street the stair is entered from: the facade it meets nearest the address
+        // point, as on the plans.
+        let Some(footprint) = doc.buildings.iter().find(|x| x.id == b.building_id).map(|x| &x.footprint) else { continue };
+        let hit = |d: [f64; 2]| {
+            crate::plan::facade_crossing(footprint, core, d).map(|t| (core[0] + d[0] * t - e.point[0]).hypot(core[1] + d[1] * t - e.point[1]))
+        };
+        let front = match (hit(fr.n), hit([-fr.n[0], -fr.n[1]])) {
+            (Some(ahead), Some(behind)) => ahead <= behind,
+            (ahead, _) => ahead.is_some(),
+        };
         let text = if front { format!("TV {} TH", e.number) } else { format!("TH {} TV", e.number) };
         labels.push(Label { at: px(u, top + 900.0), alt: None, deg: 0.0, fs: 18.0, text, balcony: false });
     }
@@ -278,7 +314,8 @@ pub(crate) fn sheet(
         _ => out.into_bytes(),
     };
     write_output(&path, &bytes)?;
-    let mut result = json!({"written": path, "facade": facade, "triangles": tris.len(), "mm_per_px": mm, "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
+    let mut result =
+        json!({"written": path, "triangles": tris.len(), "mm_per_px": mm, "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
     if ext == "png" {
         result["image_path"] = json!(path);
     }
