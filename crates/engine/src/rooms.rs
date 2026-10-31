@@ -4,7 +4,6 @@
 //! wall or the outer walls' inside face (that closes door openings without inventing walls across
 //! rooms); then the free space inside the outer walls is flood-filled on a 50 mm grid.
 
-use trigon_model::build::inner_ring;
 use trigon_model::{Building, Room};
 
 /// Widest door gap closed, mm.
@@ -27,7 +26,7 @@ fn seg_hit(p: [f64; 2], d: [f64; 2], a: [f64; 2], b: [f64; 2]) -> Option<f64> {
 pub(crate) type Ink<'a> = Option<&'a dyn Fn([f64; 2]) -> bool>;
 
 pub(crate) fn detect(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>) -> Vec<(Vec<[f64; 2]>, f64)> {
-    let inner = inner_ring(&b.footprint, b.wall_thickness);
+    let inner = b.inner_line(level);
     let walls: Vec<&trigon_model::InteriorWall> = b.interior_walls.iter().filter(|w| w.levels.contains(&level)).collect();
     // Lines that block: outer faces, interior walls as their two faces, door closers.
     let n = inner.len();

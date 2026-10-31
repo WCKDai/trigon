@@ -293,6 +293,9 @@ fn hostile_params_never_panic() {
         json!({"count": usize::MAX}),
         json!({"path": "/etc/passwd"}),
         json!({"id": "x", "name": "x", "width": 1e300, "height": 1.0, "sill": 0.0, "kind": {"family": "window", "lights": 0}}),
+        json!({"thickness": [f64::MAX, -1.0, 0.0]}),
+        json!({"preset": "copenhagen_masonry", "facades": [south]}),
+        json!({"facades": [south, "b9.f9"], "thickness": []}),
     ];
     for c in commands() {
         for p in &hostile {
@@ -770,4 +773,72 @@ fn interior_walls_traced_from_a_plan_sheet() {
     s.execute("interior.clear", json!({})).unwrap();
     assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["load_bearing"], 0);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn masonry_walls_step_inside_at_every_floor_and_interior_walls_join_them() {
+    let mut s = session();
+    s.execute("building.add_basement", json!({"floor": -2480})).unwrap();
+    let storeys = s.doc.buildings[0].storeys.len();
+    let v = s.execute("building.set_wall_schedule", json!({"preset": "copenhagen_masonry"})).unwrap();
+    let schedule: Vec<f64> = v["schedule"].as_array().unwrap().iter().map(|e| e["thickness_mm"].as_f64().unwrap()).collect();
+    assert_eq!(schedule.len(), storeys);
+    // Thinner going up; the basement is half a brick more than the ground storey; 360 on top.
+    assert!(schedule.windows(2).all(|w| w[0] >= w[1]), "{schedule:?}");
+    assert_eq!(schedule[0], schedule[1] + 100.0, "{schedule:?}");
+    assert_eq!(*schedule.last().unwrap(), 360.0);
+
+    // Each facade is one closed piece per storey at that storey's thickness; the floors rest on the steps.
+    let built = trigon_model::build(&s.doc).unwrap();
+    for w in &built[0].walls {
+        let t: Vec<f64> = w.segments.iter().map(|g| g.thickness).collect();
+        assert_eq!(t, schedule, "{}", w.id);
+    }
+    let area = |l: usize| trigon_model::doc::polygon_area(&built[0].slabs[l].polygon);
+    assert!(area(0) < area(1) && area(1) < area(storeys - 1));
+
+    // An interior wall drawn 650 mm in from the facade's outer face ends on the inner face on
+    // every storey: trimmed where the wall is thicker (700), extended where it is thinner.
+    let south = first_facade_facing(&mut s, "S");
+    let b = &s.doc.buildings[0];
+    let f = b.facade(&south).unwrap();
+    let (a, e) = b.edge(f.edge).unwrap();
+    let fr = trigon_model::FacadeFrame::new(a, e).unwrap();
+    let start = fr.point(fr.length / 2.0, 650.0, 0.0);
+    let end = fr.point(fr.length / 2.0, 4000.0, 0.0);
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [{"id": "x", "levels": [0, 1, 2], "a": [start[0], start[1]], "b": [end[0], end[1]], "thickness": 120, "load_bearing": false}]}),
+    )
+    .unwrap();
+    let built = trigon_model::build(&s.doc).unwrap();
+    for (level, thickness) in schedule.iter().enumerate().take(3) {
+        let iw = built[0].interior.iter().find(|w| w.id == format!("x.L{level}")).unwrap();
+        let depth = |p: [f64; 2]| (p[0] - a[0]) * -fr.n[0] + (p[1] - a[1]) * -fr.n[1];
+        assert!((depth(iw.axis[0]) - thickness).abs() < 1e-6, "level {level}: {:?}", iw.axis);
+        assert!(matches!(iw.ends[0], Some(trigon_model::joins::Join { target: trigon_model::joins::Target::Facade(_), .. })));
+    }
+
+    // A fire gable keeps its own thickness; the IFC has one wall per facade and storey.
+    s.execute("building.set_wall_schedule", json!({"facades": [south.clone()], "thickness": vec![360.0; storeys]})).unwrap();
+    let b = &s.doc.buildings[0];
+    let edge = b.facade(&south).unwrap().edge;
+    assert!((0..storeys).all(|l| b.edge_thickness(edge, l) == 360.0));
+    let built = trigon_model::build(&s.doc).unwrap();
+    let text = trigon_io::ifc::write(&s.doc, &built, "t.ifc", "2000-01-01T00:00:00Z");
+    assert_eq!(text.matches("IFCWALL(").count(), built[0].walls.len() * storeys + built[0].interior.len());
+
+    // Refused: wrong count, hostile values, preset with facades. The document is unchanged.
+    let before = s.doc.clone();
+    for bad in [
+        json!({"thickness": [500.0]}),
+        json!({"thickness": vec![f64::MAX; storeys]}),
+        json!({"preset": "copenhagen_masonry", "thickness": vec![400.0; storeys]}),
+        json!({"facades": [south], "preset": "copenhagen_masonry"}),
+        json!({"facades": ["b1.f999"], "thickness": vec![400.0; storeys]}),
+        json!({}),
+    ] {
+        assert!(s.execute("building.set_wall_schedule", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(s.doc, before);
 }

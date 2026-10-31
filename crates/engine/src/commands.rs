@@ -217,6 +217,50 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.set_wall_schedule",
+        summary: "Set the facade wall thickness per storey (mm, one value per storey from the bottom up), or `preset: \
+                  copenhagen_masonry`: 1½ sten (360) on the top two storeys, 2 sten (480) on the next two, 2½ sten (600) \
+                  below those and each basement half a brick more (700 under a 600 ground storey). The wall steps on the \
+                  inside at every floor and the floors rest on the steps; the outer face stays flush. With `facades`, \
+                  `thickness` applies to those walls only (fire gables and party walls usually keep one thickness all \
+                  the way up); an empty `thickness` makes them follow the building's schedule again. Check the \
+                  thickness against the archive plans (`drawing.view`) before settling on it.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetWallSchedule>,
+        run: |s, v| {
+            let p: SetWallSchedule = parse("building.set_wall_schedule", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            if let Some(facades) = &p.facades {
+                if p.preset.is_some() || facades.is_empty() {
+                    return Err(ModelError::Invalid("with `facades`, give `thickness` (one per storey, or empty), not `preset`".into()).into());
+                }
+                b.set_facade_schedule(facades, p.thickness.as_deref().unwrap_or_default())?;
+                check_building(&s.doc, p.building.as_deref())?;
+                trigon_model::build(&s.doc)?;
+                let b = s.doc.building(p.building.as_deref())?;
+                return Ok(json!({
+                    "facades": facades.iter().filter_map(|id| b.facade(id).ok()).map(|f| json!({
+                        "facade": f.id,
+                        "thickness_mm": (0..b.storeys.len()).map(|l| b.edge_thickness(f.edge, l)).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>()
+                }));
+            }
+            let values = match (p.thickness, p.preset) {
+                (Some(t), None) => t,
+                (None, Some(WallPreset::CopenhagenMasonry)) => trigon_model::doc::copenhagen_masonry(b.storeys.len(), b.ground_level),
+                _ => return Err(ModelError::Invalid("give either `thickness` (one value per storey) or `preset`".into()).into()),
+            };
+            b.set_wall_schedule(&values)?;
+            check_building(&s.doc, p.building.as_deref())?;
+            trigon_model::build(&s.doc)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            Ok(json!({
+                "schedule": b.storeys.iter().enumerate().map(|(i, st)| json!({"storey": st.name, "thickness_mm": b.facade_thickness(i)})).collect::<Vec<_>>()
+            }))
+        },
+    },
+    CommandSpec {
         id: "facade.list",
         summary: "List the facades: id, length, which way it faces, kind, bays and placements.",
         mutates: false,
@@ -1448,6 +1492,24 @@ struct SetWallThickness {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SetWallSchedule {
+    building: Option<String>,
+    /// Facade wall thickness per storey, mm, from the lowest storey up.
+    thickness: Option<Vec<f64>>,
+    /// Only these facades' walls (ids from `facade.list`).
+    facades: Option<Vec<String>>,
+    preset: Option<WallPreset>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum WallPreset {
+    /// Solid brick facades thinning by half a brick every two storeys going up.
+    CopenhagenMasonry,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetKind {
     facade: String,
     kind: FacadeKind,
@@ -1579,6 +1641,7 @@ fn info(doc: &Document) -> Value {
             "ground_level": b.ground_level,
             "height_mm": b.height(),
             "wall_thickness_mm": b.wall_thickness,
+            "wall_schedule_mm": (0..b.storeys.len()).map(|i| b.facade_thickness(i)).collect::<Vec<_>>(),
             "attributes": b.attributes,
             "facades": facades(doc, b),
             "evidence": b.evidence,
@@ -2044,7 +2107,9 @@ fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f
     };
     for b in trigon_model::build(doc)? {
         for w in &b.walls {
-            add(&w.id, vec![&w.mesh]);
+            for seg in &w.segments {
+                add(&seg.id, vec![&seg.mesh]);
+            }
             for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
                 add(&e.id, e.parts.iter().map(|(_, m)| m).collect());
             }

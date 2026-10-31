@@ -1,22 +1,29 @@
 //! Model → geometry. Deterministic: the same document always gives the same geometry.
 //!
-//! Walls are 2.5D: one prism per facade between the outer wall line and its mitred inward
-//! offset, with openings cut as 2D holes in the wall faces. No 3D booleans are needed.
+//! Walls are 2.5D: per storey, one prism per facade between the outer wall line and its mitred
+//! inward offset at that storey's thickness (`walls`), and interior walls joined face to face
+//! (`joins`). Openings are cut as 2D holes in the wall faces. No 3D booleans are needed.
 
 use crate::component::{ComponentKind, ComponentType, Deck, Finish, Railing, Screens, Side};
 use crate::doc::{Building, Document, Facade, FacadeKind, Placement, Storey};
+use crate::joins::{Axis, Join};
 use crate::mesh::{Material, Mesh};
+use crate::walls::{Span, WallSegment};
 use crate::{ModelError, Result};
 
 /// Window and door frames sit this far behind the outer wall face, mm.
 pub const REVEAL: f64 = 120.0;
 const FRAME: f64 = 60.0;
 const FRAME_DEPTH: f64 = 70.0;
-/// Clear wall kept at facade ends and between openings, mm.
-const END_MARGIN: f64 = 150.0;
+/// Wall kept between an opening and the inner face of the wall it meets at a corner, mm. An
+/// opening may come no closer than this to the corner's inner face, so it never cuts the
+/// mitre (and the other facade); the thick lower walls of Copenhagen masonry leave little room.
+const END_MARGIN: f64 = 50.0;
+/// Clear wall kept between openings, mm.
 const GAP: f64 = 100.0;
 const LINTEL: f64 = 150.0;
-const FLOOR_SLAB: f64 = 200.0;
+/// Floor build-up (joists or concrete with the floor on top), mm.
+pub const FLOOR_SLAB: f64 = 200.0;
 const ROOF_SLAB: f64 = 300.0;
 const BALCONY_SLAB: f64 = 180.0;
 
@@ -168,22 +175,30 @@ pub struct BuiltOpening {
     pub status: Status,
 }
 
+/// One facade's wall, all storeys.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuiltWall {
     pub id: String,
     pub frame: FacadeFrame,
     pub kind: FacadeKind,
-    pub thickness: f64,
     /// Top of the wall (eaves), mm.
     pub height: f64,
     /// Bottom of the wall, mm (below the terrain with a basement).
     pub bottom: f64,
-    /// Plan outline: outer start, outer end, inner end, inner start.
-    pub plan: [[f64; 2]; 4],
+    /// The whole wall as one surface (no faces where storeys meet), for display and elevations.
     pub mesh: Mesh,
+    /// One closed piece per storey at that storey's thickness, bottom up.
+    pub segments: Vec<WallSegment>,
     pub openings: Vec<BuiltOpening>,
     /// Balconies hung on the wall without an opening of their own.
     pub attachments: Vec<BuiltElement>,
+}
+
+impl BuiltWall {
+    /// The piece on a storey.
+    pub fn segment(&self, level: usize) -> Option<&WallSegment> {
+        self.segments.iter().find(|s| s.level == level)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,8 +223,13 @@ pub struct BuiltSlab {
 pub struct BuiltInterior {
     pub id: String,
     pub level: usize,
-    /// Plan outline (4 corners, site mm).
+    /// Centre line after joining, site mm.
+    pub axis: [[f64; 2]; 2],
+    pub thickness: f64,
+    /// Plan outline after joining (4 corners, counter-clockwise, site mm).
     pub outline: [[f64; 2]; 4],
+    /// What the ends at `axis[0]` and `axis[1]` join.
+    pub ends: [Option<Join>; 2],
     pub z_bottom: f64,
     pub height: f64,
     pub load_bearing: bool,
@@ -264,29 +284,75 @@ pub fn build_view(doc: &Document, view: View) -> Result<Vec<Built>> {
 }
 
 /// The inner wall line: each footprint vertex moved inward by `d` along the mitre of its two
-/// edges. Very sharp corners fall back to a plain offset so the mitre can't run away.
+/// edges. Very sharp corners fall back to a plain offset so the mitre can't run away. An edge too
+/// short for the wall (a small jog in a thick wall) shrinks to a point where its neighbours'
+/// inner lines meet, so the line never turns inside out; such an edge's facade wall is a wedge.
 pub fn inner_ring(ring: &[[f64; 2]], d: f64) -> Vec<[f64; 2]> {
+    inner_ring_by(ring, |_| d)
+}
+
+/// The inner wall line with each edge's wall at its own thickness `d(edge)`.
+pub fn inner_ring_by(ring: &[[f64; 2]], d: impl Fn(usize) -> f64) -> Vec<[f64; 2]> {
     let n = ring.len();
-    (0..n)
+    let offset = |i: usize| -> Option<([f64; 2], [f64; 2])> {
+        let e = FacadeFrame::new(ring[i % n], ring[(i + 1) % n])?;
+        let (p, d) = (ring[i % n], d(i % n));
+        Some(([p[0] - e.n[0] * d, p[1] - e.n[1] * d], e.t))
+    };
+    // Where the inner lines of edges `i` and `j` meet.
+    let meet = |i: usize, j: usize, fallback: [f64; 2]| -> [f64; 2] {
+        let (Some((p0, t0)), Some((p1, t1))) = (offset(i), offset(j)) else { return fallback };
+        let cross = t0[0] * t1[1] - t0[1] * t1[0];
+        if cross.abs() < 1e-6 {
+            return fallback;
+        }
+        let dp = [p1[0] - p0[0], p1[1] - p0[1]];
+        let s = (dp[0] * t1[1] - dp[1] * t1[0]) / cross;
+        let q = [p0[0] + s * t0[0], p0[1] + s * t0[1]];
+        let miter = ((q[0] - fallback[0]).powi(2) + (q[1] - fallback[1]).powi(2)).sqrt();
+        if miter > 5.0 * d(i % n).max(d(j % n)) { fallback } else { q }
+    };
+    let mut inner: Vec<[f64; 2]> = (0..n)
         .map(|i| {
             let p = ring[i];
-            let prev = FacadeFrame::new(ring[(i + n - 1) % n], p);
-            let next = FacadeFrame::new(p, ring[(i + 1) % n]);
-            let (Some(e0), Some(e1)) = (prev, next) else { return p };
-            let plain = [p[0] - e1.n[0] * d, p[1] - e1.n[1] * d];
-            // Intersect p0 + s·t0 and p1 + r·t1, both offset inward by d.
-            let p0 = [p[0] - e0.n[0] * d, p[1] - e0.n[1] * d];
-            let cross = e0.t[0] * e1.t[1] - e0.t[1] * e1.t[0];
-            if cross.abs() < 1e-6 {
-                return plain;
-            }
-            let dp = [plain[0] - p0[0], plain[1] - p0[1]];
-            let s = (dp[0] * e1.t[1] - dp[1] * e1.t[0]) / cross;
-            let q = [p0[0] + s * e0.t[0], p0[1] + s * e0.t[1]];
-            let miter = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt();
-            if miter > 5.0 * d { plain } else { q }
+            let plain = match FacadeFrame::new(p, ring[(i + 1) % n]) {
+                Some(e1) => [p[0] - e1.n[0] * d(i), p[1] - e1.n[1] * d(i)],
+                None => return p,
+            };
+            meet((i + n - 1) % n, i, plain)
         })
-        .collect()
+        .collect();
+    if n < 4 {
+        return inner;
+    }
+    // Collapse edges whose inner line runs backwards, one at a time, until none does.
+    let mut alive = vec![true; n];
+    for _ in 0..n {
+        let reversed = (0..n).find(|&i| {
+            let (a, b, p, q) = (ring[i], ring[(i + 1) % n], inner[i], inner[(i + 1) % n]);
+            let along = (b[0] - a[0]) * (q[0] - p[0]) + (b[1] - a[1]) * (q[1] - p[1]);
+            alive[i] && along < 0.0
+        });
+        let Some(i) = reversed else { break };
+        alive[i] = false;
+        if alive.iter().filter(|a| **a).count() < 3 {
+            break;
+        }
+        let prev = (1..n).map(|k| (i + n - k) % n).find(|&k| alive[k]).unwrap_or(i);
+        let next = (1..n).map(|k| (i + k) % n).find(|&k| alive[k]).unwrap_or(i);
+        // Vertices from the end of `prev` to the start of `next` all move to where those two meet.
+        let mid = [(inner[i][0] + inner[(i + 1) % n][0]) / 2.0, (inner[i][1] + inner[(i + 1) % n][1]) / 2.0];
+        let x = meet(prev, next, mid);
+        let mut v = (prev + 1) % n;
+        loop {
+            inner[v] = x;
+            if v == next {
+                break;
+            }
+            v = (v + 1) % n;
+        }
+    }
+    inner
 }
 
 /// One resolved opening: the placement, its type and its rectangle.
@@ -326,15 +392,18 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
     if f.kind == FacadeKind::Party && !f.placements.is_empty() {
         return Err(ModelError::Invalid(format!("facade {} is a party wall and can't have openings", f.id)));
     }
-    let inner = inner_ring(&b.footprint, b.wall_thickness);
     let n = b.footprint.len();
     let along = |q: [f64; 2]| (q[0] - a[0]) * frame.t[0] + (q[1] - a[1]) * frame.t[1];
-    let (in0, in1) = match (inner.get(f.edge), inner.get((f.edge + 1) % n)) {
-        (Some(&s), Some(&t)) => (along(s), along(t)),
-        _ => (0.0, frame.length),
-    };
-    let lo = in0.max(0.0) + END_MARGIN;
-    let hi = in1.min(frame.length) - END_MARGIN;
+    // Where the inner face starts and ends on each storey (the wall is thicker lower down).
+    let inner_lines: Vec<(f64, f64)> = (0..b.storeys.len())
+        .map(|l| {
+            let inner = b.inner_line(l);
+            match (inner.get(f.edge), inner.get((f.edge + 1) % n)) {
+                (Some(&s), Some(&t)) => (along(s), along(t)),
+                _ => (0.0, frame.length),
+            }
+        })
+        .collect();
 
     let mut out: Vec<Resolved> = Vec::with_capacity(f.placements.len());
     for p in &f.placements {
@@ -358,6 +427,9 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
             )));
         }
         let opening = ty_eff.kind.is_opening();
+        let (in0, in1) = inner_lines.get(p.level).copied().unwrap_or((0.0, frame.length));
+        let lo = in0.max(0.0) + END_MARGIN;
+        let hi = in1.min(frame.length) - END_MARGIN;
         let rect = if opening {
             Rect {
                 u0: c - ty_eff.width / 2.0,
@@ -418,44 +490,45 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
 
 fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     let h = b.height();
-    let d = b.wall_thickness;
-    let inner = inner_ring(&b.footprint, d);
     let n = b.footprint.len();
+    let levels = b.storeys.len();
+    let zb = b.bottom();
+    // Each storey's inner wall line: the facade is thicker lower down and steps at every floor.
+    let inners: Vec<Vec<[f64; 2]>> = (0..levels).map(|l| b.inner_line(l)).collect();
+    for (l, inner) in inners.iter().enumerate() {
+        check_inner_ring(&b.footprint, inner)
+            .map_err(|e| ModelError::Invalid(format!("{}: {e}", b.storeys.get(l).map_or("storey", |s| s.name.as_str()))))?;
+    }
+    // A storey's wall runs from the underside of its floor to the underside of the next one.
+    let heights: Vec<(f64, f64)> = (0..levels)
+        .map(|l| {
+            let z0 = if l == 0 { zb } else { b.storeys.get(l).map_or(zb, |s| s.elevation - FLOOR_SLAB) };
+            (z0, b.storeys.get(l + 1).map_or(h, |s| s.elevation - FLOOR_SLAB))
+        })
+        .collect();
     let mut walls = Vec::with_capacity(b.facades.len());
     for f in &b.facades {
         let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::Invalid(format!("facade {} has no edge", f.id)))?;
         let fr = FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid(format!("facade {} has zero length", f.id)))?;
-        let (qs, qe) = match (inner.get(f.edge), inner.get((f.edge + 1) % n)) {
-            (Some(&s), Some(&t)) => (s, t),
-            _ => return Err(ModelError::Invalid(format!("facade {} has no inner line", f.id))),
-        };
         let along = |q: [f64; 2]| (q[0] - a[0]) * fr.t[0] + (q[1] - a[1]) * fr.t[1];
-        let (in0, in1) = (along(qs), along(qe));
+        let mut spans = Vec::with_capacity(levels);
+        for (l, inner) in inners.iter().enumerate() {
+            let (Some(&qs), Some(&qe), Some(&(z0, z1))) = (inner.get(f.edge), inner.get((f.edge + 1) % n), heights.get(l)) else {
+                return Err(ModelError::Invalid(format!("facade {} has no inner line", f.id)));
+            };
+            spans.push(Span { level: l, thickness: b.edge_thickness(f.edge, l), z0, z1, in0: along(qs), in1: along(qe), qs, qe });
+        }
         let all = resolve_facade(doc, b, f)?;
         // What this view shows, with each element's status.
         let shown: Vec<(&Resolved, Status)> = all.iter().filter_map(|r| view.status(r.lifetime).map(|s| (r, s))).collect();
         let resolved: Vec<(&Resolved, Status)> = shown.iter().filter(|(r, _)| r.is_opening()).copied().collect();
-
-        let holes: Vec<Vec<[f64; 2]>> = resolved
+        let holes: Vec<Rect> = resolved.iter().map(|(r, _)| r.rect).collect();
+        let unbuildable = || ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id));
+        let mesh = crate::walls::skin(&fr, &spans, &holes).ok_or_else(unbuildable)?;
+        let segments = spans
             .iter()
-            .map(|(r, _)| vec![[r.rect.u0, r.rect.v0], [r.rect.u0, r.rect.v1], [r.rect.u1, r.rect.v1], [r.rect.u1, r.rect.v0]])
-            .collect();
-        let mut mesh = Mesh::default();
-        let zb = b.bottom();
-        let outer_ok = mesh.polygon(&[[0.0, zb], [fr.length, zb], [fr.length, h], [0.0, h]], &holes, |p| fr.point(p[0], 0.0, p[1]));
-        let inner_ok = mesh.polygon(&[[in0, zb], [in1, zb], [in1, h], [in0, h]], &holes, |p| fr.point(p[0], d, p[1]));
-        if !(outer_ok && inner_ok) {
-            return Err(ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id)));
-        }
-        mesh.quad(fr.point(0.0, 0.0, h), fr.point(fr.length, 0.0, h), fr.point(in1, d, h), fr.point(in0, d, h));
-        mesh.quad(fr.point(0.0, 0.0, zb), fr.point(in0, d, zb), fr.point(in1, d, zb), fr.point(fr.length, 0.0, zb));
-        for (r, _) in &resolved {
-            let Rect { u0, u1, v0, v1 } = r.rect;
-            mesh.quad(fr.point(u0, 0.0, v0), fr.point(u1, 0.0, v0), fr.point(u1, d, v0), fr.point(u0, d, v0));
-            mesh.quad(fr.point(u0, 0.0, v1), fr.point(u0, d, v1), fr.point(u1, d, v1), fr.point(u1, 0.0, v1));
-            mesh.quad(fr.point(u0, 0.0, v0), fr.point(u0, d, v0), fr.point(u0, d, v1), fr.point(u0, 0.0, v1));
-            mesh.quad(fr.point(u1, 0.0, v0), fr.point(u1, 0.0, v1), fr.point(u1, d, v1), fr.point(u1, d, v0));
-        }
+            .map(|s| crate::walls::segment(&fr, &format!("{}.L{}", f.id, s.level), s, &holes).ok_or_else(unbuildable))
+            .collect::<Result<Vec<_>>>()?;
 
         let elevation_of = |r: &Resolved| b.storeys.get(r.placement.level).map_or(0.0, |s| s.elevation);
         let openings = resolved
@@ -473,70 +546,60 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
                 attachment(&fr, &id, r, elevation_of(r), *status)
             })
             .collect();
-        walls.push(BuiltWall {
-            id: f.id.clone(),
-            frame: fr,
-            kind: f.kind,
-            thickness: d,
-            height: h,
-            bottom: zb,
-            plan: [a, e, qe, qs],
-            mesh,
-            openings,
-            attachments,
-        });
+        walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, height: h, bottom: zb, mesh, segments, openings, attachments });
     }
 
-    let mut slabs = Vec::with_capacity(b.storeys.len() + 1);
+    // Floors span to the inner face of the storey's own wall and rest on the step of the thicker wall below.
+    let mut slabs = Vec::with_capacity(levels + 1);
     let openings =
         |level: usize| -> Result<Vec<Vec<[f64; 2]>>> { b.stairs.iter().filter(|st| st.levels.contains(&level)).map(crate::stair::opening).collect() };
     for (i, s) in b.storeys.iter().enumerate() {
+        let inner = inners.get(i).cloned().unwrap_or_default();
         let z0 = s.elevation - FLOOR_SLAB;
         let holes = match i.checked_sub(1) {
             Some(l) => openings(l)?,
             None => Vec::new(),
         };
-        validate_slab_holes(&inner, &holes)?;
+        let (inner, holes) = slab_shape(&inner, holes)?;
         slabs.push(BuiltSlab {
             id: format!("{}.slab.L{i}", b.id),
             kind: SlabKind::Floor,
             level: i,
-            polygon: inner.clone(),
+            mesh: prism_with_holes(&inner, &holes, z0, FLOOR_SLAB),
+            polygon: inner,
             z_bottom: z0,
             thickness: FLOOR_SLAB,
-            mesh: prism_with_holes(&inner, &holes, z0, FLOOR_SLAB),
             holes,
         });
     }
-    let top_level = b.storeys.len().saturating_sub(1);
+    let top_level = levels.saturating_sub(1);
+    let top_inner = inners.get(top_level).cloned().unwrap_or_default();
     let roof = match &b.roof {
         crate::roof::Roof::Flat => {
-            let holes = openings(top_level)?;
-            validate_slab_holes(&b.footprint, &holes)?;
+            let (outline, holes) = slab_shape(&b.footprint, openings(top_level)?)?;
             slabs.push(BuiltSlab {
                 id: format!("{}.roof", b.id),
                 kind: SlabKind::Roof,
                 level: top_level,
-                polygon: b.footprint.clone(),
                 z_bottom: h,
                 thickness: ROOF_SLAB,
-                mesh: prism_with_holes(&b.footprint, &holes, h, ROOF_SLAB),
+                mesh: prism_with_holes(&outline, &holes, h, ROOF_SLAB),
+                polygon: outline,
                 holes,
             });
             None
         }
         crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm } => {
-            let holes = openings(top_level)?;
-            validate_slab_holes(&inner, &holes)?;
+            let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
                 id: format!("{}.attic", b.id),
                 kind: SlabKind::Floor,
                 level: top_level,
-                polygon: inner.clone(),
+                mesh: prism_with_holes(&top_inner, &holes, h - FLOOR_SLAB, FLOOR_SLAB),
+                polygon: top_inner,
                 z_bottom: h - FLOOR_SLAB,
                 thickness: FLOOR_SLAB,
-                mesh: prism_with_holes(&inner, &holes, h - FLOOR_SLAB, FLOOR_SLAB),
                 holes,
             });
             let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
@@ -545,7 +608,6 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             let mut edges = Vec::with_capacity(gables.len());
             for g in gables {
                 let f = b.facade(g)?;
-                let n = b.footprint.len();
                 let (i, j) = (f.edge, (f.edge + 1) % n);
                 let pos = kept.iter().position(|&k| k == i).filter(|&p| kept.get((p + 1) % kept.len()) == Some(&j));
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
@@ -554,27 +616,31 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             Some(BuiltRoof { id: format!("{}.roof", b.id), cover: r.cover, gables: r.gables, eaves: h, ridge: r.ridge, pitch_deg: *pitch_deg })
         }
     };
+    // Interior walls, storey by storey, joined to each other and to that storey's facade face.
     let mut interior = Vec::new();
-    for (k, iw) in b.interior_walls.iter().enumerate() {
-        let (dx, dy) = (iw.b[0] - iw.a[0], iw.b[1] - iw.a[1]);
-        let len = (dx * dx + dy * dy).sqrt();
-        if !(len > 1.0) {
+    for (level, s) in b.storeys.iter().enumerate() {
+        let on: Vec<(usize, &crate::doc::InteriorWall)> = b.interior_walls.iter().enumerate().filter(|(_, w)| w.levels.contains(&level)).collect();
+        if on.is_empty() {
             continue;
         }
-        let (nx, ny) = (-dy / len * iw.thickness / 2.0, dx / len * iw.thickness / 2.0);
-        let outline = [[iw.a[0] + nx, iw.a[1] + ny], [iw.b[0] + nx, iw.b[1] + ny], [iw.b[0] - nx, iw.b[1] - ny], [iw.a[0] - nx, iw.a[1] - ny]];
-        let ccw = if crate::footprint::signed_area2(&outline) < 0.0 { [outline[3], outline[2], outline[1], outline[0]] } else { outline };
-        for &level in &iw.levels {
-            let Some(s) = b.storeys.get(level) else { continue };
+        let axes: Vec<Axis> = on.iter().map(|(_, w)| Axis { a: w.a, b: w.b, thickness: w.thickness }).collect();
+        let joined = crate::joins::join(&axes, inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
+        for ((k, iw), j) in on.iter().zip(joined) {
+            if !(crate::footprint::signed_area2(&j.outline).abs() > 1.0) {
+                continue;
+            }
             let id = if iw.id.is_empty() { format!("{}.iw{k}", b.id) } else { iw.id.clone() };
             interior.push(BuiltInterior {
                 id: format!("{id}.L{level}"),
                 level,
-                outline: ccw,
+                axis: [j.a, j.b],
+                thickness: iw.thickness,
+                outline: j.outline,
+                ends: j.ends,
                 z_bottom: s.elevation,
                 height: s.height - FLOOR_SLAB,
                 load_bearing: iw.load_bearing,
-                mesh: prism(&ccw, s.elevation, s.height - FLOOR_SLAB),
+                mesh: prism(&j.outline, s.elevation, s.height - FLOOR_SLAB),
             });
         }
     }
@@ -595,8 +661,30 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
 }
 
-/// A vertical prism on a counter-clockwise polygon.
-fn validate_slab_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Result<()> {
+/// A facade's inner wall line must keep every edge pointing the way its outer edge does: a wall
+/// too thick for a short facade turns that edge inside out.
+fn check_inner_ring(outer: &[[f64; 2]], inner: &[[f64; 2]]) -> Result<()> {
+    let n = outer.len();
+    for i in 0..n {
+        let (Some(a), Some(b), Some(p), Some(q)) = (outer.get(i), outer.get((i + 1) % n), inner.get(i), inner.get((i + 1) % n)) else {
+            return Err(ModelError::Invalid("the inner wall line doesn't match the footprint".into()));
+        };
+        let (d, e) = ([b[0] - a[0], b[1] - a[1]], [q[0] - p[0], q[1] - p[1]]);
+        // A collapsed edge (a point) is fine; a reversed one is not.
+        if (e[0] * e[0] + e[1] * e[1]).sqrt() > 1.0 && d[0] * e[0] + d[1] * e[1] <= 0.0 {
+            return Err(ModelError::Invalid(format!(
+                "the facade wall is too thick for footprint edge {i} ({:.0} mm long); use a thinner wall there",
+                (d[0] * d[0] + d[1] * d[1]).sqrt()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A slab's outline and holes with its stair openings cut out. Openings may not overlap each
+/// other. An opening that runs into the walls (a stairwell against the facade) is clipped to the
+/// slab, so the slab's outline takes a notch there instead of a hole.
+fn slab_shape(outer: &[[f64; 2]], holes: Vec<Vec<[f64; 2]>>) -> Result<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> {
     let inside = |ring: &[[f64; 2]], p: [f64; 2]| {
         let mut yes = false;
         for i in 0..ring.len() {
@@ -618,8 +706,8 @@ fn validate_slab_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Result<()
         })
     };
     for (i, hole) in holes.iter().enumerate() {
-        if hole.iter().any(|p| !inside(outer, *p)) || intersects(outer, hole) {
-            return Err(ModelError::Invalid(format!("stair opening {i} must lie wholly inside its floor slab")));
+        if !hole.iter().any(|p| inside(outer, *p)) && !intersects(outer, hole) {
+            return Err(ModelError::Invalid(format!("stair opening {i} lies outside its floor slab")));
         }
         for other in &holes[..i] {
             if intersects(other, hole) || hole.first().is_some_and(|p| inside(other, *p)) || other.first().is_some_and(|p| inside(hole, *p)) {
@@ -627,7 +715,23 @@ fn validate_slab_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Result<()
             }
         }
     }
-    Ok(())
+    if holes.iter().all(|h| h.iter().all(|p| inside(outer, *p)) && !intersects(outer, h)) {
+        return Ok((outer.to_vec(), holes));
+    }
+    use i_overlay::core::{fill_rule::FillRule, overlay_rule::OverlayRule};
+    use i_overlay::float::overlay::FloatOverlay;
+    let subj = vec![outer.to_vec()];
+    let shapes = FloatOverlay::with_subj_and_clip(&subj, &holes).overlay(OverlayRule::Difference, FillRule::NonZero);
+    let area = |shape: &Vec<Vec<[f64; 2]>>| shape.first().map_or(0.0, |o| crate::footprint::signed_area2(o).abs() / 2.0);
+    if shapes.iter().filter(|sh| area(sh) > 1.0e6).count() > 1 {
+        return Err(ModelError::Invalid("stair openings cut the floor slab in two".into()));
+    }
+    let mut biggest = shapes.into_iter().max_by(|a, b| area(a).total_cmp(&area(b))).unwrap_or_default();
+    if biggest.is_empty() {
+        return Err(ModelError::Invalid("stair openings leave nothing of the floor slab".into()));
+    }
+    let outline = biggest.remove(0);
+    Ok((outline, biggest))
 }
 
 /// A vertical prism on a counter-clockwise polygon.
@@ -972,6 +1076,27 @@ pub fn even_bays(length: f64, count: usize, margin: f64) -> Vec<f64> {
 mod tests {
     use super::*;
     use crate::doc::Building;
+
+    #[test]
+    fn a_chamfer_shorter_than_the_wall_collapses_to_a_point() {
+        // A 10 × 10 m square with a 283 mm chamfer at one corner (two convex turns, as at the
+        // north end of a wing); the wall is 700 mm.
+        let ring = [[0.0, 0.0], [10000.0, 0.0], [10000.0, 9800.0], [9800.0, 10000.0], [0.0, 10000.0]];
+        let inner = super::inner_ring(&ring, 700.0);
+        assert_eq!(inner.len(), ring.len());
+        // The chamfer's two inner corners are one point, where the neighbours' inner lines meet.
+        let (p, q) = (inner[2], inner[3]);
+        assert!((p[0] - 9300.0).abs() < 1e-6 && (p[1] - 9300.0).abs() < 1e-6, "{p:?}");
+        assert!((p[0] - q[0]).abs() < 1e-6 && (p[1] - q[1]).abs() < 1e-6, "{p:?} {q:?}");
+        // No inner edge runs against its outer edge.
+        for i in 0..ring.len() {
+            let (a, b, c, d) = (ring[i], ring[(i + 1) % 5], inner[i], inner[(i + 1) % 5]);
+            assert!((b[0] - a[0]) * (d[0] - c[0]) + (b[1] - a[1]) * (d[1] - c[1]) >= -1e-6, "edge {i}");
+        }
+        // A thin wall keeps the chamfer.
+        let thin = super::inner_ring(&ring, 100.0);
+        assert!((thin[2][0] - thin[3][0]).abs() > 100.0);
+    }
 
     fn doc_with_block() -> Document {
         let mut doc = Document::default();

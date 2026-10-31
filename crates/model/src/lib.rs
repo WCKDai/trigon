@@ -9,10 +9,12 @@ pub mod build;
 pub mod component;
 pub mod doc;
 pub mod footprint;
+pub mod joins;
 pub mod mesh;
 pub mod roof;
 pub mod stair;
 pub mod wall_cleanup;
+pub mod walls;
 
 pub use build::{Built, BuiltElement, BuiltOpening, BuiltSlab, BuiltWall, ElementClass, FacadeFrame, Rect, SlabKind, build};
 pub use component::{ComponentKind, ComponentType, default_types};

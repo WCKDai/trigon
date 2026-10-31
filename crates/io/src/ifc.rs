@@ -202,37 +202,50 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
         let lp_of = |level: usize| storey_lps.get(level).or(storey_lps.first()).copied().unwrap_or(b_lp);
 
         for wall in &b.walls {
-            let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(0)));
-            let outline = w.polyline(&wall.plan);
-            let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
-            let base = w.point3([0.0, 0.0, wall.bottom]);
-            let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
-            let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(wall.height - wall.bottom)));
-            let shape = w.shape(body, "SweptSolid", &[solid]);
-            let wall_id = w.add(format!(
-                "IFCWALL({},$,{},$,$,#{lp},#{shape},{},.SOLIDWALL.)",
-                string(&guid(&format!("trigon:{}", wall.id))),
-                string(&format!("Facade {}", wall.id)),
-                string(&wall.id)
-            ));
-            if let Some(c) = contained.first_mut() {
-                c.push(wall_id);
+            // One wall per storey: the facade is thicker lower down.
+            let mut pieces = Vec::with_capacity(wall.segments.len());
+            for seg in &wall.segments {
+                let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(seg.level)));
+                let outline = w.polyline(&seg.plan);
+                let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
+                let base = w.point3([0.0, 0.0, seg.z0]);
+                let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
+                let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(seg.z1 - seg.z0)));
+                let shape = w.shape(body, "SweptSolid", &[solid]);
+                let wall_id = w.add(format!(
+                    "IFCWALL({},$,{},$,$,#{lp},#{shape},{},.SOLIDWALL.)",
+                    string(&guid(&format!("trigon:{}", seg.id))),
+                    string(&format!("Facade {} ({:.0} mm)", seg.id, seg.thickness)),
+                    string(&seg.id)
+                ));
+                if let Some(c) = contained.get_mut(seg.level) {
+                    c.push(wall_id);
+                }
+                pieces.push((seg, lp, wall_id));
             }
             let fr = wall.frame;
-            for o in &wall.openings {
+            for (k, o) in wall.openings.iter().enumerate() {
                 let r = o.rect;
-                let centre = w.point3(fr.point((r.u0 + r.u1) / 2.0, -50.0, (r.v0 + r.v1) / 2.0));
-                let axis = w.dir([-fr.n[0], -fr.n[1], 0.0]);
-                let refd = w.dir([fr.t[0], fr.t[1], 0.0]);
-                let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{centre},#{axis},#{refd})"));
-                let rect = w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,{},{})", real(r.u1 - r.u0), real(r.v1 - r.v0)));
-                let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{rect},#{place},#{dz},{})", real(wall.thickness + 100.0)));
-                let shape = w.shape(body, "SweptSolid", &[solid]);
-                let olp = w.add(format!("IFCLOCALPLACEMENT(#{lp},#{wcs})"));
-                let opening =
-                    w.add(format!("IFCOPENINGELEMENT({},$,'Opening',$,$,#{olp},#{shape},$,.OPENING.)", string(&guid(&format!("trigon:{}", o.id)))));
-                w.add(format!("IFCRELVOIDSELEMENT({},$,$,$,#{wall_id},#{opening})", string(&guid(&format!("trigon:{}.voids", o.id)))));
-
+                // Each storey piece the opening cuts gets its own opening element.
+                let mut first = None;
+                for (seg, lp, wall_id) in pieces.iter().filter(|(seg, _, _)| seg.openings.contains(&k)) {
+                    let centre = w.point3(fr.point((r.u0 + r.u1) / 2.0, -50.0, (r.v0 + r.v1) / 2.0));
+                    let axis = w.dir([-fr.n[0], -fr.n[1], 0.0]);
+                    let refd = w.dir([fr.t[0], fr.t[1], 0.0]);
+                    let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{centre},#{axis},#{refd})"));
+                    let rect = w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,{},{})", real(r.u1 - r.u0), real(r.v1 - r.v0)));
+                    let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{rect},#{place},#{dz},{})", real(seg.thickness + 100.0)));
+                    let shape = w.shape(body, "SweptSolid", &[solid]);
+                    let olp = w.add(format!("IFCLOCALPLACEMENT(#{lp},#{wcs})"));
+                    let key = if seg.level == o.level { o.id.clone() } else { format!("{}.L{}", o.id, seg.level) };
+                    let opening =
+                        w.add(format!("IFCOPENINGELEMENT({},$,'Opening',$,$,#{olp},#{shape},$,.OPENING.)", string(&guid(&format!("trigon:{key}")))));
+                    w.add(format!("IFCRELVOIDSELEMENT({},$,$,$,#{wall_id},#{opening})", string(&guid(&format!("trigon:{key}.voids")))));
+                    if seg.level == o.level || first.is_none() {
+                        first = Some(opening);
+                    }
+                }
+                let Some(opening) = first else { continue };
                 let level = o.level.min(contained.len().saturating_sub(1));
                 let fill = element(&mut w, body, wcs, lp_of(level), &o.fill, doc);
                 w.add(format!("IFCRELFILLSELEMENT({},$,$,$,#{opening},#{fill})", string(&guid(&format!("trigon:{}.fills", o.id)))));

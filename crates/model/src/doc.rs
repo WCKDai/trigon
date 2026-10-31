@@ -251,6 +251,10 @@ pub struct Facade {
     /// Bay centre lines, mm along the facade from its start.
     pub bays: Vec<f64>,
     pub placements: Vec<Placement>,
+    /// This wall's thickness per storey where it differs from the building's schedule (a
+    /// fire gable, for example, keeps one thickness all the way up), mm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wall_schedule: Vec<f64>,
 }
 
 /// A component type placed in one slot (storey × bay) of a facade grid.
@@ -287,7 +291,12 @@ pub struct Building {
     pub name: String,
     /// Outer wall line, counter-clockwise, local mm. No repeated closing vertex.
     pub footprint: Vec<[f64; 2]>,
+    /// Facade wall thickness where `wall_schedule` gives none, mm.
     pub wall_thickness: f64,
+    /// Facade wall thickness per storey, mm (index = storey). Copenhagen masonry walls thin
+    /// going up, stepping on the inside at each floor while the outer face stays flush.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wall_schedule: Vec<f64>,
     /// Floor level of the ground storey above the terrain, mm (a raised ground floor over a
     /// half-sunken basement is common in Copenhagen). The wall runs from the terrain up.
     #[serde(default)]
@@ -446,6 +455,20 @@ pub fn polygon_area(p: &[[f64; 2]]) -> f64 {
 
 pub const MIN_WALL: f64 = 100.0;
 pub const MAX_WALL: f64 = 1500.0;
+/// Half a Danish brick with its joint (½ sten), mm.
+pub const HALF_BRICK: f64 = 120.0;
+
+/// Copenhagen solid masonry facade walls, one thickness per storey (bottom up): 1½ sten (360 mm)
+/// on the top two storeys, 2 sten (480) on the two below, 2½ sten (600) below those, and each
+/// basement storey half a brick more than the storey above it (3 sten, 700 mm, under a 600 mm
+/// ground storey).
+pub fn copenhagen_masonry(storeys: usize, ground_level: usize) -> Vec<f64> {
+    const LADDER: [f64; 4] = [360.0, 480.0, 600.0, 700.0];
+    let step = |k: usize| LADDER.get(k).copied().unwrap_or(700.0 + (k as f64 - 3.0) * HALF_BRICK).min(MAX_WALL);
+    let ground = ground_level.min(storeys.saturating_sub(1));
+    let above = |level: usize| (storeys - 1 - level) / 2;
+    (0..storeys).map(|level| if level >= ground { step(above(level)) } else { step(above(ground) + (ground - level)) }).collect()
+}
 
 impl Building {
     /// A building on `footprint` (any orientation; it is cleaned and made counter-clockwise),
@@ -457,6 +480,7 @@ impl Building {
             name: name.to_string(),
             footprint: ring,
             wall_thickness: 400.0,
+            wall_schedule: Vec::new(),
             ground_floor: 0.0,
             storeys: Vec::new(),
             facades: Vec::new(),
@@ -471,7 +495,14 @@ impl Building {
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())
-            .map(|i| Facade { id: format!("{}.f{}", id, i + 1), edge: i, kind: FacadeKind::Unknown, bays: Vec::new(), placements: Vec::new() })
+            .map(|i| Facade {
+                id: format!("{}.f{}", id, i + 1),
+                edge: i,
+                kind: FacadeKind::Unknown,
+                bays: Vec::new(),
+                placements: Vec::new(),
+                wall_schedule: Vec::new(),
+            })
             .collect();
         Ok(b)
     }
@@ -489,6 +520,7 @@ impl Building {
         let ground_floor = checked("ground floor level", ground_floor, 0.0, 5000.0)?;
         self.ground_floor = ground_floor;
         self.storeys = (0..count).map(|i| Storey { name: storey_name(i), elevation: ground_floor + i as f64 * height, height }).collect();
+        self.fit_schedule();
         // Placements on storeys that no longer exist go away.
         for f in &mut self.facades {
             f.placements.retain(|p| p.level < count);
@@ -516,10 +548,72 @@ impl Building {
         let count = floors.len();
         self.ground_floor = levels[0];
         self.storeys = levels.windows(2).enumerate().map(|(i, w)| Storey { name: storey_name(i), elevation: w[0], height: w[1] - w[0] }).collect();
+        self.fit_schedule();
         for f in &mut self.facades {
             f.placements.retain(|p| p.level < count);
         }
         Ok(())
+    }
+
+    /// The facade wall's thickness on a storey by the building's schedule, mm.
+    pub fn facade_thickness(&self, level: usize) -> f64 {
+        self.wall_schedule.get(level).copied().unwrap_or(self.wall_thickness)
+    }
+
+    /// The thickness of the wall on footprint edge `edge` on a storey: its facade's own schedule
+    /// if it has one, else the building's, mm.
+    pub fn edge_thickness(&self, edge: usize, level: usize) -> f64 {
+        let own = self.facades.iter().find(|f| f.edge == edge).and_then(|f| f.wall_schedule.get(level).copied());
+        own.unwrap_or_else(|| self.facade_thickness(level))
+    }
+
+    /// The thickest facade wall on a storey, mm.
+    pub fn thickest_wall(&self, level: usize) -> f64 {
+        (0..self.footprint.len()).map(|e| self.edge_thickness(e, level)).fold(self.facade_thickness(level), f64::max)
+    }
+
+    /// The inner face of the facade walls on a storey: one vertex per footprint corner, each wall
+    /// at its own thickness.
+    pub fn inner_line(&self, level: usize) -> Vec<[f64; 2]> {
+        crate::build::inner_ring_by(&self.footprint, |e| self.edge_thickness(e, level))
+    }
+
+    /// Gives facades their own thickness per storey (one value per storey), or with an empty
+    /// list makes them follow the building's schedule again.
+    pub fn set_facade_schedule(&mut self, facades: &[String], thickness: &[f64]) -> Result<()> {
+        if !thickness.is_empty() && thickness.len() != self.storeys.len() {
+            return Err(ModelError::Invalid(format!("give one thickness per storey: {} storeys, {} values", self.storeys.len(), thickness.len())));
+        }
+        for t in thickness {
+            checked("wall thickness", *t, MIN_WALL, MAX_WALL)?;
+        }
+        for id in facades {
+            self.facade_mut(id)?.wall_schedule = thickness.to_vec();
+        }
+        Ok(())
+    }
+
+    /// Sets the facade wall thickness per storey (one value per storey, bottom up).
+    pub fn set_wall_schedule(&mut self, thickness: &[f64]) -> Result<()> {
+        if thickness.len() != self.storeys.len() {
+            return Err(ModelError::Invalid(format!("give one thickness per storey: {} storeys, {} values", self.storeys.len(), thickness.len())));
+        }
+        for t in thickness {
+            checked("wall thickness", *t, MIN_WALL, MAX_WALL)?;
+        }
+        self.wall_schedule = thickness.to_vec();
+        Ok(())
+    }
+
+    /// A schedule that no longer matches the storeys keeps its values from the bottom and
+    /// repeats its top value on added storeys.
+    fn fit_schedule(&mut self) {
+        let count = self.storeys.len();
+        for schedule in std::iter::once(&mut self.wall_schedule).chain(self.facades.iter_mut().map(|f| &mut f.wall_schedule)) {
+            if let Some(&top) = schedule.last() {
+                schedule.resize(count, top);
+            }
+        }
     }
 
     /// Bottom of the outer walls, mm (below the terrain when there is a basement).
@@ -536,6 +630,14 @@ impl Building {
             return Err(ModelError::Invalid("at most 60 storeys".into()));
         }
         self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor });
+        if let Some(&lowest) = self.wall_schedule.first() {
+            self.wall_schedule.insert(0, (lowest + HALF_BRICK).min(MAX_WALL));
+        }
+        for f in &mut self.facades {
+            if let Some(&lowest) = f.wall_schedule.first() {
+                f.wall_schedule.insert(0, lowest);
+            }
+        }
         self.ground_level += 1;
         for f in &mut self.facades {
             for p in &mut f.placements {
