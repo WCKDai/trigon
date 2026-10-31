@@ -1,0 +1,16 @@
+[package]
+name = "trigon-model"
+description = "Trigon's building model: document, parametric components, facade layout and geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+earcutr = { workspace = true }
+schemars = "1"

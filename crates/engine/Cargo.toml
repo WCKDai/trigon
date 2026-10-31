@@ -1,0 +1,18 @@
+[package]
+name = "trigon-engine"
+description = "Trigon's engine: every action is a command with a JSON schema, run the same way from the CLI, MCP and the UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trigon-model = { workspace = true }
+trigon-data = { workspace = true }
+trigon-io = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+schemars = "1"

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+authors = ["Trigon contributors"]
+repository = "https://github.com/WCKDai/trigon"
+
+[workspace.dependencies]
+trigon-model = { path = "crates/model" }
+trigon-data = { path = "crates/data" }
+trigon-io = { path = "crates/io" }
+trigon-engine = { path = "crates/engine" }
+trigon-mcp = { path = "crates/mcp" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+# Polygon-with-holes triangulation for walls with openings and slabs (ISC).
+earcutr = "0.5"
+# WGS84 -> ETRS89 / UTM 32N (EPSG:25832), pure Rust (MIT OR Apache-2.0).
+proj4rs = "0.3"
+# Blocking HTTP for the data providers (MIT OR Apache-2.0).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+too_many_arguments = "allow"
+type_complexity = "allow"
+neg_cmp_op_on_partial_ord = "allow"

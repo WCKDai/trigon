@@ -1,0 +1,13 @@
+[package]
+name = "trigon-mcp"
+description = "Trigon's MCP server: JSON-RPC 2.0 over stdio, one tool per engine command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trigon-engine = { workspace = true }
+serde_json = { workspace = true }
