@@ -135,7 +135,8 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "building.set_storeys",
-        summary: "Set the number of storeys and the floor-to-floor height (mm). Placements above the new top storey are removed.",
+        summary: "Set the number of storeys, the floor-to-floor height and the ground floor's level above the terrain (mm). \
+                  Placements above the new top storey are removed.",
         mutates: true,
         journaled: true,
         schema: schema::<SetStoreys>,
@@ -143,7 +144,8 @@ static COMMANDS: &[CommandSpec] = &[
             let p: SetStoreys = parse("building.set_storeys", v)?;
             let b = s.doc.building_mut(p.building.as_deref())?;
             let height = p.height.unwrap_or_else(|| b.storeys.first().map_or(3000.0, |s| s.height));
-            b.set_storeys(p.count, height)?;
+            let ground = p.ground_floor.unwrap_or(b.ground_floor);
+            b.set_storeys_from(p.count, height, ground)?;
             check_building(&s.doc, p.building.as_deref())?;
             Ok(info(&s.doc))
         },
@@ -440,6 +442,8 @@ struct SetStoreys {
     count: usize,
     /// Floor-to-floor height, mm; omit to keep the current height.
     height: Option<f64>,
+    /// Floor level of the ground storey above the terrain, mm (raised ground floor); omit to keep it.
+    ground_floor: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -481,7 +485,10 @@ struct Place {
     bays: Option<Vec<usize>>,
     width: Option<f64>,
     height: Option<f64>,
+    /// mm above the storey's floor; may be negative down to the terrain.
     sill: Option<f64>,
+    /// Allow the opening to run past the floor above (stairwell and landing windows).
+    spans_storeys: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -571,6 +578,7 @@ fn info(doc: &Document) -> Value {
             "name": b.name,
             "storeys": b.storeys.len(),
             "storey_height_mm": b.storeys.first().map(|s| s.height),
+            "ground_floor_mm": b.ground_floor,
             "height_mm": b.height(),
             "wall_thickness_mm": b.wall_thickness,
             "attributes": b.attributes,
@@ -724,7 +732,15 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
     for &level in &level_list {
         for &bay in &bay_list {
             f.placements.retain(|pl| !(pl.level == level && pl.bay == bay));
-            f.placements.push(Placement { level, bay, type_id: p.type_id.clone(), width: p.width, height: p.height, sill: p.sill });
+            f.placements.push(Placement {
+                level,
+                bay,
+                type_id: p.type_id.clone(),
+                width: p.width,
+                height: p.height,
+                sill: p.sill,
+                spans_storeys: p.spans_storeys.unwrap_or(false),
+            });
             count += 1;
         }
     }

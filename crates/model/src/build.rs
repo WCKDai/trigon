@@ -205,7 +205,16 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
         ty_eff.width = p.width.unwrap_or(ty.width);
         ty_eff.height = p.height.unwrap_or(ty.height);
         ty_eff.sill = p.sill.unwrap_or(ty.sill);
-        ty_eff.validate().map_err(|e| ModelError::Invalid(format!("{slot}: {e}")))?;
+        // The sill may go below the floor (down to the terrain); everything else as for the type.
+        let mut check = ty_eff.clone();
+        check.sill = check.sill.max(0.0);
+        check.validate().map_err(|e| ModelError::Invalid(format!("{slot}: {e}")))?;
+        if !ty_eff.sill.is_finite() || ty_eff.sill < -storey.elevation {
+            return Err(ModelError::Invalid(format!(
+                "{slot}: sill {} mm would put the opening below the terrain (the floor is {:.0} mm above it)",
+                ty_eff.sill, storey.elevation
+            )));
+        }
         let rect = Rect {
             u0: c - ty_eff.width / 2.0,
             u1: c + ty_eff.width / 2.0,
@@ -218,11 +227,17 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
                 ty_eff.width
             )));
         }
-        if rect.v1 > storey.elevation + storey.height - LINTEL {
-            return Err(ModelError::Invalid(format!(
-                "{slot}: sill {} + height {} leaves less than {LINTEL} mm below the storey above (storey height {})",
-                ty_eff.sill, ty_eff.height, storey.height
-            )));
+        let top = if p.spans_storeys { b.height() } else { storey.elevation + storey.height };
+        if rect.v1 > top - LINTEL {
+            return Err(ModelError::Invalid(if p.spans_storeys {
+                format!("{slot}: the opening runs to {:.0} mm, less than {LINTEL} mm below the eaves ({:.0} mm)", rect.v1, b.height())
+            } else {
+                format!(
+                    "{slot}: sill {} + height {} leaves less than {LINTEL} mm below the storey above (storey height {}); \
+                     stairwell windows that cross a floor need spans_storeys",
+                    ty_eff.sill, ty_eff.height, storey.height
+                )
+            }));
         }
         if let ComponentKind::Balcony { slab_width, .. } = ty_eff.kind
             && (c - slab_width / 2.0 < 0.0 || c + slab_width / 2.0 > frame.length)
@@ -494,7 +509,7 @@ mod tests {
                     (_, 4) => "balcony.french",
                     _ => "window.casement.2",
                 };
-                f.placements.push(Placement { level, bay, type_id: ty.into(), width: None, height: None, sill: None });
+                f.placements.push(Placement { level, bay, type_id: ty.into(), width: None, height: None, sill: None, spans_storeys: false });
             }
         }
         doc.buildings.push(b);
@@ -525,6 +540,39 @@ mod tests {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].placements[1].height = Some(2900.0);
         assert!(format!("{}", build(&doc).unwrap_err()).contains("storey above"));
+    }
+
+    #[test]
+    fn raised_ground_floor_stairwells_and_openings_below_the_floor() {
+        let mut doc = doc_with_block();
+        let b = &mut doc.buildings[0];
+        b.set_storeys_from(5, 3000.0, 900.0).unwrap();
+        assert_eq!(b.height(), 15900.0);
+        assert_eq!(b.storeys[1].elevation, 3900.0);
+        let f = &mut b.facades[0];
+        f.placements.clear();
+        // A landing window: 2580 mm above the ground storey's floor, 950 high, crosses the floor above.
+        let landing = Placement {
+            level: 0,
+            bay: 5,
+            type_id: "window.fixed".into(),
+            width: Some(1000.0),
+            height: Some(950.0),
+            sill: Some(2580.0),
+            spans_storeys: false,
+        };
+        f.placements.push(landing.clone());
+        let err = build(&doc).unwrap_err().to_string();
+        assert!(err.contains("spans_storeys"), "{err}");
+        doc.buildings[0].facades[0].placements[0].spans_storeys = true;
+        let built = build(&doc).unwrap();
+        assert_eq!(built[0].walls[0].openings[0].rect.v0, 900.0 + 2580.0);
+        // A door down to the courtyard: below the floor is fine, below the terrain is not.
+        let door = Placement { level: 0, bay: 0, type_id: "door.french".into(), width: None, height: None, sill: Some(-500.0), spans_storeys: false };
+        doc.buildings[0].facades[0].placements.push(door);
+        assert_eq!(build(&doc).unwrap()[0].walls[0].openings[1].rect.v0, 400.0);
+        doc.buildings[0].facades[0].placements[1].sill = Some(-1000.0);
+        assert!(build(&doc).unwrap_err().to_string().contains("below the terrain"));
     }
 
     #[test]

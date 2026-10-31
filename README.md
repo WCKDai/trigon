@@ -49,7 +49,7 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 | Storeys and terrain | Storey count from BBR; storey height from the eaves height in Danmarks Højdemodel (DSM − DTM) |
 | Photos | Skråfoto 2021–2025, matched to the facades whose camera looks at them |
 | Facade images | `evidence.facade_image` straightens a facade from the photo that shows it best (only the needed tiles are downloaded) and draws the model's storeys, bays and openings over it; over MCP the agent receives the image itself |
-| Facades | Bay grid per facade; slots take typed components; every change is checked (fits the wall and storey, no overlaps, no openings in party walls) |
+| Facades | Bay grid per facade; slots take typed components; every change is checked (fits the wall and storey, no overlaps, no openings in party walls). Raised ground floors (`building.set_storeys ground_floor`), stairwell windows that cross floors (`spans_storeys`) and openings below floor level down to the terrain |
 | Components | Casement windows (1–3 sashes), fixed window, entrance door, French door, French balcony, cantilever balcony; define your own with `types.define` |
 | Export | IFC4 (walls voided by openings, typed windows and doors, slabs, railings, georeferenced with `IfcMapConversion`) and glTF 2.0 |
 | IFC import | `ifc.check` reads a file with two independent readers (ifc-lite, bimifc) and compares them with each other and with the model; `reference.link` shows another IFC model with this one, placed through its georeference |

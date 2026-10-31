@@ -121,8 +121,14 @@ pub struct Placement {
     pub width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<f64>,
+    /// Sill override, mm above this storey's floor. May be negative (an opening below the floor
+    /// level, down to the terrain), for example a door down to a lower courtyard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sill: Option<f64>,
+    /// The opening may run past the floor above (stairwell and landing windows). It must still
+    /// stay below the eaves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spans_storeys: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +138,10 @@ pub struct Building {
     /// Outer wall line, counter-clockwise, local mm. No repeated closing vertex.
     pub footprint: Vec<[f64; 2]>,
     pub wall_thickness: f64,
+    /// Floor level of the ground storey above the terrain, mm (a raised ground floor over a
+    /// half-sunken basement is common in Copenhagen). The wall runs from the terrain up.
+    #[serde(default)]
+    pub ground_floor: f64,
     pub storeys: Vec<Storey>,
     pub facades: Vec<Facade>,
     pub evidence: Vec<Evidence>,
@@ -153,6 +163,7 @@ impl Building {
             name: name.to_string(),
             footprint: ring,
             wall_thickness: 400.0,
+            ground_floor: 0.0,
             storeys: Vec::new(),
             facades: Vec::new(),
             evidence: Vec::new(),
@@ -166,11 +177,18 @@ impl Building {
     }
 
     pub fn set_storeys(&mut self, count: usize, height: f64) -> Result<()> {
+        self.set_storeys_from(count, height, self.ground_floor)
+    }
+
+    /// Storeys of equal height with the ground storey's floor `ground_floor` mm above the terrain.
+    pub fn set_storeys_from(&mut self, count: usize, height: f64, ground_floor: f64) -> Result<()> {
         if count == 0 || count > 60 {
             return Err(ModelError::Invalid(format!("storey count must be 1 to 60 (got {count})")));
         }
         let height = checked("storey height", height, 2000.0, 10000.0)?;
-        self.storeys = (0..count).map(|i| Storey { name: storey_name(i), elevation: i as f64 * height, height }).collect();
+        let ground_floor = checked("ground floor level", ground_floor, 0.0, 5000.0)?;
+        self.ground_floor = ground_floor;
+        self.storeys = (0..count).map(|i| Storey { name: storey_name(i), elevation: ground_floor + i as f64 * height, height }).collect();
         // Placements on storeys that no longer exist go away.
         for f in &mut self.facades {
             f.placements.retain(|p| p.level < count);
@@ -178,8 +196,9 @@ impl Building {
         Ok(())
     }
 
+    /// Wall height from the terrain to the eaves, mm.
     pub fn height(&self) -> f64 {
-        self.storeys.iter().map(|s| s.height).sum()
+        self.ground_floor + self.storeys.iter().map(|s| s.height).sum::<f64>()
     }
 
     pub fn facade(&self, id: &str) -> Result<&Facade> {
