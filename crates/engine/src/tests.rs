@@ -880,3 +880,40 @@ fn door_gaps_become_doors_in_one_wall() {
         assert!(s.execute("interior.doors_from_gaps", bad.clone()).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn plinth_and_roof_build_up_are_part_of_the_model() {
+    let mut s = session();
+    let gable = s.doc.buildings[0].facades[0].id.clone();
+    s.execute(
+        "building.set_roof",
+        json!({"kind": "pitched", "pitch_deg": 40, "gables": [gable], "overhang_mm": 300, "verge_mm": 100, "thickness_mm": 250, "gutters": true}),
+    )
+    .unwrap();
+    s.execute("building.set_plinth", json!({"height_mm": 600})).unwrap();
+    let built = trigon_model::build(&s.doc).unwrap();
+    let roof = built[0].roof.as_ref().unwrap();
+    assert!(!roof.gutters.is_empty());
+    // The roof reaches past the footprint; the plinth stands proud of every wall up to 600 mm.
+    let (lo, hi) = roof.cover.bounds().unwrap();
+    let fp = &s.doc.buildings[0].footprint;
+    let minx = fp.iter().map(|p| p[0]).fold(f64::MAX, f64::min);
+    assert!(lo[0] < minx - 50.0 && hi[2] > lo[2]);
+    for w in &built[0].walls {
+        let (plo, phi) = w.plinth.bounds().unwrap();
+        assert!((phi[2] - 600.0).abs() < 1e-6 && plo[2] < 0.0, "{}", w.id);
+    }
+    // Both export.
+    let dir = std::env::temp_dir().join(format!("trigon-plinth-{}", std::process::id()));
+    s.execute("export.gltf", json!({"path": dir.join("m.glb")})).unwrap();
+    s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    // Removed again; refused when unclear or hostile.
+    s.execute("building.set_plinth", json!({"remove": true})).unwrap();
+    assert!(trigon_model::build(&s.doc).unwrap()[0].walls.iter().all(|w| w.plinth.is_empty()));
+    for bad in [json!({}), json!({"height_mm": 600, "remove": true}), json!({"height_mm": f64::MAX}), json!({"height_mm": 600, "projection_mm": -5})]
+    {
+        assert!(s.execute("building.set_plinth", bad.clone()).is_err(), "{bad}");
+    }
+    assert!(s.execute("building.set_roof", json!({"kind": "pitched", "pitch_deg": 40, "overhang_mm": -1})).is_err());
+}

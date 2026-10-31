@@ -196,7 +196,9 @@ static COMMANDS: &[CommandSpec] = &[
         id: "building.set_roof",
         summary: "Set the roof: flat, or pitched from the eaves (the top of the walls) at `pitch_deg`, or at the pitch that puts \
                   the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
-                  gable (wing ends, walls against neighbours). `source` records where the values came from.",
+                  gable (wing ends, walls against neighbours). A pitched roof can carry on past the walls (`overhang_mm` at the \
+                  eaves, `verge_mm` at the gables), have a build-up (`thickness_mm`, with fascia, soffit and verge boards) and \
+                  `gutters`. `source` records where the values came from.",
         mutates: true,
         journaled: true,
         schema: schema::<SetRoof>,
@@ -258,6 +260,29 @@ static COMMANDS: &[CommandSpec] = &[
             Ok(json!({
                 "schedule": b.storeys.iter().enumerate().map(|(i, st)| json!({"storey": st.name, "thickness_mm": b.facade_thickness(i)})).collect::<Vec<_>>()
             }))
+        },
+    },
+    CommandSpec {
+        id: "building.set_plinth",
+        summary: "Give the facades a plinth (sokkel): rendered or concrete, from below the terrain up to `height_mm` above it, \
+                  standing `projection_mm` proud of the brickwork (default 20). Openings in the plinth band (basement windows) \
+                  are cut through it. `remove: true` takes it away.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetPlinth>,
+        run: |s, v| {
+            let p: SetPlinth = parse("building.set_plinth", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.plinth = match (p.remove.unwrap_or(false), p.height_mm) {
+                (true, None) => None,
+                (false, Some(h)) => Some(trigon_model::doc::Plinth {
+                    height: trigon_model::checked("height_mm", h, 100.0, 5000.0)?,
+                    projection: trigon_model::checked("projection_mm", p.projection_mm.unwrap_or(20.0), 0.0, 300.0)?,
+                }),
+                _ => return Err(ModelError::Invalid("give height_mm, or remove: true".into()).into()),
+            };
+            trigon_model::build(&s.doc)?;
+            Ok(json!({"plinth": s.doc.building(p.building.as_deref())?.plinth}))
         },
     },
     CommandSpec {
@@ -1517,6 +1542,15 @@ struct SetRoof {
     gables: Option<Vec<String>>,
     /// Facade steps up to this deep (mm) get no roof faces of their own; the eave runs straight (default 1200, 0 = follow every step).
     straighten_mm: Option<f64>,
+    /// How far the roof runs past the walls at the eaves, mm (default 0).
+    overhang_mm: Option<f64>,
+    /// How far it runs past the gable walls, mm (default 0).
+    verge_mm: Option<f64>,
+    /// Build-up square to the roof (rafters, battens, tiles), mm (default 0: a surface). Its underside rests on the
+    /// wall line at the eaves.
+    thickness_mm: Option<f64>,
+    /// Gutters along the eaves (default false).
+    gutters: Option<bool>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -1526,6 +1560,17 @@ struct SetRoof {
 struct SetWallThickness {
     building: Option<String>,
     thickness: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetPlinth {
+    building: Option<String>,
+    /// Top of the plinth, mm above the terrain.
+    height_mm: Option<f64>,
+    /// How far it stands proud of the brickwork, mm (default 20).
+    projection_mm: Option<f64>,
+    remove: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1846,7 +1891,15 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
                 }
             };
-            trigon_model::Roof::Pitched { pitch_deg: pitch, gables, straighten_mm: p.straighten_mm.unwrap_or(1200.0) }
+            trigon_model::Roof::Pitched {
+                pitch_deg: pitch,
+                gables,
+                straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                overhang_mm: trigon_model::checked("overhang_mm", p.overhang_mm.unwrap_or(0.0), 0.0, 2000.0)?,
+                verge_mm: trigon_model::checked("verge_mm", p.verge_mm.unwrap_or(0.0), 0.0, 1500.0)?,
+                thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,
+                gutters: p.gutters.unwrap_or(false),
+            }
         }
         other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
     };

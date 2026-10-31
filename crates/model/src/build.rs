@@ -189,6 +189,8 @@ pub struct BuiltWall {
     pub mesh: Mesh,
     /// One closed piece per storey at that storey's thickness, bottom up.
     pub segments: Vec<WallSegment>,
+    /// The plinth in front of the wall's foot (empty without one).
+    pub plinth: Mesh,
     pub openings: Vec<BuiltOpening>,
     /// Balconies hung on the wall without an opening of their own.
     pub attachments: Vec<BuiltElement>,
@@ -249,6 +251,8 @@ pub struct BuiltRoof {
     pub cover: Mesh,
     /// Vertical gable triangles above gable walls.
     pub gables: Mesh,
+    /// Gutters along the eaves.
+    pub gutters: Mesh,
     pub eaves: f64,
     pub ridge: f64,
     pub pitch_deg: f64,
@@ -316,7 +320,7 @@ pub fn inner_ring_by(ring: &[[f64; 2]], d: impl Fn(usize) -> f64) -> Vec<[f64; 2
         let s = (dp[0] * t1[1] - dp[1] * t1[0]) / cross;
         let q = [p0[0] + s * t0[0], p0[1] + s * t0[1]];
         let miter = ((q[0] - fallback[0]).powi(2) + (q[1] - fallback[1]).powi(2)).sqrt();
-        if miter > 5.0 * d(i % n).max(d(j % n)) { fallback } else { q }
+        if miter > 5.0 * d(i % n).abs().max(d(j % n).abs()) { fallback } else { q }
     };
     let mut inner: Vec<[f64; 2]> = (0..n)
         .map(|i| {
@@ -513,6 +517,15 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
         })
         .collect();
     let mut walls = Vec::with_capacity(b.facades.len());
+    // The plinth's face: the footprint carried out by its projection, mitred at the corners.
+    let plinth_line = match &b.plinth {
+        Some(p) => {
+            crate::checked("plinth height", p.height, 100.0, 5000.0)?;
+            crate::checked("plinth projection", p.projection, 0.0, 300.0)?;
+            Some(inner_ring(&b.footprint, -p.projection.max(1.0)))
+        }
+        None => None,
+    };
     for f in &b.facades {
         let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::Invalid(format!("facade {} has no edge", f.id)))?;
         let fr = FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid(format!("facade {} has zero length", f.id)))?;
@@ -552,7 +565,11 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
                 attachment(&fr, &id, r, elevation_of(r), *status)
             })
             .collect();
-        walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, height: h, bottom: zb, mesh, segments, openings, attachments });
+        let plinth = match (&b.plinth, &plinth_line) {
+            (Some(p), Some(line)) => plinth_piece(&fr, f, (a, e), line, p, &holes).ok_or_else(unbuildable)?,
+            _ => Mesh::default(),
+        };
+        walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, height: h, bottom: zb, mesh, segments, plinth, openings, attachments });
     }
 
     // Floors span to the inner face of the storey's own wall and rest on the step of the thicker wall below.
@@ -595,7 +612,7 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             });
             None
         }
-        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm } => {
+        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters } => {
             let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
@@ -618,8 +635,17 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
                 let pos = kept.iter().position(|&k| k == i).filter(|&p| kept.get((p + 1) % kept.len()) == Some(&j));
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
             }
-            let r = crate::roof::pitched(&outline, h, *pitch_deg, &edges)?;
-            Some(BuiltRoof { id: format!("{}.roof", b.id), cover: r.cover, gables: r.gables, eaves: h, ridge: r.ridge, pitch_deg: *pitch_deg })
+            let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
+            let r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            Some(BuiltRoof {
+                id: format!("{}.roof", b.id),
+                cover: r.cover,
+                gables: r.gables,
+                gutters: r.gutters,
+                eaves: h,
+                ridge: r.ridge,
+                pitch_deg: *pitch_deg,
+            })
         }
     };
     // Interior walls, storey by storey, joined to each other and to that storey's facade face.
@@ -656,6 +682,30 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
         }
     }
     Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
+}
+
+/// The plinth runs this far below the terrain, mm.
+const PLINTH_FOOT: f64 = 300.0;
+
+/// The plinth in front of one facade: a closed piece from below the terrain to its top, between
+/// the wall's outer face and the plinth's face, with the facade's openings cut through it.
+fn plinth_piece(
+    fr: &FacadeFrame,
+    f: &Facade,
+    (a, e): ([f64; 2], [f64; 2]),
+    line: &[[f64; 2]],
+    p: &crate::doc::Plinth,
+    holes: &[Rect],
+) -> Option<Mesh> {
+    let n = line.len();
+    let (s, t) = (*line.get(f.edge)?, *line.get((f.edge + 1) % n)?);
+    let face = FacadeFrame::new(s, t)?;
+    let along = |q: [f64; 2]| (q[0] - s[0]) * face.t[0] + (q[1] - s[1]) * face.t[1];
+    // Openings, from the wall's frame into the plinth's (which starts further out at the corner).
+    let shift = along(fr.origin);
+    let holes: Vec<Rect> = holes.iter().map(|r| Rect { u0: r.u0 + shift, u1: r.u1 + shift, ..*r }).collect();
+    let span = Span { level: 0, thickness: p.projection.max(1.0), z0: -PLINTH_FOOT, z1: p.height, in0: along(a), in1: along(e), qs: a, qe: e };
+    crate::walls::segment(&face, &format!("{}.plinth", f.id), &span, &holes).map(|seg| seg.mesh)
 }
 
 /// Door frame (karm) width, mm.

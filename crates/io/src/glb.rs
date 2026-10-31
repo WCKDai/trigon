@@ -96,7 +96,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
 
     for b in built {
         for wall in &b.walls {
-            add(&mut w, &wall.id, &[(Material::Wall, &wall.mesh)]);
+            add(&mut w, &wall.id, &[(Material::Wall, &wall.mesh), (Material::Plinth, &wall.plinth)]);
             let elements = wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments);
             for e in elements {
                 // What a phase tears down is drawn in translucent red, as in Revit's demolition views.
@@ -111,7 +111,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             add(&mut w, &s.id, &[(m, &s.mesh)]);
         }
         if let Some(r) = &b.roof {
-            add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables)]);
+            add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables), (Material::Steel, &r.gutters)]);
         }
         for iw in &b.interior {
             add(&mut w, &iw.id, &[(Material::Slab, &iw.mesh)]);

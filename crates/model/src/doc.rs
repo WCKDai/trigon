@@ -322,6 +322,19 @@ pub struct Building {
     /// Index of the ground storey ("stueetage"); storeys below it are basements.
     #[serde(default)]
     pub ground_level: usize,
+    /// A plinth (sokkel) along the foot of every facade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plinth: Option<Plinth>,
+}
+
+/// A rendered or concrete plinth (sokkel) at the foot of the facades.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Plinth {
+    /// Its top, mm above the terrain.
+    pub height: f64,
+    /// How far it stands proud of the brickwork, mm.
+    pub projection: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -528,6 +541,7 @@ impl Building {
             rooms: Vec::new(),
             entrances: Vec::new(),
             ground_level: 0,
+            plinth: None,
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())

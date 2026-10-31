@@ -21,10 +21,12 @@ pub enum Material {
     Deck,
     /// Shown in a demolition view: what a phase tears down.
     Demolished,
+    /// Rendered or concrete plinth (sokkel) at the foot of the facade.
+    Plinth,
 }
 
 impl Material {
-    pub const ALL: [Material; 12] = [
+    pub const ALL: [Material; 13] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -37,6 +39,7 @@ impl Material {
         Material::Steel,
         Material::Deck,
         Material::Demolished,
+        Material::Plinth,
     ];
 
     pub fn name(self) -> &'static str {
@@ -53,6 +56,7 @@ impl Material {
             Material::Steel => "steel",
             Material::Deck => "deck",
             Material::Demolished => "demolished",
+            Material::Plinth => "plinth",
         }
     }
 
@@ -71,6 +75,7 @@ impl Material {
             Material::Steel => [0.62, 0.64, 0.66, 1.0],
             Material::Deck => [0.55, 0.33, 0.18, 1.0],
             Material::Demolished => [0.90, 0.10, 0.10, 0.45],
+            Material::Plinth => [0.42, 0.42, 0.41, 1.0],
         }
     }
 }
