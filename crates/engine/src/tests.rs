@@ -318,6 +318,19 @@ fn every_command_has_an_object_schema() {
     }
 }
 
+#[test]
+fn studio_plan_matches_the_exported_vector_sheet() {
+    let mut s = session();
+    let path = std::env::temp_dir().join(format!("trigon-live-plan-{}.svg", std::process::id()));
+    let before = s.doc.clone();
+    s.execute("plan.sheet", json!({"path": path, "levels": [0]})).unwrap();
+    let live = crate::plan_sheet_svg(&s.doc, 0, trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert_eq!(live, std::fs::read_to_string(&path).unwrap());
+    assert_eq!(s.doc, before);
+    assert!(crate::plan_sheet_svg(&s.doc, usize::MAX, trigon_model::build::View::latest(&s.doc)).is_err());
+    let _ = std::fs::remove_file(path);
+}
+
 fn exported(s: &mut Session, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let south = first_facade_facing(s, "S");
     s.execute("facade.set_bays", json!({"facade": south, "count": 7})).unwrap();

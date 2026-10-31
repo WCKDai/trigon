@@ -39,6 +39,52 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 `facade_place`, `types_define`, `export_ifc`, `edit_undo`, …). `trigon commands` lists them and
 `trigon schema <command>` prints a command's parameters.
 
+## Co-building with an agent
+
+**Trigon Studio** is the desktop app where you and an agent build the model together, and you
+watch the agent work: every command it runs lands in your window, in the activity feed (by the
+agent's name, with parameters, result and duration) and in the model, where what it changed glows
+for a few seconds.
+
+```sh
+cargo build --release -p trigon-studio -p trigon
+./target/release/trigon-studio path/to/model.trigon
+```
+
+Then point your agent's MCP configuration at `trigon mcp`, with no flags. It finds the running
+Studio (through the discovery file Studio writes next to its control token) and runs every tool
+call in Studio's session. With no Studio running it falls back to a session of its own.
+
+```sh
+# Claude Code
+claude mcp add trigon -- /path/to/trigon/target/release/trigon mcp
+```
+
+```toml
+# Codex (~/.codex/config.toml)
+[mcp_servers.trigon]
+command = "/path/to/trigon/target/release/trigon"
+args = ["mcp"]
+```
+
+Bridged to Studio, the agent also gets `studio_view` (show you a level, a phase, the plan, or one
+element up close) and `studio_screenshot` (see what you see). `trigon mcp --connect 127.0.0.1:PORT`
+picks a particular window and `--headless` (or `--doc FILE`) keeps a session of its own.
+
+In Studio:
+
+- **3D**: drag to orbit, Shift-drag or right-drag to pan, scroll or pinch to zoom at the pointer,
+  double-click or F to fit. "Up to level" cuts the model 1.2 m above a floor. Click an element to
+  see its id, type and properties.
+- **Plan**: the level's plan sheet, as `plan.sheet` draws it; drag to pan, scroll to zoom.
+- **Activity**: newest first; click an entry for its full JSON. Undo and Redo (⌘Z, ⇧⌘Z) apply to
+  your changes and the agent's alike.
+- **Commands…** (⌘K): search every command, edit its parameters (prefilled from its schema) and
+  run it yourself.
+
+The control channel listens on 127.0.0.1 only, with a new random token per launch in a file only
+you can read. See [`docs/control-protocol.md`](docs/control-protocol.md).
+
 ## What it does today
 
 | | |
@@ -79,8 +125,10 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 | `crates/io` | GLB and IFC4 writers, written from the public specifications |
 | `crates/ifcread` | IFC import and cross-checking through ifc-lite and bimifc |
 | `crates/engine` | Commands, session, undo, journal |
-| `crates/mcp` | MCP over stdio |
+| `crates/mcp` | MCP over stdio, headless or bridged to Trigon Studio |
+| `crates/control` | The control channel a running Studio listens on (token, discovery, limits) |
 | `apps/trigon` | CLI |
+| `apps/trigon-studio` | Trigon Studio, the desktop app (eframe/egui, wgpu) |
 
 ## Licence
 

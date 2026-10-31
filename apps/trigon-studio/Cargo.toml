@@ -1,0 +1,31 @@
+[package]
+name = "trigon-studio"
+description = "Trigon Studio: the desktop app where the owner and an AI agent build a model together, and the owner watches the agent work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trigon-model = { workspace = true }
+trigon-data = { workspace = true }
+trigon-engine = { workspace = true }
+trigon-control = { workspace = true }
+serde_json = { workspace = true }
+# The window and its UI, drawn with wgpu: Polykrom's shell stack (MIT OR Apache-2.0). Without the
+# glow (OpenGL) backend, so Polykrom's egui-wgpu patch for OpenGL sample counts isn't needed.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit"] }
+# Vertex data for the GPU (MIT OR Apache-2.0 OR Zlib; already in the tree through wgpu).
+bytemuck = "1"
+# Viewport screenshots (MIT OR Apache-2.0; already used by the engine).
+png = "0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux builds (CI) use X11 through libraries loaded at run time: no system packages to build.
+eframe = { version = "0.36", default-features = false, features = ["x11"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+# Native Open/Save dialogs (MIT).
+rfd = "0.17"
