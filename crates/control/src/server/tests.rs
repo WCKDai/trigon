@@ -287,7 +287,8 @@ fn random_bytes_never_take_the_server_down() {
         let mut c = if round % 2 == 0 { Conn::authed(app.port) } else { Conn::open(app.port) };
         for _ in 0..6 {
             let len = (next() % 300) as usize;
-            let mut line: Vec<u8> = (0..len).map(|_| (next() % 256) as u8).filter(|b| *b != b'\n').collect();
+            // Never blank: blank lines are skipped without a reply.
+            let mut line: Vec<u8> = std::iter::once(b'#').chain((0..len).map(|_| (next() % 256) as u8)).filter(|b| *b != b'\n').collect();
             if next() % 3 == 0 {
                 // Something that parses: a request with odd members.
                 line = format!(
