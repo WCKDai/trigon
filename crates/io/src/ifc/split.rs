@@ -174,10 +174,12 @@ pub fn balcony(elements: &[&BuiltElement], kind: Option<&ComponentKind>) -> Vec<
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoofPiece {
     pub key: String,
-    /// The outline, counter-clockwise seen from above (a plane) or from outside (a gable).
+    /// A plane's underside outline, counter-clockwise seen from above; a gable's outline.
     pub polygon: Vec<[f64; 3]>,
-    /// The surface as Trigon built it (a plane next to a gable may be warped).
+    /// The same as triangles, as Trigon built it (a plane next to a gable may be warped).
     pub surface: Mesh,
+    /// A plane's solid runs from its underside along this to its top face, mm.
+    pub rise: [f64; 3],
     /// For a gable: the facade wall it stands on and its thickness.
     pub gable: Option<(String, f64)>,
 }
@@ -193,6 +195,11 @@ impl RoofPiece {
         let d: Vec<f64> = self.polygon.iter().map(|p| (p[0] - o[0]) * n[0] + (p[1] - o[1]) * n[1] + (p[2] - o[2]) * n[2]).collect();
         let (lo, hi) = d.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
         hi - lo
+    }
+
+    /// The plane's thickness square to it, mm.
+    pub fn thickness(&self) -> f64 {
+        unit(normal(&self.polygon)).map_or(0.0, |n| (self.rise[0] * n[0] + self.rise[1] * n[1] + self.rise[2] * n[2]).abs())
     }
 }
 
@@ -242,16 +249,72 @@ pub fn normal(p: &[[f64; 3]]) -> [f64; 3] {
     n
 }
 
+/// The area-weighted normal of a mesh's triangles (not normalised).
+fn facing(m: &Mesh) -> [f64; 3] {
+    let p = |i: u32| m.positions.get(i as usize).copied().unwrap_or_default();
+    m.triangles.iter().fold([0.0; 3], |acc, t| {
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        let n = cross([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+        [acc[0] + n[0], acc[1] + n[1], acc[2] + n[2]]
+    })
+}
+
+fn shifted(m: &Mesh, d: [f64; 3]) -> Mesh {
+    Mesh { positions: m.positions.iter().map(|p| [p[0] + d[0], p[1] + d[1], p[2] + d[2]]).collect(), triangles: m.triangles.clone() }
+}
+
+fn centroid(p: &[[f64; 3]]) -> [f64; 3] {
+    let n = p.len().max(1) as f64;
+    p.iter().fold([0.0; 3], |c, q| [c[0] + q[0] / n, c[1] + q[1] / n, c[2] + q[2] / n])
+}
+
 /// The planes of a pitched roof and its gables. Each face of the roof was triangulated on its
-/// own, so faces are the groups of triangles that share vertices.
+/// own, so faces are the groups of triangles that share vertices. A roof with a build-up is a
+/// closed slab: each plane's top face lies straight above its soffit (the boards round the edge
+/// are vertical), and the plane is the solid between them. A roof without one is a surface: the
+/// plane hangs `ROOF_PLANE` below it.
 pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
-    let mut out = Vec::new();
-    for (k, face) in components(&r.cover, false).into_iter().enumerate() {
-        if let Some(polygon) = outline(&face) {
-            let up = normal(&polygon)[2] >= 0.0;
-            let polygon = if up { polygon } else { polygon.into_iter().rev().collect() };
-            out.push(RoofPiece { key: format!("{}.face{k}", r.id), polygon, surface: face, gable: None });
+    let mut up = Vec::new();
+    let mut down = Vec::new();
+    for face in components(&r.cover, false) {
+        let Some(polygon) = outline(&face) else { continue };
+        // Which way the face looks, from its triangles; the outline is turned to run
+        // counter-clockwise seen from above.
+        let Some(n) = unit(facing(&face)) else { continue };
+        let polygon = if normal(&polygon)[2] < 0.0 { polygon.into_iter().rev().collect() } else { polygon };
+        if n[2] > 0.2 {
+            up.push((polygon, face));
+        } else if n[2] < -0.2 {
+            down.push((polygon, face));
         }
+    }
+    let mut out = Vec::new();
+    for (k, (top, face)) in up.into_iter().enumerate() {
+        let key = format!("{}.face{k}", r.id);
+        let c = centroid(&top);
+        let soffit = down.iter().find(|(p, _)| {
+            let d = centroid(p);
+            p.len() == top.len() && (d[0] - c[0]).hypot(d[1] - c[1]) < 1.0 && d[2] < c[2]
+        });
+        let piece = match soffit {
+            Some((polygon, surface)) => {
+                let rise = [0.0, 0.0, c[2] - centroid(polygon)[2]];
+                RoofPiece { key, polygon: polygon.clone(), surface: surface.clone(), rise, gable: None }
+            }
+            None => {
+                let Some(n) = unit(normal(&top)) else { continue };
+                let rise = n.map(|v| v * ROOF_PLANE);
+                let below = rise.map(|v| -v);
+                RoofPiece {
+                    key,
+                    polygon: top.iter().map(|p| [p[0] + below[0], p[1] + below[1], p[2] + below[2]]).collect(),
+                    surface: shifted(&face, below),
+                    rise,
+                    gable: None,
+                }
+            }
+        };
+        out.push(piece);
     }
     for (k, face) in components(&r.gables, false).into_iter().enumerate() {
         let Some(polygon) = outline(&face) else { continue };
@@ -269,7 +332,7 @@ pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
             Some((id, _)) if !out.iter().any(|p: &RoofPiece| p.key == format!("{id}.gable")) => format!("{id}.gable"),
             _ => format!("{}.gable{k}", r.id),
         };
-        out.push(RoofPiece { key, polygon, surface: face, gable });
+        out.push(RoofPiece { key, polygon, surface: face, rise: [0.0; 3], gable });
     }
     out
 }
@@ -315,35 +378,30 @@ fn slab_mesh(polygon: &[[f64; 3]], d: [f64; 3]) -> Mesh {
     m
 }
 
-/// A warped roof plane as a closed solid: Trigon's surface on top, the same surface moved down
-/// the plane's normal by the roof's thickness underneath, and sides along the outline.
-pub fn warped_solid(p: &RoofPiece) -> Mesh {
+/// A roof plane as a closed solid: its underside as Trigon built it, the same moved by the
+/// rise on top, and sides along the outline, all facing out.
+pub fn plane_solid(p: &RoofPiece) -> Mesh {
     let Some(f) = plane_frame(&p.polygon) else { return Mesh::default() };
-    let d = f.z.map(|v| -v * ROOF_PLANE);
-    let mut m = Mesh::default();
-    let mut top = p.surface.clone();
-    // Faces out: the top up the normal, the underside down.
-    for t in &mut top.triangles {
-        let [a, b, c] = t.map(|i| top.positions.get(i as usize).copied().unwrap_or_default());
+    let mut under = p.surface.clone();
+    for t in &mut under.triangles {
+        let [a, b, c] = t.map(|i| under.positions.get(i as usize).copied().unwrap_or_default());
         let n = cross([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
-        if n[0] * f.z[0] + n[1] * f.z[1] + n[2] * f.z[2] < 0.0 {
+        if n[0] * f.z[0] + n[1] * f.z[1] + n[2] * f.z[2] > 0.0 {
             t.swap(1, 2);
         }
     }
-    let mut under = top.clone();
-    for q in &mut under.positions {
-        *q = [q[0] + d[0], q[1] + d[1], q[2] + d[2]];
-    }
-    for t in &mut under.triangles {
+    let mut top = shifted(&under, p.rise);
+    for t in &mut top.triangles {
         t.swap(1, 2);
     }
-    m.append(&top);
+    let mut m = Mesh::default();
     m.append(&under);
+    m.append(&top);
+    let d = p.rise;
     let n = p.polygon.len();
     for i in 0..n {
         let (a, b) = (p.polygon[i], p.polygon[(i + 1) % n]);
-        let (a1, b1) = ([a[0] + d[0], a[1] + d[1], a[2] + d[2]], [b[0] + d[0], b[1] + d[1], b[2] + d[2]]);
-        m.quad(a1, b1, b, a);
+        m.quad(a, b, [b[0] + d[0], b[1] + d[1], b[2] + d[2]], [a[0] + d[0], a[1] + d[1], a[2] + d[2]]);
     }
     m
 }
@@ -355,12 +413,16 @@ pub fn roof_solid(p: &RoofPiece, walls: &[BuiltWall]) -> Mesh {
             let inward = walls.iter().find(|w| &w.id == wall).map_or([0.0; 3], |w| [-w.frame.n[0] * t, -w.frame.n[1] * t, 0.0]);
             slab_mesh(&p.polygon, inward)
         }
-        None if p.warp() > WARP => warped_solid(p),
-        None => match plane_frame(&p.polygon) {
-            Some(f) => slab_mesh(&p.polygon, f.z.map(|v| -v * ROOF_PLANE)),
-            None => Mesh::default(),
-        },
+        None => plane_solid(p),
     }
+}
+
+/// The gutters along the eaves, one per eave.
+pub fn gutters(r: &BuiltRoof) -> Vec<(String, Mesh)> {
+    if r.gutters.is_empty() {
+        return Vec::new();
+    }
+    boxes(&r.gutters).into_iter().enumerate().map(|(k, m)| (format!("{}.gutter{k}", r.id), m)).collect()
 }
 
 /// One storey's staircase: its id as built, level, the doc's stair, and its parts with keys.
@@ -450,14 +512,22 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
             for p in roof(r, &b.walls) {
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
+            out.extend(gutters(r));
         }
         for iw in &b.interior {
             out.push((iw.id.clone(), iw.mesh.clone()));
+            for d in &iw.doors {
+                out.push((d.fill.id.clone(), merged(&d.fill.parts)));
+            }
+        }
+        for w in &b.walls {
+            out.push((format!("{}.plinth", w.id), w.plinth.clone()));
         }
         if let Some(bd) = doc.buildings.iter().find(|x| x.id == b.building_id) {
             for st in stairs(bd) {
-                if b.stairs.iter().any(|s| s.id == st.id) {
+                if let Some(built) = b.stairs.iter().find(|s| s.id == st.id) {
                     out.extend(st.parts.into_iter().map(|(k, p)| (k, p.mesh)));
+                    out.push((format!("{}.railing", st.id), built.railing.clone()));
                 }
             }
         }

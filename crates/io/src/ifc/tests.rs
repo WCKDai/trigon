@@ -32,13 +32,19 @@ fn the_sample_has_every_kind_of_building_element() {
     assert_eq!(count(&text, "IFCSPACE"), spaces);
     // Two steel balconies (four UPE beams and two tie rods each) and one cantilever balcony.
     assert_eq!((count(&text, "IFCELEMENTASSEMBLY"), count(&text, "IFCBEAM"), count(&text, "IFCMEMBER")), (3, 8, 4));
-    // Railings: three balconies and the French balcony.
-    assert_eq!(count(&text, "IFCRAILING"), 4);
+    // Railings: three balconies, the French balcony and the balustrade of each U-turn stair.
+    assert_eq!(count(&text, "IFCRAILING"), 4 + 2);
     let fills: usize = b.walls.iter().map(|w| w.openings.len()).sum();
-    assert_eq!(count(&text, "IFCWINDOW") + count(&text, "IFCDOOR"), fills);
-    assert_eq!(text.matches("IFCRELFILLSELEMENT(").count(), fills);
+    let doors: usize = b.interior.iter().map(|w| w.doors.len()).sum();
+    assert_eq!(doors, 3 * 2 + 3 + 2, "two in the spine, one in the stairwell wall, one in the partition, per storey");
+    assert_eq!(count(&text, "IFCWINDOW") + count(&text, "IFCDOOR"), fills + doors);
+    assert_eq!(text.matches("IFCRELFILLSELEMENT(").count(), fills + doors);
     // The stairwell windows cross a floor: they void two pieces each.
-    assert_eq!(count(&text, "IFCOPENINGELEMENT"), fills + 2);
+    assert_eq!(count(&text, "IFCOPENINGELEMENT"), fills + 2 + doors);
+    // A plinth on every facade, a gutter on every eave, roof planes with the roof's build-up.
+    assert_eq!(count(&text, "IFCCOVERING"), b.walls.len());
+    assert_eq!(count(&text, "IFCPIPESEGMENT"), 4);
+    assert!(text.contains("'Tag, tegl p\\X2\\00E5\\X0\\ sp\\X2\\00E6\\X0\\r 250 mm'"));
     for layer in [
         catalog::L_FACADE,
         catalog::L_INTERIOR,
@@ -114,4 +120,29 @@ fn hostile_rooms_and_stairs_are_skipped_not_fatal() {
     b.stairs.push(Stair { outline: vec![[0.0, 0.0]], ..b.stairs[0].clone() });
     let text = write(&doc, &built, "h.ifc", "t");
     assert_eq!(count(&text, "IFCSPACE"), 15 - 1, "the broken rooms are left out");
+}
+
+#[test]
+fn a_built_up_roof_is_one_slab_per_plane_as_thick_as_its_build_up() {
+    let (_, built, text) = sample();
+    let r = built[0].roof.as_ref().unwrap();
+    let pieces = split::roof(r, &built[0].walls);
+    let planes: Vec<_> = pieces.iter().filter(|p| p.gable.is_none()).collect();
+    // An L with two gables: four planes, each its soffit raised straight up to the top face.
+    assert_eq!(planes.len(), 4);
+    for p in &planes {
+        assert!((p.thickness() - 250.0).abs() < 1e-6, "{}: {}", p.key, p.thickness());
+        assert!(p.rise[0].abs() < 1e-9 && p.rise[1].abs() < 1e-9);
+    }
+    assert_eq!(text.lines().filter(|l| l.contains("=IFCSLAB(") && l.ends_with(".ROOF.);")).count(), 4);
+    // Without a build-up the roof is a surface; its planes hang square below it.
+    let mut doc = sample::document().unwrap();
+    if let trigon_model::Roof::Pitched { thickness_mm, overhang_mm, verge_mm, gutters, .. } = &mut doc.buildings[0].roof {
+        (*thickness_mm, *overhang_mm, *verge_mm, *gutters) = (0.0, 0.0, 0.0, false);
+    }
+    let bare = trigon_model::build(&doc).unwrap();
+    let r = bare[0].roof.as_ref().unwrap();
+    let planes: Vec<_> = split::roof(r, &bare[0].walls).into_iter().filter(|p| p.gable.is_none()).collect();
+    assert_eq!(planes.len(), 4);
+    assert!(planes.iter().all(|p| (p.thickness() - split::ROOF_PLANE).abs() < 1e-6));
 }

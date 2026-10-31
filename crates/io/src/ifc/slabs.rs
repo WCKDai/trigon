@@ -92,11 +92,14 @@ impl Ifc<'_> {
         }
     }
 
-    /// A pitched roof: an IfcRoof of one slab per roof plane, and its gables as walls.
+    /// A pitched roof: an IfcRoof of one slab per roof plane, its gables as walls and its
+    /// gutters as gutter segments.
     pub(super) fn roof(&mut self, b: &Built, fl: &mut Floors) {
         let Some(r) = &b.roof else { return };
         let top = b.storeys.len().saturating_sub(1);
-        let up = catalog::pitched_roof(ROOF_PLANE);
+        let pieces = split::roof(r, &b.walls);
+        let thickness = pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness());
+        let up = catalog::pitched_roof((thickness * 10.0).round() / 10.0);
         let placed = self.w.place(Some(fl.at(top)), fl.at(top).frame);
         let kind = if r.gables.is_empty() { ".HIP_ROOF." } else { ".GABLE_ROOF." };
         let roof = self.w.add(format!(
@@ -109,16 +112,16 @@ impl Ifc<'_> {
         self.common("Pset_RoofCommon", roof, &up.name, None, vec![("IsExternal", Val::Bool(true))]);
         fl.contain(top, roof);
         let mut planes = Vec::new();
-        for piece in split::roof(r, &b.walls) {
+        for piece in &pieces {
             match &piece.gable {
                 None => {
-                    if let Some(id) = self.roof_plane(&piece, &up, placed, r.pitch_deg) {
+                    if let Some(id) = self.roof_plane(piece, &up, placed, r.pitch_deg) {
                         planes.push(id);
                     }
                 }
                 Some((wall, t)) => {
                     let Some(w) = b.walls.iter().find(|w| &w.id == wall) else { continue };
-                    if let Some(id) = self.gable(&piece, w, *t, fl, top) {
+                    if let Some(id) = self.gable(piece, w, *t, fl, top) {
                         fl.contain(top, id);
                     }
                 }
@@ -127,35 +130,51 @@ impl Ifc<'_> {
         if !planes.is_empty() {
             self.w.add(format!("IFCRELAGGREGATES({},$,$,$,#{roof},({}))", gid(&format!("{}.parts", r.id)), refs(&planes)));
         }
+        for (key, mesh) in split::gutters(r) {
+            let frame = fl.at(top).frame;
+            let lp = self.w.place(Some(fl.at(top)), frame);
+            let Some(item) = self.w.faceset(&mesh, &frame) else { continue };
+            self.cat.paint(&mut self.w, item, catalog::ZINC);
+            let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
+            let id = self.w.add(format!("IFCPIPESEGMENT({},$,'Tagrende',$,$,#{},#{shape},{},.GUTTER.)", gid(&key), lp.id, string(&key)));
+            self.made_of(id, catalog::ZINC);
+            fl.contain(top, id);
+        }
     }
 
-    /// A roof plane: its outline in its own plane, extruded down by the roof's thickness.
+    /// A roof plane: its underside outline in its own plane, extruded along its rise to the top
+    /// face (straight up for a roof with a build-up, square to the plane for a bare surface).
     fn roof_plane(&mut self, piece: &split::RoofPiece, up: &catalog::BuildUp, parent: super::part21::Placed, pitch: f64) -> Option<usize> {
         let frame = split::plane_frame(&piece.polygon)?;
-        let ring: Vec<[f64; 2]> = piece.polygon.iter().map(|p| frame.local(*p)).map(|q| [q[0], -q[1]]).collect();
+        let ring: Vec<[f64; 2]> = piece.polygon.iter().map(|p| frame.local(*p)).map(|q| [q[0], q[1]]).collect();
         let ring = ccw(clean_ring(&ring));
-        if ring.len() < 3 || !(area(&ring) > 1.0) {
+        let rise = frame.local_dir(piece.rise);
+        let depth = (rise[0] * rise[0] + rise[1] * rise[1] + rise[2] * rise[2]).sqrt();
+        if ring.len() < 3 || !(area(&ring) > 1.0) || !(depth > 1.0 && rise[2] > 0.0) {
             return None;
         }
         let placed = self.w.place(Some(parent), frame);
-        let shape = if piece.warp() > split::WARP {
-            // A plane next to a gable is warped where the ridge was slid onto the gable: as built.
-            let item = self.w.faceset(&split::warped_solid(piece), &frame)?;
+        // An extrusion only where it runs square to the plane: a built-up roof's planes rise
+        // straight up (vertical fascias), which some readers (bimifc 0.1.0) extrude wrongly, and a
+        // plane next to a gable is warped where the ridge was slid onto the gable. Those are
+        // closed triangulated solids, as built.
+        let square = rise[0].abs() + rise[1].abs() < 1e-6 * depth;
+        let shape = if !square || piece.warp() > split::WARP {
+            let item = self.w.faceset(&split::plane_solid(piece), &frame)?;
             self.cat.paint(&mut self.w, item, catalog::TILES);
             self.shape("Tessellation", &[item], None, catalog::L_ROOF)?
         } else {
-            // Extruded along −z: the profile lies in a position turned over (its y is the frame's −y).
             let profile = self.w.profile(&ring, &[]);
-            let position = self.w.axis2([0.0; 3], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]);
-            let solid = self.w.extrusion(profile, position, up.thickness());
+            let position = self.w.axis2([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
+            let solid = self.w.extrusion(profile, position, depth);
             self.cat.paint(&mut self.w, solid, catalog::TILES);
             self.shape("SweptSolid", &[solid], None, catalog::L_ROOF)?
         };
         let id = self.w.add(format!("IFCSLAB({},$,{},$,$,#{},#{shape},{},.ROOF.)", gid(&piece.key), string(&up.name), placed.id, string(&piece.key)));
         self.slab_type(id, up);
-        // Layers listed from the tiles down, from the roof surface (the plane's z = 0) downwards.
-        let usage = self.cat.usage(&mut self.w, up, "AXIS3", false, 0.0);
-        self.cat.associate(&format!("usage:{}|axis3-down", up.name), usage, id);
+        // Layers from the underside (the plane's z = 0) up.
+        let usage = self.cat.usage(&mut self.w, up, "AXIS3", true, 0.0);
+        self.cat.associate(&format!("usage:{}|axis3", up.name), usage, id);
         self.common(
             "Pset_SlabCommon",
             id,
@@ -163,13 +182,13 @@ impl Ifc<'_> {
             None,
             vec![("IsExternal", Val::Bool(true)), ("LoadBearing", Val::Bool(true)), ("PitchAngle", Val::Angle(pitch.to_radians()))],
         );
-        let a = area(&ring);
+        let (a, t) = (area(&ring), piece.thickness());
         let qs = [
-            Qty::Length("Width", up.thickness()),
+            Qty::Length("Width", t),
             Qty::Area("GrossArea", a / 1e6),
             Qty::Area("NetArea", a / 1e6),
-            Qty::Volume("GrossVolume", a * up.thickness() / 1e9),
-            Qty::Volume("NetVolume", a * up.thickness() / 1e9),
+            Qty::Volume("GrossVolume", a * t / 1e9),
+            Qty::Volume("NetVolume", a * t / 1e9),
         ];
         self.cat.quantities(&mut self.w, &piece.key, "Qto_SlabBaseQuantities", &qs, id);
         Some(id)

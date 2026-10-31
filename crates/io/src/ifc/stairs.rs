@@ -13,9 +13,7 @@ use super::{Floors, Ifc};
 impl Ifc<'_> {
     pub(super) fn stairs(&mut self, b: &Built, bd: &Building, fl: &mut Floors) {
         for st in split::stairs(bd) {
-            if !b.stairs.iter().any(|s| s.id == st.id) {
-                continue;
-            }
+            let Some(built) = b.stairs.iter().find(|s| s.id == st.id) else { continue };
             let frame = fl.at(st.level).frame;
             let placed = self.w.place(Some(fl.at(st.level)), frame);
             let kind = match st.stair.kind {
@@ -60,6 +58,18 @@ impl Ifc<'_> {
                 };
                 self.made_of(id, catalog::STAIR);
                 parts.push(id);
+            }
+            // The balustrade along the well of a U-turn stair.
+            if let Some(item) = self.w.faceset(&built.railing, &frame) {
+                self.cat.paint(&mut self.w, item, catalog::RAIL);
+                let key = format!("{}.railing", st.id);
+                let lp = self.w.place(Some(placed), frame);
+                if let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_STAIR) {
+                    let id = self.w.add(format!("IFCRAILING({},$,'Trappeværn',$,$,#{},#{shape},{},.BALUSTRADE.)", gid(&key), lp.id, string(&key)));
+                    self.common("Pset_RailingCommon", id, "Trappeværn", None, vec![("IsExternal", Val::Bool(false))]);
+                    self.made_of(id, catalog::RAIL);
+                    parts.push(id);
+                }
             }
             if !parts.is_empty() {
                 self.w.add(format!("IFCRELAGGREGATES({},$,$,$,#{stair},({}))", gid(&format!("{}.parts", st.id)), refs(&parts)));

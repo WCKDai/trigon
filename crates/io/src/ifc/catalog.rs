@@ -41,6 +41,8 @@ pub const RAIL: Mat = mat("Stål, malet mørk", "steel", [0.18, 0.18, 0.18]);
 pub const STEEL: Mat = mat("Stål, varmforzinket", "steel", [0.66, 0.68, 0.70]);
 pub const DECK: Mat = mat("Træ, terrassebrædder", "wood", [0.55, 0.35, 0.20]);
 pub const STAIR: Mat = mat("Trappe", "stair", [0.70, 0.62, 0.52]);
+pub const PLINTH: Mat = mat("Sokkel, puds", "plaster", [0.55, 0.55, 0.53]);
+pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
 /// Spaces: a translucent volume, no material.
 pub const SPACE: Mat = Mat { name: "Rum", category: "space", rgb: [0.55, 0.75, 0.95], transparency: 0.75 };
 
@@ -57,6 +59,8 @@ pub fn of(m: Material) -> Mat {
         Material::Railing => RAIL,
         Material::Steel => STEEL,
         Material::Deck => DECK,
+        Material::Plinth => PLINTH,
+        Material::Plaster => PLASTER,
     }
 }
 
@@ -91,6 +95,7 @@ pub struct BuildUp {
 }
 
 impl BuildUp {
+    #[cfg(test)]
     pub fn thickness(&self) -> f64 {
         self.layers.iter().map(|l| l.thickness).sum()
     }
@@ -188,9 +193,9 @@ pub fn flat_roof(t: f64) -> BuildUp {
     BuildUp { name: format!("Tagdæk, fladt {}", mm(t)), layers, predefined: "ROOF" }
 }
 
-/// A pitched roof plane, listed from the tiles down (it hangs below the roof surface).
+/// A pitched roof plane, from its underside up: rafters, then tiles on battens.
 pub fn pitched_roof(t: f64) -> BuildUp {
-    let layers = if t > 80.0 { vec![layer(TILES, 50.0, "Finish"), layer(RAFTERS, t - 50.0, "LoadBearing")] } else { vec![layer(TILES, t, "Finish")] };
+    let layers = if t > 80.0 { vec![layer(RAFTERS, t - 50.0, "LoadBearing"), layer(TILES, 50.0, "Finish")] } else { vec![layer(TILES, t, "Finish")] };
     BuildUp { name: format!("Tag, tegl på spær {}", mm(t)), layers, predefined: "ROOF" }
 }
 

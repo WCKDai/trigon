@@ -84,7 +84,7 @@ impl Ifc<'_> {
             let Some((placed, v0, opening)) = host else { continue };
             // The window or door: placed in its opening at the opening's real bottom.
             let frame = placed.frame.shifted([0.0, 0.0, r.v0 - v0]);
-            let fill = self.fill(&o.fill, placed, frame, fl);
+            let fill = self.fill(&o.fill, placed, frame, true, fl);
             self.w.add(format!("IFCRELFILLSELEMENT({},$,$,$,#{opening},#{fill})", gid(&format!("{}.fills", o.id))));
             // A cantilever balcony belongs to its door; a French balcony is only a rail.
             if o.attached.iter().any(|a| a.class == ElementClass::BalconySlab) {
@@ -99,7 +99,7 @@ impl Ifc<'_> {
     }
 
     /// A window or door in `frame`, placed relative to its opening.
-    fn fill(&mut self, e: &BuiltElement, opening: Placed, frame: Frame, fl: &mut Floors) -> usize {
+    pub(super) fn fill(&mut self, e: &BuiltElement, opening: Placed, frame: Frame, external: bool, fl: &mut Floors) -> usize {
         let placed = self.w.place(Some(opening), frame);
         let items = self.tessellated(&e.parts, &frame);
         let door = e.class == ElementClass::Door;
@@ -110,26 +110,27 @@ impl Ifc<'_> {
         let (g, name, tag) = (gid(&e.id), string(&e.name), string(&e.id));
         let (h, wd) = (real(e.height), real(e.width));
         let id = if door {
-            let op = kind.map_or(".NOTDEFINED.", door_operation);
+            let op = kind.map_or(".SINGLE_SWING_LEFT.", door_operation);
             self.w.add(format!("IFCDOOR({g},$,{name},$,$,#{},{shape},{tag},{h},{wd},.DOOR.,{op},$)", placed.id))
         } else {
             let part = kind.map_or(".NOTDEFINED.", window_partitioning);
             self.w.add(format!("IFCWINDOW({g},$,{name},$,$,#{},{shape},{tag},{h},{wd},.WINDOW.,{part},$)", placed.id))
         };
-        if let Some(t) = ty {
-            let tg = gid(&format!("type:{}", t.id));
-            let (tn, tt) = (string(&t.name), string(&t.id));
-            self.cat.typed(&mut self.w, &t.id, id, |w| {
-                if door {
-                    w.add(format!("IFCDOORTYPE({tg},$,{tn},$,$,$,$,{tt},$,.DOOR.,{},.F.,$)", door_operation(&t.kind)))
-                } else {
-                    w.add(format!("IFCWINDOWTYPE({tg},$,{tn},$,$,$,$,{tt},$,.WINDOW.,{},.F.,$)", window_partitioning(&t.kind)))
-                }
-            });
-        }
+        // The type: the component type, or for doors Trigon makes itself (interior doors) one by name.
         let reference = ty.map_or(e.name.as_str(), |t| t.name.as_str());
+        let tg = gid(&format!("type:{}", e.type_id));
+        let (tn, tt) = (string(reference), string(&e.type_id));
+        let operation = kind.map_or(".SINGLE_SWING_LEFT.", door_operation);
+        let partitioning = kind.map_or(".NOTDEFINED.", window_partitioning);
+        self.cat.typed(&mut self.w, &e.type_id, id, |w| {
+            if door {
+                w.add(format!("IFCDOORTYPE({tg},$,{tn},$,$,$,$,{tt},$,.DOOR.,{operation},.F.,$)"))
+            } else {
+                w.add(format!("IFCWINDOWTYPE({tg},$,{tn},$,$,$,$,{tt},$,.WINDOW.,{partitioning},.F.,$)"))
+            }
+        });
         let pset = if door { "Pset_DoorCommon" } else { "Pset_WindowCommon" };
-        self.common(pset, id, reference, Some(e.status), vec![("IsExternal", Val::Bool(true))]);
+        self.common(pset, id, reference, Some(e.status), vec![("IsExternal", Val::Bool(external))]);
         fl.contain(e.level, id);
         id
     }

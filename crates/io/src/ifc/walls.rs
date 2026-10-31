@@ -10,7 +10,8 @@ use trigon_model::walls::WallSegment;
 use trigon_model::{Building, Built, FacadeKind};
 
 use super::catalog::{self, BuildUp, Qty, Val};
-use super::part21::{Frame, Placed, area, ccw, clean_ring, gid, string};
+use super::fills;
+use super::part21::{Frame, Placed, area, ccw, clean_ring, gid, real, string};
 use super::{Floors, Ifc};
 
 /// A facade piece as written: which facade and storey, its entity and placement.
@@ -36,6 +37,8 @@ impl Ifc<'_> {
                     pieces.push(Piece { wall: wall.id.clone(), edge, seg, id, placed });
                 }
             }
+            let foot = pieces.iter().find(|p| p.wall == wall.id).map(|p| (p.id, p.seg.level));
+            self.plinth(wall, foot, fl);
         }
         let mut interior = BTreeMap::new();
         for iw in &b.interior {
@@ -127,6 +130,8 @@ impl Ifc<'_> {
         let id =
             self.w.add(format!("{class}({},$,{},$,$,#{},#{shape},{},.{}.)", gid(&iw.id), string(&up.name), placed.id, string(&iw.id), up.predefined));
         let footprint = area(&ring);
+        let doors: f64 =
+            iw.doors.iter().map(|d| (d.rect.u1 - d.rect.u0).max(0.0) * (d.rect.v1.min(iw.z_bottom + h) - d.rect.v0.max(iw.z_bottom)).max(0.0)).sum();
         let qs = [
             Qty::Length("Length", len),
             Qty::Length("Width", t),
@@ -134,13 +139,59 @@ impl Ifc<'_> {
             Qty::Area("GrossFootprintArea", footprint / 1e6),
             Qty::Area("NetFootprintArea", footprint / 1e6),
             Qty::Area("GrossSideArea", len * h / 1e6),
-            Qty::Area("NetSideArea", len * h / 1e6),
+            Qty::Area("NetSideArea", (len * h - doors).max(0.0) / 1e6),
             Qty::Volume("GrossVolume", footprint * h / 1e9),
-            Qty::Volume("NetVolume", footprint * h / 1e9),
+            Qty::Volume("NetVolume", (footprint * h - doors * t).max(0.0) / 1e9),
         ];
         self.wall_data(id, &iw.id, &up, standard.then_some(-half), false, iw.load_bearing, &qs);
         fl.contain(iw.level, id);
+        self.interior_doors(iw, id, placed, fl);
         Some(id)
+    }
+
+    /// An interior wall's doors: an opening through the wall and the door in it.
+    fn interior_doors(&mut self, iw: &BuiltInterior, wall: usize, placed: Placed, fl: &mut Floors) {
+        let fr = iw.frame;
+        for d in &iw.doors {
+            let r = d.rect;
+            let (v1, w) = (r.v1.min(iw.z_bottom + iw.height), r.u1 - r.u0);
+            let h = v1 - r.v0;
+            // At the door's bottom corner on the wall's right side, x along the wall, y through it.
+            let corner = fr.point(r.u0, 0.0, r.v0);
+            let Some(frame) = Frame::plan(corner, fr.t) else { continue };
+            if !(w > 1.0 && h > 1.0) {
+                continue;
+            }
+            let opening = self.w.place(Some(placed), frame);
+            let profile = self.w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,{},{})", real(w), real(h)));
+            let position = self.w.axis2([w / 2.0, 0.0, h / 2.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+            let solid = self.w.extrusion(profile, position, iw.thickness);
+            let Some(shape) = self.shape("SweptSolid", &[solid], None, catalog::L_OPENING) else { continue };
+            let key = format!("{}.opening", d.id);
+            let o = self.w.add(format!("IFCOPENINGELEMENT({},$,'Opening',$,$,#{},#{shape},{},.OPENING.)", gid(&key), opening.id, string(&key)));
+            self.w.add(format!("IFCRELVOIDSELEMENT({},$,$,$,#{wall},#{o})", gid(&format!("{key}.voids"))));
+            let door = self.fill(&d.fill, opening, frame, false, fl);
+            self.w.add(format!("IFCRELFILLSELEMENT({},$,$,$,#{o},#{door})", gid(&format!("{}.fills", d.id))));
+        }
+    }
+
+    /// A facade's plinth (sokkel): a cladding in front of the foot of the wall.
+    fn plinth(&mut self, wall: &BuiltWall, foot: Option<(usize, usize)>, fl: &mut Floors) {
+        if wall.plinth.is_empty() {
+            return;
+        }
+        let Some((piece, level)) = foot else { return };
+        let key = format!("{}.plinth", wall.id);
+        let frame = fills::facade_frame_at(&wall.frame, std::iter::once(&wall.plinth));
+        let placed = self.w.place(Some(fl.at(level)), frame);
+        let Some(item) = self.w.faceset(&wall.plinth, &frame) else { return };
+        self.cat.paint(&mut self.w, item, catalog::PLINTH);
+        let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_FACADE) else { return };
+        let id = self.w.add(format!("IFCCOVERING({},$,'Sokkel',$,$,#{},#{shape},{},.CLADDING.)", gid(&key), placed.id, string(&key)));
+        self.w.add(format!("IFCRELCOVERSBLDGELEMENTS({},$,$,$,#{piece},(#{id}))", gid(&format!("{key}.covers"))));
+        self.common("Pset_CoveringCommon", id, "Sokkel", None, vec![("IsExternal", Val::Bool(true))]);
+        self.made_of(id, catalog::PLINTH);
+        fl.contain(level, id);
     }
 
     /// Type, material, common properties and quantities of a wall. `usage_offset` is the

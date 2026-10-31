@@ -17,7 +17,8 @@ A made-up sample is in [`examples/sample-building.ifc`](../examples/sample-build
 block of three storeys on a 300 mm raised ground floor, masonry stepping from 480 to 360 mm, a fire
 gable, a 40° roof with two gables, a U-turn staircase with stairwell windows across the floors, a
 steel balcony with tie rods on two floors (new in the phase "forslag"), a cantilever balcony and a
-French balcony, interior walls and rooms. Regenerate it with
+French balcony, interior walls with doors, a 500 mm plinth, a roof build-up (250 mm, 300 mm overhang,
+100 mm verges) with gutters, and rooms. Regenerate it with
 `TRIGON_WRITE_SAMPLE=1 cargo test -p trigon-io --test sample_building`.
 
 ## The file
@@ -42,13 +43,17 @@ French balcony, interior walls and rooms. Regenerate it with
 | Opening | `IfcOpeningElement` .OPENING. + `IfcRelVoidsElement` | One per wall piece the opening cuts (a stairwell window across a floor cuts two pieces), placed in the piece at the opening's outer bottom-left corner seen from outside; a box as wide and high as the opening within that piece, through the piece's thickness | |
 | Window, door | `IfcWindow`, `IfcDoor` + `IfcRelFillsElement` | Placed relative to its opening (`PlacementRelTo` = the opening's placement), origin at the opening's outer bottom-left corner, x along the facade, z up, +y into the building. `OverallWidth`, `OverallHeight`. `Body` `Tessellation`: frame and sashes, leaves, glass and sill as separately coloured face sets | `IfcWindowType` (partitioning SINGLE/DOUBLE/TRIPLE_PANEL_VERTICAL) or `IfcDoorType` (operation) per Trigon type. `Pset_WindowCommon`/`Pset_DoorCommon` (Reference = type name, IsExternal, Status) |
 | Floor (`<building>.slab.L<n>`, attic floor) | `IfcSlab` .FLOOR. (.BASESLAB. on the ground) | Extruded from the floor's outline; stair openings are inner loops of the profile (`IfcArbitraryProfileDefWithVoids`) | "Etagedæk, træbjælkelag 200 mm" (ceiling plaster 20, joists with pugging, floorboards 22) or "Terrændæk, beton 200 mm"; usage AXIS3, POSITIVE (from the underside up). `Pset_SlabCommon`, `Qto_SlabBaseQuantities` |
-| Pitched roof | `IfcRoof` (GABLE_ROOF or HIP_ROOF) aggregating `IfcSlab` .ROOF. per roof plane | Each plane placed in its own plane (z up its normal, x level along it) and extruded 250 mm down from the roof surface. A plane next to a gable, warped where the ridge was slid onto the gable, is a closed triangulated solid that follows Trigon's surface | "Tag, tegl på spær 250 mm" (tiles on battens 50, rafters 200); usage AXIS3, NEGATIVE (from the surface down). `Pset_SlabCommon.PitchAngle` |
+| Pitched roof | `IfcRoof` (GABLE_ROOF or HIP_ROOF) aggregating `IfcSlab` .ROOF. per roof plane | Each plane placed in its own plane (z up its normal, x level along it). With a build-up (`thickness_mm`, overhang, verge) the plane is the solid between its soffit and its top face, which lies straight above it (the fascia and verge boards are vertical): a closed triangulated solid, because an extrusion that isn't square to its profile is misread by some readers (bimifc 0.1.0 put it metres off; ifc-lite and IfcOpenShell read it right). A bare roof surface gets a 250 mm slab hanging square below it, as an extrusion. A plane next to a gable, warped where the ridge was slid onto the gable, is always a triangulated solid that follows Trigon's surface | "Tag, tegl på spær 250 mm" (rafters 200, tiles on battens 50) at the roof's thickness; usage AXIS3, POSITIVE (from the soffit up). `Pset_SlabCommon.PitchAngle` |
+| Gutters | `IfcPipeSegment` .GUTTER. 'Tagrende' per eave | Triangulated, in the top storey | Zinc |
 | Gable | `IfcWall` .SOLIDWALL. | The triangle above the eaves in the facade's plane, extruded into the building by the top storey's wall thickness | The facade's wall type |
 | Flat roof | `IfcRoof` .FLAT_ROOF. aggregating one `IfcSlab` .ROOF. | Extruded outline | "Tagdæk, fladt 300 mm" |
 | Staircase per storey (`<stair>.L<level>`) | `IfcStair` (STRAIGHT_RUN, HALF_TURN, HALF_WINDING, TWO_QUARTER_WINDING) aggregating `IfcStairFlight` (.STRAIGHT. / .WINDER.) and the half landing as `IfcSlab` .LANDING. | The steps of each flight and the landing as triangulated solids | `Pset_StairCommon` (NumberOfRiser, NumberOfTreads, RiserHeight, TreadLength) on the stair; each flight has its own counts as attributes (`NumberOfRisers`, `NumberOfTreads`, `RiserHeight`, `TreadLength`) and in `Pset_StairFlightCommon` |
 | Room per storey | `IfcSpace` .INTERNAL. | The room polygon extruded from the floor to the underside of the floor above | Name = number `<storey index>.<nn>` (Revit's room number), LongName = the room's name ("Rum" when unnamed), Description = Trigon id. `Qto_SpaceBaseQuantities` (Height, GrossPerimeter, Gross/NetFloorArea, volumes) |
 | Balcony (slab balcony, cantilever balcony with its door, MinAltan steel balcony) | `IfcElementAssembly` .USERDEFINED. 'Altan' aggregating its parts | Parts: deck as `IfcSlab` .USERDEFINED. 'Altandæk', railing as `IfcRailing` .GUARDRAIL., the steel balcony's UPE 160 frame as four `IfcBeam`s and its tie rods as `IfcMember`s 'Trækstang'. Placed on the facade at the balcony's lower left corner | `Trigon_Balcony` (TypeName, TypeId, Width, Depth, RailingHeight, and for steel balconies Railing, Finish, Deck, Handrail, Screens, TieRods, Status); each part its `Pset_*Common` and material |
 | French balcony rail | `IfcRailing` .GUARDRAIL. | Triangulated | `Pset_RailingCommon` (Height) |
+| Door in an interior wall | `IfcOpeningElement` through the wall + `IfcDoor` (`IfcDoorType` 'door.interior') | The opening placed at the door's bottom corner on the wall's right side, through the wall; the door (frame and closed leaf) placed in it | `Pset_DoorCommon` IsExternal false; the wall's NetVolume and NetSideArea are net of its doors |
+| Plinth (sokkel) | `IfcCovering` .CLADDING. 'Sokkel' per facade + `IfcRelCoversBldgElements` to the facade's lowest piece | Triangulated, in front of the wall's foot, with the facade's openings cut through it | Rendered plinth material, `Pset_CoveringCommon` |
+| Stair balustrade (U-turn stairs) | `IfcRailing` .BALUSTRADE. 'Trappeværn', part of the stair | Triangulated | `Pset_RailingCommon` |
 
 Why these choices:
 
@@ -76,7 +81,7 @@ painted and galvanised steel, decking, stairs, rooms (translucent).
 
 Every shape is on an `IfcPresentationLayerAssignment` (Vectorworks turns these into classes):
 `A-Ydervægge` (facades and gables), `A-Indervægge`, `A-Dæk` (floors), `A-Tag`, `A-Vinduer`,
-`A-Døre`, `A-Trapper`, `A-Rum`, `A-Altaner` (balconies and French balcony rails), `A-Åbninger`
+`A-Døre`, `A-Trapper` (with balustrades), `A-Rum`, `A-Altaner` (balconies and French balcony rails), `A-Åbninger`
 (opening elements).
 
 ## Checks
@@ -92,7 +97,8 @@ Every shape is on an `IfcPresentationLayerAssignment` (Vectorworks turns these i
   schema and where-rule errors (`ifcopenshell.validate` with EXPRESS rules), whether a shape is built
   for every product, and each wall's volume from IfcOpenShell (openings cut) against its
   `NetVolume`. It exits 0 when there are no errors, every product has a shape and every wall is
-  within 0.5 %. For the sample: 0 errors, 171 of 171 shapes, 34 walls within 3·10⁻¹¹.
+  within 0.5 %. For the sample: 0 errors, 205 of 205 shapes, 34 walls within 3·10⁻¹¹, and each roof plane's
+  volume equals its NetVolume.
 
 ## Limits
 
@@ -100,8 +106,8 @@ Every shape is on an `IfcPresentationLayerAssignment` (Vectorworks turns these i
 - Window and door types carry no lining or panel property sets and no representation maps, so
   receiving tools show Trigon's geometry, not their own parametric windows. +y of a window is into
   the building whatever way its sashes open.
-- Roof planes are extruded square to their plane, so neighbouring planes overlap or leave small
-  wedges at hips and ridges; the roof surface itself is exact.
+- A bare roof surface's planes hang square below it, so neighbouring planes overlap or leave small
+  wedges at hips and ridges; the roof surface itself is exact. Built-up roofs follow Trigon's slab.
 - No space boundaries (`IfcRelSpaceBoundary`); rooms are volumes only.
 - Wall build-ups (plaster thickness, floor and roof layers) are typical Copenhagen constructions,
   not surveyed ones; the total thickness is always the modelled one.
@@ -121,11 +127,13 @@ Open `examples/sample-building.ifc` (and then a real export) and tick off:
    The outer face is flush, the inner face steps at each floor. The IFC parameters show
    Pset_WallCommon (IsExternal, LoadBearing) and the base quantities.
 3. Windows and doors sit in cut openings; their type names are Trigon's ("Casement window, 2
-   sashes", …). The stairwell windows on the wing's east side cut through the floor line.
-4. Floors per storey; the first floor has the stair hole. The roof is one roof of four planes with
-   two gable walls.
-5. Two stairs (ground to first, first to second floor), each two flights and a landing; the stair's
-   IFC parameters give NumberOfRiser and RiserHeight.
+   sashes", …). The stairwell windows on the wing's east side cut through the floor line. Interior
+   walls have 11 doors in cut openings.
+4. Floors per storey; the first floor has the stair hole. The roof is one roof of four planes,
+   250 mm thick, 300 mm past the walls at the eaves, with two gable walls and four gutters. A
+   plinth runs along the foot of every facade.
+5. Two stairs (ground to first, first to second floor), each two flights, a landing and a
+   balustrade along the well; the stair's IFC parameters give NumberOfRiser and RiserHeight.
 6. Rooms (with Open IFC or Link IFC, depending on the Revit version they come in as rooms or as
    generic elements): 14, numbered "0.01" … with names Butik, Lager, Kontor, Stue, Værelse, Køkken,
    Bad, Trapperum.

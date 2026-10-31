@@ -2,12 +2,14 @@
 //! L-shaped block of three storeys on a raised ground floor, masonry walls stepping from 480 to
 //! 360 mm, a fire gable, a pitched roof with two gables, a U-turn staircase with a stairwell
 //! window across the floors, windows and doors, a steel balcony with tie rods (new in the
-//! proposal phase) and a cantilever balcony, interior walls and rooms. Not any real address.
+//! proposal phase) and a cantilever balcony, interior walls with doors, a plinth, gutters and
+//! rooms. Not any real address.
 
 use trigon_model::component::{Deck, Finish, Railing, Screens};
+use trigon_model::doc::Plinth;
 use trigon_model::{
     Building, ComponentKind, ComponentType, Document, FacadeKind, GeoPoint, InteriorWall, Phase, Placement, Result, Roof, Room, Site, Stair,
-    StairKind,
+    StairKind, WallDoor,
 };
 
 fn put<'b>(b: &'b mut Building, facade: usize, level: usize, bay: usize, ty: &str) -> Option<&'b mut Placement> {
@@ -26,8 +28,9 @@ fn put<'b>(b: &'b mut Building, facade: usize, level: usize, bay: usize, ty: &st
     f.placements.last_mut()
 }
 
-fn wall(id: &str, levels: &[usize], a: [f64; 2], b: [f64; 2], thickness: f64, load_bearing: bool) -> InteriorWall {
-    InteriorWall { id: id.into(), levels: levels.to_vec(), a, b, thickness, load_bearing }
+fn wall(id: &str, levels: &[usize], a: [f64; 2], b: [f64; 2], thickness: f64, load_bearing: bool, doors: &[f64]) -> InteriorWall {
+    let doors = doors.iter().map(|&at| WallDoor { at, width: 900.0, height: 2100.0 }).collect();
+    InteriorWall { id: id.into(), levels: levels.to_vec(), a, b, thickness, load_bearing, doors }
 }
 
 fn room(id: &str, levels: &[usize], name: &str, x0: f64, y0: f64, x1: f64, y1: f64) -> Room {
@@ -82,7 +85,16 @@ pub fn document() -> Result<Document> {
             f.kind = kind;
         }
     }
-    b.roof = Roof::Pitched { pitch_deg: 40.0, gables: vec![id(1), id(4)], straighten_mm: 1200.0 };
+    b.roof = Roof::Pitched {
+        pitch_deg: 40.0,
+        gables: vec![id(1), id(4)],
+        straighten_mm: 1200.0,
+        overhang_mm: 300.0,
+        verge_mm: 100.0,
+        thickness_mm: 250.0,
+        gutters: true,
+    };
+    b.plinth = Some(Plinth { height: 500.0, projection: 30.0 });
     let bays: [Vec<f64>; 5] = [
         trigon_model::build::even_bays(18000.0, 5, 900.0),
         trigon_model::build::even_bays(10000.0, 3, 900.0),
@@ -139,11 +151,11 @@ pub fn document() -> Result<Document> {
         }
     }
     b.interior_walls = vec![
-        wall("spine", &[0, 1, 2], [400.0, 5000.0], [17600.0, 5000.0], 240.0, true),
-        wall("wing.a", &[0, 1, 2], [400.0, 10000.0], [3000.0, 10000.0], 100.0, false),
-        wall("wing.b", &[0, 1, 2], [3900.0, 10000.0], [7400.0, 10000.0], 100.0, false),
-        wall("stairwell", &[0, 1, 2], [5100.0, 10500.0], [5100.0, 15400.0], 120.0, true),
-        wall("room", &[1, 2], [9000.0, 400.0], [9000.0, 4850.0], 100.0, false),
+        wall("spine", &[0, 1, 2], [400.0, 5000.0], [17600.0, 5000.0], 240.0, true, &[3600.0, 12600.0]),
+        wall("wing.a", &[0, 1, 2], [400.0, 10000.0], [3000.0, 10000.0], 100.0, false, &[]),
+        wall("wing.b", &[0, 1, 2], [3900.0, 10000.0], [7400.0, 10000.0], 100.0, false, &[]),
+        wall("stairwell", &[0, 1, 2], [5100.0, 10500.0], [5100.0, 15400.0], 120.0, true, &[1000.0]),
+        wall("room", &[1, 2], [9000.0, 400.0], [9000.0, 4850.0], 100.0, false, &[3500.0]),
     ];
     b.stairs = vec![Stair {
         id: "trappe".into(),
