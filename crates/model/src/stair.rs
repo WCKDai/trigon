@@ -167,12 +167,45 @@ pub fn symbol(st: &Stair, storey_height: f64) -> Result<Symbol> {
     Ok(s)
 }
 
+/// What a part of a staircase is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartKind {
+    /// Straight steps.
+    Flight,
+    /// Turning steps.
+    Winders,
+    /// A flat (half) landing.
+    Landing,
+}
+
+/// One part of a staircase on one storey as a solid, with its steps (none for a landing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Part {
+    pub kind: PartKind,
+    pub mesh: Mesh,
+    /// Risers climbed in this part, the last one onto the landing or floor above included.
+    pub risers: usize,
+    pub treads: usize,
+    /// Riser height and going (tread depth on the walking line), mm.
+    pub rise: f64,
+    pub going: f64,
+}
+
 /// The steps and landing as solids, from `floor` (mm) up `storey_height`.
 pub fn mesh(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
+    let mut m = Mesh::default();
+    for p in parts(st, floor, storey_height)? {
+        m.append(&p.mesh);
+    }
+    Ok(m)
+}
+
+/// The staircase's flights, turning steps and landing as separate solids, from `floor` (mm) up
+/// `storey_height`, in the order they are climbed. Together they are [`mesh`].
+pub fn parts(st: &Stair, floor: f64, storey_height: f64) -> Result<Vec<Part>> {
     crate::checked("stair floor", floor, -1e6, 1e6)?;
     crate::checked("stair height", storey_height, 100.0, 20_000.0)?;
     let f = frame(st)?;
-    let mut m = Mesh::default();
     let block = |m: &mut Mesh, s0: f64, s1: f64, t0: f64, t1: f64, z0: f64, z1: f64| {
         let lo = [f.at(s0, t0), f.at(s1, t0), f.at(s1, t1), f.at(s0, t1)].map(|p| [p[0], p[1], z0]);
         let hi = lo.map(|p| [p[0], p[1], z1]);
@@ -180,26 +213,56 @@ pub fn mesh(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
         let ccw = crate::footprint::signed_area2(&lo.map(|p| [p[0], p[1]])) > 0.0;
         if ccw { m.hexahedron(lo, hi) } else { m.hexahedron([lo[3], lo[2], lo[1], lo[0]], [hi[3], hi[2], hi[1], hi[0]]) }
     };
+    let part = |kind: PartKind, mesh: Mesh, risers: usize, treads: usize, rise: f64, going: f64| Part { kind, mesh, risers, treads, rise, going };
     let risers = (storey_height / RISER).round().max(2.0) as usize;
+    let mut out = Vec::new();
     match st.kind {
         StairKind::DoubleQuarterTurn => {
             let (steps, _) = quarter_steps(st, &f, storey_height);
-            let rise = storey_height / (steps.len() + 1) as f64;
-            for (k, mut ring) in steps.into_iter().enumerate() {
-                if crate::footprint::signed_area2(&ring) < 0.0 {
-                    ring.reverse();
+            let count = st.winders.unwrap_or(10);
+            let (first, last) = (count.div_ceil(2), count / 2);
+            let nominal = (storey_height / RISER).round() as usize;
+            let (_, going) = treads_in(st, f.length, nominal.saturating_sub(count));
+            let total = steps.len();
+            let rise = storey_height / (total + 1) as f64;
+            let straight = total.saturating_sub(first + last).min(total);
+            let first = first.min(total - straight);
+            let groups = [(PartKind::Winders, 0, first), (PartKind::Flight, first, first + straight), (PartKind::Winders, first + straight, total)];
+            let mut solids: Vec<Mesh> = steps
+                .into_iter()
+                .enumerate()
+                .map(|(k, mut ring)| {
+                    if crate::footprint::signed_area2(&ring) < 0.0 {
+                        ring.reverse();
+                    }
+                    let top = floor + (k + 1) as f64 * rise;
+                    crate::build::prism(&ring, top - rise - STEP_SOFFIT, rise + STEP_SOFFIT)
+                })
+                .collect();
+            let mut taken = 0;
+            for (kind, from, to) in groups {
+                if to <= from {
+                    continue;
                 }
-                let top = floor + (k + 1) as f64 * rise;
-                m.append(&crate::build::prism(&ring, top - rise - STEP_SOFFIT, rise + STEP_SOFFIT));
+                let mut m = Mesh::default();
+                for solid in solids.drain(..(to - from).min(solids.len())) {
+                    m.append(&solid);
+                }
+                taken += to - from;
+                // The last riser steps onto the floor above.
+                let risers = if taken == total { to - from + 1 } else { to - from };
+                out.push(part(kind, m, risers, to - from, rise, going));
             }
         }
         StairKind::Straight => {
             let (n, g) = treads_in(st, f.length, risers);
             let hr = storey_height / (n + 1) as f64;
+            let mut m = Mesh::default();
             for k in 1..=n.min(80) {
                 let top = floor + k as f64 * hr;
                 block(&mut m, (k - 1) as f64 * g, k as f64 * g, 0.0, f.width, top - hr - STEP_SOFFIT, top);
             }
+            out.push(part(PartKind::Flight, m, n + 1, n, hr, g));
         }
         StairKind::UTurn => {
             let r = (risers / 2).max(2);
@@ -209,15 +272,17 @@ pub fn mesh(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
             let r = n + 1;
             let turn = st.winders.unwrap_or(1);
             let hr = storey_height / (2 * n + turn + 1) as f64;
+            let (mut up, mut back) = (Mesh::default(), Mesh::default());
             for k in 1..=n.min(80) {
                 // Up along the first flight towards the landing.
                 let top = floor + k as f64 * hr;
-                block(&mut m, (k - 1) as f64 * g, k as f64 * g, 0.0, flight, top - hr - STEP_SOFFIT, top);
+                block(&mut up, (k - 1) as f64 * g, k as f64 * g, 0.0, flight, top - hr - STEP_SOFFIT, top);
                 // Back along the second flight from the landing.
                 let top2 = floor + (n + turn + k) as f64 * hr;
-                block(&mut m, f.length - k as f64 * g, f.length - (k - 1) as f64 * g, flight + well, f.width, top2 - hr - STEP_SOFFIT, top2);
+                block(&mut back, f.length - k as f64 * g, f.length - (k - 1) as f64 * g, flight + well, f.width, top2 - hr - STEP_SOFFIT, top2);
             }
             if let Some(winders) = st.winders {
+                let mut m = Mesh::default();
                 for k in 0..winders {
                     let a0 = std::f64::consts::PI * k as f64 / winders as f64;
                     let a1 = std::f64::consts::PI * (k + 1) as f64 / winders as f64;
@@ -243,7 +308,10 @@ pub fn mesh(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
                     let top = floor + (n + k + 1) as f64 * hr;
                     m.append(&crate::build::prism(&ring, top - hr - STEP_SOFFIT, hr + STEP_SOFFIT));
                 }
-                return Ok(m);
+                out.push(part(PartKind::Flight, up, n, n, hr, g));
+                out.push(part(PartKind::Winders, m, winders, winders, hr, g));
+                out.push(part(PartKind::Flight, back, n + 1, n, hr, g));
+                return Ok(out);
             }
             let zl = floor + r as f64 * hr;
             let depth = st.landing.unwrap_or(f.width / 2.0).clamp(300.0, f.width * 2.0);
@@ -262,10 +330,12 @@ pub fn mesh(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
             if crate::footprint::signed_area2(&ring) < 0.0 {
                 ring.reverse();
             }
-            m.append(&crate::build::prism(&ring, zl - LANDING_SLAB, LANDING_SLAB));
+            out.push(part(PartKind::Flight, up, n + 1, n, hr, g));
+            out.push(part(PartKind::Landing, crate::build::prism(&ring, zl - LANDING_SLAB, LANDING_SLAB), 0, 0, hr, 0.0));
+            out.push(part(PartKind::Flight, back, n + 1, n, hr, g));
         }
     }
-    Ok(m)
+    Ok(out)
 }
 
 fn turn_point(f: &Frame, st: &Stair, angle: f64, inner: bool) -> [f64; 2] {
@@ -429,6 +499,43 @@ mod tests {
         }
         assert_eq!(symbol(&st, 2830.0).unwrap().treads.len(), 19);
         assert_eq!(serde_json::from_value::<Stair>(serde_json::to_value(&st).unwrap()).unwrap(), st);
+    }
+
+    #[test]
+    fn parts_are_the_mesh_split_into_flights_turns_and_landings() {
+        let dqt = Stair {
+            kind: StairKind::DoubleQuarterTurn,
+            outline: vec![[0., 0.], [1375., 0.], [1375., 950.], [0., 950.]],
+            tread: Some(275.),
+            winders: Some(9),
+            turn_depths: Some([1400., 1150.]),
+            rounded: false,
+            ..u()
+        };
+        let winding = Stair { winders: Some(6), rounded: false, ..u() };
+        let straight = Stair { kind: StairKind::Straight, ..u() };
+        let cases = [
+            (u(), vec![PartKind::Flight, PartKind::Landing, PartKind::Flight]),
+            (winding, vec![PartKind::Flight, PartKind::Winders, PartKind::Flight]),
+            (straight, vec![PartKind::Flight]),
+            (dqt, vec![PartKind::Winders, PartKind::Flight, PartKind::Winders]),
+        ];
+        for (st, kinds) in cases {
+            let height = 2830.0;
+            let parts = parts(&st, 100.0, height).unwrap();
+            assert_eq!(parts.iter().map(|p| p.kind).collect::<Vec<_>>(), kinds, "{:?}", st.kind);
+            let mut all = Mesh::default();
+            for p in &parts {
+                all.append(&p.mesh);
+            }
+            let whole = mesh(&st, 100.0, height).unwrap();
+            assert_eq!(all.bounds(), whole.bounds());
+            assert_eq!(all.triangles.len(), whole.triangles.len());
+            // Every riser of the storey is counted once, and they add up to its height.
+            let risers: usize = parts.iter().map(|p| p.risers).sum();
+            let rise = parts[0].rise;
+            assert!((risers as f64 * rise - height).abs() < 1e-6, "{:?}: {risers} × {rise}", st.kind);
+        }
     }
 
     #[test]
