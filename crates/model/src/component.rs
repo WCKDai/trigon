@@ -37,6 +37,10 @@ pub enum ComponentKind {
     FrenchBalcony { leaves: u32, rail_height: f64 },
     /// Cantilever balcony: a French door, a slab of `depth` × `slab_width` and a guard rail.
     Balcony { leaves: u32, depth: f64, slab_width: f64, rail_height: f64 },
+    /// A door and a window in one opening (a balcony door unit): the door leaf `door_width` wide on
+    /// `door_side` (left/right seen from outside), the window over a panel `window_sill` above the
+    /// opening's bottom, `lights` sashes.
+    DoorWindow { door_width: f64, door_side: Side, window_sill: f64, lights: u32 },
     /// A balcony on its own, hung on the wall in front of an opening: a slab `depth` deep and the
     /// type's `width` wide, with a plain guard rail. Doesn't cut the wall. For existing balconies.
     BalconySlab { depth: f64, thickness: f64 },
@@ -58,6 +62,14 @@ pub enum ComponentKind {
         #[serde(default)]
         tie_rods: bool,
     },
+}
+
+/// Left or right, seen from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    Left,
+    Right,
 }
 
 /// MinAltan railing styles (balusters, rails).
@@ -103,7 +115,7 @@ pub enum Screens {
 
 impl ComponentKind {
     pub fn is_door(&self) -> bool {
-        matches!(self, Self::EntranceDoor | Self::FrenchDoor { .. } | Self::FrenchBalcony { .. } | Self::Balcony { .. })
+        matches!(self, Self::EntranceDoor | Self::FrenchDoor { .. } | Self::FrenchBalcony { .. } | Self::Balcony { .. } | Self::DoorWindow { .. })
     }
 
     /// Cuts an opening in the wall (windows and doors). Attachments (balconies hung on the
@@ -141,6 +153,14 @@ impl ComponentType {
                 checked("depth", *depth, 300.0, 3000.0)?;
                 checked("slab_width", *slab_width, self.width, 12000.0)?;
                 checked("rail_height", *rail_height, 900.0, 1500.0).map(|_| ())
+            }
+            ComponentKind::DoorWindow { door_width, window_sill, lights, .. } => {
+                checked("door_width", *door_width, 500.0, self.width - 300.0)?;
+                checked("window_sill", *window_sill, 0.0, self.height - 400.0)?;
+                if *lights == 0 || *lights > 4 {
+                    return Err(crate::ModelError::Invalid(format!("lights must be 1 to 4 (got {lights})")));
+                }
+                Ok(())
             }
             ComponentKind::BalconySlab { depth, thickness } => {
                 checked("depth", *depth, 300.0, 3000.0)?;

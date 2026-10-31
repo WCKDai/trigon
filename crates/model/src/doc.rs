@@ -64,6 +64,65 @@ pub struct Drawing {
     /// Elevations on this sheet tied to facades.
     #[serde(default)]
     pub facades: Vec<FacadeRegistration>,
+    /// Plans on this sheet tied to the site.
+    #[serde(default)]
+    pub plans: Vec<PlanRegistration>,
+}
+
+/// Ties a drawn plan to the site with a similarity transform (scale, rotation, shift; the
+/// drawing's y axis points down): `site = [a −b; b a] · (x, −y) + (tx, ty)`, mm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanRegistration {
+    /// Storeys this plan shows (an "Etageplan" usually covers several).
+    pub levels: Vec<usize>,
+    pub a: f64,
+    pub b: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+impl PlanRegistration {
+    /// Least-squares fit from (drawing px, site mm) pairs; at least two.
+    pub fn fit(levels: Vec<usize>, pairs: &[([f64; 2], [f64; 2])]) -> Result<Self> {
+        if pairs.len() < 2 {
+            return Err(ModelError::Invalid("give at least two points".into()));
+        }
+        if pairs.iter().flat_map(|(p, q)| [p[0], p[1], q[0], q[1]]).any(|v| !v.is_finite() || v.abs() > 1e9) {
+            return Err(ModelError::Invalid("points must be finite".into()));
+        }
+        let n = pairs.len() as f64;
+        let pc = pairs.iter().fold([0.0, 0.0], |c, (p, _)| [c[0] + p[0] / n, c[1] - p[1] / n]);
+        let qc = pairs.iter().fold([0.0, 0.0], |c, (_, q)| [c[0] + q[0] / n, c[1] + q[1] / n]);
+        let (mut s, mut sa, mut sb) = (0.0, 0.0, 0.0);
+        for (p, q) in pairs {
+            let (px, py) = (p[0] - pc[0], -p[1] - pc[1]);
+            let (qx, qy) = (q[0] - qc[0], q[1] - qc[1]);
+            s += px * px + py * py;
+            sa += px * qx + py * qy;
+            sb += px * qy - py * qx;
+        }
+        if !(s > 1.0) {
+            return Err(ModelError::Invalid("the drawing points must be apart".into()));
+        }
+        let (a, b) = (sa / s, sb / s);
+        Ok(Self { levels, a, b, tx: qc[0] - (a * pc[0] - b * pc[1]), ty: qc[1] - (b * pc[0] + a * pc[1]) })
+    }
+
+    pub fn to_site(&self, p: [f64; 2]) -> [f64; 2] {
+        let (x, y) = (p[0], -p[1]);
+        [self.a * x - self.b * y + self.tx, self.b * x + self.a * y + self.ty]
+    }
+
+    pub fn to_drawing(&self, q: [f64; 2]) -> [f64; 2] {
+        let k = self.a * self.a + self.b * self.b;
+        let (x, y) = (q[0] - self.tx, q[1] - self.ty);
+        [(self.a * x + self.b * y) / k, -((-self.b * x + self.a * y) / k)]
+    }
+
+    /// Drawing pixels per metre.
+    pub fn px_per_m(&self) -> f64 {
+        1000.0 / (self.a * self.a + self.b * self.b).sqrt()
+    }
 }
 
 /// Ties a drawn elevation to a facade: two x positions (the facade's ends) and two heights.
@@ -239,6 +298,150 @@ pub struct Building {
     /// Facts from registers (BBR: year built, use, wall and roof material, areas).
     #[serde(default)]
     pub attributes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub roof: crate::roof::Roof,
+    /// Walls inside the outer walls, per storey.
+    #[serde(default)]
+    pub interior_walls: Vec<InteriorWall>,
+    #[serde(default)]
+    pub stairs: Vec<Stair>,
+    #[serde(default)]
+    pub rooms: Vec<Room>,
+    /// Entrances (staircases) with their address and units, from the registers.
+    #[serde(default)]
+    pub entrances: Vec<Entrance>,
+    /// Index of the ground storey ("stueetage"); storeys below it are basements.
+    #[serde(default)]
+    pub ground_level: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Entrance {
+    pub street: String,
+    pub number: String,
+    /// Access point, site mm.
+    pub point: [f64; 2],
+    /// The staircase serving it.
+    #[serde(default)]
+    pub stair: Option<String>,
+    pub units: Vec<Unit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Unit {
+    /// "st", "1", "2", … or "kl".
+    pub floor: String,
+    /// "tv", "th", "mf", a number or empty.
+    pub door: String,
+    #[serde(default)]
+    pub area_m2: Option<f64>,
+    #[serde(default)]
+    pub rooms: Option<i64>,
+}
+
+impl Unit {
+    /// The storey index of the unit's floor, given the ground storey's index: "st" is the ground
+    /// storey, "1" the one above, "kl" the one below.
+    pub fn level(&self, ground: usize) -> Option<usize> {
+        match self.floor.as_str() {
+            "st" => Some(ground),
+            "kl" => ground.checked_sub(1),
+            f => f.parse::<usize>().ok().map(|n| ground + n),
+        }
+    }
+}
+
+/// A straight interior wall, centre line `a`–`b` in site mm, on the listed storeys (full storey height).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InteriorWall {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub thickness: f64,
+    #[serde(default)]
+    pub load_bearing: bool,
+}
+
+/// A staircase: its outline in plan (site mm) and the direction it climbs (unit vector), on the listed storeys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Stair {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    /// The flights' rectangle `[p0, p1, p2, p3]`: p0→p1 runs along the flights from the floor end to the
+    /// landing end, p1→p2 across them.
+    pub outline: Vec<[f64; 2]>,
+    /// Tread depth, mm (default: the run divided evenly).
+    #[serde(default)]
+    pub tread: Option<f64>,
+    #[serde(default)]
+    pub kind: StairKind,
+    /// Depth of the half landing beyond the p1–p2 edge, mm (U-turn stairs; default half the width).
+    #[serde(default)]
+    pub landing: Option<f64>,
+    /// Gap between the two flights, mm (U-turn stairs; default 150).
+    #[serde(default)]
+    pub well: Option<f64>,
+    /// Half landing drawn and built as a half circle (default true).
+    #[serde(default = "yes")]
+    pub rounded: bool,
+    /// Turning steps instead of a flat landing (2–16), split between the turns for a double quarter turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winders: Option<usize>,
+    /// Depths of the two quarter turns beyond the straight flight, mm; defaults to flight width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_depths: Option<[f64; 2]>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StairKind {
+    /// One flight along p0→p1.
+    #[default]
+    Straight,
+    /// Two flights side by side with a half landing at the p1–p2 end: up along p0→p1, back along p2→p3.
+    UTurn,
+    /// One straight flight with a quarter turn at each end, both turning towards p3.
+    DoubleQuarterTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Room {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub name: String,
+    pub polygon: Vec<[f64; 2]>,
+}
+
+impl InteriorWall {
+    pub fn validate(&self, storeys: usize) -> Result<()> {
+        let pts = [self.a[0], self.a[1], self.b[0], self.b[1]];
+        if pts.iter().any(|v| !v.is_finite() || v.abs() > 1e8) {
+            return Err(ModelError::Invalid("wall ends must be finite site coordinates".into()));
+        }
+        let len = ((self.b[0] - self.a[0]).powi(2) + (self.b[1] - self.a[1]).powi(2)).sqrt();
+        checked("wall length", len, 100.0, 200_000.0)?;
+        checked("wall thickness", self.thickness, 40.0, 1000.0)?;
+        if self.levels.is_empty() || self.levels.iter().any(|l| *l >= storeys) {
+            return Err(ModelError::Invalid(format!("wall levels must be storey indices below {storeys}")));
+        }
+        Ok(())
+    }
+}
+
+/// Area of a simple polygon, mm².
+pub fn polygon_area(p: &[[f64; 2]]) -> f64 {
+    crate::footprint::signed_area2(p).abs() / 2.0
 }
 
 pub const MIN_WALL: f64 = 100.0;
@@ -259,6 +462,12 @@ impl Building {
             facades: Vec::new(),
             evidence: Vec::new(),
             attributes: Default::default(),
+            roof: Default::default(),
+            interior_walls: Vec::new(),
+            stairs: Vec::new(),
+            rooms: Vec::new(),
+            entrances: Vec::new(),
+            ground_level: 0,
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())
@@ -309,6 +518,38 @@ impl Building {
         self.storeys = levels.windows(2).enumerate().map(|(i, w)| Storey { name: storey_name(i), elevation: w[0], height: w[1] - w[0] }).collect();
         for f in &mut self.facades {
             f.placements.retain(|p| p.level < count);
+        }
+        Ok(())
+    }
+
+    /// Bottom of the outer walls, mm (below the terrain when there is a basement).
+    pub fn bottom(&self) -> f64 {
+        self.storeys.first().map_or(0.0, |s| (s.elevation - 200.0).min(0.0))
+    }
+
+    /// Adds a basement storey below the lowest one, with its floor at `floor` mm (below the terrain),
+    /// and shifts every storey reference (placements, interior, plans) up by one.
+    pub fn add_basement(&mut self, floor: f64, name: &str) -> Result<()> {
+        let first = self.storeys.first().cloned().ok_or_else(|| ModelError::Invalid("the building has no storeys".into()))?;
+        let floor = checked("basement floor", floor, -15_000.0, first.elevation - 2000.0)?;
+        if self.storeys.len() >= 60 {
+            return Err(ModelError::Invalid("at most 60 storeys".into()));
+        }
+        self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor });
+        self.ground_level += 1;
+        for f in &mut self.facades {
+            for p in &mut f.placements {
+                p.level += 1;
+            }
+        }
+        for w in &mut self.interior_walls {
+            w.levels.iter_mut().for_each(|l| *l += 1);
+        }
+        for s in &mut self.stairs {
+            s.levels.iter_mut().for_each(|l| *l += 1);
+        }
+        for r in &mut self.rooms {
+            r.levels.iter_mut().for_each(|l| *l += 1);
         }
         Ok(())
     }
@@ -396,5 +637,31 @@ impl Document {
             let known: Vec<&str> = self.types.iter().map(|t| t.id.as_str()).collect();
             ModelError::NotFound(format!("component type {id} (known: {})", known.join(", ")))
         })
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::PlanRegistration;
+
+    #[test]
+    fn similarity_round_trips_and_fits_exactly() {
+        // A sheet at 100 px/m, rotated 30°, shifted.
+        let (s, t) = (10.0, 30f64.to_radians());
+        let truth = |p: [f64; 2]| {
+            let (x, y) = (p[0], -p[1]);
+            [s * (t.cos() * x - t.sin() * y) + 5000.0, s * (t.sin() * x + t.cos() * y) - 2000.0]
+        };
+        let pts = [[100.0, 200.0], [900.0, 250.0], [400.0, 800.0]];
+        let pairs: Vec<_> = pts.iter().map(|p| (*p, truth(*p))).collect();
+        let r = PlanRegistration::fit(vec![1], &pairs).unwrap();
+        assert!((r.px_per_m() - 100.0).abs() < 1e-9);
+        for p in pts {
+            let q = r.to_site(p);
+            assert!((q[0] - truth(p)[0]).abs() < 1e-6 && (q[1] - truth(p)[1]).abs() < 1e-6);
+            let back = r.to_drawing(q);
+            assert!((back[0] - p[0]).abs() < 1e-9 && (back[1] - p[1]).abs() < 1e-9);
+        }
+        assert!(PlanRegistration::fit(vec![1], &pairs[..1]).is_err());
     }
 }

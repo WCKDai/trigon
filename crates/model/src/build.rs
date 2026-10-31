@@ -3,7 +3,7 @@
 //! Walls are 2.5D: one prism per facade between the outer wall line and its mitred inward
 //! offset, with openings cut as 2D holes in the wall faces. No 3D booleans are needed.
 
-use crate::component::{ComponentKind, ComponentType, Deck, Finish, Railing, Screens};
+use crate::component::{ComponentKind, ComponentType, Deck, Finish, Railing, Screens, Side};
 use crate::doc::{Building, Document, Facade, FacadeKind, Placement, Storey};
 use crate::mesh::{Material, Mesh};
 use crate::{ModelError, Result};
@@ -174,7 +174,10 @@ pub struct BuiltWall {
     pub frame: FacadeFrame,
     pub kind: FacadeKind,
     pub thickness: f64,
+    /// Top of the wall (eaves), mm.
     pub height: f64,
+    /// Bottom of the wall, mm (below the terrain with a basement).
+    pub bottom: f64,
     /// Plan outline: outer start, outer end, inner end, inner start.
     pub plan: [[f64; 2]; 4],
     pub mesh: Mesh,
@@ -195,9 +198,34 @@ pub struct BuiltSlab {
     pub kind: SlabKind,
     pub level: usize,
     pub polygon: Vec<[f64; 2]>,
+    pub holes: Vec<Vec<[f64; 2]>>,
     pub z_bottom: f64,
     pub thickness: f64,
     pub mesh: Mesh,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltInterior {
+    pub id: String,
+    pub level: usize,
+    /// Plan outline (4 corners, site mm).
+    pub outline: [[f64; 2]; 4],
+    pub z_bottom: f64,
+    pub height: f64,
+    pub load_bearing: bool,
+    pub mesh: Mesh,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltRoof {
+    pub id: String,
+    /// The roof surface.
+    pub cover: Mesh,
+    /// Vertical gable triangles above gable walls.
+    pub gables: Mesh,
+    pub eaves: f64,
+    pub ridge: f64,
+    pub pitch_deg: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,6 +235,19 @@ pub struct Built {
     pub storeys: Vec<Storey>,
     pub walls: Vec<BuiltWall>,
     pub slabs: Vec<BuiltSlab>,
+    /// A pitched roof; a flat roof is a slab in `slabs`.
+    pub roof: Option<BuiltRoof>,
+    pub interior: Vec<BuiltInterior>,
+    pub stairs: Vec<BuiltStair>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltStair {
+    pub id: String,
+    pub level: usize,
+    pub kind: crate::StairKind,
+    pub winding: bool,
+    pub mesh: Mesh,
 }
 
 /// Builds every building as it stands at the end of the last phase.
@@ -400,13 +441,14 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             .map(|(r, _)| vec![[r.rect.u0, r.rect.v0], [r.rect.u0, r.rect.v1], [r.rect.u1, r.rect.v1], [r.rect.u1, r.rect.v0]])
             .collect();
         let mut mesh = Mesh::default();
-        let outer_ok = mesh.polygon(&[[0.0, 0.0], [fr.length, 0.0], [fr.length, h], [0.0, h]], &holes, |p| fr.point(p[0], 0.0, p[1]));
-        let inner_ok = mesh.polygon(&[[in0, 0.0], [in1, 0.0], [in1, h], [in0, h]], &holes, |p| fr.point(p[0], d, p[1]));
+        let zb = b.bottom();
+        let outer_ok = mesh.polygon(&[[0.0, zb], [fr.length, zb], [fr.length, h], [0.0, h]], &holes, |p| fr.point(p[0], 0.0, p[1]));
+        let inner_ok = mesh.polygon(&[[in0, zb], [in1, zb], [in1, h], [in0, h]], &holes, |p| fr.point(p[0], d, p[1]));
         if !(outer_ok && inner_ok) {
             return Err(ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id)));
         }
         mesh.quad(fr.point(0.0, 0.0, h), fr.point(fr.length, 0.0, h), fr.point(in1, d, h), fr.point(in0, d, h));
-        mesh.quad(fr.point(0.0, 0.0, 0.0), fr.point(in0, d, 0.0), fr.point(in1, d, 0.0), fr.point(fr.length, 0.0, 0.0));
+        mesh.quad(fr.point(0.0, 0.0, zb), fr.point(in0, d, zb), fr.point(in1, d, zb), fr.point(fr.length, 0.0, zb));
         for (r, _) in &resolved {
             let Rect { u0, u1, v0, v1 } = r.rect;
             mesh.quad(fr.point(u0, 0.0, v0), fr.point(u1, 0.0, v0), fr.point(u1, d, v0), fr.point(u0, d, v0));
@@ -437,6 +479,7 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             kind: f.kind,
             thickness: d,
             height: h,
+            bottom: zb,
             plan: [a, e, qe, qs],
             mesh,
             openings,
@@ -445,8 +488,15 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     }
 
     let mut slabs = Vec::with_capacity(b.storeys.len() + 1);
+    let openings =
+        |level: usize| -> Result<Vec<Vec<[f64; 2]>>> { b.stairs.iter().filter(|st| st.levels.contains(&level)).map(crate::stair::opening).collect() };
     for (i, s) in b.storeys.iter().enumerate() {
         let z0 = s.elevation - FLOOR_SLAB;
+        let holes = match i.checked_sub(1) {
+            Some(l) => openings(l)?,
+            None => Vec::new(),
+        };
+        validate_slab_holes(&inner, &holes)?;
         slabs.push(BuiltSlab {
             id: format!("{}.slab.L{i}", b.id),
             kind: SlabKind::Floor,
@@ -454,28 +504,143 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             polygon: inner.clone(),
             z_bottom: z0,
             thickness: FLOOR_SLAB,
-            mesh: prism(&inner, z0, FLOOR_SLAB),
+            mesh: prism_with_holes(&inner, &holes, z0, FLOOR_SLAB),
+            holes,
         });
     }
-    slabs.push(BuiltSlab {
-        id: format!("{}.roof", b.id),
-        kind: SlabKind::Roof,
-        level: b.storeys.len().saturating_sub(1),
-        polygon: b.footprint.clone(),
-        z_bottom: h,
-        thickness: ROOF_SLAB,
-        mesh: prism(&b.footprint, h, ROOF_SLAB),
-    });
-    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs })
+    let top_level = b.storeys.len().saturating_sub(1);
+    let roof = match &b.roof {
+        crate::roof::Roof::Flat => {
+            let holes = openings(top_level)?;
+            validate_slab_holes(&b.footprint, &holes)?;
+            slabs.push(BuiltSlab {
+                id: format!("{}.roof", b.id),
+                kind: SlabKind::Roof,
+                level: top_level,
+                polygon: b.footprint.clone(),
+                z_bottom: h,
+                thickness: ROOF_SLAB,
+                mesh: prism_with_holes(&b.footprint, &holes, h, ROOF_SLAB),
+                holes,
+            });
+            None
+        }
+        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm } => {
+            let holes = openings(top_level)?;
+            validate_slab_holes(&inner, &holes)?;
+            // The attic floor closes the top storey; the roof rises from the eaves above it.
+            slabs.push(BuiltSlab {
+                id: format!("{}.attic", b.id),
+                kind: SlabKind::Floor,
+                level: top_level,
+                polygon: inner.clone(),
+                z_bottom: h - FLOOR_SLAB,
+                thickness: FLOOR_SLAB,
+                mesh: prism_with_holes(&inner, &holes, h - FLOOR_SLAB, FLOOR_SLAB),
+                holes,
+            });
+            let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
+            let outline: Vec<[f64; 2]> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+            // A gable facade is an edge of the eave outline when both its corners were kept next to each other.
+            let mut edges = Vec::with_capacity(gables.len());
+            for g in gables {
+                let f = b.facade(g)?;
+                let n = b.footprint.len();
+                let (i, j) = (f.edge, (f.edge + 1) % n);
+                let pos = kept.iter().position(|&k| k == i).filter(|&p| kept.get((p + 1) % kept.len()) == Some(&j));
+                edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
+            }
+            let r = crate::roof::pitched(&outline, h, *pitch_deg, &edges)?;
+            Some(BuiltRoof { id: format!("{}.roof", b.id), cover: r.cover, gables: r.gables, eaves: h, ridge: r.ridge, pitch_deg: *pitch_deg })
+        }
+    };
+    let mut interior = Vec::new();
+    for (k, iw) in b.interior_walls.iter().enumerate() {
+        let (dx, dy) = (iw.b[0] - iw.a[0], iw.b[1] - iw.a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if !(len > 1.0) {
+            continue;
+        }
+        let (nx, ny) = (-dy / len * iw.thickness / 2.0, dx / len * iw.thickness / 2.0);
+        let outline = [[iw.a[0] + nx, iw.a[1] + ny], [iw.b[0] + nx, iw.b[1] + ny], [iw.b[0] - nx, iw.b[1] - ny], [iw.a[0] - nx, iw.a[1] - ny]];
+        let ccw = if crate::footprint::signed_area2(&outline) < 0.0 { [outline[3], outline[2], outline[1], outline[0]] } else { outline };
+        for &level in &iw.levels {
+            let Some(s) = b.storeys.get(level) else { continue };
+            let id = if iw.id.is_empty() { format!("{}.iw{k}", b.id) } else { iw.id.clone() };
+            interior.push(BuiltInterior {
+                id: format!("{id}.L{level}"),
+                level,
+                outline: ccw,
+                z_bottom: s.elevation,
+                height: s.height - FLOOR_SLAB,
+                load_bearing: iw.load_bearing,
+                mesh: prism(&ccw, s.elevation, s.height - FLOOR_SLAB),
+            });
+        }
+    }
+    let mut stairs = Vec::new();
+    for (k, st) in b.stairs.iter().enumerate() {
+        for &level in &st.levels {
+            let Some(s) = b.storeys.get(level) else { continue };
+            let id = if st.id.is_empty() { format!("{}.stair{k}", b.id) } else { st.id.clone() };
+            stairs.push(BuiltStair {
+                id: format!("{id}.L{level}"),
+                level,
+                kind: st.kind,
+                winding: st.winders.is_some(),
+                mesh: crate::stair::mesh(st, s.elevation, s.height)?,
+            });
+        }
+    }
+    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
+}
+
+/// A vertical prism on a counter-clockwise polygon.
+fn validate_slab_holes(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Result<()> {
+    let inside = |ring: &[[f64; 2]], p: [f64; 2]| {
+        let mut yes = false;
+        for i in 0..ring.len() {
+            let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+            if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+                yes = !yes;
+            }
+        }
+        yes
+    };
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let intersects = |r: &[[f64; 2]], s: &[[f64; 2]]| {
+        (0..r.len()).any(|i| {
+            (0..s.len()).any(|j| {
+                let (a, b, c, d) = (r[i], r[(i + 1) % r.len()], s[j], s[(j + 1) % s.len()]);
+                let bbox = (0..2).all(|k| a[k].min(b[k]) <= c[k].max(d[k]) + 1e-6 && c[k].min(d[k]) <= a[k].max(b[k]) + 1e-6);
+                bbox && cross(a, b, c) * cross(a, b, d) <= 0.0 && cross(c, d, a) * cross(c, d, b) <= 0.0
+            })
+        })
+    };
+    for (i, hole) in holes.iter().enumerate() {
+        if hole.iter().any(|p| !inside(outer, *p)) || intersects(outer, hole) {
+            return Err(ModelError::Invalid(format!("stair opening {i} must lie wholly inside its floor slab")));
+        }
+        for other in &holes[..i] {
+            if intersects(other, hole) || hole.first().is_some_and(|p| inside(other, *p)) || other.first().is_some_and(|p| inside(hole, *p)) {
+                return Err(ModelError::Invalid(format!("stair opening {i} overlaps another stair opening")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A vertical prism on a counter-clockwise polygon.
 pub fn prism(poly: &[[f64; 2]], z0: f64, height: f64) -> Mesh {
+    prism_with_holes(poly, &[], z0, height)
+}
+
+fn prism_with_holes(poly: &[[f64; 2]], holes: &[Vec<[f64; 2]>], z0: f64, height: f64) -> Mesh {
     let mut m = Mesh::default();
     let z1 = z0 + height;
-    m.polygon(poly, &[], |p| [p[0], p[1], z1]);
+    m.polygon(poly, holes, |p| [p[0], p[1], z1]);
     let mut bottom = Mesh::default();
-    bottom.polygon(poly, &[], |p| [p[0], p[1], z0]);
+    bottom.polygon(poly, holes, |p| [p[0], p[1], z0]);
     for t in &mut bottom.triangles {
         t.swap(1, 2);
     }
@@ -484,6 +649,12 @@ pub fn prism(poly: &[[f64; 2]], z0: f64, height: f64) -> Mesh {
     for i in 0..n {
         let (a, b) = (poly[i], poly[(i + 1) % n]);
         m.quad([a[0], a[1], z0], [b[0], b[1], z0], [b[0], b[1], z1], [a[0], a[1], z1]);
+    }
+    for hole in holes {
+        for i in 0..hole.len() {
+            let (a, b) = (hole[i], hole[(i + 1) % hole.len()]);
+            m.quad([b[0], b[1], z0], [a[0], a[1], z0], [a[0], a[1], z1], [b[0], b[1], z1]);
+        }
     }
     m
 }
@@ -538,6 +709,24 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind) -> Vec<(Materi
                 frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (v0 + panel, v1 - FRAME)));
             }
             glass.append(&fbox(fr, (iu0, iu1), glass_w, (v0 + panel, v1 - FRAME)));
+        }
+        ComponentKind::DoorWindow { door_width, door_side, window_sill, lights } => {
+            // Split the opening: door leaf on one side, window over a brick panel on the other.
+            let (du0, du1, wu0, wu1) = match door_side {
+                Side::Left => (u0, u0 + door_width, u0 + door_width, u1),
+                Side::Right => (u1 - door_width, u1, u0, u1 - door_width),
+            };
+            let mullion = if door_side == &Side::Left { wu0 } else { wu1 };
+            frame.append(&fbox(fr, (mullion - FRAME / 2.0, mullion + FRAME / 2.0), w, (v0, v1 - FRAME)));
+            parts.push((Material::Door, fbox(fr, (du0 + FRAME / 2.0, du1 - FRAME / 2.0), (REVEAL + 15.0, REVEAL + 60.0), (v0, v1 - FRAME))));
+            let ws = v0 + window_sill;
+            parts.push((Material::Wall, fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
+            frame.append(&fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), w, (ws, ws + FRAME)));
+            for c in dividers(wu0 + FRAME / 2.0, wu1 - FRAME / 2.0, *lights) {
+                frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (ws + FRAME, v1 - FRAME)));
+            }
+            glass.append(&fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), glass_w, (ws + FRAME, v1 - FRAME)));
+            parts.push((Material::Sill, fbox(fr, (wu0, wu1), (-40.0, REVEAL), (ws - 40.0, ws))));
         }
         ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
     }
@@ -829,6 +1018,35 @@ mod tests {
         // Wall geometry stays inside the building's extent plus nothing outward.
         let (lo, hi) = b.walls[0].mesh.bounds().unwrap();
         assert!(lo[1] >= -1e-6 && hi[1] <= 400.0 + 1e-6, "{lo:?} {hi:?}");
+    }
+
+    #[test]
+    fn stairs_open_the_arrival_slab_but_leave_the_lowest_floor_solid() {
+        let mut doc = doc_with_block();
+        let st: crate::Stair = serde_json::from_value(serde_json::json!({
+            "id":"stair", "levels":[0,1], "outline":[[4000,4000],[6000,4000],[6000,5900],[4000,5900]],
+            "kind":"u_turn", "rounded":false, "landing":950
+        }))
+        .unwrap();
+        doc.buildings[0].stairs.push(st);
+        let built = build(&doc).unwrap();
+        let area = |s: &BuiltSlab| {
+            s.mesh
+                .triangles
+                .iter()
+                .filter_map(|t| {
+                    let [a, b, c] = t.map(|i| s.mesh.positions[i as usize]);
+                    ((a[2] - (s.z_bottom + s.thickness)).abs() < 1e-6 && (a[2] - b[2]).abs() < 1e-6 && (a[2] - c[2]).abs() < 1e-6)
+                        .then_some(((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0)
+                })
+                .sum::<f64>()
+        };
+        let slabs = &built[0].slabs;
+        let solid = area(&slabs[0]);
+        for level in [1, 2] {
+            assert!((solid - area(&slabs[level]) - 2950.0 * 1900.0).abs() < 1e-3, "arrival slab {level} must have the flight and landing opening");
+        }
+        assert!((area(&slabs[3]) - solid).abs() < 1e-3);
     }
 
     #[test]

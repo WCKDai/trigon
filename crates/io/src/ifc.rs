@@ -132,6 +132,7 @@ fn door_operation(kind: &ComponentKind) -> &'static str {
         ComponentKind::FrenchDoor { leaves: 2 } | ComponentKind::FrenchBalcony { leaves: 2, .. } | ComponentKind::Balcony { leaves: 2, .. } => {
             ".DOUBLE_DOOR_SINGLE_SWING."
         }
+        ComponentKind::DoorWindow { door_side: trigon_model::component::Side::Right, .. } => ".SINGLE_SWING_RIGHT.",
         _ => ".SINGLE_SWING_LEFT.",
     }
 }
@@ -204,7 +205,9 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
             let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(0)));
             let outline = w.polyline(&wall.plan);
             let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
-            let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{wcs},#{dz},{})", real(wall.height)));
+            let base = w.point3([0.0, 0.0, wall.bottom]);
+            let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
+            let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(wall.height - wall.bottom)));
             let shape = w.shape(body, "SweptSolid", &[solid]);
             let wall_id = w.add(format!(
                 "IFCWALL({},$,{},$,$,#{lp},#{shape},{},.SOLIDWALL.)",
@@ -278,12 +281,18 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
 
         for s in &b.slabs {
             let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(s.level)));
-            let outline = w.polyline(&s.polygon);
-            let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
-            let base = w.point3([0.0, 0.0, s.z_bottom]);
-            let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
-            let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(s.thickness)));
-            let shape = w.shape(body, "SweptSolid", &[solid]);
+            let shape = if s.holes.is_empty() {
+                let outline = w.polyline(&s.polygon);
+                let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
+                let base = w.point3([0.0, 0.0, s.z_bottom]);
+                let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
+                let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(s.thickness)));
+                w.shape(body, "SweptSolid", &[solid])
+            } else if let Some(fs) = w.faceset(&s.mesh) {
+                w.shape(body, "Tessellation", &[fs])
+            } else {
+                continue;
+            };
             let (name, kind) = match s.kind {
                 SlabKind::Floor => ("Floor slab", ".FLOOR."),
                 SlabKind::Roof => ("Roof slab", ".ROOF."),
@@ -299,6 +308,72 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
             }
         }
 
+        for st in &b.stairs {
+            let kind = match st.kind {
+                trigon_model::StairKind::Straight => "STRAIGHT_RUN_STAIR",
+                trigon_model::StairKind::UTurn if st.winding => "HALF_WINDING_STAIR",
+                trigon_model::StairKind::UTurn => "HALF_TURN_STAIR",
+                trigon_model::StairKind::DoubleQuarterTurn => "TWO_QUARTER_WINDING_STAIR",
+            };
+            let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(st.level)));
+            if let Some(fs) = w.faceset(&st.mesh) {
+                let shape = w.shape(body, "Tessellation", &[fs]);
+                let id = w.add(format!(
+                    "IFCSTAIR({},$,'Stair',$,$,#{lp},#{shape},{},.{kind}.)",
+                    string(&guid(&format!("trigon:{}", st.id))),
+                    string(&st.id)
+                ));
+                if let Some(c) = contained.get_mut(st.level) {
+                    c.push(id);
+                }
+            }
+        }
+        for iw in &b.interior {
+            let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(iw.level)));
+            let outline = w.polyline(&iw.outline);
+            let profile = w.add(format!("IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,#{outline})"));
+            let base = w.point3([0.0, 0.0, iw.z_bottom]);
+            let place = w.add(format!("IFCAXIS2PLACEMENT3D(#{base},$,$)"));
+            let solid = w.add(format!("IFCEXTRUDEDAREASOLID(#{profile},#{place},#{dz},{})", real(iw.height)));
+            let shape = w.shape(body, "SweptSolid", &[solid]);
+            let kind = if iw.load_bearing { ".SOLIDWALL." } else { ".PARTITIONING." };
+            let id = w.add(format!(
+                "IFCWALL({},$,{},$,$,#{lp},#{shape},{},{kind})",
+                string(&guid(&format!("trigon:{}", iw.id))),
+                string(if iw.load_bearing { "Interior wall (load-bearing)" } else { "Partition" }),
+                string(&iw.id)
+            ));
+            if let Some(c) = contained.get_mut(iw.level) {
+                c.push(id);
+            }
+        }
+        if let Some(r) = &b.roof {
+            let top = contained.len().saturating_sub(1);
+            let lp = w.add(format!("IFCLOCALPLACEMENT(#{},#{wcs})", lp_of(top)));
+            if let Some(fs) = w.faceset(&r.cover) {
+                let shape = w.shape(body, "Tessellation", &[fs]);
+                let id = w.add(format!(
+                    "IFCSLAB({},$,{},$,$,#{lp},#{shape},{},.ROOF.)",
+                    string(&guid(&format!("trigon:{}", r.id))),
+                    string(&format!("Roof {:.0} deg", r.pitch_deg)),
+                    string(&r.id)
+                ));
+                if let Some(c) = contained.get_mut(top) {
+                    c.push(id);
+                }
+            }
+            if let Some(fs) = w.faceset(&r.gables) {
+                let shape = w.shape(body, "Tessellation", &[fs]);
+                let id = w.add(format!(
+                    "IFCWALL({},$,'Gables',$,$,#{lp},#{shape},{},.SOLIDWALL.)",
+                    string(&guid(&format!("trigon:{}.gables", r.id))),
+                    string(&format!("{}.gables", r.id))
+                ));
+                if let Some(c) = contained.get_mut(top) {
+                    c.push(id);
+                }
+            }
+        }
         w.add(format!("IFCRELAGGREGATES({},$,$,$,#{building},({}))", string(&guid(&format!("trigon:{}.storeys", b.building_id))), refs(&storeys)));
         for (i, (storey, elems)) in storeys.iter().zip(&contained).enumerate() {
             if !elems.is_empty() {

@@ -170,6 +170,39 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.add_basement",
+        summary: "Add a basement storey below the lowest storey, its floor `floor` mm relative to the terrain (negative, e.g. \
+                  read from a section). Every storey reference (placements, interior, registered plans) moves up by one; \
+                  the outer walls then reach down to the basement floor. `source` is recorded as evidence.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddBasement>,
+        run: |s, v| {
+            let p: AddBasement = parse("building.add_basement", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.add_basement(p.floor, p.name.as_deref().unwrap_or("Kælder"))?;
+            if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
+                b.evidence.push(trigon_model::Evidence { source: src, supplies: "levels".into(), attribution: p.attribution.unwrap_or_default() });
+            }
+            for d in &mut s.doc.drawings {
+                for r in &mut d.plans {
+                    r.levels.iter_mut().for_each(|l| *l += 1);
+                }
+            }
+            Ok(info(&s.doc))
+        },
+    },
+    CommandSpec {
+        id: "building.set_roof",
+        summary: "Set the roof: flat, or pitched from the eaves (the top of the walls) at `pitch_deg`, or at the pitch that puts \
+                  the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
+                  gable (wing ends, walls against neighbours). `source` records where the values came from.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetRoof>,
+        run: |s, v| set_roof(s, parse("building.set_roof", v)?),
+    },
+    CommandSpec {
         id: "building.set_wall_thickness",
         summary: "Set the outer wall thickness (mm).",
         mutates: true,
@@ -429,6 +462,529 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "drawing.trace_walls",
+        summary: "Read candidate interior walls off a registered plan for one storey: dark bands as thick as walls (min_mm to \
+                  max_mm, default 70–450) running at least min_len (default 600) along the building's wall directions, inside \
+                  the outer walls, and stair flights (evenly spaced treads; walls inside a flight are dropped). Returns them; `add: true` \
+                  also adds them for the given `levels` (default: the traced storey).",
+        mutates: true,
+        journaled: true,
+        schema: schema::<TraceWalls>,
+        run: |s, v| {
+            let p: TraceWalls = parse("drawing.trace_walls", v)?;
+            let dark = trigon_model::checked("contrast", p.contrast.unwrap_or(60.0), 5.0, 250.0)?;
+            let (mn, mx) = (
+                trigon_model::checked("min_mm", p.min_mm.unwrap_or(70.0), 30.0, 500.0)?,
+                trigon_model::checked("max_mm", p.max_mm.unwrap_or(450.0), 60.0, 1500.0)?,
+            );
+            let min_len = trigon_model::checked("min_len", p.min_len.unwrap_or(600.0), 200.0, 10_000.0)?;
+            let (mut walls, mut stairs) = crate::drawings::trace_walls(s, &p.name, p.level, dark, mn, mx, min_len)?;
+            let total_m: f64 = walls.iter().map(|w| ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt()).sum::<f64>() / 1000.0;
+            let summary = json!({
+                "walls": walls.len(),
+                "load_bearing": walls.iter().filter(|w| w.load_bearing).count(),
+                "total_length_m": total_m.round(),
+                "stair_flights": stairs.len(),
+            });
+            if p.add.unwrap_or(false) {
+                let levels = p.levels.clone().unwrap_or_else(|| vec![p.level]);
+                let b = s.doc.building_mut(None)?;
+                let start = b.interior_walls.len();
+                for (k, w) in walls.iter_mut().enumerate() {
+                    w.levels = levels.clone();
+                    w.id = format!("{}.iw{}", b.id, start + k);
+                    w.validate(b.storeys.len())?;
+                }
+                b.interior_walls.extend(walls);
+                let added = b.interior_walls.len() - start;
+                let mut stairs_added = 0;
+                if p.stairs.unwrap_or(true) {
+                    let s0 = b.stairs.len();
+                    for (k, st) in stairs.iter_mut().enumerate() {
+                        st.levels = levels.clone();
+                        st.id = format!("{}.stair{}", b.id, s0 + k);
+                    }
+                    stairs_added = stairs.len();
+                    b.stairs.extend(stairs);
+                }
+                return Ok(json!({"traced": summary, "added": added, "stairs_added": stairs_added}));
+            }
+            Ok(json!({"traced": summary, "walls": walls, "stairs": stairs}))
+        },
+    },
+    CommandSpec {
+        id: "drawing.to_site",
+        summary: "Convert drawing pixels on a registered plan to site mm (x east, y north), to place walls, stairs and rooms read \
+                  off the drawing.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<ToSite>,
+        run: |s, v| {
+            let p: ToSite = parse("drawing.to_site", v)?;
+            let d = s.doc.drawings.iter().find(|d| d.name == p.name).ok_or_else(|| ModelError::NotFound(format!("drawing {}", p.name)))?;
+            let reg = d
+                .plans
+                .iter()
+                .find(|r| r.levels.contains(&p.level))
+                .ok_or_else(|| ModelError::NotFound(format!("drawing {} has no plan registered for level {}", p.name, p.level)))?;
+            if p.points.len() > 10_000 || p.points.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(ModelError::Invalid("give up to 10000 finite points".into()).into());
+            }
+            Ok(json!(
+                p.points
+                    .iter()
+                    .map(|q| {
+                        let r = reg.to_site(*q);
+                        [r[0].round(), r[1].round()]
+                    })
+                    .collect::<Vec<_>>()
+            ))
+        },
+    },
+    CommandSpec {
+        id: "drawing.fit_stair",
+        summary: "Measure a U-turn staircase on a registered plan from a rough box around it (four drawing pixels: p0→p1 along \
+                  the flights towards the half landing, p1→p2 across): finds the tread lines, stringers and well and returns the \
+                  exact stair in site mm. `add: true` adds it on `levels` (default: this storey) and removes traced walls inside it.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<FitStair>,
+        run: |s, v| {
+            let p: FitStair = parse("drawing.fit_stair", v)?;
+            let fit = crate::drawings::fit_stair(s, &p.name, p.level, p.rough, p.template)?;
+            let report = json!({
+                "treads_found": fit.treads,
+                "tread_mm": fit.tread_mm.round(),
+                "run_mm": fit.length_mm.round(),
+                "width_mm": fit.width_mm.round(),
+                "well_mm": fit.well_mm.round(),
+                "lines_across_mm": fit.lines_across.iter().map(|(t, v)| [t.round(), (v * 100.0).round() / 100.0]).collect::<Vec<_>>(),
+                "outline": fit.stair.outline.iter().map(|p| [p[0].round(), p[1].round()]).collect::<Vec<_>>(),
+            });
+            if p.add.unwrap_or(false) {
+                let mut st = fit.stair;
+                st.levels = p.levels.unwrap_or_else(|| vec![p.level]);
+                let b = s.doc.building_mut(None)?;
+                st.id = format!("{}.stair{}", b.id, b.stairs.len());
+                if st.levels.iter().any(|l| *l >= b.storeys.len()) {
+                    return Err(ModelError::Invalid("levels must be existing storeys".into()).into());
+                }
+                let sym = trigon_model::stair::symbol(&st, 3000.0)?;
+                let mut area: Vec<[f64; 2]> = vec![st.outline[0], st.outline[1]];
+                area.extend(sym.landing.iter().copied());
+                area.push(st.outline[2]);
+                area.push(st.outline[3]);
+                let before = b.interior_walls.len();
+                b.interior_walls.retain_mut(|w| {
+                    let m = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
+                    if crate::drawings::inside(&area, m) {
+                        w.levels.retain(|l| !st.levels.contains(l));
+                    }
+                    !w.levels.is_empty()
+                });
+                let removed = before - b.interior_walls.len();
+                b.stairs.push(st);
+                trigon_model::build(&s.doc)?;
+                return Ok(json!({"measured": report, "added": true, "walls_removed": removed}));
+            }
+            Ok(json!({"measured": report}))
+        },
+    },
+    CommandSpec {
+        id: "interior.add_walls",
+        summary: "Add interior walls: centre line a–b (site mm), thickness, storeys, load-bearing or partition. Leave gaps for \
+                  doors. Use drawing.trace_walls to read candidates off a registered plan.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddWalls>,
+        run: |s, v| {
+            let p: AddWalls = parse("interior.add_walls", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let n = b.storeys.len();
+            if p.walls.len() > 5000 {
+                return Err(ModelError::Invalid("at most 5000 walls at a time".into()).into());
+            }
+            for w in &p.walls {
+                w.validate(n)?;
+            }
+            let start = b.interior_walls.len();
+            for (k, mut w) in p.walls.into_iter().enumerate() {
+                if w.id.is_empty() {
+                    w.id = format!("{}.iw{}", b.id, start + k);
+                }
+                b.interior_walls.push(w);
+            }
+            Ok(json!({"added": b.interior_walls.len() - start, "interior_walls": b.interior_walls.len()}))
+        },
+    },
+    CommandSpec {
+        id: "interior.regularize",
+        summary: "Straighten measured interior walls onto explicit building axes, co-align fragments, merge duplicates and \
+                  repair small junction gaps. Preserves door-size gaps and storey boundaries. Undoable; refresh derived room \
+                  boundaries afterwards.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<RegularizeWalls>,
+        run: |s, v| {
+            let p: RegularizeWalls = parse("interior.regularize", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let before = b.interior_walls.clone();
+            let inner = trigon_model::build::inner_ring(&b.footprint, b.wall_thickness);
+            let walls = trigon_model::wall_cleanup::regularize(
+                &before,
+                &p.axes_deg,
+                p.tolerance_mm.unwrap_or(100.0),
+                p.angle_tolerance_deg.unwrap_or(3.0),
+                &inner,
+            )?;
+            for wall in &walls {
+                wall.validate(b.storeys.len())?;
+            }
+            let retired: Vec<_> = before.iter().filter(|old| !walls.iter().any(|w| w.id == old.id)).map(|w| w.id.clone()).collect();
+            let moved = walls.iter().filter(|w| before.iter().find(|old| old.id == w.id).is_some_and(|old| old.a != w.a || old.b != w.b)).count();
+            let result = json!({"before": before.len(), "after": walls.len(), "moved": moved, "retired_ids": retired, "room_boundaries_need_refresh": !b.rooms.is_empty()});
+            b.interior_walls = walls;
+            trigon_model::build(&s.doc)?;
+            Ok(result)
+        },
+    },
+    CommandSpec {
+        id: "interior.add_stairs",
+        summary: "Add staircases: four rectangle corners (site mm) on the listed departure storeys, drawn with treads in plans.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddStairs>,
+        run: |s, v| {
+            let p: AddStairs = parse("interior.add_stairs", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let n = b.storeys.len();
+            let start = b.stairs.len();
+            for (k, mut st) in p.stairs.into_iter().enumerate() {
+                if st.levels.is_empty() || st.levels.iter().any(|l| *l >= n) {
+                    return Err(ModelError::Invalid(format!("stair {k}: give at least one existing storey below {n}")).into());
+                }
+                trigon_model::stair::frame(&st)?;
+                if st.id.is_empty() {
+                    st.id = format!("{}.stair{}", b.id, start + k);
+                }
+                b.stairs.push(st);
+            }
+            let mut removed = 0;
+            if p.clear_walls_inside.unwrap_or(false) {
+                let stairs: Vec<_> = b.stairs[start..]
+                    .iter()
+                    .map(|st| Ok((st.levels.clone(), trigon_model::stair::opening(st)?)))
+                    .collect::<trigon_model::Result<_>>()?;
+                let before = b.interior_walls.len();
+                b.interior_walls.retain_mut(|w| {
+                    let m = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
+                    for (levels, area) in &stairs {
+                        if crate::drawings::inside(area, m) {
+                            w.levels.retain(|l| !levels.contains(l));
+                        }
+                    }
+                    !w.levels.is_empty()
+                });
+                removed = before - b.interior_walls.len();
+            }
+            let count = b.stairs.len();
+            trigon_model::build(&s.doc)?;
+            Ok(json!({"stairs": count, "walls_removed": removed}))
+        },
+    },
+    CommandSpec {
+        id: "interior.add_rooms",
+        summary: "Add rooms: a name and a polygon (site mm) on the listed storeys; plans label them with name and area.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<AddRooms>,
+        run: |s, v| {
+            let p: AddRooms = parse("interior.add_rooms", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let n = b.storeys.len();
+            let start = b.rooms.len();
+            for (k, mut r) in p.rooms.into_iter().enumerate() {
+                if r.polygon.len() < 3
+                    || r.polygon.len() > 256
+                    || r.polygon.iter().flatten().any(|v| !v.is_finite())
+                    || r.levels.iter().any(|l| *l >= n)
+                {
+                    return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
+                }
+                if r.id.is_empty() {
+                    r.id = format!("{}.room{}", b.id, start + k);
+                }
+                b.rooms.push(r);
+            }
+            Ok(json!({"rooms": b.rooms.len()}))
+        },
+    },
+    CommandSpec {
+        id: "interior.detect_rooms",
+        summary: "Find the rooms on the given storeys: the spaces enclosed by the modelled walls and, where a plan is \
+                  registered, the drawn lines (partitions, door leaves); door gaps up to 1.1 m are closed. Stores them, replacing earlier detected rooms on those storeys. Rooms smaller than min_area_m2 \
+                  (default 1.0) are ignored. Plans label each room with its area.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<DetectRooms>,
+        run: |s, v| {
+            let p: DetectRooms = parse("interior.detect_rooms", v)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let levels = p.levels.clone().unwrap_or_else(|| (0..b.storeys.len()).collect());
+            if levels.iter().any(|l| *l >= b.storeys.len()) {
+                return Err(ModelError::Invalid("levels must be existing storeys".into()).into());
+            }
+            let min = trigon_model::checked("min_area_m2", p.min_area_m2.unwrap_or(1.0), 0.2, 100.0)?;
+            let contrast = trigon_model::checked("contrast", p.contrast.unwrap_or(40.0), 5.0, 250.0)?;
+            let use_scan = p.use_scan.unwrap_or(true);
+            let mut found = Vec::new();
+            for &l in &levels {
+                let ink = if use_scan { crate::drawings::ink_for(s, l, contrast)? } else { None };
+                let b = s.doc.building(p.building.as_deref())?;
+                found.extend(crate::rooms::rooms_for(b, l, min, ink.as_ref().map(|f| f as &dyn Fn([f64; 2]) -> bool)));
+            }
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.rooms.retain_mut(|r| {
+                if r.name.is_empty() {
+                    r.levels.retain(|l| !levels.contains(l));
+                }
+                !r.levels.is_empty()
+            });
+            let per: Vec<Value> = levels
+                .iter()
+                .map(|l| {
+                    let rs: Vec<&trigon_model::Room> = found.iter().filter(|r| r.levels.contains(l)).collect();
+                    let total: f64 = rs.iter().map(|r| trigon_model::doc::polygon_area(&r.polygon)).sum::<f64>() / 1e6;
+                    json!({"level": l, "rooms": rs.len(), "area_m2": total.round()})
+                })
+                .collect();
+            b.rooms.extend(found);
+            Ok(json!(per))
+        },
+    },
+    CommandSpec {
+        id: "interior.clear",
+        summary: "Remove interior walls, stairs and rooms (`what`: walls, stairs, rooms or all; default all).",
+        mutates: true,
+        journaled: true,
+        schema: schema::<InteriorClear>,
+        run: |s, v| {
+            let p: InteriorClear = parse("interior.clear", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let what = p.what.as_deref().unwrap_or("all");
+            if !matches!(what, "all" | "walls" | "stairs" | "rooms") {
+                return Err(ModelError::Invalid(format!("what {what}: use walls, stairs, rooms or all")).into());
+            }
+            if matches!(what, "all" | "walls") {
+                b.interior_walls.clear();
+            }
+            if matches!(what, "all" | "stairs") {
+                b.stairs.clear();
+            }
+            if matches!(what, "all" | "rooms") {
+                b.rooms.clear();
+            }
+            Ok(json!({"cleared": what}))
+        },
+    },
+    CommandSpec {
+        id: "interior.list",
+        summary: "Count the interior walls (load-bearing and partitions), stairs and rooms per storey, with room areas.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<BuildingParam>,
+        run: |s, v| {
+            let p: BuildingParam = parse("interior.list", v)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let per: Vec<Value> = (0..b.storeys.len())
+                .map(|l| {
+                    let walls: Vec<&trigon_model::InteriorWall> = b.interior_walls.iter().filter(|w| w.levels.contains(&l)).collect();
+                    json!({
+                        "level": l,
+                        "load_bearing": walls.iter().filter(|w| w.load_bearing).count(),
+                        "partitions": walls.iter().filter(|w| !w.load_bearing).count(),
+                        "stairs": b.stairs.iter().filter(|x| x.levels.contains(&l)).count(),
+                        "rooms": b.rooms.iter().filter(|r| r.levels.contains(&l)).map(|r| json!({"name": r.name, "area_m2": (trigon_model::doc::polygon_area(&r.polygon) / 1e4).round() / 100.0})).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(json!(per))
+        },
+    },
+    CommandSpec {
+        id: "building.load_units",
+        summary: "Load the building's entrances and apartments from the registers (BBR staircases and units, DAR addresses: \
+                  street, house number, access point, floor and door) and tie each entrance to the nearest staircase. Plans then \
+                  label each staircase \"TV 7 TH\" per floor.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<BuildingParam>,
+        run: |s, v| {
+            let p: BuildingParam = parse("building.load_units", v)?;
+            let origin = s.doc.site.as_ref().map(|x| x.origin_utm).ok_or_else(|| ModelError::NotFound("no site yet".into()))?;
+            let bbr = s
+                .doc
+                .building(p.building.as_deref())?
+                .attributes
+                .get("bbr_id")
+                .cloned()
+                .ok_or_else(|| ModelError::NotFound("the building has no BBR id (load it with a Datafordeler key)".into()))?;
+            let data = s.provider().entrances(&bbr)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let mut entrances: Vec<trigon_model::Entrance> = data
+                .into_iter()
+                .map(|e| trigon_model::Entrance {
+                    street: e.street,
+                    number: e.number,
+                    point: [(e.point_utm[0] - origin[0]) * 1000.0, (e.point_utm[1] - origin[1]) * 1000.0],
+                    stair: None,
+                    units: e
+                        .units
+                        .into_iter()
+                        .map(|u| trigon_model::Unit { floor: u.floor, door: u.door, area_m2: u.area_m2, rooms: u.rooms })
+                        .collect(),
+                })
+                .collect();
+            // Nearest staircase to each access point, each staircase used once (closest pairs first).
+            let centre = |st: &trigon_model::Stair| {
+                let n = st.outline.len().max(1) as f64;
+                st.outline.iter().fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n])
+            };
+            let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
+            for (i, e) in entrances.iter().enumerate() {
+                for (k, st) in b.stairs.iter().enumerate() {
+                    let c = centre(st);
+                    pairs.push((((c[0] - e.point[0]).powi(2) + (c[1] - e.point[1]).powi(2)).sqrt(), i, k));
+                }
+            }
+            pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (mut used_e, mut used_s) = (vec![false; entrances.len()], vec![false; b.stairs.len()]);
+            let mut matched = Vec::new();
+            for (d, i, k) in pairs {
+                if used_e[i] || used_s[k] || d > 25_000.0 {
+                    continue;
+                }
+                used_e[i] = true;
+                used_s[k] = true;
+                entrances[i].stair = Some(b.stairs[k].id.clone());
+                matched.push(json!({"entrance": format!("{} {}", entrances[i].street, entrances[i].number), "stair": b.stairs[k].id, "distance_m": (d / 100.0).round() / 10.0}));
+            }
+            let units: usize = entrances.iter().map(|e| e.units.len()).sum();
+            b.entrances = entrances;
+            Ok(json!({"entrances": b.entrances.len(), "units": units, "matched": matched}))
+        },
+    },
+    CommandSpec {
+        id: "building.outline",
+        summary: "The building's outline corners in site mm (x east, y north of the site origin) with the facades meeting at each, \
+                  for tying drawings to the site.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<BuildingParam>,
+        run: |s, v| {
+            let p: BuildingParam = parse("building.outline", v)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let n = b.footprint.len();
+            Ok(json!(
+                b.footprint
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| json!({
+                        "corner": i,
+                        "x": c[0].round(),
+                        "y": c[1].round(),
+                        "ends": b.facades.iter().find(|f| (f.edge + 1) % n == i).map(|f| f.id.clone()),
+                        "starts": b.facades.iter().find(|f| f.edge == i).map(|f| f.id.clone()),
+                    }))
+                    .collect::<Vec<_>>()
+            ))
+        },
+    },
+    CommandSpec {
+        id: "drawing.register_plan",
+        summary: "Tie a plan on a linked drawing to the site for the storeys it shows: two or more points, each a drawing pixel \
+                  (px, py) and either a site point (x, y in mm) or a facade point (facade, u = mm along it from its start, on the \
+                  outer face). Fits scale, rotation and shift and reports the residual at each point.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<RegisterPlan>,
+        run: |s, v| register_plan(s, parse("drawing.register_plan", v)?),
+    },
+    CommandSpec {
+        id: "plan.image",
+        summary: "Draw a floor plan of a storey, cut 1 m above its floor: walls, windows, closed door leaves and balconies with their \
+                  size (\"Ca. depth x width\"), coloured by phase (green new, red dashed demolished), the model only (set \
+                  show_scan to put the registered archive scan underneath for checking). `path` ending in .png gives an image (returned to agents), .svg a vector drawing.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<PlanImage>,
+        run: |s, v| {
+            let p: PlanImage = parse("plan.image", v)?;
+            let path = PathBuf::from(&p.path);
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::plan::render(
+                s,
+                p.level,
+                p.drawing.as_deref(),
+                p.show_scan.unwrap_or(false),
+                view,
+                p.mm_per_px.unwrap_or(20.0),
+                p.rotate_deg.unwrap_or(0.0),
+                path,
+            )
+        },
+    },
+    CommandSpec {
+        id: "plan.sheet",
+        summary: "Compose clean landscape presentation plans: joined wall outlines, masonry hatching, balcony dimensions, \
+                  entrance labels and a floor title. No scan underlay. PDF accepts several levels; SVG/PNG one. An optional \
+                  site-coordinate region crops the viewport without changing the model.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<PlanSheet>,
+        run: |s, v| {
+            let p: PlanSheet = parse("plan.sheet", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::plan::sheet(
+                &s.doc,
+                &p.levels,
+                view,
+                p.rotate_deg.unwrap_or(0.0),
+                p.region.as_deref(),
+                p.caption.as_deref().unwrap_or_default(),
+                PathBuf::from(p.path),
+            )
+        },
+    },
+    CommandSpec {
+        id: "elevation.sheet",
+        summary: "Draw a facade elevation as a presentation sheet: the model seen square-on to one facade (walls, windows, doors, \
+                  balconies, roof behind the eaves), each balcony labelled with its size (\"Ca. depth x width\") and each staircase \
+                  with its entrance (\"TV 7 TH\", mirrored when seen from behind). Give `facade`, or `along` (two site points) for a \
+                  stepped front. from_mm/to_mm crop along it. .pdf, .png or .svg.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<ElevationSheet>,
+        run: |s, v| {
+            let p: ElevationSheet = parse("elevation.sheet", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            let side = match (&p.facade, p.along) {
+                (Some(f), None) => crate::elevation::Side::Facade(f),
+                (None, Some(line)) => crate::elevation::Side::Along(line),
+                _ => return Err(ModelError::Invalid("give either `facade` or `along`".into()).into()),
+            };
+            crate::elevation::sheet(
+                &s.doc,
+                side,
+                view,
+                (p.from_mm, p.to_mm),
+                p.title.as_deref().unwrap_or("Facade"),
+                p.caption.as_deref().unwrap_or_default(),
+                PathBuf::from(p.path),
+            )
+        },
+    },
+    CommandSpec {
         id: "export.gltf",
         summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up. `phase` and `filter` choose the view (default: the \
                   active phase, complete); demolished elements are translucent red.",
@@ -614,6 +1170,175 @@ struct DrawingRegister {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ToSite {
+    name: String,
+    /// A storey the plan is registered for.
+    level: usize,
+    /// Drawing pixels [x, y].
+    points: Vec<[f64; 2]>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FitStair {
+    name: String,
+    level: usize,
+    /// Rough box in drawing pixels: p0→p1 along the flights towards the half landing, p1→p2 across.
+    rough: [[f64; 2]; 4],
+    /// A known design to match instead of measuring freely (e.g. one stair fitted already).
+    template: Option<crate::drawings::StairTemplate>,
+    add: Option<bool>,
+    levels: Option<Vec<usize>>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TraceWalls {
+    name: String,
+    level: usize,
+    /// How much darker than the surrounding paper a pixel must be to count as wall (0–255, default 60).
+    contrast: Option<f64>,
+    min_mm: Option<f64>,
+    max_mm: Option<f64>,
+    min_len: Option<f64>,
+    /// Add the traced walls to the model.
+    add: Option<bool>,
+    /// Storeys the added walls stand on (default: the traced one).
+    levels: Option<Vec<usize>>,
+    /// Also add the stair flights found (default true).
+    stairs: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddWalls {
+    building: Option<String>,
+    walls: Vec<trigon_model::InteriorWall>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RegularizeWalls {
+    building: Option<String>,
+    /// Building grids in degrees from site X, modulo 90. Supply each wing's grid explicitly.
+    axes_deg: Vec<f64>,
+    /// Maximum local adjustment in millimetres (default 100).
+    tolerance_mm: Option<f64>,
+    /// Maximum angular discrepancy accepted for snapping (default 3 degrees).
+    angle_tolerance_deg: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddStairs {
+    building: Option<String>,
+    stairs: Vec<trigon_model::Stair>,
+    /// Remove interior walls on the same storeys whose middle lies inside a staircase (traced rails and stringers).
+    clear_walls_inside: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddRooms {
+    building: Option<String>,
+    rooms: Vec<trigon_model::Room>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DetectRooms {
+    building: Option<String>,
+    levels: Option<Vec<usize>>,
+    min_area_m2: Option<f64>,
+    /// Use the registered plan's drawn lines as room boundaries too (default true).
+    use_scan: Option<bool>,
+    /// How much darker than the paper counts as a drawn line (default 40).
+    contrast: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct InteriorClear {
+    building: Option<String>,
+    what: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanPoint {
+    px: f64,
+    py: f64,
+    x: Option<f64>,
+    y: Option<f64>,
+    facade: Option<String>,
+    u: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RegisterPlan {
+    name: String,
+    /// Storey indices the plan shows.
+    levels: Vec<usize>,
+    points: Vec<PlanPoint>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanImage {
+    level: usize,
+    /// .png or .svg
+    path: String,
+    /// A drawing with a plan registered for this level (default: the first one found).
+    drawing: Option<String>,
+    /// Draw the registered archive scan under the plan, for checking and tracing (default false: output material
+    /// shows only the model).
+    show_scan: Option<bool>,
+    phase: Option<String>,
+    filter: Option<String>,
+    /// Scale, mm per pixel (default 20).
+    mm_per_px: Option<f64>,
+    /// Rotate the drawing counter-clockwise by this many degrees (0 = north up).
+    rotate_deg: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanSheet {
+    levels: Vec<usize>,
+    /// .pdf for multiple vector pages; .svg or .png for one sheet.
+    path: String,
+    /// Site points bounding the desired viewport. The model is never clipped or altered.
+    region: Option<Vec<[f64; 2]>>,
+    rotate_deg: Option<f64>,
+    /// Street or drawing caption; defaults to the building name.
+    caption: Option<String>,
+    phase: Option<String>,
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ElevationSheet {
+    /// Facade id, e.g. "b1.f31".
+    facade: Option<String>,
+    /// Or a line along a stepped front, from a to b in site mm with the outside on the right: the view is square-on to it.
+    along: Option<[[f64; 2]; 2]>,
+    /// .pdf, .png or .svg.
+    path: String,
+    /// Start and end along the facade, mm from its start (default: all of it plus 1.5 m either side).
+    from_mm: Option<f64>,
+    to_mm: Option<f64>,
+    /// Title in the box at the top left (default "Facade").
+    title: Option<String>,
+    /// Caption under the drawing.
+    caption: Option<String>,
+    phase: Option<String>,
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct NameParams {
     name: String,
 }
@@ -681,6 +1406,35 @@ struct SetLevels {
     /// Top of the last storey (eaves or attic floor), mm above the terrain.
     top: f64,
     /// Where the levels come from, for example a drawing's archive number.
+    source: Option<String>,
+    attribution: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddBasement {
+    building: Option<String>,
+    /// Basement floor, mm relative to the terrain (negative).
+    floor: f64,
+    name: Option<String>,
+    source: Option<String>,
+    attribution: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetRoof {
+    building: Option<String>,
+    /// flat or pitched.
+    kind: String,
+    /// Roof pitch in degrees.
+    pitch_deg: Option<f64>,
+    /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
+    ridge: Option<f64>,
+    /// Facades that end in a gable.
+    gables: Option<Vec<String>>,
+    /// Facade steps up to this deep (mm) get no roof faces of their own; the eave runs straight (default 1200, 0 = follow every step).
+    straighten_mm: Option<f64>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -822,6 +1576,7 @@ fn info(doc: &Document) -> Value {
             "storey_height_mm": b.storeys.first().map(|s| s.height),
             "levels_mm": b.storeys.iter().map(|s| json!({"name": s.name, "floor": s.elevation, "height": s.height})).collect::<Vec<_>>(),
             "ground_floor_mm": b.ground_floor,
+            "ground_level": b.ground_level,
             "height_mm": b.height(),
             "wall_thickness_mm": b.wall_thickness,
             "attributes": b.attributes,
@@ -953,6 +1708,103 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 }
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
+fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+    let b = s.doc.building_mut(p.building.as_deref())?;
+    let roof = match p.kind.as_str() {
+        "flat" => trigon_model::Roof::Flat,
+        "pitched" => {
+            let gables = p.gables.unwrap_or_default();
+            for g in &gables {
+                b.facade(g)?;
+            }
+            let pitch = match (p.pitch_deg, p.ridge) {
+                (Some(d), None) => d,
+                (None, Some(ridge)) => {
+                    let eaves = b.height();
+                    let kept = trigon_model::roof::eave_outline(&b.footprint, p.straighten_mm.unwrap_or(1200.0));
+                    let outline: Vec<[f64; 2]> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+                    let depth = trigon_model::roof::max_depth(&outline)?;
+                    let rise = trigon_model::checked("ridge", ridge, eaves + 500.0, eaves + 30_000.0)? - eaves;
+                    (rise / depth).atan().to_degrees()
+                }
+                _ => {
+                    return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
+                }
+            };
+            trigon_model::Roof::Pitched { pitch_deg: pitch, gables, straighten_mm: p.straighten_mm.unwrap_or(1200.0) }
+        }
+        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
+    };
+    b.roof = roof;
+    if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
+        b.evidence.push(trigon_model::Evidence { source: src, supplies: "roof".into(), attribution: p.attribution.unwrap_or_default() });
+    }
+    let id = b.id.clone();
+    let built = trigon_model::build(&s.doc)?;
+    let r = built.iter().find(|x| x.building_id == id).and_then(|x| x.roof.as_ref());
+    Ok(json!({
+        "roof": s.doc.building(Some(&id))?.roof,
+        "eaves_mm": r.map(|r| r.eaves.round()),
+        "ridge_mm": r.map(|r| r.ridge.round()),
+        "pitch_deg": r.map(|r| (r.pitch_deg * 10.0).round() / 10.0),
+    }))
+}
+
+fn register_plan(s: &mut Session, p: RegisterPlan) -> Result<Value> {
+    let storeys = s.doc.building(None)?.storeys.len();
+    if p.levels.is_empty() || p.levels.iter().any(|l| *l >= storeys) {
+        return Err(ModelError::Invalid(format!("levels must be storey indices below {storeys}")).into());
+    }
+    if p.points.len() > 50 {
+        return Err(ModelError::Invalid("at most 50 points".into()).into());
+    }
+    let mut pairs = Vec::with_capacity(p.points.len());
+    for (i, q) in p.points.iter().enumerate() {
+        let site = match (q.x, q.y, q.facade.as_deref(), q.u) {
+            (Some(x), Some(y), None, None) => [x, y],
+            (None, None, Some(fid), Some(u)) => {
+                let b = s
+                    .doc
+                    .buildings
+                    .iter()
+                    .find(|b| b.facades.iter().any(|f| f.id == fid))
+                    .ok_or_else(|| ModelError::NotFound(format!("facade {fid}")))?;
+                let f = b.facade(fid)?;
+                let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::NotFound(format!("facade {fid}")))?;
+                let fr = FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid(format!("facade {fid} has zero length")))?;
+                let u = trigon_model::checked("u", u, -5000.0, fr.length + 5000.0)?;
+                let pt = fr.point(u, 0.0, 0.0);
+                [pt[0], pt[1]]
+            }
+            _ => {
+                return Err(EngineError::Params {
+                    command: "drawing.register_plan".into(),
+                    message: format!("point {i}: give x and y, or facade and u"),
+                });
+            }
+        };
+        pairs.push(([q.px, q.py], site));
+    }
+    let reg = trigon_model::PlanRegistration::fit(p.levels.clone(), &pairs)?;
+    let residuals: Vec<f64> = pairs
+        .iter()
+        .map(|(px, q)| {
+            let r = reg.to_site(*px);
+            ((r[0] - q[0]).powi(2) + (r[1] - q[1]).powi(2)).sqrt().round()
+        })
+        .collect();
+    let d = s.doc.drawings.iter_mut().find(|d| d.name == p.name).ok_or_else(|| ModelError::NotFound(format!("drawing {}", p.name)))?;
+    d.plans.retain(|r| !r.levels.iter().any(|l| p.levels.contains(l)));
+    d.plans.push(reg.clone());
+    Ok(json!({
+        "drawing": p.name,
+        "levels": p.levels,
+        "px_per_m": (reg.px_per_m() * 100.0).round() / 100.0,
+        "rotation_deg": (reg.b.atan2(reg.a).to_degrees() * 100.0).round() / 100.0,
+        "residuals_mm": residuals,
+    }))
+}
+
 fn phase_list(doc: &Document) -> Value {
     let active = doc.active_index();
     let mut built = vec![0usize; doc.phases.len()];
@@ -1199,6 +2051,16 @@ fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f
         }
         for s in &b.slabs {
             add(&s.id, vec![&s.mesh]);
+        }
+        if let Some(r) = &b.roof {
+            add(&r.id, vec![&r.cover]);
+            add(&format!("{}.gables", r.id), vec![&r.gables]);
+        }
+        for iw in &b.interior {
+            add(&iw.id, vec![&iw.mesh]);
+        }
+        for stair in &b.stairs {
+            add(&stair.id, vec![&stair.mesh]);
         }
     }
     Ok(out)

@@ -110,6 +110,15 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             let m = if s.kind == trigon_model::SlabKind::Roof { Material::Roof } else { Material::Slab };
             add(&mut w, &s.id, &[(m, &s.mesh)]);
         }
+        if let Some(r) = &b.roof {
+            add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables)]);
+        }
+        for iw in &b.interior {
+            add(&mut w, &iw.id, &[(Material::Slab, &iw.mesh)]);
+        }
+        for st in &b.stairs {
+            add(&mut w, &st.id, &[(Material::Sill, &st.mesh)]);
+        }
     }
     for (name, mesh) in references {
         add(&mut w, name, &[(Material::Reference, mesh)]);

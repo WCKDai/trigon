@@ -58,6 +58,39 @@ impl Gray {
         Some(v.round().clamp(0.0, 255.0) as u8)
     }
 
+    /// The paper's brightness around each point: the `pct` percentile of blocks of `block` pixels,
+    /// as a small image whose pixel (i, j) covers the block starting at (i·block, j·block).
+    pub fn background(&self, block: u32, pct: f64) -> Gray {
+        let block = block.max(4);
+        let (bw, bh) = (self.width.div_ceil(block), self.height.div_ceil(block));
+        let mut data = Vec::with_capacity((bw * bh) as usize);
+        let mut hist = [0u32; 256];
+        for j in 0..bh {
+            for i in 0..bw {
+                hist.iter_mut().for_each(|h| *h = 0);
+                let mut n = 0u32;
+                for y in (j * block..((j + 1) * block).min(self.height)).step_by(2) {
+                    for x in (i * block..((i + 1) * block).min(self.width)).step_by(2) {
+                        hist[self.get(x, y) as usize] += 1;
+                        n += 1;
+                    }
+                }
+                let target = (f64::from(n) * pct.clamp(0.0, 1.0)) as u32;
+                let mut acc = 0;
+                let mut v = 255u8;
+                for (g, c) in hist.iter().enumerate() {
+                    acc += c;
+                    if acc > target {
+                        v = g as u8;
+                        break;
+                    }
+                }
+                data.push(v);
+            }
+        }
+        Gray { width: bw, height: bh, data }
+    }
+
     /// Rotated clockwise by `degrees` (0, 90, 180 or 270).
     pub fn rotated(self, degrees: u32) -> Result<Gray> {
         let (w, h) = (self.width, self.height);
