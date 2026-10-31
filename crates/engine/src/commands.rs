@@ -1152,8 +1152,10 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "plan.sheet",
         summary: "Compose clean landscape presentation plans: joined wall outlines, masonry hatching, balcony dimensions, \
-                  entrance labels and a floor title. No scan underlay. PDF accepts several levels; SVG/PNG one. An optional \
-                  site-coordinate region crops the viewport without changing the model.",
+                  entrance labels and a floor title. No scan underlay. PDF accepts several levels; SVG/PNG/DXF one. An optional \
+                  site-coordinate region crops the viewport without changing the model. DXF (AutoCAD 2000, layers A-WALL-CUT, \
+                  A-GLAZ, A-DOOR, A-BALC, A-ANNO, …) holds the whole storey in model space at 1:1 in mm: site coordinates, \
+                  turned by rotate_deg about the site origin when one is given.",
         mutates: false,
         journaled: false,
         schema: schema::<PlanSheet>,
@@ -1176,7 +1178,9 @@ static COMMANDS: &[CommandSpec] = &[
         summary: "Draw a facade elevation as a presentation sheet: the model seen square-on to one facade (walls, windows, doors, \
                   balconies, roof behind the eaves), each balcony labelled with its size (\"Ca. depth x width\") and each staircase \
                   with its entrance (\"TV 7 TH\", mirrored when seen from behind). Give `facade`, or `along` (two site points) for a \
-                  stepped front. from_mm/to_mm crop along it. .pdf, .png or .svg.",
+                  stepped front. from_mm/to_mm crop along it. A line drawing: hidden lines removed, feature edges only, the \
+                  outline heavier, lighter and thinner further back, light tones. .pdf, .png, .svg or .dxf (model space 1:1 in mm: \
+                  x along the facade from its start, y = height above the terrain).",
         mutates: false,
         journaled: false,
         schema: schema::<ElevationSheet>,
@@ -1194,6 +1198,32 @@ static COMMANDS: &[CommandSpec] = &[
                 view,
                 (p.from_mm, p.to_mm),
                 p.title.as_deref().unwrap_or("Facade"),
+                p.caption.as_deref().unwrap_or_default(),
+                PathBuf::from(p.path),
+            )
+        },
+    },
+    CommandSpec {
+        id: "section.sheet",
+        summary: "Draw a vertical section as a sheet: the model cut along a line `from` → `to` (site mm), looking to the left of \
+                  that direction (`flip` looks to the right; the drawing then runs from `to` on the left). Cut walls, slabs, \
+                  stairs and roofs are filled (masonry hatched, concrete grey) and outlined heavy; what lies up to `depth_mm` \
+                  (default 30000) beyond the cut is drawn with hidden lines removed, lighter further back. Storey levels \
+                  (+0,00 at the ground storey floor) and names at the sides, the ground line outside the building. .pdf, \
+                  .png, .svg or .dxf (model space 1:1 in mm: x along the line from its left end, y = height above the terrain).",
+        mutates: false,
+        journaled: false,
+        schema: schema::<SectionSheet>,
+        run: |s, v| {
+            let p: SectionSheet = parse("section.sheet", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::section::sheet(
+                &s.doc,
+                [p.from, p.to],
+                p.flip.unwrap_or(false),
+                p.depth_mm.unwrap_or(30_000.0),
+                view,
+                p.title.as_deref().unwrap_or("Snit"),
                 p.caption.as_deref().unwrap_or_default(),
                 PathBuf::from(p.path),
             )
@@ -1535,7 +1565,7 @@ struct PlanImage {
 #[serde(deny_unknown_fields)]
 struct PlanSheet {
     levels: Vec<usize>,
-    /// .pdf for multiple vector pages; .svg or .png for one sheet.
+    /// .pdf for multiple vector pages; .svg, .png or .dxf for one sheet.
     path: String,
     /// Site points bounding the desired viewport. The model is never clipped or altered.
     region: Option<Vec<[f64; 2]>>,
@@ -1553,12 +1583,33 @@ struct ElevationSheet {
     facade: Option<String>,
     /// Or a line along a stepped front, from a to b in site mm with the outside on the right: the view is square-on to it.
     along: Option<[[f64; 2]; 2]>,
-    /// .pdf, .png or .svg.
+    /// .pdf, .png, .svg or .dxf.
     path: String,
     /// Start and end along the facade, mm from its start (default: all of it plus 1.5 m either side).
     from_mm: Option<f64>,
     to_mm: Option<f64>,
     /// Title in the box at the top left (default "Facade").
+    title: Option<String>,
+    /// Caption under the drawing.
+    caption: Option<String>,
+    phase: Option<String>,
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SectionSheet {
+    /// Start of the cut line, site mm. The section looks to the left of from → to.
+    from: [f64; 2],
+    /// End of the cut line, site mm.
+    to: [f64; 2],
+    /// Look to the right of from → to instead (the drawing then runs from `to` on the left).
+    flip: Option<bool>,
+    /// How far beyond the cut to draw, mm (default 30000).
+    depth_mm: Option<f64>,
+    /// .pdf, .png, .svg or .dxf.
+    path: String,
+    /// Title in the box at the top left (default "Snit").
     title: Option<String>,
     /// Caption under the drawing.
     caption: Option<String>,

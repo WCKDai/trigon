@@ -24,6 +24,10 @@ png = "0.18"
 resvg = { version = "0.47", default-features = false, features = ["text", "raster-images"] }
 krilla = "0.8.2"
 krilla-svg = "0.8.1"
+# Poche: union and difference of cut regions (MIT OR Apache-2.0; already used by trigon-model).
+i_overlay = "8.1.2"
+# Caps over cut regions for hidden lines (ISC; already used by trigon-model).
+earcutr = { workspace = true }
 
 [dev-dependencies]
 # Parse generated PDFs in export tests (MIT; already used by trigon-drawing).

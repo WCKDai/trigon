@@ -612,6 +612,7 @@ fn elevation_sheets_project_the_model_and_label_balconies() {
     let dir = std::env::temp_dir().join(format!("trigon-elevation-{}", std::process::id()));
     let result = s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.svg"), "title": "Gårdfacade"})).unwrap();
     assert!(result["triangles"].as_u64().unwrap() > 10, "{result}");
+    assert!(result["lines"].as_u64().unwrap() > 10, "{result}");
     assert_eq!(result["balcony_labels"], 1);
     let svg = std::fs::read_to_string(dir.join("e.svg")).unwrap();
     assert!(svg.contains("Ca. 1200 × 3000") && svg.contains("Gårdfacade") && !svg.contains("data:image"));
@@ -634,6 +635,121 @@ fn elevation_sheets_project_the_model_and_label_balconies() {
         assert!(s.execute("elevation.sheet", request).is_err());
     }
     assert!(!dir.join("bad.svg").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A DXF's group-code pairs, checked to be well formed.
+fn dxf_pairs(path: &std::path::Path) -> Vec<(i32, String)> {
+    // Windows-1252: one byte per character, æ is 0xE6.
+    let text: String = std::fs::read(path).unwrap().iter().map(|b| char::from(*b)).collect();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len() % 2, 0);
+    let pairs: Vec<(i32, String)> = lines.chunks(2).map(|p| (p[0].trim().parse::<i32>().unwrap(), p[1].to_string())).collect();
+    let sections: Vec<&str> = pairs.windows(2).filter(|w| w[0] == (0, "SECTION".into())).map(|w| w[1].1.as_str()).collect();
+    assert_eq!(sections, ["HEADER", "CLASSES", "TABLES", "BLOCKS", "ENTITIES", "OBJECTS"]);
+    assert_eq!(pairs.last().unwrap(), &(0, "EOF".to_string()));
+    pairs
+}
+
+fn dxf_count(pairs: &[(i32, String)], kind: &str) -> usize {
+    let start = pairs.iter().position(|p| *p == (2, "ENTITIES".to_string())).unwrap();
+    pairs[start..].iter().take_while(|p| **p != (0, "ENDSEC".to_string())).filter(|p| p.0 == 0 && p.1 == kind).count()
+}
+
+#[test]
+fn sections_cut_the_model_and_mark_the_levels() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 2})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.cantilever", "levels": [1], "bays": [0]})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "window.casement.2", "levels": [2, 3], "bays": [0, 1]})).unwrap();
+    let before = s.doc.clone();
+    let dir = std::env::temp_dir().join(format!("trigon-section-{}", std::process::id()));
+    // Across the 24 × 12 m block from south to north, through the balcony bay, looking west.
+    let x = s.doc.buildings[0].footprint.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min) + 6000.0;
+    let line = |path: &str| json!({"from": [x, -12000.0], "to": [x, 12000.0], "path": dir.join(path), "title": "Snit A–A", "caption": "Gård"});
+    let svg = s.execute("section.sheet", line("s.svg")).unwrap();
+    assert_eq!(svg["looking"], "left of from → to");
+    // Two cut walls, five floor slabs and the roof slab, the balcony slab.
+    assert!(svg["cut_regions"].as_u64().unwrap() >= 8, "{svg}");
+    assert!(svg["levels"].as_u64().unwrap() >= 6, "{svg}");
+    let text = std::fs::read_to_string(dir.join("s.svg")).unwrap();
+    assert!(text.contains("url(#masonry)") && text.contains("+0,00") && text.contains("Snit A–A") && text.contains("Stueetage"));
+    assert!(!text.contains("NaN") && !text.contains("inf"));
+    s.execute("section.sheet", line("s.pdf")).unwrap();
+    assert_eq!(lopdf::Document::load(dir.join("s.pdf")).unwrap().get_pages().len(), 1);
+    let png = s.execute("section.sheet", line("s.png")).unwrap();
+    assert_eq!(png["image_path"], json!(dir.join("s.png")));
+    let dxf = s.execute("section.sheet", line("s.dxf")).unwrap();
+    let pairs = dxf_pairs(&dir.join("s.dxf"));
+    assert!(dxf_count(&pairs, "HATCH") >= 8, "poche: {dxf}");
+    assert!(dxf_count(&pairs, "TEXT") >= 12, "levels and names: {dxf}");
+    for layer in ["A-WALL-CUT", "A-WALL-PATT", "A-LEVL", "A-GRND", "A-ANNO-TTLB"] {
+        assert!(dxf["dxf"]["layers"].as_array().unwrap().iter().any(|l| l == layer), "{layer} used: {dxf}");
+    }
+    // The other way: the same cut, mirrored, with the north end on the left.
+    let mut flipped = line("f.svg");
+    flipped["flip"] = json!(true);
+    flipped["depth_mm"] = json!(500.0);
+    let f = s.execute("section.sheet", flipped).unwrap();
+    assert_eq!(f["looking"], "right of from → to");
+    assert_eq!(f["cut_regions"], svg["cut_regions"]);
+    assert_eq!(s.doc, before);
+    // Walls cut storey by storey: thicker walls lower down cut a larger area.
+    s.execute("building.set_wall_schedule", json!({"thickness": [600.0, 600.0, 480.0, 480.0, 360.0]})).unwrap();
+    let stepped = s.execute("section.sheet", line("t.svg")).unwrap();
+    assert!(stepped["cut_area_m2"].as_f64().unwrap() > svg["cut_area_m2"].as_f64().unwrap(), "{stepped} vs {svg}");
+    s.execute("edit.undo", json!({})).unwrap();
+    for (k, request) in [
+        json!({"from": [0., 0.], "to": [0., 0.], "path": dir.join("bad.svg")}),
+        json!({"from": [0., 0.], "to": [500., 0.], "path": dir.join("bad.svg")}),
+        json!({"from": [0., 0.], "to": [f64::MAX, 0.], "path": dir.join("bad.svg")}),
+        json!({"from": [-1e300, 0.], "to": [0., 0.], "path": dir.join("bad.svg")}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "depth_mm": 0.0, "path": dir.join("bad.svg")}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "depth_mm": -5.0, "path": dir.join("bad.svg")}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "depth_mm": 1e300, "path": dir.join("bad.svg")}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "path": dir.join("bad.txt")}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "path": dir.join("bad.svg"), "title": "x".repeat(300)}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "path": dir.join("bad.svg"), "phase": "nope"}),
+        json!({"from": [0., -9000.], "path": dir.join("bad.svg")}),
+        json!({"from": [0., -9000.], "to": [0., 9000.], "path": dir.join("bad.svg"), "extra": 1}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(matches!(s.execute("section.sheet", request), Err(e) if !matches!(e, EngineError::Internal(_))), "request {k}");
+    }
+    assert!(!dir.join("bad.svg").exists());
+    // A line that misses the building cuts nothing and still draws a sheet.
+    let empty = s.execute("section.sheet", json!({"from": [-90000., 50000.], "to": [90000., 50000.], "path": dir.join("e.svg")})).unwrap();
+    assert_eq!(empty["cut_regions"], 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn plans_and_elevations_write_dxf() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 2})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.cantilever", "levels": [1], "bays": [0]})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "window.casement.2", "levels": [1], "bays": [1]})).unwrap();
+    let dir = std::env::temp_dir().join(format!("trigon-dxf-{}", std::process::id()));
+    let plan = s.execute("plan.sheet", json!({"levels": [1], "path": dir.join("p.dxf"), "caption": "Kælder & gård"})).unwrap();
+    let pairs = dxf_pairs(&dir.join("p.dxf"));
+    assert!(dxf_count(&pairs, "HATCH") >= 1 && dxf_count(&pairs, "LWPOLYLINE") >= 1, "{plan}");
+    let value = |pairs: &[(i32, String)], var: &str| pairs.iter().position(|(c, v)| *c == 9 && v == var).map(|i| pairs[i + 1].1.clone());
+    assert_eq!(value(&pairs, "$INSUNITS").as_deref(), Some("4"));
+    assert!(pairs.iter().any(|(c, v)| *c == 1 && v.contains("Kælder & gård")), "caption in the title block, in Windows-1252");
+    // Unturned, the plan is in site coordinates: the footprint's corners are polyline vertices.
+    let corner = s.doc.buildings[0].footprint[0];
+    let xs: Vec<f64> = pairs.iter().filter(|(c, _)| *c == 10).filter_map(|(_, v)| v.parse().ok()).collect();
+    assert!(xs.iter().any(|x| (x - corner[0]).abs() < 0.01), "site coordinates");
+    assert!(s.execute("plan.sheet", json!({"levels": [1, 2], "path": dir.join("two.dxf")})).is_err(), "one level per DXF");
+    let elevation = s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.dxf"), "title": "Gårdfacade"})).unwrap();
+    let pairs = dxf_pairs(&dir.join("e.dxf"));
+    assert!(dxf_count(&pairs, "LINE") > 20, "{elevation}");
+    assert!(pairs.iter().any(|(c, v)| *c == 1 && v == "Ca. 1200 × 3000"), "the balcony's size as TEXT");
+    assert!(pairs.iter().any(|(c, v)| *c == 8 && v == "A-GRND"));
     let _ = std::fs::remove_dir_all(dir);
 }
 
