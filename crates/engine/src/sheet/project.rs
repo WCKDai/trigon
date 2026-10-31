@@ -43,6 +43,8 @@ pub(crate) enum Class {
     Railing,
     Stair,
     Partition,
+    /// The rendered or concrete base along the foot of the facade.
+    Plinth,
 }
 
 #[derive(Clone)]

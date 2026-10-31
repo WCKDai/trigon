@@ -44,8 +44,8 @@ impl Poche {
             Material::Deck => Poche::Timber,
             Material::Frame | Material::Door | Material::Sill => Poche::Frame,
             Material::Roof => Poche::Roof,
-            Material::Wall if class == Class::Partition => Poche::Partition,
-            Material::Wall => Poche::Masonry,
+            Material::Wall | Material::Plaster if class == Class::Partition => Poche::Partition,
+            Material::Wall | Material::Plaster => Poche::Masonry,
             _ => Poche::Concrete,
         }
     }
@@ -159,7 +159,7 @@ pub(crate) fn sheet(
     for g in groups {
         let mut segs = Vec::new();
         let mut kind = None;
-        for p in parts.iter().filter(|p| p.source.group == g) {
+        for p in parts.iter().filter(|p| p.source.group == g && p.role != style::Role::Seen) {
             cut::segments(p.source.mesh, &|q| look.map(q), &mut segs);
             kind.get_or_insert(Poche::of(p.source.class, p.material));
         }
@@ -177,7 +177,7 @@ pub(crate) fn sheet(
     let all_poche: Vec<Shape> = poche.iter().flat_map(|(_, s)| s.iter().cloned()).collect();
 
     // Beyond the cut.
-    let sources: Vec<_> = parts.iter().map(|p| p.source.clone()).collect();
+    let sources = style::seen(&parts);
     let projection = project(&sources, &look, (0.0, depth), Near::Caps(&all_poche));
 
     // Fit: the cut line across, everything cut or seen up and down, the terrain included.

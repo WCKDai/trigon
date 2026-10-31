@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use trigon_model::build::{Built, ElementClass, Status};
-use trigon_model::mesh::Material;
+use trigon_model::mesh::{Material, Mesh};
 
 use super::project::{Class, Projection, Source};
 use super::{Fill, INK, Layer, Rgb, Scene, Stroke, thinner};
@@ -21,15 +21,32 @@ pub(crate) fn class_of(element: ElementClass, m: Material) -> Class {
     }
 }
 
+/// Which drawings a mesh takes part in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// Seen and cut.
+    Both,
+    /// Only seen (the whole facade wall as one surface).
+    Seen,
+    /// Only cut (the facade wall's closed piece on each storey).
+    Cut,
+}
+
 /// A mesh to draw with the material it is made of (sections hatch by material).
 pub(crate) struct Part<'a> {
     pub(crate) source: Source<'a>,
     pub(crate) material: Material,
+    pub(crate) role: Role,
 }
 
-/// The meshes of the buildings as a view shows them. Walls (and gables) of a building form one
-/// group, so joints between facades in line don't show. `inside` adds slabs, interior walls and
-/// stairs (for sections).
+fn part(mesh: &Mesh, class: Class, group: usize, material: Material, role: Role) -> Part<'_> {
+    Part { source: Source { mesh, class, group }, material, role }
+}
+
+/// The meshes of the buildings as a view shows them. A facade wall is seen as one surface and
+/// cut storey by storey (each piece is closed); walls and gables of a building form one group, so
+/// joints between facades in line don't show. `inside` adds slabs, interior walls with their doors
+/// and stairs (for sections).
 pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
     let mut out = Vec::new();
     let mut group = 0;
@@ -40,39 +57,56 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
     for b in built {
         let walls = next();
         for w in &b.walls {
-            out.push(Part { source: Source { mesh: &w.mesh, class: Class::Wall, group: walls }, material: Material::Wall });
+            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, Role::Seen));
+            for seg in &w.segments {
+                out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut));
+            }
+            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both));
             for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
                 if e.status == Status::Demolished {
                     continue;
                 }
                 for (m, mesh) in &e.parts {
-                    out.push(Part { source: Source { mesh, class: class_of(e.class, *m), group: next() }, material: *m });
+                    out.push(part(mesh, class_of(e.class, *m), next(), *m, Role::Both));
                 }
             }
         }
         if let Some(r) = &b.roof {
-            out.push(Part { source: Source { mesh: &r.cover, class: Class::Roof, group: next() }, material: Material::Roof });
-            out.push(Part { source: Source { mesh: &r.gables, class: Class::Wall, group: walls }, material: Material::Wall });
+            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both));
+            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both));
+            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both));
         }
         if inside {
             for s in &b.slabs {
-                out.push(Part { source: Source { mesh: &s.mesh, class: Class::Slab, group: next() }, material: Material::Slab });
+                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both));
             }
             for iw in &b.interior {
                 let class = if iw.load_bearing { Class::Wall } else { Class::Partition };
-                out.push(Part { source: Source { mesh: &iw.mesh, class, group: next() }, material: Material::Wall });
+                out.push(part(&iw.mesh, class, next(), Material::Plaster, Role::Both));
+                for d in iw.doors.iter().filter(|d| d.status != Status::Demolished) {
+                    for (m, mesh) in &d.fill.parts {
+                        out.push(part(mesh, class_of(d.fill.class, *m), next(), *m, Role::Both));
+                    }
+                }
             }
             for st in &b.stairs {
-                out.push(Part { source: Source { mesh: &st.mesh, class: Class::Stair, group: next() }, material: Material::Slab });
+                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both));
+                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both));
             }
         }
     }
+    out.retain(|p| !p.source.mesh.is_empty());
     out
+}
+
+/// The sources to project (everything seen).
+pub(crate) fn seen<'a>(parts: &[Part<'a>]) -> Vec<Source<'a>> {
+    parts.iter().filter(|p| p.role != Role::Cut).map(|p| p.source.clone()).collect()
 }
 
 pub(crate) fn layer(class: Class) -> Layer {
     match class {
-        Class::Wall | Class::Partition => Layer::Wall,
+        Class::Wall | Class::Partition | Class::Plinth => Layer::Wall,
         Class::Roof => Layer::Roof,
         Class::Slab => Layer::Floor,
         Class::Frame | Class::Glass => Layer::Glazing,
@@ -85,7 +119,7 @@ pub(crate) fn layer(class: Class) -> Layer {
 /// The pen for a visible edge near the front, paper mm.
 fn pen(class: Class) -> f64 {
     match class {
-        Class::Wall | Class::Roof => 0.35,
+        Class::Wall | Class::Roof | Class::Plinth => 0.35,
         Class::Slab | Class::Stair | Class::Partition | Class::Frame | Class::Door | Class::Balcony => 0.25,
         Class::Glass => 0.18,
         Class::Railing => 0.13,
@@ -97,6 +131,7 @@ fn tone(class: Class) -> Option<Rgb> {
     match class {
         Class::Wall => Some([0xf4, 0xef, 0xea]),
         Class::Roof => Some([0xdf, 0xdf, 0xdf]),
+        Class::Plinth => Some([0xe4, 0xe2, 0xde]),
         Class::Slab | Class::Stair | Class::Balcony => Some([0xee, 0xee, 0xee]),
         Class::Partition => Some([0xf4, 0xf4, 0xf4]),
         Class::Frame => Some([0xff, 0xff, 0xff]),

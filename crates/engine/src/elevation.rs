@@ -78,7 +78,7 @@ pub(crate) fn sheet(
     // Looking at the facade from outside: x along it, depth into the building.
     let look = Look { origin: fr.origin, t: fr.t, d: [-fr.n[0], -fr.n[1]] };
     let parts = style::parts(&built, false);
-    let sources: Vec<_> = parts.iter().map(|p| p.source.clone()).collect();
+    let sources = style::seen(&parts);
     let projection = project(&sources, &look, (-NEAR, FAR), Near::Cut);
     let top = projection.edges.iter().flat_map(|e| [e.a, e.b]).filter(|p| (from..=to).contains(&p[0])).map(|p| p[1]).fold(1000.0_f64, f64::max);
     let fit = ((to - from) / WIDTH).max(top / HEIGHT) / MM_PER_PX;

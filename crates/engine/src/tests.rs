@@ -695,6 +695,11 @@ fn sections_cut_the_model_and_mark_the_levels() {
     assert_eq!(f["looking"], "right of from → to");
     assert_eq!(f["cut_regions"], svg["cut_regions"]);
     assert_eq!(s.doc, before);
+    // Walls cut storey by storey: thicker walls lower down cut a larger area.
+    s.execute("building.set_wall_schedule", json!({"thickness": [600.0, 600.0, 480.0, 480.0, 360.0]})).unwrap();
+    let stepped = s.execute("section.sheet", line("t.svg")).unwrap();
+    assert!(stepped["cut_area_m2"].as_f64().unwrap() > svg["cut_area_m2"].as_f64().unwrap(), "{stepped} vs {svg}");
+    s.execute("edit.undo", json!({})).unwrap();
     for (k, request) in [
         json!({"from": [0., 0.], "to": [0., 0.], "path": dir.join("bad.svg")}),
         json!({"from": [0., 0.], "to": [500., 0.], "path": dir.join("bad.svg")}),
