@@ -588,7 +588,7 @@ pub(crate) fn trace_walls(
             !flights.iter().any(|f| inside_poly(&shrink(&f.outline, 120.0), m))
         })
         .collect();
-    let inner = b.inner_line(level);
+    let inner = b.storey_inner(level);
     Ok((snap_ends(clean_walls(walls, &grids), &inner), flights))
 }
 

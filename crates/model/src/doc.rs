@@ -325,6 +325,10 @@ pub struct Building {
     /// A plinth (sokkel) along the foot of every facade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plinth: Option<Plinth>,
+    /// Below the ground storey, the walls run straight along the inner corners of facade steps
+    /// up to this deep (bays and stepped fronts that start at the ground floor), mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basement_straighten_mm: Option<f64>,
 }
 
 /// A rendered or concrete plinth (sokkel) at the foot of the facades.
@@ -542,6 +546,7 @@ impl Building {
             entrances: Vec::new(),
             ground_level: 0,
             plinth: None,
+            basement_straighten_mm: None,
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())
@@ -626,6 +631,34 @@ impl Building {
     /// at its own thickness.
     pub fn inner_line(&self, level: usize) -> Vec<[f64; 2]> {
         crate::build::inner_ring_by(&self.footprint, |e| self.edge_thickness(e, level))
+    }
+
+    /// The wall line on a storey and, for each of its edges, the footprint edge it starts at: the
+    /// footprint, or below the ground storey with `basement_straighten_mm` the footprint with
+    /// outward steps up to that deep cut off.
+    pub fn storey_ring(&self, level: usize) -> (Vec<[f64; 2]>, Vec<usize>) {
+        let n = self.footprint.len();
+        // Only steps in street fronts: gables and the corners of wings keep their basement walls.
+        let street = |edge: usize| self.facades.iter().any(|f| f.edge == edge && f.kind == FacadeKind::Street);
+        let kept = match self.basement_straighten_mm {
+            Some(d) if level < self.ground_level && n > 0 => footprint::inner_outline(&self.footprint, d, |k| street(k) || street((k + n - 1) % n)),
+            _ => (0..n).collect(),
+        };
+        (kept.iter().filter_map(|&i| self.footprint.get(i).copied()).collect(), kept)
+    }
+
+    /// The inner face of the walls on a storey, one vertex per corner of `storey_ring(level)`.
+    pub fn storey_inner(&self, level: usize) -> Vec<[f64; 2]> {
+        let (ring, kept) = self.storey_ring(level);
+        crate::build::inner_ring_by(&ring, |i| kept.get(i).map_or(self.wall_thickness, |&e| self.edge_thickness(e, level)))
+    }
+
+    /// Whether footprint edge `edge` has its own wall on a storey (not where a straight basement
+    /// wall cuts a step off).
+    pub fn edge_on_storey(&self, edge: usize, level: usize) -> bool {
+        let n = self.footprint.len();
+        let (_, kept) = self.storey_ring(level);
+        kept.iter().enumerate().any(|(i, &k)| k == edge && kept.get((i + 1) % kept.len()) == Some(&((edge + 1) % n)))
     }
 
     /// Gives facades their own thickness per storey (one value per storey), or with an empty

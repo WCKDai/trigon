@@ -458,6 +458,9 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
             )));
         }
         let opening = ty_eff.kind.is_opening();
+        if opening && !b.edge_on_storey(f.edge, p.level) {
+            return Err(ModelError::Invalid(format!("{slot}: the facade has no wall on this storey (the basement wall runs straight past it)")));
+        }
         let (in0, in1) = inner_lines.get(p.level).copied().unwrap_or((0.0, frame.length));
         let lo = in0.max(0.0) + END_MARGIN;
         let hi = in1.min(frame.length) - END_MARGIN;
@@ -528,9 +531,15 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
     let zb = b.bottom();
     // Each storey's inner wall line: the facade is thicker lower down and steps at every floor.
     let inners: Vec<Vec<[f64; 2]>> = (0..levels).map(|l| b.inner_line(l)).collect();
+    // Each storey's own wall line (straight below ground where steps are cut off) and inner face.
+    let rings: Vec<(Vec<[f64; 2]>, Vec<usize>)> = (0..levels).map(|l| b.storey_ring(l)).collect();
+    let storey_inners: Vec<Vec<[f64; 2]>> = (0..levels).map(|l| b.storey_inner(l)).collect();
     for (l, inner) in inners.iter().enumerate() {
-        check_inner_ring(&b.footprint, inner)
-            .map_err(|e| ModelError::Invalid(format!("{}: {e}", b.storeys.get(l).map_or("storey", |s| s.name.as_str()))))?;
+        let name = b.storeys.get(l).map_or("storey", |s| s.name.as_str());
+        check_inner_ring(&b.footprint, inner).map_err(|e| ModelError::Invalid(format!("{name}: {e}")))?;
+        if let (Some((ring, _)), Some(own)) = (rings.get(l), storey_inners.get(l)) {
+            check_inner_ring(ring, own).map_err(|e| ModelError::Invalid(format!("{name}: {e}")))?;
+        }
     }
     // A storey's wall runs from the underside of its floor to the underside of the next one.
     let heights: Vec<(f64, f64)> = (0..levels)
@@ -558,10 +567,17 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             let (Some(&qs), Some(&qe), Some(&(z0, z1))) = (inner.get(f.edge), inner.get((f.edge + 1) % n), heights.get(l)) else {
                 return Err(ModelError::Invalid(format!("facade {} has no inner line", f.id)));
             };
-            if above(z0) {
+            if above(z0) || !b.edge_on_storey(f.edge, l) {
                 continue;
             }
             spans.push(Span { level: l, thickness: b.edge_thickness(f.edge, l), z0, z1: top_at(z1), in0: along(qs), in1: along(qe), qs, qe });
+        }
+        // A step cut off below ground stands on its own foundation: run it down into the ground.
+        if let Some(first) = spans.first_mut()
+            && first.level > 0
+            && !b.edge_on_storey(f.edge, first.level - 1)
+        {
+            first.z0 = first.z0.min(-PLINTH_FOOT);
         }
         if spans.is_empty() {
             continue;
@@ -613,12 +629,52 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, height: h, bottom: zb, mesh, segments, plinth, openings, attachments });
     }
 
+    // Straight basement walls past cut-off steps: one wall per such run, on those storeys only.
+    for (l, (ring, kept)) in rings.iter().enumerate() {
+        let m = ring.len();
+        if m == n || above(heights.get(l).map_or(0.0, |z| z.0)) {
+            continue;
+        }
+        let Some(own) = storey_inners.get(l) else { continue };
+        for i in 0..m {
+            let (Some(&k0), Some(&k1)) = (kept.get(i), kept.get((i + 1) % m)) else { continue };
+            if (k0 + 1) % n == k1 {
+                continue;
+            }
+            let (Some(&a), Some(&e), Some(&qs), Some(&qe), Some(&(z0, z1))) =
+                (ring.get(i), ring.get((i + 1) % m), own.get(i), own.get((i + 1) % m), heights.get(l))
+            else {
+                continue;
+            };
+            let Some(fr) = FacadeFrame::new(a, e) else { continue };
+            let along = |q: [f64; 2]| (q[0] - a[0]) * fr.t[0] + (q[1] - a[1]) * fr.t[1];
+            let span = Span { level: l, thickness: b.edge_thickness(k0, l), z0, z1: top_at(z1), in0: along(qs), in1: along(qe), qs, qe };
+            let id = format!("{}.basement{k0}", b.id);
+            let unbuildable = || ModelError::Invalid(format!("{id}: the wall faces could not be triangulated"));
+            let mesh = crate::walls::skin(&fr, &[span], &[]).ok_or_else(unbuildable)?;
+            let segment = crate::walls::segment(&fr, &format!("{id}.L{l}"), &span, &[]).ok_or_else(unbuildable)?;
+            let kind = b.facades.iter().find(|f| f.edge == k0).map_or(FacadeKind::Unknown, |f| f.kind);
+            walls.push(BuiltWall {
+                id,
+                frame: fr,
+                kind,
+                height: span.z1,
+                bottom: z0,
+                mesh,
+                segments: vec![segment],
+                plinth: Mesh::default(),
+                openings: Vec::new(),
+                attachments: Vec::new(),
+            });
+        }
+    }
+
     // Floors span to the inner face of the storey's own wall and rest on the step of the thicker wall below.
     let mut slabs = Vec::with_capacity(levels + 1);
     let openings =
         |level: usize| -> Result<Vec<Vec<[f64; 2]>>> { b.stairs.iter().filter(|st| st.levels.contains(&level)).map(crate::stair::opening).collect() };
     for (i, s) in b.storeys.iter().enumerate() {
-        let inner = inners.get(i).cloned().unwrap_or_default();
+        let inner = storey_inners.get(i).cloned().unwrap_or_default();
         let z0 = s.elevation - FLOOR_SLAB;
         if above(z0) {
             continue;
@@ -702,7 +758,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         }
         let wall_height = top_at(s.elevation + s.height - FLOOR_SLAB) - s.elevation;
         let axes: Vec<Axis> = on.iter().map(|(_, w)| Axis { a: w.a, b: w.b, thickness: w.thickness }).collect();
-        let joined = crate::joins::join(&axes, inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
+        let joined = crate::joins::join(&axes, storey_inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
         for ((k, iw), j) in on.iter().zip(joined) {
             if !(crate::footprint::signed_area2(&j.outline).abs() > 1.0) {
                 continue;
@@ -1276,6 +1332,50 @@ mod tests {
         // A thin wall keeps the chamfer.
         let thin = super::inner_ring(&ring, 100.0);
         assert!((thin[2][0] - thin[3][0]).abs() > 100.0);
+    }
+
+    #[test]
+    fn a_basement_wall_runs_straight_past_street_bays() {
+        // A 30 × 12 m wing whose street side (y = 12000) has two 800 mm bays.
+        let fp = [
+            [0.0, 0.0],
+            [30000.0, 0.0],
+            [30000.0, 12000.0],
+            [24000.0, 12000.0],
+            [24000.0, 12800.0],
+            [18000.0, 12800.0],
+            [18000.0, 12000.0],
+            [12000.0, 12000.0],
+            [12000.0, 12800.0],
+            [6000.0, 12800.0],
+            [6000.0, 12000.0],
+            [0.0, 12000.0],
+        ];
+        let mut doc = Document::default();
+        let mut b = Building::new("b1", "Test", &fp, 3, 3000.0).unwrap();
+        b.add_basement(-2500.0, "Kælder").unwrap();
+        for f in &mut b.facades {
+            let (p, q) = (fp[f.edge], fp[(f.edge + 1) % fp.len()]);
+            if p[1] > 11000.0 && q[1] > 11000.0 {
+                f.kind = FacadeKind::Street;
+            }
+        }
+        b.basement_straighten_mm = Some(1000.0);
+        doc.buildings.push(b);
+        let b = &doc.buildings[0];
+        let (ring, _) = b.storey_ring(0);
+        assert_eq!(ring.len(), 4, "the basement is a plain rectangle: {ring:?}");
+        assert_eq!(b.storey_ring(1).0.len(), fp.len(), "the ground storey keeps its bays");
+        let built = build(&doc).unwrap();
+        // One straight basement wall along the street; the bay walls start below the terrain on the ground storey.
+        let basement: Vec<&BuiltWall> = built[0].walls.iter().filter(|w| w.id.starts_with("b1.basement")).collect();
+        assert_eq!(basement.len(), 1);
+        assert_eq!(basement[0].segments.len(), 1);
+        let bay = built[0].walls.iter().find(|w| w.frame.origin == [24000.0, 12000.0]).unwrap();
+        assert_eq!(bay.segments.first().map(|s| (s.level, s.z0)), Some((1, -PLINTH_FOOT)));
+        // The basement floor stops at the straight wall.
+        assert!(built[0].slabs[0].polygon.iter().all(|p| p[1] <= 12000.0));
+        assert!(built[0].slabs[1].polygon.iter().any(|p| p[1] > 12000.0));
     }
 
     fn doc_with_block() -> Document {

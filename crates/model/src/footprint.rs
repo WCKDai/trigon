@@ -77,6 +77,42 @@ pub fn clean(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>> {
     Ok(ring)
 }
 
+/// The ring with outward steps up to `tolerance` deep cut off: convex corners standing at most
+/// `tolerance` outside the line between their neighbours are dropped, so a wall runs straight
+/// along the inner corners of a stepped facade (a basement under bays). Only convex corners go,
+/// so the result never leaves the ring. `may_drop(k)` says whether corner `k` may go at all.
+/// Returns the kept corner indices.
+pub fn inner_outline(ring: &[[f64; 2]], tolerance: f64, may_drop: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut keep: Vec<usize> = (0..ring.len()).collect();
+    if !(tolerance > 0.0) {
+        return keep;
+    }
+    loop {
+        let n = keep.len();
+        if n <= 4 {
+            break;
+        }
+        let mut best: Option<(usize, f64)> = None;
+        for k in 0..n {
+            let (p, c, q) = (ring[keep[(k + n - 1) % n]], ring[keep[k]], ring[keep[(k + 1) % n]]);
+            let cross = (c[0] - p[0]) * (q[1] - p[1]) - (c[1] - p[1]) * (q[0] - p[0]);
+            let len = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt().max(1e-9);
+            // How far c stands outside the chord p–q (a convex corner of a CCW ring).
+            let out = cross / len;
+            if out >= 0.0 && out <= tolerance && may_drop(keep[k]) && best.is_none_or(|(_, d)| out < d) {
+                best = Some((k, out));
+            }
+        }
+        match best {
+            Some((k, _)) => {
+                keep.remove(k);
+            }
+            None => break,
+        }
+    }
+    keep
+}
+
 /// Union wall-cut polygons into continuous bands, preserving enclosed holes.
 /// Inputs are solid contours, irrespective of winding; this does not simplify or move walls.
 pub fn union(polygons: &[Vec<[f64; 2]>]) -> Result<Vec<Vec<Vec<[f64; 2]>>>> {
@@ -110,6 +146,26 @@ pub fn union(polygons: &[Vec<[f64; 2]>]) -> Result<Vec<Vec<Vec<[f64; 2]>>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stepped_front_gets_a_straight_line_along_its_inner_corners() {
+        // A 30 × 12 m wing whose street side (y = 12000) steps out by 800 mm on every other 6 m bay.
+        let mut ring = vec![[0.0, 0.0], [30000.0, 0.0]];
+        for k in 0..5 {
+            let (x1, x0) = (30000.0 - k as f64 * 6000.0, 24000.0 - k as f64 * 6000.0);
+            let y = if k % 2 == 0 { 12000.0 } else { 12800.0 };
+            ring.push([x1, y]);
+            ring.push([x0, y]);
+        }
+        let ring = clean(&ring).unwrap();
+        let kept = inner_outline(&ring, 1000.0, |_| true);
+        let line: Vec<[f64; 2]> = kept.iter().map(|&i| ring[i]).collect();
+        assert_eq!(line.len(), 4, "{line:?}");
+        assert!(line.iter().all(|p| p[1] <= 12000.0 + 1e-6), "the bays are cut off: {line:?}");
+        assert_eq!(inner_outline(&ring, 0.0, |_| true).len(), ring.len());
+        assert_eq!(inner_outline(&ring, 500.0, |_| true).len(), ring.len(), "steps deeper than the tolerance stay");
+        assert_eq!(inner_outline(&ring, 1000.0, |_| false).len(), ring.len(), "corners that may not go stay");
+    }
 
     #[test]
     fn closes_orients_and_removes_wiggles() {

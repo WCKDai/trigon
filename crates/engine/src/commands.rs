@@ -263,6 +263,28 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.set_basement_line",
+        summary: "Below the ground storey, run the walls straight along the inner corners of facade steps up to \
+                  `straighten_mm` deep (bays and stepped fronts that begin at the ground floor stand on a straight basement \
+                  wall in most Copenhagen blocks; check the basement plan). The steps above run down into the ground on \
+                  their own foundation. `straighten_mm: 0` makes the basement follow the footprint again.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetBasementLine>,
+        run: |s, v| {
+            let p: SetBasementLine = parse("building.set_basement_line", v)?;
+            let d = trigon_model::checked("straighten_mm", p.straighten_mm, 0.0, 5000.0)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.basement_straighten_mm = (d > 0.0).then_some(d);
+            check_building(&s.doc, p.building.as_deref())?;
+            trigon_model::build(&s.doc)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let cut: Vec<String> =
+                b.facades.iter().filter(|f| (0..b.ground_level).any(|l| !b.edge_on_storey(f.edge, l))).map(|f| f.id.clone()).collect();
+            Ok(json!({"straighten_mm": b.basement_straighten_mm, "facades_without_basement_wall": cut}))
+        },
+    },
+    CommandSpec {
         id: "building.set_plinth",
         summary: "Give the facades a plinth (sokkel): rendered or concrete, from below the terrain up to `height_mm` above it, \
                   standing `projection_mm` proud of the brickwork (default 20). Openings in the plinth band (basement windows) \
@@ -1584,6 +1606,14 @@ struct ExportGltf {
     cut_level: Option<usize>,
     /// Height of the cut above that storey's floor, mm (default 1200).
     cut_mm: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetBasementLine {
+    building: Option<String>,
+    /// Deepest facade step the basement wall runs straight past, mm (0: follow the footprint).
+    straighten_mm: f64,
 }
 
 #[derive(Deserialize, JsonSchema)]

@@ -83,6 +83,18 @@ fn frame(a: [f64; 2], b: [f64; 2]) -> Option<([f64; 2], [f64; 2], f64)> {
     Some((t, [-t[1], t[0]], len))
 }
 
+/// Whether `p` lies inside the closed polygon `ring` (even–odd rule).
+fn inside(ring: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let mut yes = false;
+    for i in 0..ring.len() {
+        let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+            yes = !yes;
+        }
+    }
+    yes
+}
+
 /// Where the line `p + s·t` crosses the line through `q` along `d`, as `s`; `None` if parallel.
 fn hit(p: [f64; 2], t: [f64; 2], q: [f64; 2], d: [f64; 2]) -> Option<f64> {
     let den = cross(t, d);
@@ -122,8 +134,11 @@ pub fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Joined> {
                         best = Some(c);
                     }
                 };
-                // The facade's inner face.
+                // The facade's inner face. An end outside it (drawn out to where the facade used to
+                // be) comes back to the face however far out it is.
                 let m = facade.len();
+                let end_point = along(w.a, t, s_end);
+                let reach_in = if m >= 3 && !inside(facade, end_point) { len } else { band + SLACK };
                 for k in 0..m {
                     let (p, q) = (facade[k], facade[(k + 1) % m]);
                     let Some((d, _, flen)) = frame(p, q) else { continue };
@@ -138,7 +153,7 @@ pub fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Joined> {
                         continue;
                     }
                     let gap = (sc - s_end) * out;
-                    if gap > REACH || gap < -(band + SLACK) {
+                    if gap > REACH || gap < -reach_in {
                         continue;
                     }
                     offer(Candidate { point: p, dir: d, rank: gap.abs(), join: Join { target: Target::Facade(k), kind: JoinKind::Butt } });
@@ -297,6 +312,14 @@ mod tests {
             assert!((p[0] + p[1] - 10000.0).abs() < 1e-6, "{p:?}");
         }
         assert!(close(j.b, [2000.0, 8000.0]));
+    }
+
+    #[test]
+    fn an_end_drawn_out_past_the_facade_comes_back_to_its_face() {
+        // Drawn 900 mm past the inner face (out to where a bay used to be): more than the band.
+        let w = Axis { a: [5000.0, 4000.0], b: [5000.0, 8900.0], thickness: 120.0 };
+        let j = &join(&[w], &facade(), 600.0)[0];
+        assert!(close(j.b, [5000.0, 8000.0]), "{:?}", j.b);
     }
 
     #[test]
