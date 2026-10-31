@@ -151,6 +151,25 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.set_levels",
+        summary: "Set the storeys from explicit floor levels (mm above the site's terrain, rising) and the top of the last storey \
+                  (eaves or attic floor), for storeys of different heights read from a section drawing. `source` records where \
+                  the levels came from as evidence. Placements above the new top storey are removed.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetLevels>,
+        run: |s, v| {
+            let p: SetLevels = parse("building.set_levels", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.set_levels(&p.floors, p.top)?;
+            if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
+                b.evidence.push(trigon_model::Evidence { source: src, supplies: "levels".into(), attribution: p.attribution.unwrap_or_default() });
+            }
+            check_building(&s.doc, p.building.as_deref())?;
+            Ok(info(&s.doc))
+        },
+    },
+    CommandSpec {
         id: "building.set_wall_thickness",
         summary: "Set the outer wall thickness (mm).",
         mutates: true,
@@ -448,6 +467,19 @@ struct SetStoreys {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SetLevels {
+    building: Option<String>,
+    /// Floor level of each storey, mm above the terrain, rising (ground floor first).
+    floors: Vec<f64>,
+    /// Top of the last storey (eaves or attic floor), mm above the terrain.
+    top: f64,
+    /// Where the levels come from, for example a drawing's archive number.
+    source: Option<String>,
+    attribution: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetWallThickness {
     building: Option<String>,
     thickness: f64,
@@ -578,6 +610,7 @@ fn info(doc: &Document) -> Value {
             "name": b.name,
             "storeys": b.storeys.len(),
             "storey_height_mm": b.storeys.first().map(|s| s.height),
+            "levels_mm": b.storeys.iter().map(|s| json!({"name": s.name, "floor": s.elevation, "height": s.height})).collect::<Vec<_>>(),
             "ground_floor_mm": b.ground_floor,
             "height_mm": b.height(),
             "wall_thickness_mm": b.wall_thickness,

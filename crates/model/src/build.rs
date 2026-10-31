@@ -576,6 +576,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_levels_from_a_section() {
+        let mut doc = doc_with_block();
+        let b = &mut doc.buildings[0];
+        // Frederikssundsvej 28, section S505/39: a 3.61 m ground floor, then 3.00 m storeys.
+        b.set_levels(&[350.0, 3960.0, 6960.0, 9960.0, 12960.0], 15960.0).unwrap();
+        assert_eq!(b.height(), 15960.0);
+        assert_eq!(b.storeys[0].height, 3610.0);
+        assert_eq!(b.ground_floor, 350.0);
+        assert!(b.set_levels(&[0.0, 1000.0], 4000.0).is_err(), "a 1 m storey is refused");
+        assert!(b.set_levels(&[3000.0, 1000.0], 5000.0).is_err(), "levels must rise");
+        assert!(b.set_levels(&[f64::NAN], 3000.0).is_err());
+        build(&doc).unwrap();
+    }
+
+    #[test]
     fn party_walls_refuse_openings() {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].kind = FacadeKind::Party;

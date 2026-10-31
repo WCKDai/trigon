@@ -196,9 +196,35 @@ impl Building {
         Ok(())
     }
 
+    /// Storeys from explicit floor levels (mm above the terrain, rising), the top one ending at
+    /// `top` (the eaves or attic floor). For buildings whose storeys differ in height, as read
+    /// from a section drawing.
+    pub fn set_levels(&mut self, floors: &[f64], top: f64) -> Result<()> {
+        if floors.is_empty() || floors.len() > 60 {
+            return Err(ModelError::Invalid(format!("give 1 to 60 floor levels (got {})", floors.len())));
+        }
+        let mut levels: Vec<f64> = floors.to_vec();
+        levels.push(top);
+        for (i, w) in levels.windows(2).enumerate() {
+            let (a, b) = (w[0], w[1]);
+            checked("floor level", a, 0.0, 300_000.0)?;
+            let h = b - a;
+            if !(2000.0..=10000.0).contains(&h) {
+                return Err(ModelError::Invalid(format!("storey {i} would be {h} mm high (from {a} to {b}); allowed 2000 to 10000")));
+            }
+        }
+        let count = floors.len();
+        self.ground_floor = levels[0];
+        self.storeys = levels.windows(2).enumerate().map(|(i, w)| Storey { name: storey_name(i), elevation: w[0], height: w[1] - w[0] }).collect();
+        for f in &mut self.facades {
+            f.placements.retain(|p| p.level < count);
+        }
+        Ok(())
+    }
+
     /// Wall height from the terrain to the eaves, mm.
     pub fn height(&self) -> f64 {
-        self.ground_floor + self.storeys.iter().map(|s| s.height).sum::<f64>()
+        self.storeys.last().map_or(self.ground_floor, |s| s.elevation + s.height)
     }
 
     pub fn facade(&self, id: &str) -> Result<&Facade> {
