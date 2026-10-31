@@ -793,7 +793,13 @@ impl StudioApp {
                 Tab::Families => {
                     ui.weak("Select a component type to edit, create a variant or place instances.");
                 }
-                Tab::Drawings => self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" }),
+                Tab::Drawings => {
+                    if ui.button("Edit elements").on_hover_text("Pick model lines, then move, copy or align the selected element").clicked() {
+                        self.authoring.tab = Tab::Project;
+                        self.drafting.picking = None;
+                    }
+                    self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" });
+                }
             }
             let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone());
             if before != after {
@@ -1059,6 +1065,7 @@ impl StudioApp {
         for (i, id, kind) in elements {
             let response = ui.selectable_label(self.selection == Some(i), &id).on_hover_text(kind);
             if response.clicked() {
+                self.pending_selection = None;
                 self.selection = Some(i);
                 self.selection_dirty = true;
                 self.redraw = true;
@@ -1131,6 +1138,39 @@ impl StudioApp {
         if self.drawing_plan() || self.plan.error.is_some() || !self.plan.ready(rect, self.ppp) {
             return;
         }
+        if !picking
+            && response.clicked()
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            let annotation = (self.mode == Mode::Drawing && self.authoring.tab == Tab::Drawings)
+                .then(|| self.plan.screen_to_model(rect, p))
+                .flatten()
+                .and_then(|point| Drafting::hit(&self.session.doc, &self.drawing, point, self.plan.tolerance_mm().unwrap_or(0.0)))
+                .cloned();
+            self.selection = None;
+            self.pending_selection = None;
+            if let Some(annotation) = annotation {
+                self.drafting.select(&annotation);
+            } else {
+                self.drafting.new_note(&self.session.doc);
+                if let Some(hit) = self.plan.pick_element(rect, p) {
+                    self.authoring.targets.clear();
+                    self.pending_selection = Some(hit.id.clone());
+                    self.selection = self.scene.find(&hit.id);
+                    if self.selection.is_some() {
+                        self.authoring.tab = Tab::Project;
+                    }
+                    self.status = Some((format!("Selected {}", hit.id), false));
+                }
+            }
+            self.selection_dirty = true;
+            self.redraw = true;
+        }
+        if let Some(id) =
+            self.pending_selection.clone().or_else(|| self.selection.and_then(|i| self.scene.elements.get(i).map(|element| element.id.clone())))
+        {
+            self.plan.highlight_element(&ui.painter_at(rect), rect, &id);
+        }
         if self.mode == Mode::Drawing && self.authoring.tab == Tab::Drawings {
             let painter = ui.painter_at(rect);
             if picking || self.drafting.selected.is_some() {
@@ -1171,11 +1211,6 @@ impl StudioApp {
                         if response.clicked() {
                             self.drafting.picked(point);
                         }
-                    } else if response.clicked()
-                        && let Some(raw) = self.plan.screen_to_model(rect, p)
-                        && let Some(a) = Drafting::hit(&self.session.doc, &self.drawing, raw, self.plan.tolerance_mm().unwrap_or(0.0))
-                    {
-                        self.drafting.select(a);
                     }
                     let text =
                         format!("x {:.3}  ·  y {:.3} mm{}", point[0], point[1], snapped.map_or(String::new(), |s| format!("  ·  {}", s.kind.name())));
@@ -1223,6 +1258,7 @@ impl StudioApp {
         {
             let ndc = [(p.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (p.y - rect.top()) / rect.height() * 2.0];
             let (o, dir) = self.camera.ray(ndc, aspect);
+            self.pending_selection = None;
             self.selection = self.scene.pick(o, dir, self.clip_z());
             self.selection_dirty = true;
             self.redraw = true;

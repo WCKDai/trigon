@@ -30,7 +30,10 @@ pub use commands::{CommandSpec, commands};
 pub use plan::sheet_svg_text as plan_sheet_svg;
 pub use plan_output::parse_svg;
 pub use resvg;
-pub use views::{DrawingPreview, DrawingSnap, DrawingTransform, SnapKind, SnapOptions, drawing_view, plan_drawing, snap_drawing};
+pub use views::{
+    DrawingElementHit, DrawingElementKind, DrawingElementSegment, DrawingPreview, DrawingSnap, DrawingTransform, SnapKind, SnapOptions, drawing_view,
+    plan_drawing, snap_drawing,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

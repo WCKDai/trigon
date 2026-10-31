@@ -160,11 +160,16 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
     groups.dedup();
     let mut poche: Vec<(Poche, Vec<Shape>)> = Vec::new();
     let mut open: Vec<(Poche, Vec<[f64; 2]>)> = Vec::new();
+    let mut cut_elements = Vec::new();
     for g in groups {
         let mut segs = Vec::new();
         let mut kind = None;
         for p in parts.iter().filter(|p| p.source.group == g && p.role != style::Role::Seen) {
+            let start = segs.len();
             cut::segments(p.source.mesh, &|q| look.map(q), &mut segs);
+            if let Some(element) = &p.source.element {
+                cut_elements.extend(segs[start..].iter().map(|segment| element.segment(*segment)));
+            }
             kind.get_or_insert(Poche::of(p.source.class, p.material));
         }
         let Some(kind) = kind.filter(|_| !segs.is_empty()) else { continue };
@@ -215,11 +220,13 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
         let (layer, fill, pen) = kind.look();
         for shape in shapes {
             scene.polygon(layer, shape.clone(), fill, Some(Stroke::new(pen)));
+            scene.attribute_last(&cut_elements);
         }
     }
     for (kind, chain) in &open {
         let (layer, _, pen) = kind.look();
         scene.polyline(layer, chain.clone(), Stroke::new(pen));
+        scene.attribute_last(&cut_elements);
     }
     scene.clip([0.0, f64::MIN, length, f64::MAX]);
 

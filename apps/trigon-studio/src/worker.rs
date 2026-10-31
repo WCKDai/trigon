@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
 use trigon_engine::resvg::usvg;
-use trigon_engine::{DrawingPreview, DrawingTransform};
+use trigon_engine::{DrawingElementSegment, DrawingPreview, DrawingTransform};
 use trigon_model::Document;
 use trigon_model::build::View;
 
@@ -24,6 +24,8 @@ pub struct PreparedDrawing {
     pub tree: Arc<usvg::Tree>,
     pub transform: DrawingTransform,
     pub segments: Vec<[[f64; 2]; 2]>,
+    /// Visible model linework, in drawing-plane mm, with the built element id that owns each stroke.
+    pub element_segments: Vec<DrawingElementSegment>,
 }
 
 pub struct Job {
@@ -74,13 +76,13 @@ pub fn run(job: &Job) -> Done {
     let drawing = job.drawing.as_ref().map(|request| {
         let t = Instant::now();
         let tree = guarded("drawing the workspace", || {
-            let DrawingPreview { svg, transform, segments } = match request {
+            let DrawingPreview { svg, transform, segments, element_segments } = match request {
                 DrawingRequest::Plan(level) => trigon_engine::plan_drawing(&job.doc, *level, job.view),
                 DrawingRequest::Saved(id) => trigon_engine::drawing_view(&job.doc, id, job.view),
             }
             .map_err(|e| e.to_string())?;
             let tree = trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())?;
-            Ok(PreparedDrawing { tree, transform, segments })
+            Ok(PreparedDrawing { tree, transform, segments, element_segments })
         });
         plan_ms = ms(t);
         (request.clone(), tree)
@@ -143,7 +145,71 @@ mod tests {
         bad_view.view.phase = usize::MAX;
         assert!(matches!(run(&bad_view).scene, Some(Err(_))));
         let done = run(&job(doc, Some(1)));
-        assert!(matches!(done.drawing, Some((DrawingRequest::Plan(1), Ok(_)))), "a real plan sheet parses");
+        let Some((DrawingRequest::Plan(1), Ok(drawing))) = done.drawing else {
+            panic!("a real plan sheet parses");
+        };
+        assert!(drawing.element_segments.iter().any(|line| line.id.starts_with("b1.f")), "plan strokes keep facade wall ids");
+        assert!(drawing.element_segments.iter().all(|line| !line.id.ends_with(".opening")));
         assert!(matches!(done.scene, Some(Ok(ref s)) if !s.elements.is_empty()));
+    }
+
+    #[test]
+    fn drawing_picks_resolve_in_the_scene_and_drive_the_shared_undoable_edit() {
+        use serde_json::json;
+        use trigon_engine::{DrawingElementKind, Session};
+        let mut session = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        session.doc.buildings.push(
+            trigon_model::Building::new("b", "Studio picking", &[[0.0, 0.0], [12000.0, 0.0], [12000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap(),
+        );
+        for (command, params) in [
+            ("facade.set_bays", json!({"facade":"b.f1","count":3})),
+            ("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[0,1],"bays":[0]})),
+            ("interior.add_walls", json!({"walls":[{"id":"partition","a":[2000,4000],"b":[10000,4000],"thickness":150,"levels":[0,1]}]})),
+            ("view.define", json!({"id":"plan","name":"Plan","kind":{"view":"plan","level":0}})),
+            ("view.define", json!({"id":"facade","name":"Facade","kind":{"view":"facade","facade":"b.f1"}})),
+            ("view.define", json!({"id":"section","name":"Section","kind":{"view":"section","from":[0,2000],"to":[12000,2000]}})),
+        ] {
+            session.execute(command, params).unwrap();
+        }
+        for request in [
+            DrawingRequest::Plan(0),
+            DrawingRequest::Saved("plan".into()),
+            DrawingRequest::Saved("facade".into()),
+            DrawingRequest::Saved("section".into()),
+        ] {
+            let before = session.doc.clone();
+            let mut request_job = job(session.doc.clone(), None);
+            request_job.drawing = Some(request.clone());
+            let result = run(&request_job);
+            let scene = result.scene.unwrap().unwrap();
+            let (actual, drawing) = result.drawing.unwrap();
+            assert_eq!(actual, request);
+            let drawing = drawing.unwrap();
+            assert!(!drawing.element_segments.is_empty());
+            for line in &drawing.element_segments {
+                assert!(scene.find(&line.id).is_some(), "{request:?}: {} must resolve to a real scene element", line.id);
+            }
+            let preview = DrawingPreview {
+                svg: String::new(),
+                transform: drawing.transform,
+                segments: drawing.segments,
+                element_segments: drawing.element_segments,
+            };
+            let (point, expected) = match &request {
+                DrawingRequest::Saved(id) if id == "facade" => ([session.doc.buildings[0].facades[0].bays[0], 850.0], "b.f1.L0.B0"),
+                DrawingRequest::Saved(id) if id == "section" => ([2000.0, 1500.0], "partition.L0"),
+                _ => ([3000.0, 3925.0], "partition.L0"),
+            };
+            let hit = preview.pick_element(point, 2.0).unwrap_or_else(|| panic!("{request:?}: expected {expected} at {point:?}"));
+            assert_eq!(hit.id, expected, "{request:?}");
+            assert_eq!(session.doc, before, "drawing and picking must leave the document unchanged");
+            let selected = &scene.elements[scene.find(&hit.id).unwrap()];
+            assert_eq!(selected.id, expected);
+            assert_eq!(selected.kind, if hit.kind == DrawingElementKind::Opening { "window" } else { "interior wall" });
+            session.execute("edit.move", json!({"targets":[hit.id],"delta":[100,0,0]})).unwrap();
+            assert_ne!(session.doc.buildings, before.buildings);
+            assert_eq!(session.execute("edit.undo", json!({})).unwrap()["undone"], true);
+            assert_eq!(session.doc, before, "{request:?}: undo must restore the whole document");
+        }
     }
 }

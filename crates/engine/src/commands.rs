@@ -83,6 +83,18 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "view.pick",
+        summary: "Find the nearest visible model-element line within tolerance_mm in a saved drawing view. Drawing-plane mm; returns hit with the existing semantic id, kind, nearest point and distance_mm, or null. Exact ties prefer openings, interior walls, facade walls, then lexical id. Read-only.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::PickRequest>,
+        run: |s, v| {
+            let p: crate::views::PickRequest = parse("view.pick", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::pick(&s.doc, p, view)
+        },
+    },
+    CommandSpec {
         id: "view.export",
         summary: "Export one saved drawing view and its annotations to SVG, PNG, vector PDF or DXF at 1:1 in drawing-plane mm. Phase/filter defaults match other sheet exports.",
         mutates: false,
