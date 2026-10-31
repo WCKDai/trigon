@@ -2267,8 +2267,12 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
     if f.bays.is_empty() {
         return Err(ModelError::Invalid(format!("facade {} has no bays yet; run facade.set_bays first", p.facade)).into());
     }
-    let level_list: Vec<usize> = p.levels.clone().unwrap_or_else(|| (0..levels).collect());
-    let bay_list: Vec<usize> = p.bays.clone().unwrap_or_else(|| (0..f.bays.len()).collect());
+    let mut level_list: Vec<usize> = p.levels.clone().unwrap_or_else(|| (0..levels).collect());
+    let mut bay_list: Vec<usize> = p.bays.clone().unwrap_or_else(|| (0..f.bays.len()).collect());
+    level_list.sort_unstable();
+    level_list.dedup();
+    bay_list.sort_unstable();
+    bay_list.dedup();
     for &l in &level_list {
         if l >= levels {
             return Err(ModelError::Invalid(format!("level {l} doesn't exist (the building has {levels} storeys)")).into());

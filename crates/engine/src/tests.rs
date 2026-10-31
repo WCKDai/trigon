@@ -331,6 +331,16 @@ fn studio_plan_matches_the_exported_vector_sheet() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+fn repeated_facade_indices_place_each_slot_once() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 3})).unwrap();
+    let out = s.execute("facade.place", json!({"facade": facade, "type": "window.casement.2", "levels": [0,0,1,1], "bays": [0,0,1,1]})).unwrap();
+    assert_eq!(out["placed"], 4);
+    assert_eq!(s.doc.buildings[0].facade(&facade).unwrap().placements.len(), 4);
+}
+
 fn exported(s: &mut Session, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let south = first_facade_facing(s, "S");
     s.execute("facade.set_bays", json!({"facade": south, "count": 7})).unwrap();
