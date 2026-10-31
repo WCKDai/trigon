@@ -38,7 +38,7 @@ pub(crate) const SHOT_WAIT: Duration = Duration::from_secs(30);
 
 const CHANGED: [f32; 4] = [1.0, 0.55, 0.05, 0.55];
 const REMOVED: [f32; 4] = [0.95, 0.10, 0.10, 0.45];
-const SELECTED: [f32; 4] = [0.15, 0.45, 1.0, 0.40];
+const SELECTED: [f32; 4] = [1.0, 0.42, 0.21, 0.45];
 pub const AGENT_BLUE: egui::Color32 = egui::Color32::from_rgb(70, 140, 230);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -652,19 +652,27 @@ impl StudioApp {
         self.session.doc.buildings.first().map(|b| b.storeys.iter().map(|s| s.name.clone()).collect()).unwrap_or_default()
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open…").on_hover_text("Open a .trigon model (⌘O)").clicked() {
-                self.pick_open();
-            }
-            let save = ui.add_enabled(true, egui::Button::new("Save")).on_hover_text("Save (⌘S)");
-            if save.clicked() {
-                if self.session.path.is_some() { self.save(None) } else { self.pick_save_as() }
-            }
-            if ui.button("Save as…").clicked() {
-                self.pick_save_as();
-            }
-            ui.menu_button("Templates", |ui| {
+    fn app_bar(&mut self, ui: &mut egui::Ui) {
+        let wide = ui.available_width() > 1100.0;
+        ui.horizontal(|ui| {
+            theme::mark(ui, 32.0);
+            ui.label(egui::RichText::new("TRIGON").size(19.0).strong());
+            ui.label(egui::RichText::new("STUDIO").monospace().size(12.0).color(theme::MUTED));
+            ui.separator();
+            let project = self.session.doc.buildings.first().map(|b| b.name.clone()).unwrap_or_else(|| "Untitled project".into());
+            let short = if project.chars().count() > 24 { format!("{}…", project.chars().take(24).collect::<String>()) } else { project.clone() };
+            ui.menu_button(short, |ui| {
+                ui.strong(&project);
+                ui.separator();
+                if ui.button("Open project…").clicked() {
+                    self.pick_open();
+                    ui.close();
+                }
+                if ui.button("Save as…").clicked() {
+                    self.pick_save_as();
+                    ui.close();
+                }
+                ui.separator();
                 if ui.button("New from template…").clicked() {
                     self.pick_template(false);
                     ui.close();
@@ -674,9 +682,56 @@ impl StudioApp {
                     ui.close();
                 }
             });
+            if wide {
+                ui.separator();
+                if ui.button("Undo").on_hover_text("Undo the last model or annotation change (⌘Z)").clicked() {
+                    self.undo_redo(Action::Undo);
+                }
+                if ui.button("Redo").on_hover_text("Redo (⇧⌘Z)").clicked() {
+                    self.undo_redo(Action::Redo);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.mode == Mode::Drawing, egui::Button::new("Export drawing"))
+                    .on_hover_text("Open the saved drawing's PDF, SVG, PNG and DXF export settings")
+                    .clicked()
+                {
+                    self.authoring.tab = Tab::Drawings;
+                    self.drafting.show_export();
+                }
+                if theme::primary(ui, "Save").on_hover_text("Save project (⌘S)").clicked() {
+                    if self.session.path.is_some() { self.save(None) } else { self.pick_save_as() }
+                }
+                ui.separator();
+                let search = if wide { "Search commands…    ⌘ K" } else { "Commands…" };
+                if ui
+                    .add_sized([if wide { 230.0 } else { 100.0 }, 30.0], egui::Button::new(egui::RichText::new(search).color(theme::MUTED)))
+                    .on_hover_text("Search and run any command (⌘K)")
+                    .clicked()
+                {
+                    self.palette.show();
+                }
+            });
+        });
+    }
+
+    fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (tab, label) in [(Tab::Project, "Model"), (Tab::Families, "Families"), (Tab::Drawings, "Document")] {
+                if theme::workspace_tab(ui, label, self.authoring.tab == tab).clicked() {
+                    self.authoring.tab = tab;
+                    self.drafting.picking = None;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.presence_chip(ui));
+        });
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(180.0));
-            ui.separator();
             let before = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone());
             ui.selectable_value(&mut self.mode, Mode::ThreeD, "3D");
             ui.selectable_value(&mut self.mode, Mode::Plan, "Plan");
@@ -733,8 +788,12 @@ impl StudioApp {
                 self.fit();
             }
             ui.separator();
-            if ui.button("Commands…").on_hover_text("Search and run any command (⌘K)").clicked() {
-                self.palette.show();
+            match self.authoring.tab {
+                Tab::Project => self.authoring.ribbon(ui),
+                Tab::Families => {
+                    ui.weak("Select a component type to edit, create a variant or place instances.");
+                }
+                Tab::Drawings => self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" }),
             }
             let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone());
             if before != after {
@@ -744,7 +803,6 @@ impl StudioApp {
                 }
                 self.view_changed(before.3 != after.3 || before.4 != after.4);
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.presence_chip(ui));
         });
     }
 
@@ -799,7 +857,8 @@ impl StudioApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let path = self.session.path.as_ref().map_or("untitled".into(), |p| p.display().to_string());
-            ui.weak(path);
+            let name = self.session.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled project".into(), |p| p.to_string_lossy().into_owned());
+            ui.weak(name).on_hover_text(path);
             if self.session.dirty {
                 ui.label(egui::RichText::new("unsaved").color(egui::Color32::from_rgb(200, 130, 20)));
             }
@@ -811,19 +870,14 @@ impl StudioApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(&self.control_note);
-                if let (Mode::Plan, Some(ms)) = (self.mode, self.plan_ms) {
-                    ui.weak(format!("plan {ms:.0} ms"));
-                }
-                if let Some((b, s)) = self.timings {
-                    ui.weak(format!("rebuild {b:.0} + {s:.0} ms"))
-                        .on_hover_text("build_view, then the viewport's triangles and edges (off the UI thread)");
-                }
-                ui.weak(format!(
-                    "{} elements · {} triangles · {} edges",
-                    self.scene.elements.len(),
+                ui.label(egui::RichText::new("Model units / mm").size(11.0).color(theme::MUTED));
+                ui.separator();
+                let timing = self.timings.map_or(String::new(), |(b, s)| format!("\nBuild {b:.0} ms; prepare {s:.0} ms"));
+                ui.weak(format!("{} elements", self.scene.elements.len())).on_hover_text(format!(
+                    "{} triangles; {} edges{timing}\nControl: {}",
                     self.scene.triangle_count(),
-                    self.scene.edge_count()
+                    self.scene.edge_count(),
+                    self.control_note
                 ));
             });
         });
@@ -902,11 +956,14 @@ impl StudioApp {
     }
 
     fn project_browser(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.authoring.tab, Tab::Project, "Project");
-            ui.selectable_value(&mut self.authoring.tab, Tab::Families, "Families");
-            ui.selectable_value(&mut self.authoring.tab, Tab::Drawings, "Drawings");
-        });
+        theme::eyebrow(
+            ui,
+            match self.authoring.tab {
+                Tab::Project => "PROJECT",
+                Tab::Families => "FAMILIES / COMPONENTS",
+                Tab::Drawings => "VIEWS / DRAWINGS",
+            },
+        );
         ui.separator();
         if self.authoring.tab == Tab::Drawings {
             if let Some(action) = self.drafting.library(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" }) {
@@ -1123,7 +1180,7 @@ impl StudioApp {
                     let text =
                         format!("x {:.3}  ·  y {:.3} mm{}", point[0], point[1], snapped.map_or(String::new(), |s| format!("  ·  {}", s.kind.name())));
                     let at = rect.left_bottom() + egui::vec2(12.0, -12.0);
-                    painter.text(at, egui::Align2::LEFT_BOTTOM, text, egui::FontId::monospace(12.0), theme::INK);
+                    painter.text(at, egui::Align2::LEFT_BOTTOM, text, egui::FontId::monospace(12.0), theme::DRAWING_INK);
                 }
             }
         }
@@ -1307,22 +1364,13 @@ impl eframe::App for StudioApp {
         self.collect_window_shots(&ctx);
         self.shortcuts(&ctx);
         self.update_title(&ctx);
-        egui::Panel::top("studio-title").frame(egui::Frame::new().fill(theme::INK).inner_margin(egui::Margin::symmetric(16, 10))).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("TRIGON").size(20.0).strong().color(egui::Color32::WHITE));
-                ui.label(egui::RichText::new("STUDIO").size(11.0).color(egui::Color32::from_gray(170)));
-                ui.add_space(18.0);
-                let name =
-                    self.session.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled project".into(), |s| s.to_string_lossy().into_owned());
-                ui.label(
-                    egui::RichText::new(format!("{name}{}", if self.session.dirty { " · unsaved" } else { "" })).color(egui::Color32::from_gray(220)),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("mm   ·   Z up").size(11.0).color(egui::Color32::from_rgb(151, 207, 196)));
-                });
-            });
-        });
-        egui::Panel::top("toolbar").show(ui, |ui| {
+        egui::Panel::top("studio-title")
+            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(16, 8)))
+            .show(ui, |ui| self.app_bar(ui));
+        egui::Panel::top("workspace-tabs")
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 0)))
+            .show(ui, |ui| self.workspace_tabs(ui));
+        egui::Panel::top("toolbar").frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 6))).show(ui, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
             ui.add_space(2.0);
@@ -1332,16 +1380,39 @@ impl eframe::App for StudioApp {
             egui::ScrollArea::vertical().id_salt("project-scroll").show(ui, |ui| self.project_browser(ui));
         });
         egui::Panel::right("side").resizable(true).default_size(330.0).min_size(280.0).show(ui, |ui| {
-            egui::Panel::bottom("activity-panel").resizable(true).default_size(230.0).min_size(120.0).show(ui, |ui| {
+            egui::Panel::bottom("activity-panel").resizable(true).default_size(170.0).min_size(80.0).show(ui, |ui| {
                 if let Some(a) = self.feed.ui(ui, true, true) {
                     self.undo_redo(a);
                 }
             });
             egui::ScrollArea::vertical().id_salt("properties-scroll").show(ui, |ui| self.selection_panel(ui));
         });
-        egui::CentralPanel::no_frame().show(ui, |ui| match self.mode {
-            Mode::ThreeD => self.viewport_3d(ui),
-            Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            let label = match self.mode {
+                Mode::ThreeD => "3D / Coordination".to_string(),
+                Mode::Plan => format!("{} / Floor plan", self.levels().get(self.plan_level).map_or("Level", String::as_str)),
+                Mode::Drawing => self.session.doc.views.iter().find(|v| v.id == self.drawing).map_or("Drawing", |v| &v.name).to_string(),
+            };
+            egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 7)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let active = ui.label(egui::RichText::new(label).strong());
+                    ui.painter().line_segment(
+                        [active.rect.left_bottom() + egui::vec2(0.0, 6.0), active.rect.right_bottom() + egui::vec2(0.0, 6.0)],
+                        egui::Stroke::new(2.0, theme::ACCENT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(if self.mode == Mode::ThreeD { "SITE LOCAL / mm / Z up" } else { "DRAWING PLANE / mm" })
+                                .size(10.0)
+                                .color(theme::MUTED),
+                        );
+                    });
+                });
+            });
+            match self.mode {
+                Mode::ThreeD => self.viewport_3d(ui),
+                Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
+            }
         });
         if let Some(run) = self.palette.ui(&ctx) {
             let r = self.run(Who::Owner, run.command, run.params);

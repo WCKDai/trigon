@@ -38,6 +38,7 @@ pub struct Drafting {
     grid: bool,
     grid_step: f64,
     export_path: String,
+    reveal_export: bool,
 }
 
 impl Default for Drafting {
@@ -66,6 +67,7 @@ impl Default for Drafting {
             grid: true,
             grid_step: 100.0,
             export_path: "out/drawing.pdf".into(),
+            reveal_export: false,
         }
     }
 }
@@ -216,6 +218,25 @@ impl Drafting {
         }
     }
 
+    pub fn show_export(&mut self) {
+        self.reveal_export = true;
+    }
+
+    pub fn ribbon(&mut self, ui: &mut egui::Ui, doc: &Document, id: &str) {
+        if ui.selectable_label(self.picking.is_none(), "Select").clicked() {
+            self.picking = None;
+        }
+        let view = doc.views.iter().find(|v| v.id == id);
+        for (i, label) in ["Text", "Dimension", "Leader", "Level"].into_iter().enumerate() {
+            let enabled = view.is_some_and(|v| i != 3 || !matches!(v.kind, DrawingViewKind::Plan { .. }));
+            if ui.add_enabled(enabled, egui::Button::selectable(self.picking.is_some() && self.kind == i, label)).clicked() {
+                self.new_note(doc);
+                self.kind = i;
+                self.picking = Some(0);
+            }
+        }
+    }
+
     pub fn options(&self) -> SnapOptions {
         SnapOptions { grid_mm: self.grid.then_some(self.grid_step), ..self.snaps }
     }
@@ -339,7 +360,7 @@ impl Drafting {
                 });
             }
             1 => {
-                ui.label("Offset · left of From to To");
+                ui.label("Offset · positive to the left");
                 number(ui, &mut self.offset);
                 let [a, b] = [self.points[0], self.points[1]];
                 ui.weak(format!("Measured length: {:.3} mm", (b[0] - a[0]).hypot(b[1] - a[1])));
@@ -360,7 +381,7 @@ impl Drafting {
             ui.add(egui::DragValue::new(&mut self.size).range(0.5..=12.0).speed(0.1).suffix(" mm"));
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button(if self.selected.is_some() { "Update annotation" } else { "Add annotation" }).clicked() {
+            if theme::primary(ui, if self.selected.is_some() { "Update annotation" } else { "Add annotation" }).clicked() {
                 run = Some(Run {
                     command: "annotation.define",
                     params: json!({"id":self.note_id,"view":id,"size_mm":self.size,"kind":self.annotation_kind()}),
@@ -386,13 +407,17 @@ impl Drafting {
                 ui.add(egui::DragValue::new(&mut self.grid_step).range(0.01..=100000.0).suffix(" mm"));
             });
         });
-        egui::CollapsingHeader::new("Export drawing").show(ui, |ui| {
+        let reveal_export = std::mem::take(&mut self.reveal_export);
+        let export = egui::CollapsingHeader::new("Export drawing").open(reveal_export.then_some(true)).show(ui, |ui| {
             ui.weak("PDF, SVG, PNG or DXF · file extension chooses format");
             ui.text_edit_singleline(&mut self.export_path);
             if ui.button("Export annotated view").clicked() {
                 run = Some(Run { command: "view.export", params: json!({"id":id,"path":self.export_path}) });
             }
         });
+        if reveal_export {
+            export.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
         run
     }
 

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
+
+use crate::theme;
 use trigon_engine::resvg::{self, tiny_skia, usvg};
 use trigon_engine::{DrawingSnap, DrawingTransform, SnapOptions, snap_drawing};
 
@@ -169,7 +171,7 @@ impl PlanView {
     pub fn ui(&mut self, ui: &mut egui::Ui, picking: bool) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(236));
+        painter.rect_filled(rect, 0.0, theme::PAPER);
         while let Ok((key, img)) = self.done.try_recv() {
             let options = egui::TextureOptions::LINEAR;
             match &mut self.picture {
@@ -227,7 +229,7 @@ impl PlanView {
             let w = k.size[0] as f32 / k.scale;
             let h = k.size[1] as f32 / k.scale;
             let r = egui::Rect::from_min_max(to_screen(k.origin[0], k.origin[1]), to_screen(k.origin[0] + w, k.origin[1] + h));
-            painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), theme::PAPER);
         }
         resp
     }

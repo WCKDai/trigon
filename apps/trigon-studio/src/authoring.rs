@@ -129,6 +129,14 @@ impl Authoring {
         }
     }
 
+    pub fn ribbon(&mut self, ui: &mut egui::Ui) {
+        for (tool, label) in
+            [(Tool::Move, "Move"), (Tool::Copy, "Copy"), (Tool::Align, "Align"), (Tool::Levels, "To levels"), (Tool::Delete, "Delete")]
+        {
+            ui.selectable_value(&mut self.tool, tool, label);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, doc: &Document, current: Option<&Element>, level: usize) -> Option<Run> {
         if self.tab == Tab::Families {
             return self.family_editor(ui, doc, level);

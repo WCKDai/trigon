@@ -65,11 +65,13 @@ zoom; it must never infer a scale from the raster image.
 
 ## Studio workflow and precise picking
 
-Choose **Drawings** in the project browser. Create a plan, facade or section frame, or select
+Choose **Document** in the workspace tabs. Create a plan, facade or section frame, or select
 an existing one. The **Facade elevations** project browser also opens a real 2D elevation,
 creating a saved frame through `view.define` on first use. The 3D and unsaved Plan views remain
 available in the toolbar. In a saved drawing, the properties panel lists its annotations and
-provides typed Text, Dimension, Leader and Level forms.
+provides typed Text, Dimension, Leader and Level forms. The document toolbar starts these
+annotation tools directly; **Select** returns to selection without adding a note. **Export
+drawing** in the app bar opens the current saved drawing's export settings.
 
 **Pick** fills a position from the drawing. Dimension picks progress from From to To; leader
 picks progress from arrow tip to bend to text position. Click **Add annotation** or **Update
