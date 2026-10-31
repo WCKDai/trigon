@@ -96,3 +96,30 @@ impl Worker {
         self.done.try_recv().ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trigon_model::build::PhaseFilter;
+
+    fn job(doc: Document, plan_level: Option<usize>) -> Job {
+        Job { generation: 1, doc: Arc::new(doc), view: View { phase: 0, filter: PhaseFilter::Complete }, want_scene: true, plan_level }
+    }
+
+    #[test]
+    fn empty_and_hostile_requests_give_errors_not_panics() {
+        let done = run(&job(Document::default(), Some(0)));
+        assert!(matches!(done.scene, Some(Ok(ref s)) if s.elements.is_empty()));
+        assert!(done.plan.is_some());
+        let mut doc = Document::default();
+        doc.buildings.push(trigon_model::Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
+        let done = run(&job(doc.clone(), Some(usize::MAX)));
+        assert!(matches!(done.plan, Some((_, Err(_)))));
+        let mut bad_view = job(doc.clone(), Some(0));
+        bad_view.view.phase = usize::MAX;
+        assert!(matches!(run(&bad_view).scene, Some(Err(_))));
+        let done = run(&job(doc, Some(1)));
+        assert!(matches!(done.plan, Some((1, Ok(_)))), "a real plan sheet parses");
+        assert!(matches!(done.scene, Some(Ok(ref s)) if !s.elements.is_empty()));
+    }
+}
