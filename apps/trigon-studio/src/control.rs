@@ -11,6 +11,62 @@ use trigon_control::{Request, methods};
 use crate::activity::Who;
 use crate::app::{Mode, SHOT_WAIT, Shot, ShotTarget, StudioApp, filter_name, parse_filter};
 
+/// A checked `ui.view` request; `None` keeps the current setting.
+#[derive(Debug, Default, PartialEq)]
+pub struct ViewRequest {
+    pub mode: Option<Mode>,
+    /// `Some(None)`: the whole model in 3D.
+    pub level: Option<Option<usize>>,
+    pub phase: Option<usize>,
+    pub filter: Option<trigon_model::build::PhaseFilter>,
+    pub fit: bool,
+    pub focus: Option<String>,
+}
+
+fn opt_str<'a>(p: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.len() <= 256 => Ok(Some(s)),
+        Some(_) => Err(format!("ui.view: `{key}` must be a short string")),
+    }
+}
+
+/// Check a `ui.view` request against a model with `levels` levels; `phase_index` finds a phase.
+pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result<usize, String>) -> Result<ViewRequest, String> {
+    if !p.is_object() && !p.is_null() {
+        return Err("ui.view: params must be an object".into());
+    }
+    let mode = match opt_str(p, "mode")? {
+        None => None,
+        Some("3d") => Some(Mode::ThreeD),
+        Some("plan") => Some(Mode::Plan),
+        Some(other) => return Err(format!("ui.view: mode {other}: use 3d or plan")),
+    };
+    let level = match p.get("level") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => match v.as_u64().and_then(|l| usize::try_from(l).ok()).filter(|l| *l < levels) {
+            Some(l) => Some(Some(l)),
+            None => return Err(format!("ui.view: level {v}: the model has levels 0 to {}", levels.saturating_sub(1))),
+        },
+    };
+    let phase = match opt_str(p, "phase")? {
+        None => None,
+        Some(id) => Some(phase_index(id).map_err(|e| format!("ui.view: {e}"))?),
+    };
+    let filter = match opt_str(p, "filter")? {
+        None => None,
+        Some(f) => Some(parse_filter(f).ok_or_else(|| format!("ui.view: filter {f}: use complete, demolition, new or all"))?),
+    };
+    let fit = match p.get("fit") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("ui.view: `fit` must be true or false".into()),
+    };
+    let focus = opt_str(p, "focus")?.map(str::to_string);
+    Ok(ViewRequest { mode, level, phase, filter, fit, focus })
+}
+
 /// Widest window screenshot sent back; wider ones are halved (Retina windows), so replies stay
 /// well inside the channel's line limit.
 const MAX_SHOT_WIDTH: usize = 2400;
@@ -93,48 +149,23 @@ impl StudioApp {
         ctx.request_repaint();
     }
 
-    /// `ui.view {mode?, level?, phase?, filter?, fit?}`: checked whole, then applied.
+    /// `ui.view`: checked whole, then applied.
     fn ui_view(&mut self, p: &Value) -> Result<Value, String> {
-        if !p.is_object() && !p.is_null() {
-            return Err("ui.view: params must be an object".into());
-        }
-        let mode = match p.get("mode").and_then(Value::as_str) {
-            None => self.mode,
-            Some("3d") => Mode::ThreeD,
-            Some("plan") => Mode::Plan,
-            Some(other) => return Err(format!("ui.view: mode {other}: use 3d or plan")),
-        };
         let levels = self.session.doc.buildings.first().map_or(0, |b| b.storeys.len());
-        let level = match p.get("level") {
+        let doc = &self.session.doc;
+        let req = parse_view(p, levels, &|id| doc.phase_index(id).map_err(|e| e.to_string()))?;
+        let focus = match &req.focus {
+            Some(id) => Some(self.scene.find(id).ok_or_else(|| format!("ui.view: no element {id} in the view"))?),
             None => None,
-            Some(Value::Null) => Some(None),
-            Some(v) => match v.as_u64().and_then(|l| usize::try_from(l).ok()).filter(|l| *l < levels) {
-                Some(l) => Some(Some(l)),
-                None => return Err(format!("ui.view: level {v}: the model has levels 0 to {}", levels.saturating_sub(1))),
-            },
         };
-        let phase = match p.get("phase").and_then(Value::as_str) {
-            None => self.phase,
-            Some(id) => self.session.doc.phase_index(id).map_err(|e| format!("ui.view: {e}"))?,
-        };
-        let filter = match p.get("filter").and_then(Value::as_str) {
-            None => self.filter,
-            Some(f) => parse_filter(f).ok_or_else(|| format!("ui.view: filter {f}: use complete, demolition, new or all"))?,
-        };
-        let focus = match p.get("focus") {
-            None | Some(Value::Null) => None,
-            Some(v) => {
-                let id = v.as_str().ok_or("ui.view: focus must be an element id")?;
-                let i = self.scene.find(id).ok_or_else(|| format!("ui.view: no element {} in the view", id.chars().take(128).collect::<String>()))?;
-                Some(i)
-            }
-        };
+        let phase = req.phase.unwrap_or(self.phase);
+        let filter = req.filter.unwrap_or(self.filter);
         let phase_changed = phase != self.phase || filter != self.filter;
         let before = (self.mode, self.level, self.plan_level);
-        self.mode = mode;
+        self.mode = req.mode.unwrap_or(self.mode);
         self.phase = phase;
         self.filter = filter;
-        if let Some(l) = level {
+        if let Some(l) = req.level {
             self.level = l;
             if let Some(l) = l {
                 self.plan_level = l;
@@ -143,7 +174,7 @@ impl StudioApp {
         if phase_changed || before != (self.mode, self.level, self.plan_level) {
             self.view_changed(phase_changed);
         }
-        if p.get("fit").and_then(Value::as_bool) == Some(true) {
+        if req.fit {
             self.fit();
         }
         if let Some(i) = focus {
@@ -287,6 +318,38 @@ mod tests {
     fn base64_matches_rfc_4648() {
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(b"fo"), "Zm8=");
+    }
+
+    #[test]
+    fn view_requests_are_checked_whole() {
+        let phases = |id: &str| if id == "2026" { Ok(1) } else { Err(format!("phase {id} not found")) };
+        let ok =
+            parse_view(&json!({"mode": "plan", "level": 2, "phase": "2026", "filter": "all", "fit": true, "focus": "b1.f3"}), 6, &phases).unwrap();
+        assert_eq!(ok.mode, Some(Mode::Plan));
+        assert_eq!((ok.level, ok.phase, ok.fit, ok.focus.as_deref()), (Some(Some(2)), Some(1), true, Some("b1.f3")));
+        assert_eq!(parse_view(&json!(null), 6, &phases).unwrap(), ViewRequest::default());
+        assert_eq!(parse_view(&json!({"level": null}), 6, &phases).unwrap().level, Some(None));
+        let long = "x".repeat(10_000);
+        for bad in [
+            json!([]),
+            json!("plan"),
+            json!({"mode": 5}),
+            json!({"mode": "top"}),
+            json!({"level": -1}),
+            json!({"level": 6}),
+            json!({"level": 1e300}),
+            json!({"level": "2"}),
+            json!({"level": u64::MAX}),
+            json!({"phase": "1066"}),
+            json!({"phase": ["2026"]}),
+            json!({"filter": "everything"}),
+            json!({"fit": "yes"}),
+            json!({"focus": 7}),
+            json!({"focus": long}),
+        ] {
+            assert!(parse_view(&bad, 6, &phases).is_err(), "{bad}");
+        }
+        assert!(parse_view(&json!({"level": 0}), 0, &phases).is_err(), "an empty model has no levels");
     }
 
     #[test]
