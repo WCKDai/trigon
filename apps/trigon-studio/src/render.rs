@@ -20,7 +20,7 @@ const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const EGUI_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Largest offscreen image, pixels per side.
 const MAX_SIDE: u32 = 4096;
-const BACKGROUND: wgpu::Color = wgpu::Color { r: 0.56, g: 0.59, b: 0.63, a: 1.0 };
+const BACKGROUND: wgpu::Color = wgpu::Color { r: 0.79, g: 0.83, b: 0.86, a: 1.0 };
 
 const SHADER: &str = r#"
 struct U {

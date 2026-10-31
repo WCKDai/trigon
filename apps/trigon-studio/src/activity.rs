@@ -165,16 +165,16 @@ impl Feed {
                             .scope(|ui| {
                                 ui.horizontal(|ui| {
                                     dot(ui, colour);
-                                    ui.strong(&e.command);
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.weak(age(e.at.elapsed()));
-                                        ui.weak(if e.ms < 10.0 { format!("{:.1} ms", e.ms) } else { format!("{:.0} ms", e.ms) });
-                                        let who = egui::RichText::new(e.who.label()).small();
-                                        match e.who {
-                                            Who::Agent(_) => ui.label(who.color(egui::Color32::from_rgb(70, 140, 230))),
-                                            Who::Owner => ui.label(who.weak()),
-                                        };
-                                    });
+                                    ui.add(egui::Label::new(egui::RichText::new(&e.command).strong()).wrap());
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    let who = egui::RichText::new(e.who.label()).small();
+                                    match e.who {
+                                        Who::Agent(_) => ui.label(who.color(egui::Color32::from_rgb(70, 140, 230))),
+                                        Who::Owner => ui.label(who.weak()),
+                                    };
+                                    ui.weak(if e.ms < 10.0 { format!("{:.1} ms", e.ms) } else { format!("{:.0} ms", e.ms) });
+                                    ui.weak(age(e.at.elapsed()));
                                 });
                                 let line = gist(&e.result);
                                 if e.result.is_err() {

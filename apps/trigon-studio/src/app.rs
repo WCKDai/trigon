@@ -15,11 +15,13 @@ use trigon_engine::{Session, commands};
 use trigon_model::build::{PhaseFilter, View};
 
 use crate::activity::{Action, Changes, Feed, Who};
+use crate::authoring::{Authoring, Tab};
 use crate::camera::Orbit;
 use crate::palette::Palette;
 use crate::plan_view::PlanView;
 use crate::render::{self, Viewport3d};
 use crate::scene::{self, Scene};
+use crate::theme;
 use crate::worker::{Job, Worker};
 
 /// How long a change stays highlighted, and how much of that is the fade.
@@ -149,6 +151,8 @@ pub struct StudioApp {
     highlight_dirty: bool,
     diff: scene::Diff,
     pub(crate) selection: Option<usize>,
+    authoring: Authoring,
+    pending_selection: Option<String>,
     selection_dirty: bool,
     pub(crate) plan: PlanView,
     cut_faces_dark: bool,
@@ -164,6 +168,7 @@ pub struct StudioApp {
 impl StudioApp {
     pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> StudioApp {
         let ctx = cc.egui_ctx.clone();
+        theme::apply(&ctx);
         let wake = ctx.clone();
         if let Some(rs) = &cc.wgpu_render_state {
             // wgpu panics on a validation error by default; a driver quirk is reported instead.
@@ -211,6 +216,8 @@ impl StudioApp {
             highlight_dirty: false,
             diff: scene::Diff::default(),
             selection: None,
+            authoring: Authoring::default(),
+            pending_selection: None,
             selection_dirty: false,
             plan: PlanView::new(ctx.clone()),
             cut_faces_dark: true,
@@ -288,9 +295,11 @@ impl StudioApp {
             if undo_redo && (v.get("undone") == Some(&json!(false)) || v.get("redone") == Some(&json!(false))) {
                 return r;
             }
-            if matches!(id, "document.open" | "document.new") {
+            if matches!(id, "document.open" | "document.new" | "document.from_template") {
                 self.fit_pending = true;
                 self.selection = None;
+                self.authoring = Authoring::default();
+                self.pending_selection = None;
                 self.level = None;
                 self.plan_level = self.session.doc.buildings.first().map_or(0, |b| b.ground_level);
                 self.phase = self.session.doc.active_index();
@@ -417,7 +426,17 @@ impl StudioApp {
         }
         let selected = self.selection.and_then(|i| old.elements.get(i)).map(|e| e.id.clone());
         let new = Arc::new(new);
-        self.selection = selected.and_then(|id| new.find(&id));
+        self.selection = self
+            .pending_selection
+            .take()
+            .and_then(|id| {
+                new.find(&id).or_else(|| {
+                    let root = id.split_once(':').map_or(id.as_str(), |(_, root)| root);
+                    new.find(&format!("{root}.L{}", self.plan_level))
+                        .or_else(|| new.elements.iter().position(|e| e.id.starts_with(&format!("{root}.L"))))
+                })
+            })
+            .or_else(|| selected.and_then(|id| new.find(&id)));
         self.selection_dirty = true;
         if !diff.is_empty() {
             self.highlight = Some(Highlight { started: Instant::now() });
@@ -526,7 +545,10 @@ impl StudioApp {
             Action::Undo => "edit.undo",
             Action::Redo => "edit.redo",
         };
-        let _ = self.run(Who::Owner, id, json!({}));
+        self.status = match self.run(Who::Owner, id, json!({})) {
+            Ok(_) => Some((if id == "edit.undo" { "Undo completed" } else { "Redo completed" }.into(), false)),
+            Err(error) => Some((error, true)),
+        };
     }
 
     fn open_file(&mut self, path: PathBuf) {
@@ -619,7 +641,7 @@ impl StudioApp {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Open…").on_hover_text("Open a .trigon model (⌘O)").clicked() {
                 self.pick_open();
             }
@@ -630,6 +652,16 @@ impl StudioApp {
             if ui.button("Save as…").clicked() {
                 self.pick_save_as();
             }
+            ui.menu_button("Templates", |ui| {
+                if ui.button("New from template…").clicked() {
+                    self.pick_template(false);
+                    ui.close();
+                }
+                if ui.button("Save project as template…").clicked() {
+                    self.pick_template(true);
+                    ui.close();
+                }
+            });
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(180.0));
             ui.separator();
@@ -767,16 +799,34 @@ impl StudioApp {
     }
 
     fn selection_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Selection");
-        let Some(e) = self.selection.and_then(|i| self.scene.elements.get(i)) else {
-            ui.weak("Click an element in the 3D view.");
+        ui.heading(if self.authoring.tab == Tab::Families { "Type properties" } else { "Properties" });
+        let selected = self.selection.and_then(|i| self.scene.elements.get(i)).cloned();
+        if let Some(run) = self.authoring.ui(ui, &self.session.doc, selected.as_ref(), self.plan_level) {
+            match self.run(Who::Owner, run.command, run.params) {
+                Ok(value) => {
+                    if let Some(targets) = value.get("targets").and_then(Value::as_array) {
+                        let ids = targets.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                        self.pending_selection = ids.first().map(|s| s.to_string());
+                        if !self.authoring.targets.is_empty() {
+                            self.authoring.targets = ids.join("\n");
+                        }
+                    }
+                    self.status = Some((format!("{} completed", run.command), false));
+                }
+                Err(error) => self.status = Some((error, true)),
+            }
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        let Some(e) = selected else {
             return;
         };
+        theme::eyebrow(ui, "PICKED ELEMENT");
         egui::Grid::new("selection").num_columns(2).striped(true).show(ui, |ui| {
             ui.weak("id");
             ui.monospace(&e.id);
             ui.end_row();
-            ui.weak("type");
+            ui.weak("category");
             ui.label(e.kind);
             ui.end_row();
             if let Some(l) = e.level {
@@ -790,6 +840,111 @@ impl StudioApp {
                 ui.end_row();
             }
         });
+    }
+
+    fn pick_template(&mut self, save: bool) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let path = {
+            let picker = rfd::FileDialog::new().add_filter("Trigon template", &["trigon"]);
+            if save { picker.set_file_name("template.trigon").save_file() } else { picker.pick_file() }
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let path = (!self.path_text.is_empty()).then(|| PathBuf::from(&self.path_text));
+        if let Some(path) = path {
+            let command = if save { "document.save_template" } else { "document.from_template" };
+            match self.run(Who::Owner, command, json!({"path":path})) {
+                Ok(_) => self.status = Some((if save { "Template saved" } else { "Unsaved copy created from template" }.into(), false)),
+                Err(error) => self.status = Some((error, true)),
+            }
+        }
+    }
+
+    fn project_browser(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.authoring.tab, Tab::Project, "Project");
+            ui.selectable_value(&mut self.authoring.tab, Tab::Families, "Families");
+        });
+        ui.separator();
+        if self.authoring.tab == Tab::Families {
+            self.authoring.library(ui, &self.session.doc);
+            return;
+        }
+        theme::eyebrow(ui, "PROJECT BROWSER");
+        let project = self.session.doc.buildings.first().map_or("Untitled project", |b| b.name.as_str());
+        ui.heading(project);
+        let before = (self.mode, self.level, self.plan_level);
+        ui.add_space(8.0);
+        if ui.selectable_label(self.mode == Mode::ThreeD && self.level.is_none(), "3D model").clicked() {
+            self.mode = Mode::ThreeD;
+            self.level = None;
+        }
+        let levels = self.levels();
+        egui::CollapsingHeader::new("Floor plans").default_open(true).show(ui, |ui| {
+            for (i, name) in levels.iter().enumerate() {
+                if ui.selectable_label(self.mode == Mode::Plan && self.plan_level == i, name).clicked() {
+                    self.mode = Mode::Plan;
+                    self.plan_level = i;
+                }
+            }
+        });
+        egui::CollapsingHeader::new("3D cut views").default_open(true).show(ui, |ui| {
+            for (i, name) in levels.iter().enumerate() {
+                if ui.selectable_label(self.mode == Mode::ThreeD && self.level == Some(i), format!("{name} · cut")).clicked() {
+                    self.mode = Mode::ThreeD;
+                    self.level = Some(i);
+                    self.plan_level = i;
+                }
+            }
+        });
+        let facades = self.session.doc.buildings.iter().flat_map(|b| b.facades.iter().map(|f| (f.id.clone(), f.kind))).collect::<Vec<_>>();
+        egui::CollapsingHeader::new("Facades").show(ui, |ui| {
+            for (id, kind) in facades {
+                if ui.selectable_label(false, format!("{id} · {kind:?}")).clicked()
+                    && let Some(i) = self.scene.find(&id)
+                {
+                    self.mode = Mode::ThreeD;
+                    self.level = None;
+                    self.focus(i);
+                    self.selection = Some(i);
+                    self.selection_dirty = true;
+                }
+            }
+        });
+        theme::eyebrow(ui, "GROUPS");
+        let groups = self.session.doc.groups.iter().map(|g| (g.id.clone(), g.name.clone(), g.targets.len())).collect::<Vec<_>>();
+        if groups.is_empty() {
+            ui.weak("Collect elements in Properties to save a group.");
+        }
+        for (id, name, n) in groups {
+            if ui.selectable_label(self.authoring.targets == format!("group:{id}"), format!("{name} · {n}")).clicked() {
+                self.authoring.targets = format!("group:{id}");
+            }
+        }
+        theme::eyebrow(ui, "ELEMENTS ON THIS STOREY");
+        let elements = self
+            .scene
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.host && e.level == Some(self.plan_level))
+            .map(|(i, e)| (i, e.id.clone(), e.kind))
+            .collect::<Vec<_>>();
+        for (i, id, kind) in elements {
+            let response = ui.selectable_label(self.selection == Some(i), &id).on_hover_text(kind);
+            if response.clicked() {
+                self.selection = Some(i);
+                self.selection_dirty = true;
+                self.redraw = true;
+                self.authoring.targets.clear();
+            }
+            if response.double_clicked() {
+                self.mode = Mode::ThreeD;
+                self.focus(i);
+            }
+        }
+        if before != (self.mode, self.level, self.plan_level) {
+            self.view_changed(false);
+        }
     }
 
     fn viewport_3d(&mut self, ui: &mut egui::Ui) {
@@ -970,18 +1125,37 @@ impl eframe::App for StudioApp {
         self.collect_window_shots(&ctx);
         self.shortcuts(&ctx);
         self.update_title(&ctx);
+        egui::Panel::top("studio-title").frame(egui::Frame::new().fill(theme::INK).inner_margin(egui::Margin::symmetric(16, 10))).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("TRIGON").size(20.0).strong().color(egui::Color32::WHITE));
+                ui.label(egui::RichText::new("STUDIO").size(11.0).color(egui::Color32::from_gray(170)));
+                ui.add_space(18.0);
+                let name =
+                    self.session.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled project".into(), |s| s.to_string_lossy().into_owned());
+                ui.label(
+                    egui::RichText::new(format!("{name}{}", if self.session.dirty { " · unsaved" } else { "" })).color(egui::Color32::from_gray(220)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("mm   ·   Z up").size(11.0).color(egui::Color32::from_rgb(151, 207, 196)));
+                });
+            });
+        });
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
             ui.add_space(2.0);
         });
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::right("side").resizable(true).default_size(400.0).min_size(280.0).show(ui, |ui| {
-            egui::Panel::bottom("selection-panel").resizable(true).default_size(200.0).show(ui, |ui| self.selection_panel(ui));
-            let (can_undo, can_redo) = (true, true);
-            if let Some(a) = self.feed.ui(ui, can_undo, can_redo) {
-                self.undo_redo(a);
-            }
+        egui::Panel::left("project-browser").resizable(true).default_size(235.0).min_size(180.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("project-scroll").show(ui, |ui| self.project_browser(ui));
+        });
+        egui::Panel::right("side").resizable(true).default_size(330.0).min_size(280.0).show(ui, |ui| {
+            egui::Panel::bottom("activity-panel").resizable(true).default_size(230.0).min_size(120.0).show(ui, |ui| {
+                if let Some(a) = self.feed.ui(ui, true, true) {
+                    self.undo_redo(a);
+                }
+            });
+            egui::ScrollArea::vertical().id_salt("properties-scroll").show(ui, |ui| self.selection_panel(ui));
         });
         egui::CentralPanel::no_frame().show(ui, |ui| match self.mode {
             Mode::ThreeD => self.viewport_3d(ui),
