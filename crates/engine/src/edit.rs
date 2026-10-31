@@ -251,6 +251,28 @@ impl Entry {
 }
 
 fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
+    if targets.len() > MAX_TARGETS {
+        return Err(invalid("select at most 256 elements"));
+    }
+    let mut expanded = Vec::new();
+    for target in targets {
+        if let Some(id) = target.strip_prefix("group:") {
+            let group = doc.groups.iter().find(|g| g.id == id).ok_or_else(|| invalid(format!("group {id} does not exist")))?;
+            if group.targets.iter().any(|t| t.starts_with("group:")) {
+                return Err(invalid("groups must contain elements, not nested group references"));
+            }
+            if expanded.len().saturating_add(group.targets.len()) > MAX_TARGETS {
+                return Err(invalid("expanded groups exceed 256 elements"));
+            }
+            expanded.extend(group.targets.iter().cloned());
+        } else {
+            expanded.push(target.clone());
+        }
+        if expanded.len() > MAX_TARGETS {
+            return Err(invalid("expanded groups exceed 256 elements"));
+        }
+    }
+    let targets = &expanded;
     if targets.is_empty() || targets.len() > MAX_TARGETS || targets.iter().any(|s| s.is_empty() || s.len() > 512) {
         return Err(invalid("select 1 to 256 elements (ids at most 512 bytes)"));
     }
@@ -315,6 +337,111 @@ fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
         entries.push(entry);
     }
     Ok(entries)
+}
+
+fn handle(doc: &Document, entry: &Entry) -> Result<String> {
+    let item = &entry.item;
+    if let Item::Placement(p) = item {
+        let attachment = !doc.component(&p.type_id)?.kind.is_opening();
+        return Ok(format!("{}.L{}.B{}{}", entry.facade.as_deref().unwrap_or(""), p.level, p.bay, if attachment { ".balcony" } else { "" }));
+    }
+    if item.id().is_empty() {
+        return Err(invalid("groups require named source definitions"));
+    }
+    let kind = match item {
+        Item::Wall(_) => "wall",
+        Item::Stair(_) => "stair",
+        Item::Room(_) => "room",
+        Item::Placement(_) => "placement",
+    };
+    let levels = item.levels();
+    Ok(if levels.len() == 1 { format!("{}.L{}", item.id(), levels.first().copied().unwrap_or(0)) } else { format!("{kind}:{}", item.id()) })
+}
+
+pub(crate) fn define_group(s: &mut Session, mut group: trigon_model::doc::ModelGroup) -> Result<Value> {
+    if group.id.is_empty()
+        || group.id.len() > 128
+        || !group.id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        || group.name.trim().is_empty()
+        || group.name.len() > 256
+    {
+        return Err(invalid("give a group id of 1–128 letters/digits/dots/dashes and a name of 1–256 bytes"));
+    }
+    let entries = selected(&s.doc, &group.targets)?;
+    for e in &entries {
+        if let Item::Placement(p) = &e.item {
+            let (c, d) = s.doc.lifetime(p)?;
+            if !(c <= s.doc.active_index() && s.doc.active_index() < d) {
+                return Err(invalid("groups select active facade instances"));
+            }
+        }
+    }
+    group.targets = entries.iter().map(|e| handle(&s.doc, e)).collect::<Result<_>>()?;
+    let id = group.id.clone();
+    if let Some(old) = s.doc.groups.iter_mut().find(|g| g.id == id) {
+        *old = group;
+    } else {
+        if s.doc.groups.len() >= 200 {
+            return Err(invalid("at most 200 groups"));
+        }
+        s.doc.groups.push(group);
+    }
+    Ok(json!({"defined":id}))
+}
+
+pub(crate) fn list_groups(s: &Session) -> Value {
+    json!({"groups":s.doc.groups.iter().map(|g| {
+        let error=selected(&s.doc,&g.targets).err().map(|e|e.to_string());
+        json!({"id":g.id,"name":g.name,"targets":g.targets,"valid":error.is_none(),"error":error})
+    }).collect::<Vec<_>>()})
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupId {
+    pub id: String,
+}
+
+pub(crate) fn remove_group(s: &mut Session, p: GroupId) -> Result<Value> {
+    let i = s.doc.groups.iter().position(|g| g.id == p.id).ok_or_else(|| invalid(format!("group {} does not exist", p.id)))?;
+    s.doc.groups.remove(i);
+    Ok(json!({"removed":p.id}))
+}
+
+fn remap_groups(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
+    if matches!(entry.item, Item::Placement(_)) {
+        return;
+    }
+    let kind = match entry.item {
+        Item::Wall(_) => "wall",
+        Item::Stair(_) => "stair",
+        Item::Room(_) => "room",
+        Item::Placement(_) => "placement",
+    };
+    let all = format!("{kind}:{}", entry.original.id());
+    let base = next.split_once(':').map(|(_, s)| s).or_else(|| next.rsplit_once(".L").map(|(s, _)| s)).unwrap_or(next);
+    let levels = entry.item.levels();
+    for group in &mut doc.groups {
+        let mut add = false;
+        for target in &mut group.targets {
+            if *target == all {
+                if shared {
+                    add = true;
+                } else {
+                    *target = next.to_string();
+                }
+            } else if let Some(level) = target.strip_prefix(&format!("{}.L", entry.original.id())).and_then(|s| s.parse::<usize>().ok())
+                && levels.contains(&level)
+            {
+                *target = format!("{base}.L{level}");
+            }
+        }
+        if add {
+            group.targets.push(next.to_string());
+        }
+        group.targets.sort();
+        group.targets.dedup();
+    }
 }
 
 /// Remove only the selected storeys. True means a shared definition remains behind.
@@ -428,7 +555,9 @@ pub(crate) fn move_elements(s: &mut Session, p: Move) -> Result<Value> {
     let mut ids = Vec::new();
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
-        ids.push(put(&mut s.doc, entry, item, shared, false, false)?);
+        let next = put(&mut s.doc, entry, item, shared, false, false)?;
+        remap_groups(&mut s.doc, entry, &next, shared);
+        ids.push(next);
     }
     finish(s, ids)
 }
@@ -521,11 +650,12 @@ pub(crate) fn copy_to_levels(s: &mut Session, mut p: CopyToLevels) -> Result<Val
             if !p.replace && !matches.is_empty() {
                 return Err(invalid(format!("storey {level} already contains this geometry or facade slot; use replace to copy over it")));
             }
+            let mut replacements = Vec::new();
             for m in matches {
                 // Replacing an older placement ends its life in the active phase, just as
                 // facade.place does. Earlier phases must retain their original opening.
                 let phase = s.doc.active_index();
-                if let Item::Placement(original) = &m.original
+                let shared = if let Item::Placement(original) = &m.original
                     && s.doc.lifetime(original)?.0 < phase
                 {
                     let demolished = s.doc.phases.get(phase).map(|p| p.id.clone());
@@ -533,11 +663,17 @@ pub(crate) fn copy_to_levels(s: &mut Session, mut p: CopyToLevels) -> Result<Val
                     let f = b.facade_mut(m.facade.as_deref().ok_or_else(|| invalid("missing facade"))?)?;
                     let placement = f.placements.iter_mut().find(|p| *p == original).ok_or_else(|| invalid("source placement changed"))?;
                     placement.demolished = demolished;
+                    false
                 } else {
-                    remove(&mut s.doc, &m)?;
-                }
+                    remove(&mut s.doc, &m)?
+                };
+                replacements.push((m, shared));
             }
-            ids.push(put(&mut s.doc, &entry, item, true, false, true)?);
+            let next = put(&mut s.doc, &entry, item, true, false, true)?;
+            for (replaced, shared) in replacements {
+                remap_groups(&mut s.doc, &replaced, &next, shared);
+            }
+            ids.push(next);
         }
     }
     finish(s, ids)
@@ -549,6 +685,12 @@ pub(crate) fn delete(s: &mut Session, p: Selection) -> Result<Value> {
     for e in entries {
         remove(&mut s.doc, &e)?;
     }
+    let valid: Vec<Vec<String>> =
+        s.doc.groups.iter().map(|g| g.targets.iter().filter(|t| selected(&s.doc, std::slice::from_ref(*t)).is_ok()).cloned().collect()).collect();
+    for (group, targets) in s.doc.groups.iter_mut().zip(valid) {
+        group.targets = targets;
+    }
+    s.doc.groups.retain(|g| !g.targets.is_empty());
     for b in &mut s.doc.buildings {
         for entrance in &mut b.entrances {
             if entrance.stair.as_ref().is_some_and(|id| !b.stairs.iter().any(|s| &s.id == id)) {
@@ -623,7 +765,9 @@ pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {
     let mut ids = Vec::new();
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
-        ids.push(put(&mut s.doc, entry, item, shared, false, false)?);
+        let next = put(&mut s.doc, entry, item, shared, false, false)?;
+        remap_groups(&mut s.doc, entry, &next, shared);
+        ids.push(next);
     }
     finish(s, ids)
 }

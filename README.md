@@ -46,6 +46,12 @@ watch the agent work: every command it runs lands in your window, in the activit
 agent's name, with parameters, result and duration) and in the model, where what it changed glows
 for a few seconds.
 
+The Project browser opens floor plans, 3D cuts and facades. Properties provides precise move,
+copy, align, storey-copy and delete tools; saved selection groups run as one undoable batch.
+Families browses and edits component types and creates parameter variants. The Templates menu
+saves reusable projects and starts detached copies. See [precise editing](docs/editing.md) for
+the shared commands, coordinate conventions and current boundaries.
+
 ```sh
 cargo build --release -p trigon-studio -p trigon
 ./target/release/trigon-studio path/to/model.trigon

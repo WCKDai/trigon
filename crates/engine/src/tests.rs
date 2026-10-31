@@ -485,6 +485,80 @@ fn editing_stairs_and_rooms_and_aligning_to_reference_elements() {
     assert_eq!(s.doc.buildings[0].interior_walls[0].a[1], 1940.0, "the 120 mm wall's upper face meets the room's upper edge");
 }
 
+#[test]
+fn saved_groups_edit_as_one_batch_and_follow_split_instances() {
+    let mut s = session();
+    editing_wall(&mut s, &[0, 1]);
+    s.execute("group.define", json!({"id":"core","name":"Core walls","targets":["wall:shared"]})).unwrap();
+    let before = s.doc.clone();
+    s.execute("edit.move", json!({"targets":["shared.L1"],"delta":[0,100,0]})).unwrap();
+    let group = s.execute("group.list", json!({})).unwrap();
+    assert_eq!(group["groups"][0]["targets"].as_array().unwrap().len(), 2);
+    assert_eq!(group["groups"][0]["valid"], true);
+    s.execute("edit.move", json!({"targets":["group:core"],"delta":[0,200,0]})).unwrap();
+    assert!(s.doc.buildings[0].interior_walls.iter().all(|w| w.a[1] >= 200.0));
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("edit.delete", json!({"targets":["group:core"]})).unwrap();
+    assert!(s.doc.buildings[0].interior_walls.is_empty());
+    assert_eq!(s.execute("group.list", json!({})).unwrap()["groups"], json!([]));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn project_templates_are_detached_copies_and_never_change_the_source_file() {
+    let mut s = session();
+    editing_wall(&mut s, &[0]);
+    s.execute("group.define", json!({"id":"seed","name":"Template group","targets":["wall:shared"]})).unwrap();
+    let template = std::env::temp_dir().join(format!("trigon-template-{}.trigon", std::process::id()));
+    let original_path = std::path::PathBuf::from("original.trigon");
+    s.path = Some(original_path.clone());
+    let original = s.doc.clone();
+    let dirty = s.dirty;
+    s.execute("document.save_template", json!({"path":template})).unwrap();
+    assert_eq!(s.path, Some(original_path));
+    assert_eq!(s.dirty, dirty);
+    assert_eq!(s.doc, original);
+    let source_bytes = std::fs::read(&template).unwrap();
+    s.execute("document.from_template", json!({"path":template})).unwrap();
+    assert!(s.path.is_none());
+    assert!(s.dirty);
+    assert_eq!(s.doc, original);
+    s.execute("building.set_storeys", json!({"count":2})).unwrap();
+    assert_eq!(std::fs::read(&template).unwrap(), source_bytes);
+    let _ = std::fs::remove_file(template);
+}
+
+#[test]
+fn copied_over_group_members_follow_the_replacement_definition() {
+    let mut s = session();
+    editing_wall(&mut s, &[0]);
+    s.execute("interior.add_walls", json!({"walls":[{"id":"destination","levels":[1],"a":[-4000,0],"b":[-2000,0],"thickness":120}]})).unwrap();
+    s.execute("group.define", json!({"id":"upper","name":"Upper walls","targets":["destination.L1"]})).unwrap();
+    s.execute("edit.copy_to_levels", json!({"targets":["wall:shared"],"levels":[1],"replace":true})).unwrap();
+    assert_eq!(s.execute("group.list", json!({})).unwrap()["groups"][0]["valid"], true);
+    s.execute("edit.move", json!({"targets":["group:upper"],"delta":[0,100,0]})).unwrap();
+    assert!(s.doc.buildings[0].interior_walls.iter().any(|w| w.levels == [1] && w.a[1] == 100.0));
+}
+
+#[test]
+fn invalid_or_recursive_groups_are_refused_atomically() {
+    let mut s = session();
+    editing_wall(&mut s, &[0]);
+    let before = s.doc.clone();
+    assert!(s.execute("group.define", json!({"id":"bad","name":"Bad","targets":["missing"]})).is_err());
+    assert_eq!(s.doc, before);
+    s.execute("group.define", json!({"id":"one","name":"One","targets":["wall:shared"]})).unwrap();
+    s.execute("group.define", json!({"id":"two","name":"Two","targets":["group:one"]})).unwrap();
+    assert!(!s.doc.groups[1].targets.iter().any(|t| t.starts_with("group:")));
+    s.doc.groups[0].targets = vec!["group:one".into()];
+    let before = s.doc.clone();
+    assert!(s.execute("edit.move", json!({"targets":["group:one"],"delta":[0,100,0]})).is_err());
+    assert_eq!(s.doc, before);
+}
+
 fn exported(s: &mut Session, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let south = first_facade_facing(s, "S");
     s.execute("facade.set_bays", json!({"facade": south, "count": 7})).unwrap();

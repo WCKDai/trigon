@@ -107,6 +107,12 @@ impl PlanView {
         rasterize(tree, key.origin, key.scale, key.size)
     }
 
+    /// Parsing the SVG finishes before the on-screen raster job. Window captures must wait
+    /// for the texture of this generation and view, rather than capture a blank/older sheet.
+    pub fn ready(&self, rect: egui::Rect, ppp: f32) -> bool {
+        self.key(rect, ppp).is_some_and(|wanted| self.picture.as_ref().is_some_and(|(_, shown)| *shown == wanted))
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) -> egui::Rect {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -177,6 +183,30 @@ impl PlanView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_parsed_plan_is_not_ready_until_its_raster_has_arrived() {
+        let ctx = egui::Context::default();
+        let mut view = PlanView::new(ctx.clone());
+        let tree = Arc::new(
+            trigon_engine::parse_svg(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="50" height="50" fill="black"/></svg>"#,
+            )
+            .unwrap(),
+        );
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        view.set_tree(1, tree.clone());
+        view.fit_to(rect.size());
+        assert!(!view.ready(rect, 1.0));
+        let key = view.key(rect, 1.0).unwrap();
+        view.jobs.send(Job { tree: tree.clone(), key }).unwrap();
+        let (key, img) = view.done.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        assert!(img.pixels.iter().any(|p| p.r() < 10));
+        view.picture = Some((ctx.load_texture("ready-plan", img, egui::TextureOptions::LINEAR), key));
+        assert!(view.ready(rect, 1.0));
+        view.set_tree(2, tree);
+        assert!(!view.ready(rect, 1.0), "an older texture cannot stand in for a changed plan");
+    }
 
     #[test]
     fn a_region_of_the_sheet_rasterizes_at_the_asked_scale() {

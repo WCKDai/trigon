@@ -42,3 +42,29 @@ leaves and cellar stairs are not independent editable targets in this version.
 Exact facade positions are stored as an optional `u` override on a placement. Existing
 `trigon/1` files without that field retain their original bay-based geometry. Updated files
 round-trip with the override; older Trigon versions do not understand its position.
+
+## Groups, component types and project templates
+
+`group.define` saves a named selection, for example
+`{"id":"core","name":"Core walls","targets":["wall:partition","stair:main"]}`.
+Use `group:core` as a target of any editing command. A batch expands to its source members and
+is still one undo step. Defining a group from other groups flattens their members; stored
+nested references are refused. Moves, split storey instances and explicit copy-over update
+member handles. Deletion drops removed members and removes an empty group.
+
+`group.list` reports each group's targets and whether its references still resolve. Other
+commands, such as replacing all traced interiors, can leave stale references; redefine the
+group to repair those. `group.remove` removes just the saved selection. Groups are named
+collections, with independent copies; they do not create linked parametric assemblies.
+
+Studio's Families tab browses the component types and edits their sizes and family parameters.
+Duplicate a type to create a variant; update a type to change all its instances. Saving and
+placing both run the existing `types.define` and `facade.place` commands, including their
+geometry validation. New geometric family kinds still require parametric code in the model.
+
+`document.save_template {"path":"seed.trigon"}` writes a complete project template, including
+its types, groups, model, evidence and site, without changing the working document's path,
+dirty state or undo history. `document.from_template {"path":"seed.trigon"}` starts a detached,
+unsaved copy with no save path. Saving that copy requires choosing a new file. A template is a
+normal `.trigon` document, so no separate format or migration is needed. These actions are in
+Studio's Templates menu.

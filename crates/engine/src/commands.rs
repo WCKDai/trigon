@@ -44,6 +44,61 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "group.define",
+        summary: "Save a named group of up to 256 editable source definitions/instances. Groups may be targets of edit commands (group:<id>); references to existing groups are flattened. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<trigon_model::doc::ModelGroup>,
+        run: |s, v| crate::edit::define_group(s, parse("group.define", v)?),
+    },
+    CommandSpec {
+        id: "group.list",
+        summary: "List saved selection groups and report stale or invalid member references.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| parse::<NoParams>("group.list", v).map(|_| crate::edit::list_groups(s)),
+    },
+    CommandSpec {
+        id: "group.remove",
+        summary: "Remove a saved group without deleting its model elements. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::GroupId>,
+        run: |s, v| crate::edit::remove_group(s, parse("group.remove", v)?),
+    },
+    CommandSpec {
+        id: "document.from_template",
+        summary: "Start an unsaved copy of a .trigon project template, with its families, groups and model. The source file stays unchanged and the copy has no save path.",
+        mutates: true,
+        journaled: false,
+        schema: schema::<PathParams>,
+        run: |s, v| {
+            let p: PathParams = parse("document.from_template", v)?;
+            let path = checked_path(&p.path, "trigon")?;
+            let doc = read_document(&path)?;
+            s.doc = doc;
+            s.path = None;
+            s.dirty = true;
+            s.reset_history();
+            Ok(info(&s.doc))
+        },
+    },
+    CommandSpec {
+        id: "document.save_template",
+        summary: "Save a reusable .trigon project template without changing the current document's path, dirty state or undo history.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<PathParams>,
+        run: |s, v| {
+            let p: PathParams = parse("document.save_template", v)?;
+            let path = checked_path(&p.path, "trigon")?;
+            let text = serde_json::to_string_pretty(&s.doc).map_err(|e| EngineError::Io(e.to_string()))?;
+            write_file(&path, text.as_bytes())?;
+            Ok(json!({"saved":path,"template":true}))
+        },
+    },
+    CommandSpec {
         id: "edit.move",
         summary: "Move selected walls, stairs, rooms or facade instances by a precise [dx,dy,dz] offset in mm. Studio ids select one storey; wall:<id>, stair:<id>, room:<id> select all its storeys. Atomic and undoable.",
         mutates: true,

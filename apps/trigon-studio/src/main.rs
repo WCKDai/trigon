@@ -5,12 +5,14 @@
 
 mod activity;
 mod app;
+mod authoring;
 mod camera;
 mod control;
 mod palette;
 mod plan_view;
 mod render;
 mod scene;
+mod theme;
 mod worker;
 
 use std::path::PathBuf;
