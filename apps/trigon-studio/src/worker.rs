@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
 use trigon_engine::resvg::usvg;
-use trigon_engine::{DrawingElementSegment, DrawingPreview, DrawingTransform};
+use trigon_engine::{DrawingElementSegment, DrawingPreview, DrawingTransform, OpeningSchedule, opening_schedule_from_built};
 use trigon_model::Document;
 use trigon_model::build::View;
 
@@ -39,12 +39,18 @@ pub struct Job {
 
 pub struct Done {
     pub generation: u64,
-    pub scene: Option<Result<Scene, String>>,
+    pub scene: Option<Result<PreparedScene, String>>,
     pub drawing: Option<(DrawingRequest, Result<PreparedDrawing, String>)>,
     /// Milliseconds in `build_view`, in making the scene, in drawing and parsing the plan.
     pub build_ms: f64,
     pub scene_ms: f64,
     pub plan_ms: f64,
+}
+
+/// One built view, delivered atomically so its inventory and picking geometry cannot diverge.
+pub struct PreparedScene {
+    pub scene: Scene,
+    pub schedule: OpeningSchedule,
 }
 
 pub struct Worker {
@@ -69,7 +75,12 @@ pub fn run(job: &Job) -> Done {
         build_ms = ms(t);
         let t = Instant::now();
         let phases = job.doc.phases.len() > 1;
-        let scene = built.and_then(|b| guarded("preparing the view", || Ok(Scene::from_built(&b, phases))));
+        let scene = built.and_then(|b| {
+            guarded("preparing the view", || {
+                let schedule = opening_schedule_from_built(&job.doc, &b).map_err(|e| e.to_string())?;
+                Ok(PreparedScene { scene: Scene::from_built(&b, phases), schedule })
+            })
+        });
         scene_ms = ms(t);
         scene
     });
@@ -135,7 +146,7 @@ mod tests {
     #[test]
     fn empty_and_hostile_requests_give_errors_not_panics() {
         let done = run(&job(Document::default(), Some(0)));
-        assert!(matches!(done.scene, Some(Ok(ref s)) if s.elements.is_empty()));
+        assert!(matches!(done.scene, Some(Ok(ref s)) if s.scene.elements.is_empty() && s.schedule.rows.is_empty()));
         assert!(done.drawing.is_some());
         let mut doc = Document::default();
         doc.buildings.push(trigon_model::Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
@@ -150,7 +161,35 @@ mod tests {
         };
         assert!(drawing.element_segments.iter().any(|line| line.id.starts_with("b1.f")), "plan strokes keep facade wall ids");
         assert!(drawing.element_segments.iter().all(|line| !line.id.ends_with(".opening")));
-        assert!(matches!(done.scene, Some(Ok(ref s)) if !s.elements.is_empty()));
+        assert!(matches!(done.scene, Some(Ok(ref s)) if !s.scene.elements.is_empty()));
+    }
+
+    #[test]
+    fn worker_inventory_and_scene_share_the_built_occurrences_in_every_phase_filter() {
+        let mut s = crate::schedules::tests::phase_session();
+        s.execute("building.add_basement", serde_json::json!({"floor":-2400})).unwrap();
+        s.execute("building.set_cellar_stairs", serde_json::json!({"stairs":[{"id":"cellar","facade":"b.f2","from":1000,"to":5000,"width":1100,"top":4800,"bottom":2000,"floor":-2400,"door_at":1450,"door_width":900}]})).unwrap();
+        for filter in [PhaseFilter::Complete, PhaseFilter::New, PhaseFilter::Demolition, PhaseFilter::All] {
+            let mut job = job(s.doc.clone(), None);
+            job.view = View { phase: 1, filter };
+            let prepared = run(&job).scene.unwrap().unwrap();
+            let openings = prepared.scene.elements.iter().filter(|e| matches!(e.kind, "window" | "door")).count();
+            assert_eq!(openings, prepared.schedule.totals.instances);
+            for row in &prepared.schedule.rows {
+                if prepared.scene.ambiguous(&row.id) {
+                    assert_eq!(crate::schedules::resolve_row(&prepared.scene, row), Err(crate::schedules::AMBIGUOUS));
+                } else {
+                    assert!(crate::schedules::resolve_row(&prepared.scene, row).is_ok(), "{filter:?}: {}", row.id);
+                }
+            }
+            let inherited: Vec<_> = prepared.schedule.rows.iter().filter(|r| !r.external || r.type_id == "door.cellar").collect();
+            assert_eq!(inherited.len(), 3);
+            assert!(inherited.iter().all(|r| r.status == "existing"));
+            assert_eq!(prepared.schedule.totals.area_excluded, usize::from(filter != PhaseFilter::New));
+            let mut plan_only = job;
+            plan_only.want_scene = false;
+            assert!(run(&plan_only).scene.is_none(), "a plan-only job must not replace the model inventory");
+        }
     }
 
     #[test]
@@ -181,7 +220,7 @@ mod tests {
             let mut request_job = job(session.doc.clone(), None);
             request_job.drawing = Some(request.clone());
             let result = run(&request_job);
-            let scene = result.scene.unwrap().unwrap();
+            let scene = result.scene.unwrap().unwrap().scene;
             let (actual, drawing) = result.drawing.unwrap();
             assert_eq!(actual, request);
             let drawing = drawing.unwrap();

@@ -22,9 +22,10 @@ use crate::palette::Palette;
 use crate::plan_view::PlanView;
 use crate::render::{self, Viewport3d};
 use crate::scene::{self, Scene};
+use crate::schedules::{self, Schedules};
 use crate::theme;
 use crate::worker::DrawingRequest;
-use crate::worker::{Job, Worker};
+use crate::worker::{Done, Job, Worker};
 
 /// How long a change stays highlighted, and how much of that is the fade.
 const HIGHLIGHT: Duration = Duration::from_millis(4000);
@@ -158,6 +159,7 @@ pub struct StudioApp {
     diff: scene::Diff,
     pub(crate) selection: Option<usize>,
     authoring: Authoring,
+    schedules: Schedules,
     pending_selection: Option<String>,
     selection_dirty: bool,
     pub(crate) plan: PlanView,
@@ -174,14 +176,39 @@ pub struct StudioApp {
 impl StudioApp {
     pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> StudioApp {
         let ctx = cc.egui_ctx.clone();
+        let session = Session::new(Box::new(Live::new(Credentials::from_env())));
+        let mut app = Self::with_context(ctx.clone(), cc.wgpu_render_state.clone(), session);
+        if let Some(listen) = launch.control {
+            app.start_control(listen, &ctx);
+        }
+        match &launch.file {
+            Some(path) if path.exists() => {
+                let _ = app.run(Who::Owner, "document.open", json!({"path": path}));
+            }
+            Some(path) => {
+                // A new file: saved there on the first save.
+                app.session.path = Some(path.clone());
+                app.status = Some((format!("{} does not exist yet; it is written on Save", path.display()), false));
+                app.request_rebuild(None);
+            }
+            None => app.request_rebuild(None),
+        }
+        if app.viewport.is_none() {
+            app.status = Some(("no GPU renderer: the 3D view is unavailable".into(), true));
+        }
+        app
+    }
+
+    /// The workspace state is also usable without a GPU for state-transition tests.
+    fn with_context(ctx: egui::Context, render_state: Option<eframe::egui_wgpu::RenderState>, session: Session) -> StudioApp {
         theme::apply(&ctx);
         let wake = ctx.clone();
-        if let Some(rs) = &cc.wgpu_render_state {
+        if let Some(rs) = &render_state {
             // wgpu panics on a validation error by default; a driver quirk is reported instead.
             rs.device.on_uncaptured_error(Arc::new(|e| eprintln!("trigon-studio: GPU error: {e}")));
         }
-        let mut app = StudioApp {
-            session: Session::new(Box::new(Live::new(Credentials::from_env()))),
+        StudioApp {
+            session,
             feed: Feed::default(),
             palette: Palette::default(),
             server: None,
@@ -211,11 +238,11 @@ impl StudioApp {
             filter: PhaseFilter::Complete,
             camera: Orbit::default(),
             fit_pending: true,
-            render_state: cc.wgpu_render_state.clone(),
-            viewport: cc.wgpu_render_state.as_ref().map(|rs| Viewport3d::new(&rs.device, &rs.adapter)),
+            viewport: render_state.as_ref().map(|rs| Viewport3d::new(&rs.device, &rs.adapter)),
+            render_state,
             texture: None,
             texture_size: [0, 0],
-            ppp: cc.egui_ctx.pixels_per_point(),
+            ppp: ctx.pixels_per_point(),
             window_hidden: false,
             synthetic: std::collections::VecDeque::new(),
             viewport_rect: None,
@@ -225,6 +252,7 @@ impl StudioApp {
             diff: scene::Diff::default(),
             selection: None,
             authoring: Authoring::default(),
+            schedules: Schedules::default(),
             pending_selection: None,
             selection_dirty: false,
             plan: PlanView::new(ctx.clone()),
@@ -235,26 +263,7 @@ impl StudioApp {
             title: String::new(),
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             path_text: String::new(),
-        };
-        if let Some(listen) = launch.control {
-            app.start_control(listen, &ctx);
         }
-        match &launch.file {
-            Some(path) if path.exists() => {
-                let _ = app.run(Who::Owner, "document.open", json!({"path": path}));
-            }
-            Some(path) => {
-                // A new file: saved there on the first save.
-                app.session.path = Some(path.clone());
-                app.status = Some((format!("{} does not exist yet; it is written on Save", path.display()), false));
-                app.request_rebuild(None);
-            }
-            None => app.request_rebuild(None),
-        }
-        if app.viewport.is_none() {
-            app.status = Some(("no GPU renderer: the 3D view is unavailable".into(), true));
-        }
-        app
     }
 
     fn start_control(&mut self, listen: Listen, ctx: &egui::Context) {
@@ -307,6 +316,7 @@ impl StudioApp {
                 self.fit_pending = true;
                 self.selection = None;
                 self.authoring = Authoring::default();
+                self.schedules = Schedules::default();
                 self.drafting = Drafting::default();
                 self.drawing.clear();
                 if self.mode == Mode::Drawing {
@@ -342,6 +352,8 @@ impl StudioApp {
         }
         self.generation += 1;
         self.scene_wanted = self.generation;
+        self.schedules.begin(self.generation);
+        self.build_error = None;
         if let Some(seq) = cause {
             self.cause = Some((self.generation, seq));
         }
@@ -383,29 +395,41 @@ impl StudioApp {
 
     fn poll_worker(&mut self) {
         while let Some(done) = self.worker.try_recv() {
-            if let Some(scene) = done.scene
-                && done.generation > self.scene_generation
-            {
-                self.scene_generation = done.generation;
-                match scene {
-                    Ok(new) => {
-                        self.timings = Some((done.build_ms, done.scene_ms));
-                        self.build_error = None;
-                        self.apply_scene(new, done.generation);
-                    }
-                    Err(e) => self.build_error = Some(e),
+            self.apply_done(done);
+        }
+    }
+
+    fn apply_done(&mut self, done: Done) {
+        if let Some(scene) = done.scene
+            && done.generation > self.scene_generation
+            && done.generation >= self.scene_wanted
+        {
+            self.scene_generation = done.generation;
+            match scene {
+                Ok(prepared) => {
+                    self.timings = Some((done.build_ms, done.scene_ms));
+                    self.build_error = None;
+                    self.schedules.finish(done.generation, Ok(prepared.schedule));
+                    self.apply_scene(prepared.scene, done.generation);
+                }
+                Err(e) => {
+                    self.schedules.finish(done.generation, Err(e.clone()));
+                    self.build_error = Some(e);
+                    self.selection = None;
+                    self.pending_selection = None;
+                    self.selection_dirty = true;
                 }
             }
-            if let Some((request, tree)) = done.drawing
-                && done.generation >= self.plan_wanted
-                && Some(request) == self.drawing_request()
-            {
-                self.plan_generation = done.generation;
-                self.plan_ms = Some(done.plan_ms);
-                match tree {
-                    Ok(t) => self.plan.set_drawing(done.generation, t),
-                    Err(e) => self.plan.fail(e),
-                }
+        }
+        if let Some((request, tree)) = done.drawing
+            && done.generation >= self.plan_wanted
+            && Some(request) == self.drawing_request()
+        {
+            self.plan_generation = done.generation;
+            self.plan_ms = Some(done.plan_ms);
+            match tree {
+                Ok(t) => self.plan.set_drawing(done.generation, t),
+                Err(e) => self.plan.fail(e),
             }
         }
     }
@@ -442,13 +466,13 @@ impl StudioApp {
             .pending_selection
             .take()
             .and_then(|id| {
-                new.find(&id).or_else(|| {
+                new.find_unique(&id).or_else(|| {
                     let root = id.split_once(':').map_or(id.as_str(), |(_, root)| root);
-                    new.find(&format!("{root}.L{}", self.plan_level))
+                    new.find_unique(&format!("{root}.L{}", self.plan_level))
                         .or_else(|| new.elements.iter().position(|e| e.id.starts_with(&format!("{root}.L"))))
                 })
             })
-            .or_else(|| selected.and_then(|id| new.find(&id)));
+            .or_else(|| selected.and_then(|id| new.find_unique(&id)));
         self.selection_dirty = true;
         if !diff.is_empty() {
             self.highlight = Some(Highlight { started: Instant::now() });
@@ -481,6 +505,9 @@ impl StudioApp {
         {
             let aspect = self.viewport_rect.map_or(1.6, |r| r.width() / r.height().max(1.0));
             self.camera.focus(lo, hi, e.facing, aspect);
+            if self.authoring.tab == Tab::Schedules {
+                self.authoring.tab = Tab::Project;
+            }
             self.mode = Mode::ThreeD;
             self.redraw = true;
         }
@@ -718,7 +745,7 @@ impl StudioApp {
 
     fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(Tab::Project, "Model"), (Tab::Families, "Families"), (Tab::Drawings, "Document")] {
+            for (tab, label) in [(Tab::Project, "Model"), (Tab::Families, "Families"), (Tab::Drawings, "Document"), (Tab::Schedules, "Schedules")] {
                 if theme::workspace_tab(ui, label, self.authoring.tab == tab).clicked() {
                     self.authoring.tab = tab;
                     self.drafting.picking = None;
@@ -800,6 +827,9 @@ impl StudioApp {
                     }
                     self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" });
                 }
+                Tab::Schedules => {
+                    ui.weak("Window & door inventory · select a row to edit in Properties");
+                }
             }
             let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone());
             if before != after {
@@ -815,6 +845,9 @@ impl StudioApp {
     /// The view settings changed: rebuild what the new view needs.
     pub(crate) fn view_changed(&mut self, phase_changed: bool) {
         self.redraw = true;
+        if !phase_changed && self.authoring.tab == Tab::Schedules {
+            self.authoring.tab = Tab::Project;
+        }
         if phase_changed {
             self.request_rebuild(None);
         } else if self.mode != Mode::ThreeD {
@@ -889,6 +922,37 @@ impl StudioApp {
         });
     }
 
+    fn edit_block_reason(&self) -> Option<&'static str> {
+        if self.authoring.tab == Tab::Families {
+            return None;
+        }
+        if self.build_error.is_some() {
+            return Some("The model build failed. Correct the model before editing this view.");
+        }
+        if self.building() || (self.authoring.tab == Tab::Schedules && self.schedules.data().is_none()) {
+            return Some("Wait for the current model build before editing.");
+        }
+        let selected = self.selection.and_then(|i| self.scene.elements.get(i));
+        let ambiguous = |id: &str| {
+            if let Some(group) = id.strip_prefix("group:") {
+                self.session.doc.groups.iter().find(|g| g.id == group).is_some_and(|g| g.targets.iter().any(|id| self.scene.ambiguous(id)))
+            } else {
+                self.scene.ambiguous(id)
+            }
+        };
+        if self.authoring.selected(selected).iter().any(|id| ambiguous(id)) {
+            return Some(schedules::AMBIGUOUS);
+        }
+        // Semantic edit commands target the document's active phase, not a historical view.
+        if (self.authoring.tab == Tab::Schedules || selected.is_some_and(|e| matches!(e.kind, "window" | "door")))
+            && (self.phase != self.session.doc.active_index()
+                || selected.is_some_and(|e| e.props.iter().any(|(k, v)| *k == "phase status" && v == "demolished")))
+        {
+            return Some("Opening edits use the active phase. Use its complete view to edit this element.");
+        }
+        None
+    }
+
     fn selection_panel(&mut self, ui: &mut egui::Ui) {
         if self.authoring.tab == Tab::Drawings {
             if self.mode == Mode::Drawing {
@@ -903,7 +967,14 @@ impl StudioApp {
         }
         ui.heading(if self.authoring.tab == Tab::Families { "Type properties" } else { "Properties" });
         let selected = self.selection.and_then(|i| self.scene.elements.get(i)).cloned();
-        if let Some(run) = self.authoring.ui(ui, &self.session.doc, selected.as_ref(), self.plan_level) {
+        let blocked = self.edit_block_reason();
+        if let Some(reason) = blocked {
+            ui.label(egui::RichText::new(reason).color(theme::ACCENT));
+        }
+        let run = ui.add_enabled_ui(blocked.is_none(), |ui| self.authoring.ui(ui, &self.session.doc, selected.as_ref(), self.plan_level)).inner;
+        if let Some(run) = run
+            && self.edit_block_reason().is_none()
+        {
             match self.run(Who::Owner, run.command, run.params) {
                 Ok(value) => {
                     if let Some(targets) = value.get("targets").and_then(Value::as_array) {
@@ -933,7 +1004,15 @@ impl StudioApp {
             ui.end_row();
             if let Some(l) = e.level {
                 ui.weak("level");
-                ui.label(self.levels().get(l).cloned().unwrap_or_else(|| l.to_string()));
+                let building =
+                    e.props.iter().find(|(k, _)| *k == "building").and_then(|(_, id)| self.session.doc.buildings.iter().find(|b| b.id == *id));
+                ui.label(
+                    building
+                        .and_then(|b| b.storeys.get(l))
+                        .map(|s| s.name.clone())
+                        .or_else(|| self.levels().get(l).cloned())
+                        .unwrap_or_else(|| l.to_string()),
+                );
                 ui.end_row();
             }
             for (k, v) in &e.props {
@@ -968,9 +1047,14 @@ impl StudioApp {
                 Tab::Project => "PROJECT",
                 Tab::Families => "FAMILIES / COMPONENTS",
                 Tab::Drawings => "VIEWS / DRAWINGS",
+                Tab::Schedules => "SCHEDULES",
             },
         );
         ui.separator();
+        if self.authoring.tab == Tab::Schedules {
+            self.schedules.browser(ui, &self.session.doc);
+            return;
+        }
         if self.authoring.tab == Tab::Drawings {
             if let Some(action) = self.drafting.library(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" }) {
                 match action {
@@ -1078,6 +1162,26 @@ impl StudioApp {
         }
         if before != (self.mode, self.level, self.plan_level) {
             self.view_changed(false);
+        }
+    }
+
+    fn schedule_action(&mut self, action: schedules::Action) {
+        if self.building() {
+            return;
+        }
+        let (schedules::Action::Select(index) | schedules::Action::Show(index)) = action;
+        let Some(row) = self.schedules.data().and_then(|s| s.rows.iter().find(|r| schedules::resolve_row(&self.scene, r) == Ok(index))) else {
+            return;
+        };
+        self.plan_level = row.level;
+        self.selection = Some(index);
+        self.pending_selection = None;
+        self.selection_dirty = true;
+        self.redraw = true;
+        self.authoring.targets.clear();
+        if matches!(action, schedules::Action::Show(_)) {
+            self.level = None;
+            self.focus(index);
         }
     }
 
@@ -1424,6 +1528,12 @@ impl eframe::App for StudioApp {
             egui::ScrollArea::vertical().id_salt("properties-scroll").show(ui, |ui| self.selection_panel(ui));
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            if self.authoring.tab == Tab::Schedules {
+                if let Some(action) = self.schedules.ui(ui, &self.scene, self.selection) {
+                    self.schedule_action(action);
+                }
+                return;
+            }
             let label = match self.mode {
                 Mode::ThreeD => "3D / Coordination".to_string(),
                 Mode::Plan => format!("{} / Floor plan", self.levels().get(self.plan_level).map_or("Level", String::as_str)),
@@ -1455,5 +1565,186 @@ impl eframe::App for StudioApp {
             self.palette.set_outcome(r.map(|v| crate::activity::pretty(&v)));
         }
         self.confirm_close_dialog(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(phases: bool) -> StudioApp {
+        let session = if phases { schedules::tests::phase_session() } else { schedules::tests::session() };
+        let mut app = StudioApp::with_context(egui::Context::default(), None, session);
+        app.phase = app.session.doc.active_index();
+        app.request_rebuild(None);
+        complete(&mut app);
+        app.authoring.tab = Tab::Schedules;
+        app
+    }
+
+    fn result(app: &StudioApp) -> Done {
+        crate::worker::run(&Job {
+            generation: app.generation,
+            doc: Arc::new(app.session.doc.clone()),
+            view: app.view(),
+            want_scene: true,
+            drawing: None,
+        })
+    }
+
+    fn complete(app: &mut StudioApp) {
+        app.apply_done(result(app));
+        assert!(!app.building());
+    }
+
+    fn window(app: &StudioApp) -> usize {
+        let row = app.schedules.data().unwrap().rows.iter().find(|r| r.kind == trigon_engine::ScheduleOpeningKind::Window).unwrap();
+        schedules::resolve_row(&app.scene, row).unwrap()
+    }
+
+    #[test]
+    fn schedule_selection_uses_existing_properties_and_refreshes_after_edit_undo_redo() {
+        let mut app = app(false);
+        let before = app.schedules.data().unwrap().clone();
+        app.authoring.targets = "previous selection".into();
+        let index = window(&app);
+        let id = app.scene.elements[index].id.clone();
+        app.schedule_action(schedules::Action::Select(index));
+        assert_eq!(app.selection, Some(index));
+        assert!(app.authoring.tab == Tab::Schedules, "the table must remain visible while editing");
+        assert!(app.authoring.targets.is_empty());
+        assert!(app.edit_block_reason().is_none());
+        assert_eq!(app.authoring.selected(app.scene.elements.get(index)), vec![id.clone()]);
+
+        app.run(Who::Owner, "edit.copy", json!({"targets":[id],"delta":[1800,0,0],"count":1})).unwrap();
+        assert!(app.building());
+        assert!(app.schedules.data().is_none());
+        assert!(app.edit_block_reason().is_some());
+        complete(&mut app);
+        let changed = app.schedules.data().unwrap().clone();
+        assert_eq!(changed.totals.instances, before.totals.instances + 1);
+        assert!((changed.totals.area_m2 - before.totals.area_m2 - 2.16).abs() < 1e-9);
+        assert!(app.authoring.tab == Tab::Schedules);
+        assert!(app.edit_block_reason().is_none());
+
+        app.run(Who::Owner, "edit.undo", json!({})).unwrap();
+        assert!(app.schedules.data().is_none());
+        complete(&mut app);
+        assert_eq!(app.schedules.data(), Some(&before));
+        app.run(Who::Owner, "edit.redo", json!({})).unwrap();
+        assert!(app.schedules.data().is_none());
+        complete(&mut app);
+        assert_eq!(app.schedules.data(), Some(&changed));
+        let generation = app.generation;
+        app.request_plan();
+        assert_eq!(app.schedules.data(), Some(&changed), "a drawing-only request does not invalidate quantities");
+        assert!(app.generation > generation);
+    }
+
+    #[test]
+    fn obsolete_phase_results_and_errors_are_rejected_and_new_documents_clear_inventory() {
+        let mut app = app(true);
+        app.request_rebuild(None);
+        let stale = result(&app);
+        let displayed = app.scene_generation;
+        app.filter = PhaseFilter::New;
+        app.view_changed(true);
+        app.apply_done(stale);
+        assert_eq!(app.scene_generation, displayed, "an obsolete model must not replace the displayed scene");
+        assert!(app.schedules.data().is_none());
+        assert!(app.building());
+        complete(&mut app);
+        assert!(app.schedules.data().unwrap().rows.iter().all(|r| r.status == "new" || !r.external));
+
+        app.schedule_action(schedules::Action::Select(window(&app)));
+        app.request_rebuild(None);
+        let mut failure = result(&app);
+        failure.scene = Some(Err("test build error".into()));
+        app.apply_done(failure);
+        assert!(app.schedules.data().is_none());
+        assert_eq!(app.build_error.as_deref(), Some("test build error"));
+        assert!(app.selection.is_none());
+        assert!(app.edit_block_reason().is_some());
+
+        app.request_rebuild(None);
+        app.request_plan();
+        complete(&mut app); // A coalesced scene/plan result may be newer than scene_wanted.
+        assert!(app.schedules.data().is_some());
+        app.request_rebuild(None);
+        let old_document = result(&app);
+        app.schedules.filters.search = "window".into();
+        app.run(Who::Owner, "document.new", json!({})).unwrap();
+        assert!(app.schedules.data().is_none());
+        assert!(app.schedules.filters.search.is_empty());
+        app.apply_done(old_document);
+        assert!(app.schedules.data().is_none());
+        assert!(app.selection.is_none());
+        complete(&mut app);
+        assert_eq!(app.schedules.data(), Some(&trigon_engine::OpeningSchedule::default()));
+    }
+
+    #[test]
+    fn ambiguous_same_type_phase_ids_cannot_select_focus_or_edit_even_through_a_group() {
+        let mut app = app(true);
+        app.filter = PhaseFilter::All;
+        app.view_changed(true);
+        complete(&mut app);
+        let index = app.scene.find("b.f1.L0.B0").unwrap();
+        let target = app.camera.target;
+        app.schedule_action(schedules::Action::Select(index));
+        assert!(app.selection.is_none());
+        app.schedule_action(schedules::Action::Show(index));
+        assert_eq!(app.camera.target, target);
+        assert!(app.authoring.tab == Tab::Schedules);
+        app.selection = Some(index); // A viewport pick or an older selection must not bypass the guard.
+        assert_eq!(app.edit_block_reason(), Some(schedules::AMBIGUOUS));
+        app.selection = None;
+        app.session.doc.groups.push(trigon_model::doc::ModelGroup {
+            id: "duplicate".into(),
+            name: "Duplicate".into(),
+            targets: vec!["b.f1.L0.B0".into()],
+        });
+        app.authoring.targets = "group:duplicate".into();
+        assert_eq!(app.edit_block_reason(), Some(schedules::AMBIGUOUS));
+        app.authoring.targets.clear();
+        app.filter = PhaseFilter::Complete;
+        app.view_changed(true);
+        complete(&mut app);
+        let index = window(&app);
+        app.schedule_action(schedules::Action::Select(index));
+        assert_eq!(app.selection, Some(index));
+        assert!(app.edit_block_reason().is_none());
+    }
+
+    #[test]
+    fn historical_and_demolished_openings_are_read_only_and_show_in_3d_uses_existing_focus() {
+        let mut app = app(true);
+        app.phase = 0;
+        app.view_changed(true);
+        complete(&mut app);
+        let index = window(&app);
+        app.schedule_action(schedules::Action::Select(index));
+        assert!(app.edit_block_reason().unwrap().contains("active phase"));
+        app.phase = 1;
+        app.filter = PhaseFilter::Demolition;
+        app.view_changed(true);
+        complete(&mut app);
+        let index = window(&app);
+        app.schedule_action(schedules::Action::Select(index));
+        assert!(app.edit_block_reason().unwrap().contains("active phase"));
+        app.filter = PhaseFilter::Complete;
+        app.view_changed(true);
+        complete(&mut app);
+        let index = window(&app);
+        app.mode = Mode::Plan;
+        app.level = Some(0);
+        app.camera.target = [500.0; 3];
+        app.schedule_action(schedules::Action::Show(index));
+        assert_eq!(app.mode, Mode::ThreeD);
+        assert!(app.authoring.tab == Tab::Project);
+        assert_eq!(app.selection, Some(index));
+        assert!(app.level.is_none(), "the previously active cut must not hide the focused row");
+        assert_ne!(app.camera.target, [500.0; 3]);
+        assert!(app.redraw && app.selection_dirty);
     }
 }

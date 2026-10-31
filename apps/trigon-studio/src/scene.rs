@@ -345,6 +345,7 @@ impl Scene {
                         element_kind(e),
                         Some(e.level),
                         vec![
+                            ("building", building.building_id.clone()),
                             ("type", e.type_id.clone()),
                             ("name", e.name.clone()),
                             ("facade", w.id.clone()),
@@ -405,7 +406,22 @@ impl Scene {
                 for door in &iw.doors {
                     let e = &door.fill;
                     let parts: Vec<Part<'_>> = e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases) }).collect();
-                    b.add(&e.id, "door", Some(e.level), vec![("host", iw.id.clone()), ("width", mm(e.width))], false, &parts);
+                    b.add(
+                        &e.id,
+                        "door",
+                        Some(e.level),
+                        vec![
+                            ("building", building.building_id.clone()),
+                            ("type", e.type_id.clone()),
+                            ("name", e.name.clone()),
+                            ("host", iw.id.clone()),
+                            ("width", mm(e.width)),
+                            ("height", mm(e.height)),
+                            ("phase status", e.status.name().to_string()),
+                        ],
+                        false,
+                        &parts,
+                    );
                 }
             }
             for st in &building.stairs {
@@ -480,6 +496,17 @@ impl Scene {
     /// The element with this id, if any.
     pub fn find(&self, id: &str) -> Option<usize> {
         self.elements.iter().position(|e| e.id == id)
+    }
+
+    /// Semantic ids are not unique in every phase view. Never silently choose an occurrence.
+    pub fn find_unique(&self, id: &str) -> Option<usize> {
+        let mut matches = self.elements.iter().enumerate().filter(|(_, e)| e.id == id);
+        let (index, _) = matches.next()?;
+        matches.next().is_none().then_some(index)
+    }
+
+    pub fn ambiguous(&self, id: &str) -> bool {
+        self.elements.iter().filter(|e| e.id == id).take(2).count() > 1
     }
 
     /// Element keys (ids, made unique) and fingerprints.
