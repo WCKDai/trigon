@@ -116,6 +116,9 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
         for iw in &b.interior {
             add(&mut w, &iw.id, &[(Material::Slab, &iw.mesh)]);
         }
+        for st in &b.stairs {
+            add(&mut w, &st.id, &[(Material::Sill, &st.mesh)]);
+        }
     }
     for (name, mesh) in references {
         add(&mut w, name, &[(Material::Reference, mesh)]);

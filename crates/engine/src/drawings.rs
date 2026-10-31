@@ -278,10 +278,6 @@ pub(crate) fn facade_image(
     }))
 }
 
-pub(crate) fn digit(d: u32) -> [u8; 5] {
-    DIGITS.get(d as usize).copied().unwrap_or([0; 5])
-}
-
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -293,6 +289,9 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// Facades at least this long set the wall directions the tracer follows (a block's grid).
+const MIN_FACADE: f64 = 3000.0;
 
 /// Candidate interior walls read off a registered plan: dark bands between `min_mm` and `max_mm`
 /// thick that run at least `min_len` along one of the building's wall directions, inside the outer
@@ -314,29 +313,46 @@ pub(crate) fn trace_walls(
         .cloned()
         .ok_or_else(|| ModelError::NotFound(format!("drawing {name} has no plan registered for level {level}; run drawing.register_plan")))?;
     let img = image(s, &d.path, d.page, d.rotate)?;
-    // Paper brightness per 48 px block (about 0.4 m at 1:100), so lighter parts of a sheet read the same.
-    let bg = img.background(48, 0.8);
+    // Sample paper over a region wider than the largest wall. A small tile wholly inside
+    // thick masonry would otherwise classify the wall itself as the paper background.
+    let paper_block = (3.0 * max_mm * reg.px_per_m() / 1000.0).ceil().clamp(128.0, 2048.0) as u32;
+    let bg = img.background(paper_block, 0.8);
     let b = s.doc.building(None)?.clone();
     let inside = trigon_model::build::inner_ring(&b.footprint, b.wall_thickness + 60.0);
-    // Wall directions: the long facade edges' directions, merged within 3°, plus their perpendiculars.
+    // Wall directions: the building's grids, i.e. facade directions (modulo 90°) clustered within 2.5°, weighted
+    // by facade length; a grid needs at least 20 m of facade. Each grid is traced along both of its axes.
     let n = b.footprint.len();
-    let mut dirs: Vec<f64> = Vec::new();
+    let mut clusters: Vec<(f64, f64)> = Vec::new(); // (angle mod 90° in radians, total length)
+    let quarter = std::f64::consts::FRAC_PI_2;
     for i in 0..n {
         let (p, q) = (b.footprint[i], b.footprint[(i + 1) % n]);
         let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
-        if (dx * dx + dy * dy).sqrt() < 8000.0 {
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < MIN_FACADE {
             continue;
         }
-        for t in [dy.atan2(dx), dy.atan2(dx) + std::f64::consts::FRAC_PI_2] {
-            let t = t.rem_euclid(std::f64::consts::PI);
-            if !dirs.iter().any(|o| {
-                let diff = (o - t).abs();
-                diff.min(std::f64::consts::PI - diff) < 3f64.to_radians()
-            }) {
-                dirs.push(t);
+        let t = dy.atan2(dx).rem_euclid(quarter);
+        let close = |o: f64| {
+            let d = (o - t).abs();
+            d.min(quarter - d) < 2.5f64.to_radians()
+        };
+        match clusters.iter_mut().find(|c| close(c.0)) {
+            Some(c) => {
+                // Length-weighted mean, unwrapped around the 0/90° seam.
+                let mut tt = t;
+                if tt - c.0 > quarter / 2.0 {
+                    tt -= quarter;
+                } else if c.0 - tt > quarter / 2.0 {
+                    tt += quarter;
+                }
+                c.0 = ((c.0 * c.1 + tt * len) / (c.1 + len)).rem_euclid(quarter);
+                c.1 += len;
             }
+            None => clusters.push((t, len)),
         }
     }
+    let grids: Vec<f64> = clusters.iter().filter(|c| c.1 >= 20_000.0).map(|c| c.0).collect();
+    let dirs: Vec<f64> = grids.iter().flat_map(|&t| [t, t + quarter]).collect();
     let contains = |p: [f64; 2]| {
         let mut c = false;
         for i in 0..inside.len() {
@@ -384,8 +400,16 @@ pub(crate) fn trace_walls(
             let is_dark = |p: [f64; 2]| {
                 contains(p) && {
                     let [x, y] = reg.to_drawing(p);
-                    let paper = bg.sample(x / 48.0, y / 48.0).map_or(200.0, f64::from);
+                    let paper = bg.sample(x / f64::from(paper_block), y / f64::from(paper_block)).map_or(200.0, f64::from);
                     img.sample(x, y).is_some_and(|g| f64::from(g) < (paper - dark).min(paper * 0.75))
+                }
+            };
+            // Walls filled with grey (not black): lighter, so only accepted as thick runs.
+            let is_grey = |p: [f64; 2]| {
+                contains(p) && {
+                    let [x, y] = reg.to_drawing(p);
+                    let paper = bg.sample(x / f64::from(paper_block), y / f64::from(paper_block)).map_or(200.0, f64::from);
+                    img.sample(x, y).is_some_and(|g| f64::from(g) < paper - dark * 0.5)
                 }
             };
             // All dark runs across this column: (first cell, length).
@@ -417,6 +441,24 @@ pub(crate) fn trace_walls(
                     k = e + 1;
                 }
             }
+            // Grey-filled walls: runs of the lighter threshold at least 150 mm thick that the dark pass didn't see as a wall.
+            let grey_min = ((150.0 / step).round() as usize).max(min_c);
+            let mut j = 0;
+            let mut grey_runs: Vec<(f64, f64)> = Vec::new();
+            while j < cells {
+                if is_grey(site(i, j)) {
+                    let s0 = j;
+                    while j < cells && is_grey(site(i, j)) {
+                        j += 1;
+                    }
+                    let len = j - s0;
+                    if len >= grey_min && len <= max_c {
+                        grey_runs.push(((s0 + j - 1) as f64 / 2.0, len as f64));
+                    }
+                } else {
+                    j += 1;
+                }
+            }
             // Filled walls: one run as thick as a wall. Outlined walls: two thin lines a wall's thickness apart.
             let mut runs: Vec<(f64, f64)> = Vec::new();
             for (k, &(s0, len)) in all.iter().enumerate() {
@@ -429,6 +471,11 @@ pub(crate) fn trace_walls(
                     if len1 <= 3 && s1 > s0 + len && span >= min_c && span <= max_c {
                         runs.push(((s0 + s0 + span - 1) as f64 / 2.0, -(span as f64)));
                     }
+                }
+            }
+            for g in grey_runs {
+                if !runs.iter().any(|r| (r.0 - g.0).abs() <= g.1 / 2.0 + 1.0) {
+                    runs.push(g);
                 }
             }
             let mut next = Vec::new();
@@ -481,6 +528,12 @@ pub(crate) fn trace_walls(
                 levels: vec![level],
                 outline: vec![c(a, cc), c(a, d), c(b, d), c(b, cc)],
                 tread: None,
+                kind: trigon_model::StairKind::Straight,
+                landing: None,
+                well: None,
+                rounded: true,
+                winders: None,
+                turn_depths: None,
             });
         }
         for t in done {
@@ -534,7 +587,8 @@ pub(crate) fn trace_walls(
             !flights.iter().any(|f| inside_poly(&shrink(&f.outline, 120.0), m))
         })
         .collect();
-    Ok((clean_walls(walls, &b.footprint), flights))
+    let inner = trigon_model::build::inner_ring(&b.footprint, b.wall_thickness);
+    Ok((snap_ends(clean_walls(walls, &grids), &inner), flights))
 }
 
 pub(crate) fn inside(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
@@ -566,34 +620,20 @@ fn shrink(poly: &[[f64; 2]], d: f64) -> Vec<[f64; 2]> {
         .collect()
 }
 
-/// Cleans traced walls: keeps each only where its direction matches the nearest long facade (so
-/// one wing's grid isn't read into another), merges collinear overlapping pieces, and drops thin
-/// short bits (text, treads, fixtures).
-fn clean_walls(walls: Vec<trigon_model::InteriorWall>, footprint: &[[f64; 2]]) -> Vec<trigon_model::InteriorWall> {
-    let n = footprint.len();
-    let long: Vec<([f64; 2], [f64; 2])> = (0..n)
-        .map(|i| (footprint[i], footprint[(i + 1) % n]))
-        .filter(|(p, q)| ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt() >= 8000.0)
-        .collect();
+/// Cleans traced walls: keeps those square to one of the building's grids (each wall keeps the angle
+/// fitted to its own runs), merges collinear overlapping pieces (one wall traced along two grids comes
+/// out twice), and drops thin short bits (text, treads, fixtures).
+fn clean_walls(walls: Vec<trigon_model::InteriorWall>, grids: &[f64]) -> Vec<trigon_model::InteriorWall> {
     let dir = |a: [f64; 2], b: [f64; 2]| (b[1] - a[1]).atan2(b[0] - a[0]).rem_euclid(std::f64::consts::PI);
     let square = |t1: f64, t2: f64| {
         let d = (t1 - t2).rem_euclid(std::f64::consts::FRAC_PI_2);
         d.min(std::f64::consts::FRAC_PI_2 - d) < 3f64.to_radians()
     };
-    let seg_dist = |p: [f64; 2], a: [f64; 2], b: [f64; 2]| {
-        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        let l2 = (dx * dx + dy * dy).max(1e-9);
-        let t = (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0);
-        ((a[0] + t * dx - p[0]).powi(2) + (a[1] + t * dy - p[1]).powi(2)).sqrt()
-    };
     let mut kept: Vec<trigon_model::InteriorWall> = walls
         .into_iter()
         .filter(|w| {
-            let m = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
             let len = ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt();
-            let near = long.iter().min_by(|x, y| seg_dist(m, x.0, x.1).total_cmp(&seg_dist(m, y.0, y.1)));
-            let aligned = near.is_none_or(|(p, q)| square(dir(w.a, w.b), dir(*p, *q)));
-            aligned && (len >= 1000.0 || w.thickness >= 200.0)
+            grids.iter().any(|g| square(dir(w.a, w.b), *g)) && (len >= 1000.0 || w.thickness >= 200.0)
         })
         .collect();
     // Merge collinear overlapping or touching pieces (same direction, centre lines closer than their half thicknesses).
@@ -642,4 +682,338 @@ fn clean_walls(walls: Vec<trigon_model::InteriorWall>, footprint: &[[f64; 2]]) -
         }
     }
     kept
+}
+
+/// Joins wall ends to the walls they meet: each end moves along its wall to the nearest centre line
+/// of another wall, or the inside face of the outer walls, if that is at most 600 mm beyond the end
+/// (or 150 mm short of it) and the meeting point lies on that wall.
+fn snap_ends(mut walls: Vec<trigon_model::InteriorWall>, inner: &[[f64; 2]]) -> Vec<trigon_model::InteriorWall> {
+    let n = inner.len();
+    let mut targets: Vec<([f64; 2], [f64; 2], f64)> = (0..n).map(|i| (inner[i], inner[(i + 1) % n], 0.0)).collect();
+    targets.extend(walls.iter().map(|w| (w.a, w.b, w.thickness / 2.0)));
+    let outer_count = n;
+    for (k, w) in walls.iter_mut().enumerate() {
+        for end in 0..2 {
+            let (p, other) = if end == 0 { (w.a, w.b) } else { (w.b, w.a) };
+            let (dx, dy) = (p[0] - other[0], p[1] - other[1]);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1.0 {
+                continue;
+            }
+            let d = [dx / len, dy / len];
+            let mut best: Option<(f64, [f64; 2])> = None;
+            for (ti, (a, b, half)) in targets.iter().enumerate() {
+                if ti >= outer_count && ti - outer_count == k {
+                    continue;
+                }
+                let e = [b[0] - a[0], b[1] - a[1]];
+                let el = (e[0] * e[0] + e[1] * e[1]).sqrt();
+                let denom = d[0] * e[1] - d[1] * e[0];
+                if el < 1.0 || denom.abs() / el < 0.5 {
+                    continue; // parallel-ish: not a junction
+                }
+                // p + t·d = a + s·e
+                let t = ((a[0] - p[0]) * e[1] - (a[1] - p[1]) * e[0]) / denom;
+                let sp = ((a[0] - p[0]) * d[1] - (a[1] - p[1]) * d[0]) / denom;
+                let tol = (200.0 + half) / el;
+                // Stop at the near face of a wall, at the centre line of a thin one.
+                let t_face = t - half / (denom.abs() / el);
+                if !(-150.0..=600.0).contains(&t_face) || sp < -tol || sp > 1.0 + tol {
+                    continue;
+                }
+                if best.is_none_or(|(bt, _)| t_face.abs() < bt.abs()) {
+                    best = Some((t_face, [p[0] + d[0] * t_face, p[1] + d[1] * t_face]));
+                }
+            }
+            if let Some((_, q)) = best {
+                if end == 0 {
+                    w.a = q;
+                } else {
+                    w.b = q;
+                }
+            }
+        }
+    }
+    walls.retain(|w| ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt() >= 200.0);
+    walls
+}
+
+/// What `fit_stair` measured.
+/// A known stair design to match (all stairwells of one building usually share it).
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StairTemplate {
+    /// Tread lines in one flight (including the first nosing).
+    pub treads: usize,
+    pub tread_mm: f64,
+    pub width_mm: f64,
+    pub well_mm: f64,
+}
+
+pub(crate) struct StairFit {
+    pub stair: trigon_model::Stair,
+    /// Lines found across the flights, mm from p0's side, with their strength.
+    pub lines_across: Vec<(f64, f64)>,
+    pub treads: usize,
+    pub tread_mm: f64,
+    pub length_mm: f64,
+    pub width_mm: f64,
+    pub well_mm: f64,
+}
+
+/// Local maxima of a profile above `min`, at least `gap` apart (strongest kept).
+fn peaks(p: &[f64], min: f64, gap: usize) -> Vec<usize> {
+    let mut c: Vec<usize> = (1..p.len().saturating_sub(1)).filter(|&i| p[i] >= min && p[i] >= p[i - 1] && p[i] >= p[i + 1]).collect();
+    c.sort_by(|a, b| p[*b].total_cmp(&p[*a]));
+    let mut kept: Vec<usize> = Vec::new();
+    for i in c {
+        if kept.iter().all(|k| k.abs_diff(i) >= gap) {
+            kept.push(i);
+        }
+    }
+    kept.sort_unstable();
+    kept
+}
+
+/// Measures a U-turn staircase on a registered plan from a rough box `[p0, p1, p2, p3]` in drawing
+/// pixels (p0→p1 along the flights towards the half landing, p1→p2 across): the tread lines give
+/// the run and tread depth, the stringers and the well's lines the width and the well.
+pub(crate) fn fit_stair(s: &mut Session, name: &str, level: usize, rough: [[f64; 2]; 4], template: Option<StairTemplate>) -> Result<StairFit> {
+    let d = find(s, name)?.clone();
+    let reg = d
+        .plans
+        .iter()
+        .find(|p| p.levels.contains(&level))
+        .cloned()
+        .ok_or_else(|| ModelError::NotFound(format!("drawing {name} has no plan registered for level {level}; run drawing.register_plan")))?;
+    let img = image(s, &d.path, d.page, d.rotate)?;
+    let bg = img.background(48, 0.8);
+    let [p0, p1, _, p3] = rough;
+    let (rv, av) = ([p1[0] - p0[0], p1[1] - p0[1]], [p3[0] - p0[0], p3[1] - p0[1]]);
+    let (len, wid) = ((rv[0] * rv[0] + rv[1] * rv[1]).sqrt(), (av[0] * av[0] + av[1] * av[1]).sqrt());
+    if !(len >= 40.0 && wid >= 40.0 && len <= 3000.0 && wid <= 3000.0) {
+        return Err(ModelError::Invalid("the rough box must be 40 to 3000 drawing px on each side".into()).into());
+    }
+    let (ru, au) = ([rv[0] / len, rv[1] / len], [av[0] / wid, av[1] / wid]);
+    let m = (0.25 * len.max(wid)).round();
+    let (ns, nt) = ((len + 2.0 * m) as usize, (wid + 2.0 * m) as usize);
+    let dark = |sx: f64, ty: f64| {
+        let (x, y) = (p0[0] + ru[0] * sx + au[0] * ty, p0[1] + ru[1] * sx + au[1] * ty);
+        let paper = bg.sample(x / 48.0, y / 48.0).map_or(200.0, f64::from).max(1.0);
+        img.sample(x, y).map_or(0.0, |g| ((paper - f64::from(g)) / paper).max(0.0))
+    };
+    let grid: Vec<Vec<f64>> = (0..ns).map(|i| (0..nt).map(|j| dark(i as f64 - m, j as f64 - m)).collect()).collect();
+    let px_mm0 = 1000.0 / reg.px_per_m();
+    if let Some(tp) = template {
+        // Slide the template's lines (treads in both flights, well lines, outer edges) over the box.
+        if !(2..=40).contains(&tp.treads)
+            || !(150.0..=400.0).contains(&tp.tread_mm)
+            || !(600.0..=5000.0).contains(&tp.width_mm)
+            || !(0.0..=600.0).contains(&tp.well_mm)
+        {
+            return Err(ModelError::Invalid("template out of range".into()).into());
+        }
+        let (g, w, wl) = (tp.tread_mm / px_mm0, tp.width_mm / px_mm0, tp.well_mm / px_mm0);
+        let run_px = g * (tp.treads - 1) as f64;
+        let flight = (w - wl) / 2.0;
+        let mut samples: Vec<(f64, f64)> = Vec::new();
+        for k in 0..tp.treads {
+            let sx = k as f64 * g;
+            let mut t = 0.0;
+            while t <= w {
+                if t <= flight || t >= flight + wl {
+                    samples.push((sx, t));
+                }
+                t += 2.0;
+            }
+        }
+        let mut sx = 0.0;
+        while sx <= run_px {
+            for t in [0.0, flight, flight + wl, w] {
+                samples.push((sx, t));
+            }
+            sx += 2.0;
+        }
+        let cell = |i: f64, j: f64| grid.get(i.round() as usize).and_then(|r| r.get(j.round() as usize)).copied().unwrap_or(0.0);
+        let mut best = (f64::MIN, 0.0, 0.0);
+        let (si_max, tj_max) = (ns as f64 - run_px - 1.0, nt as f64 - w - 1.0);
+        let mut i0 = 0.0;
+        while i0 <= si_max {
+            let mut j0 = 0.0;
+            while j0 <= tj_max {
+                let score: f64 = samples.iter().map(|(a, b)| cell(i0 + a, j0 + b)).sum::<f64>() / samples.len() as f64;
+                if score > best.0 {
+                    best = (score, i0, j0);
+                }
+                j0 += 1.0;
+            }
+            i0 += 1.0;
+        }
+        let (_, i0, j0) = best;
+        let at = |i: f64, j: f64| {
+            let (sx, ty) = (i - m, j - m);
+            reg.to_site([p0[0] + ru[0] * sx + au[0] * ty, p0[1] + ru[1] * sx + au[1] * ty])
+        };
+        let outline = vec![at(i0, j0), at(i0 + run_px, j0), at(i0 + run_px, j0 + w), at(i0, j0 + w)];
+        let stair = trigon_model::Stair {
+            id: String::new(),
+            levels: vec![level],
+            outline,
+            tread: Some(tp.tread_mm),
+            kind: trigon_model::StairKind::UTurn,
+            landing: None,
+            well: Some(tp.well_mm),
+            rounded: true,
+            winders: None,
+            turn_depths: None,
+        };
+        return Ok(StairFit {
+            stair,
+            lines_across: vec![(0.0, best.0)],
+            treads: tp.treads,
+            tread_mm: tp.tread_mm,
+            length_mm: run_px * px_mm0,
+            width_mm: tp.width_mm,
+            well_mm: tp.well_mm,
+        });
+    }
+    // Treads: lines across the flights, so peaks of darkness averaged across the middle of each flight.
+    let (t_lo, t_hi) = ((m + 0.08 * wid) as usize, (m + 0.92 * wid) as usize);
+    let run: Vec<f64> = grid.iter().map(|row| row[t_lo..t_hi.min(nt)].iter().sum::<f64>() / (t_hi - t_lo).max(1) as f64).collect();
+    let base = {
+        let mut v = run.clone();
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let pk = peaks(&run, base + 0.08, 12);
+    // The longest chain of evenly spaced peaks (150–380 mm apart) is the flight.
+    let px_mm = 1000.0 / reg.px_per_m();
+    let (gmin, gmax) = (150.0 / px_mm, 380.0 / px_mm);
+    let mut best: Vec<usize> = Vec::new();
+    for (a, &start) in pk.iter().enumerate() {
+        let mut chain = vec![start];
+        let mut step: Option<f64> = None;
+        for &q in &pk[a + 1..] {
+            let last = *chain.last().unwrap_or(&start);
+            let gap = (q - last) as f64;
+            if !(gmin..=gmax * 1.1).contains(&gap) {
+                if gap > gmax * 1.1 {
+                    break;
+                }
+                continue;
+            }
+            if step.is_none_or(|g| (gap - g).abs() <= 0.3 * g) {
+                step = Some(step.map_or(gap, |g| (g * (chain.len() - 1) as f64 + gap) / chain.len() as f64));
+                chain.push(q);
+            }
+        }
+        if chain.len() > best.len() {
+            best = chain;
+        }
+    }
+    if best.len() < 4 {
+        return Err(ModelError::NotFound(format!("only {} evenly spaced tread lines found; adjust the box", best.len())).into());
+    }
+    let (sf, sl) = (best[0], best[best.len() - 1]);
+    // Stringers and the well's lines: peaks across, averaged over the treads' run.
+    let across: Vec<f64> = (0..nt).map(|j| (sf..=sl).map(|i| grid[i][j]).sum::<f64>() / (sl - sf + 1) as f64).collect();
+    let abase = {
+        let mut v = across.clone();
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let ap = peaks(&across, abase + 0.15, 4);
+    // The well: the strongest pair of lines 60–420 mm apart near the middle of the box.
+    let mm = |j: usize| (j as f64 - m) * px_mm;
+    let centre = wid * px_mm / 2.0;
+    let strength = |j: usize| across.get(j).copied().unwrap_or(0.0);
+    let mut well: Option<(usize, usize, f64)> = None;
+    for (x, &a) in ap.iter().enumerate() {
+        for &b in &ap[x + 1..] {
+            let gap = mm(b) - mm(a);
+            let mid = (mm(a) + mm(b)) / 2.0;
+            if !(60.0..=420.0).contains(&gap) || (mid - centre).abs() > 0.3 * wid * px_mm {
+                continue;
+            }
+            let score = strength(a) + strength(b) - (mid - centre).abs() / (wid * px_mm);
+            if well.is_none_or(|w| score > w.2) {
+                well = Some((a, b, score));
+            }
+        }
+    }
+    let (wa, wb) = match well {
+        Some((a, b, _)) => (a, b),
+        None => return Err(ModelError::NotFound("no stair well (two lines near the middle) found; adjust the box".into()).into()),
+    };
+    // The flights' outer edges: a pair of lines either side of the well at matching distances (0.5–1.6 m).
+    let mut edges: Option<(usize, usize, f64)> = None;
+    for &l in ap.iter().filter(|&&j| j < wa) {
+        for &r in ap.iter().filter(|&&j| j > wb) {
+            let (dl, dr) = (mm(wa) - mm(l), mm(r) - mm(wb));
+            if !(500.0..=1600.0).contains(&dl) || !(500.0..=1600.0).contains(&dr) {
+                continue;
+            }
+            let score = strength(l) + strength(r) - (dl - dr).abs() / 200.0;
+            if edges.is_none_or(|e| score > e.2) {
+                edges = Some((l, r, score));
+            }
+        }
+    }
+    let (j0, j1) = match edges {
+        Some((l, r, _)) => (l, r),
+        None => return Err(ModelError::NotFound("no matching flight edges either side of the well; adjust the box".into()).into()),
+    };
+    let well_px = (wb - wa) as f64;
+    let at = |i: f64, j: f64| {
+        let (sx, ty) = (i - m, j - m);
+        reg.to_site([p0[0] + ru[0] * sx + au[0] * ty, p0[1] + ru[1] * sx + au[1] * ty])
+    };
+    let (sf, sl, j0, j1) = (sf as f64, sl as f64, j0 as f64, j1 as f64);
+    let outline = vec![at(sf, j0), at(sl, j0), at(sl, j1), at(sf, j1)];
+    let tread_mm = (sl - sf) / (best.len() - 1) as f64 * px_mm;
+    let stair = trigon_model::Stair {
+        id: String::new(),
+        levels: vec![level],
+        outline,
+        tread: Some(tread_mm),
+        kind: trigon_model::StairKind::UTurn,
+        landing: None,
+        well: Some(well_px * px_mm),
+        rounded: true,
+        winders: None,
+        turn_depths: None,
+    };
+    let lines_across = ap.iter().map(|&j| (((j as f64) - m) * px_mm, across[j])).collect();
+    Ok(StairFit {
+        stair,
+        lines_across,
+        treads: best.len(),
+        tread_mm,
+        length_mm: (sl - sf) * px_mm,
+        width_mm: (j1 - j0) * px_mm,
+        well_mm: well_px * px_mm,
+    })
+}
+
+/// A test for drawn line work on the plan registered for `level`: the darkest scan pixel within a
+/// 50 mm cell around a site point, compared with the local paper.
+pub(crate) fn ink_for(s: &mut Session, level: usize, contrast: f64) -> Result<Option<impl Fn([f64; 2]) -> bool + use<>>> {
+    let Some(d) = s.doc.drawings.iter().find(|d| d.plans.iter().any(|p| p.levels.contains(&level))).cloned() else { return Ok(None) };
+    let Some(reg) = d.plans.iter().find(|p| p.levels.contains(&level)).cloned() else { return Ok(None) };
+    let img = image(s, &d.path, d.page, d.rotate)?;
+    let bg = std::sync::Arc::new(img.background(48, 0.8));
+    let half = (25.0 * reg.px_per_m() / 1000.0).max(1.0);
+    Ok(Some(move |p: [f64; 2]| {
+        let [x, y] = reg.to_drawing(p);
+        let paper = bg.sample(x / 48.0, y / 48.0).map_or(200.0, f64::from);
+        let (x0, x1, y0, y1) =
+            ((x - half).floor().max(0.0) as u32, (x + half).ceil() as u32, (y - half).floor().max(0.0) as u32, (y + half).ceil() as u32);
+        let mut darkest = 255u8;
+        for yy in y0..y1.min(img.height) {
+            for xx in x0..x1.min(img.width) {
+                darkest = darkest.min(img.get(xx, yy));
+            }
+        }
+        f64::from(darkest) < paper - contrast
+    }))
 }

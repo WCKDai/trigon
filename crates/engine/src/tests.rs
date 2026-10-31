@@ -92,6 +92,114 @@ fn session() -> Session {
     s
 }
 
+#[test]
+fn clearing_stair_walls_preserves_the_other_storeys() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[{"id":"shared", "levels":[0,1,2], "a":[-1000,0],"b":[1000,0],"thickness":100,"load_bearing":false}]}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs":[{"id":"s","levels":[1],"outline":[[-2000,-1000],[2000,-1000],[2000,1000],[-2000,1000]]}],"clear_walls_inside":true}),
+    )
+    .unwrap();
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.len(), 1);
+    assert_eq!(walls[0].levels, vec![0, 2]);
+}
+
+#[test]
+fn stairs_and_basement_keep_levels_and_export_real_floor_openings() {
+    let mut s = session();
+    s.execute("interior.add_stairs",json!({"stairs":[{"id":"core","levels":[0,1,2,3,4],"outline":[[-2000,-1000],[0,-1000],[0,1000],[-2000,1000]],"kind":"u_turn","landing":1000,"rounded":false}]})).unwrap();
+    s.execute("building.add_basement", json!({"floor":-2480})).unwrap();
+    assert_eq!(s.doc.buildings[0].ground_level, 1);
+    assert_eq!(s.doc.buildings[0].stairs[0].levels, vec![1, 2, 3, 4, 5]);
+    assert_eq!(s.doc.buildings[0].storeys[1].elevation, 0.0);
+    let built = trigon_model::build(&s.doc).unwrap();
+    assert!(built[0].slabs[0].holes.is_empty());
+    assert!(built[0].slabs[1].holes.is_empty());
+    assert_eq!(built[0].slabs[2].holes.len(), 1);
+    let text = trigon_io::ifc::write(&s.doc, &built, "test.ifc", "2000-01-01T00:00:00Z");
+    let slab = &built[0].slabs[2];
+    let expected = trigon_model::doc::polygon_area(&slab.polygon) - 6_000_000.0;
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        let id = trigon_io::ifc::guid(&format!("trigon:{}", slab.id));
+        let m = &read.elements.iter().find(|e| e.global_id == id).unwrap().mesh;
+        let top = m.bounds().unwrap().1[2];
+        let area: f64 = m
+            .triangles
+            .iter()
+            .filter_map(|t| {
+                let [a, b, c] = t.map(|i| m.positions[i as usize]);
+                ([a, b, c].iter().all(|p| (p[2] - top).abs() < 1e-3))
+                    .then_some(((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0)
+            })
+            .sum();
+        assert!((area - expected).abs() < expected * 1e-6, "{} filled stair shaft: {area} vs {expected}", read.reader.name());
+    }
+}
+
+#[test]
+fn malformed_stairs_are_rejected_without_mutating_the_document() {
+    let mut s = session();
+    for stair in [
+        json!({"levels":[0],"outline":[[0,0],[2000,0],[2000,2000]]}),
+        json!({"levels":[0],"outline":[[0,0],[2000,0],[2400,2000],[0,2000]]}),
+        json!({"levels":[],"outline":[[0,0],[2000,0],[2000,2000],[0,2000]]}),
+        json!({"levels":[0],"outline":[[0,0],[2000,0],[2000,2000],[0,2000]],"winders":20000000}),
+    ] {
+        let before = s.doc.clone();
+        assert!(s.execute("interior.add_stairs", json!({"stairs":[stair]})).is_err());
+        assert_eq!(s.doc, before);
+    }
+    let valid = json!({"levels":[0],"outline":[[0,0],[2000,0],[2000,2000],[0,2000]]});
+    s.execute("interior.add_stairs", json!({"stairs":[valid.clone()]})).unwrap();
+    let before = s.doc.clone();
+    assert!(s.execute("interior.add_stairs", json!({"stairs":[valid]})).is_err(), "overlapping shafts");
+    assert_eq!(s.doc, before);
+    assert!(
+        s.execute("interior.add_stairs", json!({"stairs":[{"levels":[0],"outline":[[20000,0],[22000,0],[22000,2000],[20000,2000]]}]})).is_err(),
+        "outside building"
+    );
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn thick_gray_masonry_is_not_mistaken_for_its_own_paper_background() {
+    let mut s = session();
+    let (w, h) = (3000u32, 2200u32);
+    let mut data = vec![210u8; (w * h) as usize];
+    for y in 1150..1250 {
+        for x in 700..2300 {
+            data[(y * w + x) as usize] = 120;
+        }
+    }
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "thick".into(),
+        path: "/virtual/thick.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: w,
+        height: h,
+        note: String::new(),
+        facades: Vec::new(),
+        plans: vec![trigon_model::PlanRegistration::fit(vec![1], &[([300., 1800.], [-12000., -6000.]), ([2700., 1800.], [12000., -6000.])]).unwrap()],
+    });
+    s.drawing_cache = Some((("/virtual/thick.pdf".into(), 1, 0), std::sync::Arc::new(trigon_drawing::Gray { width: w, height: h, data })));
+    let v = s.execute("drawing.trace_walls", json!({"name":"thick","level":1,"contrast":45,"max_mm":1100})).unwrap();
+    let walls = v["walls"].as_array().unwrap();
+    assert!(
+        walls.iter().any(|w| {
+            let (a, b) = (&w["a"], &w["b"]);
+            w["thickness"].as_f64().unwrap() > 850.0 && (a[0].as_f64().unwrap() - b[0].as_f64().unwrap()).abs() > 15000.0
+        }),
+        "the solid 1m wall was split or lost: {walls:?}"
+    );
+}
+
 fn first_facade_facing(s: &mut Session, faces: &str) -> String {
     let list = s.execute("facade.list", json!({})).unwrap();
     list.as_array().unwrap().iter().find(|f| f["faces"] == faces).unwrap()["id"].as_str().unwrap().to_string()
@@ -431,6 +539,63 @@ fn phases_past_present_future() {
     let list = s.execute("phase.list", json!({})).unwrap();
     assert_eq!(list["phases"][2]["builds"], 1);
     assert_eq!(list["phases"][2]["demolishes"], 2, "old balcony and door");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn wall_regularization_is_explicit_undoable_and_atomic() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [
+            {"id":"measured", "levels":[1], "a":[0.,0.], "b":[4000.,80.], "thickness":100.}
+        ]}),
+    )
+    .unwrap();
+    let original = s.doc.clone();
+    assert!(s.execute("interior.regularize", json!({"axes_deg":[0.], "tolerance_mm": -1.})).is_err());
+    assert_eq!(s.doc, original);
+    let result = s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    assert_eq!(result["moved"], 1);
+    let wall = &s.doc.buildings[0].interior_walls[0];
+    assert!((wall.a[1] - wall.b[1]).abs() < 1e-8);
+    assert!(s.undo());
+    assert_eq!(s.doc.buildings, original.buildings);
+}
+
+#[test]
+fn presentation_sheets_are_vector_composed_and_leave_the_model_unchanged() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 2})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.cantilever", "levels": [1], "bays": [0]})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.french", "levels": [1], "bays": [1]})).unwrap();
+    let before = s.doc.clone();
+    let dir = std::env::temp_dir().join(format!("trigon-sheet-{}", std::process::id()));
+    let request = json!({"levels": [1], "path": dir.join("sheet.svg"), "caption": "Frederikssundsvej & gård"});
+    let result = s.execute("plan.sheet", request).unwrap();
+    assert_eq!(result["pages"], 1);
+    let svg = std::fs::read_to_string(dir.join("sheet.svg")).unwrap();
+    assert!(svg.contains("url(#masonry)") && svg.contains("fill-rule=\"evenodd\""));
+    assert!(svg.contains("Frederikssundsvej &amp; gård") && svg.contains("Liberation Sans"));
+    assert!(svg.contains("Ca. 1200 × 3000"), "the balcony's slab width differs from its 1000 mm door opening");
+    assert!(!svg.contains("data:image") && !svg.contains(" m²"), "offer sheets have neither a scan nor derived room-area clutter");
+    s.execute("plan.sheet", json!({"levels": [1], "path": dir.join("sheet.png")})).unwrap();
+    let reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join("sheet.png")).unwrap())).read_info().unwrap();
+    assert_eq!((reader.info().width, reader.info().height), (1600, 900));
+    s.execute("plan.sheet", json!({"levels": [1, 2], "path": dir.join("set.pdf")})).unwrap();
+    let pdf = lopdf::Document::load(dir.join("set.pdf")).unwrap();
+    assert_eq!(pdf.get_pages().len(), 2);
+    assert_eq!(s.doc, before);
+    for request in [
+        json!({"levels": [], "path": dir.join("bad.pdf")}),
+        json!({"levels": [1, 2], "path": dir.join("bad.png")}),
+        json!({"levels": [1], "path": dir.join("bad.pdf"), "region": [[0.,0.],[0.,0.]]}),
+        json!({"levels": [999], "path": dir.join("bad.pdf")}),
+    ] {
+        assert!(s.execute("plan.sheet", request).is_err());
+    }
+    assert!(!dir.join("bad.pdf").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 

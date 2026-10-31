@@ -15,6 +15,8 @@ mod commands;
 mod drawings;
 mod facade_image;
 mod plan;
+mod plan_output;
+mod rooms;
 mod time;
 
 pub use commands::{CommandSpec, commands};
