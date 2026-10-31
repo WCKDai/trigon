@@ -13,6 +13,7 @@ pub enum Tab {
     #[default]
     Project,
     Families,
+    Drawings,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]

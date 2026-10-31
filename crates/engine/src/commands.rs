@@ -71,6 +71,18 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "view.snap",
+        summary: "Find the closest endpoint, midpoint, intersection or grid point within a tolerance in drawing mm in a saved view. Read-only; returns the original point when no candidate is near.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::SnapRequest>,
+        run: |s, v| {
+            let p: crate::views::SnapRequest = parse("view.snap", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::snap(&s.doc, p, view)
+        },
+    },
+    CommandSpec {
         id: "view.export",
         summary: "Export one saved drawing view and its annotations to SVG, PNG, vector PDF or DXF at 1:1 in drawing-plane mm. Phase/filter defaults match other sheet exports.",
         mutates: false,

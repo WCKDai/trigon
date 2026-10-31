@@ -62,3 +62,38 @@ For live integrations, the engine's `drawing_view` and `plan_drawing` APIs retur
 with the exact `DrawingTransform` and path segments. `to_sheet` maps drawing mm to the
 1600 × 900 sheet, `to_model` is its inverse. Picking must additionally invert the UI's pan and
 zoom; it must never infer a scale from the raster image.
+
+## Studio workflow and precise picking
+
+Choose **Drawings** in the project browser. Create a plan, facade or section frame, or select
+an existing one. The **Facade elevations** project browser also opens a real 2D elevation,
+creating a saved frame through `view.define` on first use. The 3D and unsaved Plan views remain
+available in the toolbar. In a saved drawing, the properties panel lists its annotations and
+provides typed Text, Dimension, Leader and Level forms.
+
+**Pick** fills a position from the drawing. Dimension picks progress from From to To; leader
+picks progress from arrow tip to bend to text position. Click **Add annotation** or **Update
+annotation** to commit the form through the engine. Picking alone does not change the document.
+Click a dimension/leader line or a text/level insertion point to select it; annotations are also
+selectable from the list. **New annotation** starts an independent note, **Delete annotation**
+removes the selected one. Escape cancels a pick. Middle/right drag pans; the wheel zooms around
+the cursor; Alt temporarily bypasses snaps. Typed coordinate fields keep full model precision.
+
+Endpoint, midpoint, intersection and grid snaps use visible drawing paths in millimetres.
+The nearest candidate within ten window points wins; exact ties prefer endpoints, intersections,
+midpoints, then grid points. Intersection work is limited to the 128 nearest segments through
+the cursor neighbourhood. The cursor label identifies the snap and shows its exact coordinates.
+
+The same helper is available through `view.snap`:
+
+```json
+{"command":"view.snap","params":{"id":"ground","point":[1001,1999],"tolerance_mm":20,"options":{"endpoints":true,"midpoints":true,"intersections":true,"grid_mm":100}}}
+```
+
+It is read-only and returns `point` and `snap` (null if none is close). The optional `phase` and
+`filter` select the same geometry as `view.export`. The Studio control/MCP view accepts
+`{"mode":"drawing","drawing":"ground","fit":true}`. Its returned `drawing_mapping`, when
+ready, maps drawing coordinates to window points with `screen_x = origin.x + x * points_per_mm`
+and `screen_y = origin.y - y * points_per_mm`. It is updated after pan/zoom and omitted while a
+new drawing is being prepared. Full direct selection and manipulation of model elements from
+2D linework is a separate step; the current canvas picking authors/selects drafting annotations.

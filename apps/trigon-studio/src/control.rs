@@ -15,6 +15,7 @@ use crate::app::{Mode, SHOT_WAIT, Shot, ShotTarget, StudioApp, filter_name, pars
 #[derive(Debug, Default, PartialEq)]
 pub struct ViewRequest {
     pub mode: Option<Mode>,
+    pub drawing: Option<String>,
     /// `Some(None)`: the whole model in 3D.
     pub level: Option<Option<usize>>,
     pub phase: Option<usize>,
@@ -40,8 +41,14 @@ pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result
         None => None,
         Some("3d") => Some(Mode::ThreeD),
         Some("plan") => Some(Mode::Plan),
-        Some(other) => return Err(format!("ui.view: mode {other}: use 3d or plan")),
+        Some("drawing") => Some(Mode::Drawing),
+        Some(other) => return Err(format!("ui.view: mode {other}: use 3d, plan or drawing")),
     };
+    let drawing = opt_str(p, "drawing")?.map(str::to_string);
+    if let Some(id) = &drawing {
+        trigon_model::annotation::identifier(id).map_err(|e| format!("ui.view: {e}"))?;
+    }
+    let mode = mode.or(drawing.as_ref().map(|_| Mode::Drawing));
     let level = match p.get("level") {
         None => None,
         Some(Value::Null) => Some(None),
@@ -64,7 +71,7 @@ pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result
         Some(_) => return Err("ui.view: `fit` must be true or false".into()),
     };
     let focus = opt_str(p, "focus")?.map(str::to_string);
-    Ok(ViewRequest { mode, level, phase, filter, fit, focus })
+    Ok(ViewRequest { mode, drawing, level, phase, filter, fit, focus })
 }
 
 /// Longest queue of synthetic input.
@@ -207,6 +214,18 @@ impl StudioApp {
         let levels = self.session.doc.buildings.first().map_or(0, |b| b.storeys.len());
         let doc = &self.session.doc;
         let req = parse_view(p, levels, &|id| doc.phase_index(id).map_err(|e| e.to_string()))?;
+        let drawing = req.drawing.as_deref().unwrap_or(&self.drawing);
+        if req.mode == Some(Mode::Drawing) || req.drawing.is_some() {
+            doc.views
+                .iter()
+                .find(|v| v.id == drawing)
+                .ok_or_else(|| format!("ui.view: no drawing {drawing}"))?
+                .validate_source(doc)
+                .map_err(|e| format!("ui.view: {e}"))?;
+        }
+        if req.mode.unwrap_or(self.mode) == Mode::Drawing && req.focus.is_some() {
+            return Err("ui.view: use focus in 3D, or drawing to open a saved drawing".into());
+        }
         let focus = match &req.focus {
             Some(id) => Some(self.scene.find(id).ok_or_else(|| format!("ui.view: no element {id} in the view"))?),
             None => None,
@@ -214,8 +233,14 @@ impl StudioApp {
         let phase = req.phase.unwrap_or(self.phase);
         let filter = req.filter.unwrap_or(self.filter);
         let phase_changed = phase != self.phase || filter != self.filter;
-        let before = (self.mode, self.level, self.plan_level);
+        let before = (self.mode, self.level, self.plan_level, self.drawing.clone());
         self.mode = req.mode.unwrap_or(self.mode);
+        if let Some(id) = req.drawing {
+            self.drawing = id;
+        }
+        if req.mode == Some(Mode::Drawing) {
+            self.show_drawing_properties();
+        }
         self.phase = phase;
         self.filter = filter;
         if let Some(l) = req.level {
@@ -224,7 +249,7 @@ impl StudioApp {
                 self.plan_level = l;
             }
         }
-        if phase_changed || before != (self.mode, self.level, self.plan_level) {
+        if phase_changed || before != (self.mode, self.level, self.plan_level, self.drawing.clone()) {
             self.view_changed(phase_changed);
         }
         if req.fit {
@@ -242,6 +267,9 @@ impl StudioApp {
             "mode": self.mode.name(),
             "level": self.level,
             "plan_level": self.plan_level,
+            "drawing": if self.mode==Mode::Drawing {Some(&self.drawing)} else {None},
+            "drawing_mapping": if self.mode!=Mode::ThreeD && !self.drawing_plan() {self.viewport_rect.filter(|r|self.plan.ready(*r,self.ppp)).and_then(|r|self.plan.screen_mapping(r))} else {None},
+            "drawings": self.session.doc.views.iter().map(|v|(&v.id,&v.name)).collect::<Vec<_>>(),
             "levels": b.map(|b| b.storeys.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()).unwrap_or_default(),
             "phase": self.session.doc.phases.get(self.phase).map(|p| p.id.as_str()),
             "phases": self.session.doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
@@ -264,7 +292,7 @@ impl StudioApp {
         if self.shots.is_empty() {
             return;
         }
-        let ready = !self.building() && !(self.mode == Mode::Plan && self.drawing_plan());
+        let ready = !self.building() && !(self.mode != Mode::ThreeD && self.drawing_plan());
         let now = Instant::now();
         let mut keep = Vec::new();
         for mut shot in std::mem::take(&mut self.shots) {
@@ -293,7 +321,9 @@ impl StudioApp {
                     keep.push(shot);
                 }
                 ShotTarget::Window => {
-                    if self.mode == Mode::Plan && self.plan.error.is_none() && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
+                    if self.mode != Mode::ThreeD
+                        && self.plan.error.is_none()
+                        && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
                     {
                         keep.push(shot);
                         continue;
@@ -321,7 +351,7 @@ impl StudioApp {
                 let rs = self.render_state.clone().ok_or("no GPU renderer: the 3D view is unavailable")?;
                 self.capture_3d(&rs, size, ppp)
             }
-            Mode::Plan => {
+            Mode::Plan | Mode::Drawing => {
                 let img = self.plan.snapshot(rect, ppp).ok_or("the plan is not drawn yet")?;
                 let size = [img.size[0] as u32, img.size[1] as u32];
                 Ok((size, crate::render::png(size, img.as_raw())?))
@@ -384,6 +414,10 @@ mod tests {
         let ok =
             parse_view(&json!({"mode": "plan", "level": 2, "phase": "2026", "filter": "all", "fit": true, "focus": "b1.f3"}), 6, &phases).unwrap();
         assert_eq!(ok.mode, Some(Mode::Plan));
+        let drawing = parse_view(&json!({"mode":"drawing","drawing":"section-a"}), 6, &phases).unwrap();
+        assert_eq!((drawing.mode, drawing.drawing.as_deref()), (Some(Mode::Drawing), Some("section-a")));
+        assert_eq!(parse_view(&json!({"drawing":"facade-b1.f1"}), 6, &phases).unwrap().mode, Some(Mode::Drawing));
+        assert!(parse_view(&json!({"drawing":"../invalid"}), 6, &phases).is_err());
         assert_eq!((ok.level, ok.phase, ok.fit, ok.focus.as_deref()), (Some(Some(2)), Some(1), true, Some("b1.f3")));
         assert_eq!(parse_view(&json!(null), 6, &phases).unwrap(), ViewRequest::default());
         assert_eq!(parse_view(&json!({"level": null}), 6, &phases).unwrap().level, Some(None));

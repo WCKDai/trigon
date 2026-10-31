@@ -1583,13 +1583,14 @@ fn saved_drawing_views_isolate_notes_and_share_every_export_format() {
                     let pdf = lopdf::Document::load(&path).unwrap();
                     assert_eq!(pdf.get_pages().len(), 1);
                     // These remain vector sheets, not a whole-page raster image.
-                    assert!(
-                        !pdf.objects.values().any(|o| o
-                            .as_dict()
-                            .ok()
-                            .and_then(|d| d.get(b"Subtype").ok())
-                            .is_some_and(|v| v.as_name().ok() == Some(b"Image")))
-                    );
+                    assert!(!pdf.objects.values().any(|o| {
+                        let dict = match o {
+                            lopdf::Object::Dictionary(dict) => Some(dict),
+                            lopdf::Object::Stream(stream) => Some(&stream.dict),
+                            _ => None,
+                        };
+                        dict.and_then(|d| d.get(b"Subtype").ok()).is_some_and(|v| v.as_name().ok() == Some(b"Image"))
+                    }));
                 }
                 _ => {
                     assert_eq!(ext, "dxf");
@@ -1601,6 +1602,19 @@ fn saved_drawing_views_isolate_notes_and_share_every_export_format() {
             }
         }
     }
+    let notes = s.doc.annotations.clone();
+    // Projection depth does not change the section coordinate frame.
+    s.execute(
+        "view.define",
+        json!({"id":"view-2","name":"Deeper section","kind":{"view":"section","from":[-15000,0],"to":[15000,0],"depth_mm":45000}}),
+    )
+    .unwrap();
+    assert_eq!(s.doc.annotations, notes);
+    let before_snap = s.doc.clone();
+    let snapped=s.execute("view.snap",json!({"id":"view-0","point":[11001,5001],"tolerance_mm":10,"options":{"endpoints":false,"midpoints":false,"intersections":false,"grid_mm":100}})).unwrap();
+    assert_eq!(snapped["point"], json!([11000.0, 5000.0]));
+    assert_eq!(snapped["snap"]["kind"], "grid");
+    assert_eq!(s.doc, before_snap);
     let plan = crate::drawing_view(&s.doc, "view-0", View::latest(&s.doc)).unwrap().svg;
     assert!(!plan.contains("Only view 1") && !plan.contains("Only view 2"));
     let before = s.doc.clone();
@@ -1617,6 +1631,8 @@ fn drawing_commands_refuse_hostile_values_without_changing_history() {
     s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
     let before = s.doc.clone();
     let bad = [
+        ("view.snap", json!({"id":"p","point":[1e300,0],"tolerance_mm":10})),
+        ("view.snap", json!({"id":"p","point":[0,0],"tolerance_mm":10,"options":{"grid_mm":0}})),
         ("view.define", json!({"id":"p","name":"x","kind":{"view":"plan","level":usize::MAX}})),
         ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[1e300,0]}})),
         ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[0,0]}})),

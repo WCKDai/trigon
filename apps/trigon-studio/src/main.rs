@@ -8,6 +8,7 @@ mod app;
 mod authoring;
 mod camera;
 mod control;
+mod drafting;
 mod palette;
 mod plan_view;
 mod render;
