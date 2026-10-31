@@ -9,6 +9,15 @@ use crate::{ModelError, Result, checked};
 /// Format tag written into every `.trigon` file.
 pub const FORMAT: &str = "trigon/1";
 
+/// A reusable named selection of source definitions or storey instances.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelGroup {
+    pub id: String,
+    pub name: String,
+    pub targets: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub format: String,
@@ -16,6 +25,8 @@ pub struct Document {
     pub buildings: Vec<Building>,
     /// The component library (parametric families with their parameters set).
     pub types: Vec<ComponentType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ModelGroup>,
     /// Every model-changing command that produced this document, in order. Replaying it from an
     /// empty document gives the same model (given the same source data).
     #[serde(default)]
@@ -182,6 +193,7 @@ impl Default for Document {
             site: None,
             buildings: Vec::new(),
             types: default_types(),
+            groups: Vec::new(),
             journal: Vec::new(),
             references: Vec::new(),
             drawings: Vec::new(),
