@@ -541,11 +541,20 @@ fn interior_walls_traced_from_a_plan_sheet() {
         json!({"rooms": [{"levels": [1], "name": "Stue", "polygon": [[-8000.0, 0.0], [4000.0, 0.0], [4000.0, 5000.0], [-8000.0, 5000.0]]}]}),
     )
     .unwrap();
-    s.execute(
-        "interior.add_stairs",
-        json!({"stairs": [{"levels": [1, 2], "outline": [[5000.0, 500.0], [8000.0, 500.0], [8000.0, 2700.0], [5000.0, 2700.0]]}]}),
-    )
-    .unwrap();
+    // drawing.to_site: pixel (1500, 1200) is the site origin on this sheet.
+    let q = s.execute("drawing.to_site", json!({"name": "plan", "level": 1, "points": [[1500.0, 1200.0], [1600.0, 1100.0]]})).unwrap();
+    assert_eq!(q, json!([[0.0, 0.0], [1000.0, 1000.0]]));
+    // A wall drawn inside a staircase (a traced rail) goes when the stair is added with clear_walls_inside.
+    s.execute("interior.add_walls", json!({"walls": [{"levels": [1], "a": [5500.0, 1500.0], "b": [7500.0, 1500.0], "thickness": 80.0}]})).unwrap();
+    let before = s.doc.building(None).unwrap().interior_walls.len();
+    let v = s
+        .execute(
+            "interior.add_stairs",
+            json!({"stairs": [{"levels": [1, 2], "outline": [[5000.0, 500.0], [8000.0, 500.0], [8000.0, 2700.0], [5000.0, 2700.0]]}], "clear_walls_inside": true}),
+        )
+        .unwrap();
+    assert_eq!(v["walls_removed"], 1);
+    assert_eq!(s.doc.building(None).unwrap().interior_walls.len(), before - 1);
     assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["rooms"][0]["area_m2"], 60.0);
     let dir = std::env::temp_dir().join(format!("trigon-interior-{}", std::process::id()));
     s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();

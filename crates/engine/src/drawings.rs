@@ -305,7 +305,7 @@ pub(crate) fn trace_walls(
     min_mm: f64,
     max_mm: f64,
     min_len: f64,
-) -> Result<Vec<trigon_model::InteriorWall>> {
+) -> Result<(Vec<trigon_model::InteriorWall>, Vec<trigon_model::Stair>)> {
     let d = find(s, name)?.clone();
     let reg = d
         .plans
@@ -362,6 +362,7 @@ pub(crate) fn trace_walls(
     }
     let (min_c, max_c) = ((min_mm / step).round().max(2.0) as usize, (max_mm / step).round() as usize);
     let mut walls = Vec::new();
+    let mut stairs: Vec<trigon_model::Stair> = Vec::new();
     for &t in &dirs {
         let (ux, uy) = (t.cos(), t.sin());
         let (vx, vy) = (-uy, ux);
@@ -369,9 +370,16 @@ pub(crate) fn trace_walls(
             let (u, v) = (-half + (i as f64 + 0.5) * step, -half + (j as f64 + 0.5) * step);
             [centre[0] + u * ux + v * vx, centre[1] + u * uy + v * vy]
         };
-        // runs[i] = (centre j, thickness in cells) of wall-thick dark runs across column i.
-        let mut open: Vec<(f64, f64, usize, usize)> = Vec::new(); // (centre j, thickness, first i, last i)
-        let mut done: Vec<(f64, f64, usize, usize)> = Vec::new();
+        // A wall being followed: its run centres (column, centre cell), mean thickness (negative = outlined), last column.
+        struct Track {
+            pts: Vec<(usize, f64)>,
+            th: f64,
+            last: usize,
+        }
+        let mut open: Vec<Track> = Vec::new();
+        let mut done: Vec<Track> = Vec::new();
+        // (column, first tread cell, last tread cell)
+        let mut treads: Vec<(usize, usize, usize)> = Vec::new();
         for i in 0..cells {
             let is_dark = |p: [f64; 2]| {
                 contains(p) && {
@@ -394,6 +402,21 @@ pub(crate) fn trace_walls(
                     j += 1;
                 }
             }
+            // Stair evidence: six or more thin lines in a row, 200–325 mm apart (treads seen along the flight).
+            {
+                let thin: Vec<usize> = all.iter().filter(|r| r.1 <= 3).map(|r| r.0).collect();
+                let mut k = 0;
+                while k < thin.len() {
+                    let mut e = k;
+                    while e + 1 < thin.len() && (8..=13).contains(&(thin[e + 1] - thin[e])) {
+                        e += 1;
+                    }
+                    if e - k + 1 >= 6 {
+                        treads.push((i, thin[k], thin[e]));
+                    }
+                    k = e + 1;
+                }
+            }
             // Filled walls: one run as thick as a wall. Outlined walls: two thin lines a wall's thickness apart.
             let mut runs: Vec<(f64, f64)> = Vec::new();
             for (k, &(s0, len)) in all.iter().enumerate() {
@@ -409,45 +432,138 @@ pub(crate) fn trace_walls(
                 }
             }
             let mut next = Vec::new();
-            for (c, th, first, last) in open.drain(..) {
+            for mut t in open.drain(..) {
+                // Follow the wall from where it was last seen, so a slight angle against the grid doesn't break it.
+                let c = t.pts.last().map_or(0.0, |p| p.1);
                 if let Some(k) =
-                    runs.iter().position(|(rc, rt)| (rc - c).abs() <= 1.0 && (rt.abs() - th.abs()).abs() <= 2.0 && (rt.signum() == th.signum()))
+                    runs.iter().position(|(rc, rt)| (rc - c).abs() <= 1.0 && (rt.abs() - t.th.abs()).abs() <= 2.0 && rt.signum() == t.th.signum())
                 {
                     let (rc, rt) = runs.remove(k);
-                    let span = (i - first + 1) as f64;
-                    next.push(((c * (span - 1.0) + rc) / span, (th * (span - 1.0) + rt) / span, first, i));
-                } else if i - last <= GAP_CELLS {
-                    next.push((c, th, first, last));
+                    let n = t.pts.len() as f64;
+                    t.th = (t.th * n + rt) / (n + 1.0);
+                    t.pts.push((i, rc));
+                    t.last = i;
+                    next.push(t);
+                } else if i - t.last <= GAP_CELLS {
+                    next.push(t);
                 } else {
-                    done.push((c, th, first, last));
+                    done.push(t);
                 }
             }
-            next.extend(runs.into_iter().map(|(c, th)| (c, th, i, i)));
+            next.extend(runs.into_iter().map(|(c, th)| Track { pts: vec![(i, c)], th, last: i }));
             open = next;
         }
         done.extend(open);
-        for (c, th, first, last) in done {
+        // Flights: columns with treads over overlapping ranges, at least 0.8 m wide.
+        let mut groups: Vec<(usize, usize, usize, usize, usize)> = Vec::new(); // (i0, i1, j0, j1, count)
+        for (i, j0, j1) in treads {
+            if let Some(g) = groups.iter_mut().find(|g| i <= g.1 + 2 && j0 < g.3 && g.2 < j1) {
+                g.1 = i;
+                g.2 = g.2.min(j0);
+                g.3 = g.3.max(j1);
+                g.4 += 1;
+            } else {
+                groups.push((i, i, j0, j1, 1));
+            }
+        }
+        for (i0, i1, j0, j1, count) in groups {
+            if i1 - i0 + 1 < 32 || count * 10 < (i1 - i0 + 1) * 6 {
+                continue;
+            }
+            let c = |i: f64, j: f64| {
+                let (u, v) = (-half + i * step, -half + j * step);
+                [centre[0] + u * ux + v * vx, centre[1] + u * uy + v * vy]
+            };
+            let (a, b, cc, d) = (i0 as f64, (i1 + 1) as f64, j0 as f64, (j1 + 1) as f64);
+            // Outline with its first edge along the flight (v), so plans draw treads across it.
+            stairs.push(trigon_model::Stair {
+                id: String::new(),
+                levels: vec![level],
+                outline: vec![c(a, cc), c(a, d), c(b, d), c(b, cc)],
+                tread: None,
+            });
+        }
+        for t in done {
+            let (first, last, th) = (t.pts.first().map_or(0, |p| p.0), t.last, t.th);
             let len = (last - first + 1) as f64 * step;
             // Outlined walls (negative thickness) need more length: stair treads and fixtures are short pairs of lines.
             if len < min_len || (th < 0.0 && len < min_len.max(1500.0)) {
                 continue;
             }
             let th = th.abs();
-            let v = -half + (c + 0.5) * step;
-            let (u0, u1) = (-half + first as f64 * step, -half + (last + 1) as f64 * step);
-            let p = |u: f64| [centre[0] + u * ux + v * vx, centre[1] + u * uy + v * vy];
+            // The wall's own line through its run centres (least squares), so its true angle is kept.
+            let n = t.pts.len() as f64;
+            let (mi, mc) = t.pts.iter().fold((0.0, 0.0), |(a, b), p| (a + p.0 as f64 / n, b + p.1 / n));
+            let (sxx, sxy) = t.pts.iter().fold((0.0, 0.0), |(a, b), p| (a + (p.0 as f64 - mi).powi(2), b + (p.0 as f64 - mi) * (p.1 - mc)));
+            let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+            let at = |i: f64| {
+                let (u, v) = (-half + (i + 0.5) * step, -half + (mc + slope * (i - mi) + 0.5) * step);
+                [centre[0] + u * ux + v * vx, centre[1] + u * uy + v * vy]
+            };
+            let (pa, pb) = (at(first as f64 - 0.5), at(last as f64 + 0.5));
             let thickness = (th * step).round();
             walls.push(trigon_model::InteriorWall {
                 id: String::new(),
                 levels: vec![level],
-                a: p(u0),
-                b: p(u1),
+                a: pa,
+                b: pb,
                 thickness,
                 load_bearing: thickness >= 200.0,
             });
         }
     }
-    Ok(clean_walls(walls, &b.footprint))
+    // Stair flights found in both directions of a grid are the same flight: keep the larger.
+    let area = |s: &trigon_model::Stair| trigon_model::doc::polygon_area(&s.outline);
+    let centre_of = |s: &trigon_model::Stair| {
+        let n = s.outline.len() as f64;
+        s.outline.iter().fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n])
+    };
+    stairs.sort_by(|x, y| area(y).total_cmp(&area(x)));
+    let mut flights: Vec<trigon_model::Stair> = Vec::new();
+    for st in stairs {
+        let c = centre_of(&st);
+        if !flights.iter().any(|f| inside_poly(&f.outline, c)) {
+            flights.push(st);
+        }
+    }
+    // Walls whose middle lies inside a flight are its treads or stringers, not walls.
+    let walls: Vec<trigon_model::InteriorWall> = walls
+        .into_iter()
+        .filter(|w| {
+            let m = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
+            !flights.iter().any(|f| inside_poly(&shrink(&f.outline, 120.0), m))
+        })
+        .collect();
+    Ok((clean_walls(walls, &b.footprint), flights))
+}
+
+pub(crate) fn inside(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
+    inside_poly(poly, p)
+}
+
+fn inside_poly(poly: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let mut c = false;
+    for i in 0..poly.len() {
+        let (a, e) = (poly[i], poly[(i + poly.len() - 1) % poly.len()]);
+        if (a[1] > p[1]) != (e[1] > p[1]) && p[0] < (e[0] - a[0]) * (p[1] - a[1]) / (e[1] - a[1]) + a[0] {
+            c = !c;
+        }
+    }
+    c
+}
+
+/// A convex outline moved towards its centre by `d` mm (corners pulled in).
+fn shrink(poly: &[[f64; 2]], d: f64) -> Vec<[f64; 2]> {
+    let n = poly.len().max(1) as f64;
+    let c = poly.iter().fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n]);
+    poly.iter()
+        .map(|p| {
+            let (dx, dy) = (c[0] - p[0], c[1] - p[1]);
+            let l = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let k = (d * std::f64::consts::SQRT_2 / l).min(0.5);
+            [p[0] + dx * k, p[1] + dy * k]
+        })
+        .collect()
 }
 
 /// Cleans traced walls: keeps each only where its direction matches the nearest long facade (so

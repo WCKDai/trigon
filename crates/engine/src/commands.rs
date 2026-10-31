@@ -442,7 +442,8 @@ static COMMANDS: &[CommandSpec] = &[
         id: "drawing.trace_walls",
         summary: "Read candidate interior walls off a registered plan for one storey: dark bands as thick as walls (min_mm to \
                   max_mm, default 70–450) running at least min_len (default 600) along the building's wall directions, inside \
-                  the outer walls. Returns them; `add: true` also adds them for the given `levels` (default: the traced storey).",
+                  the outer walls, and stair flights (evenly spaced treads; walls inside a flight are dropped). Returns them; `add: true` \
+                  also adds them for the given `levels` (default: the traced storey).",
         mutates: true,
         journaled: true,
         schema: schema::<TraceWalls>,
@@ -454,12 +455,13 @@ static COMMANDS: &[CommandSpec] = &[
                 trigon_model::checked("max_mm", p.max_mm.unwrap_or(450.0), 60.0, 1500.0)?,
             );
             let min_len = trigon_model::checked("min_len", p.min_len.unwrap_or(600.0), 200.0, 10_000.0)?;
-            let mut walls = crate::drawings::trace_walls(s, &p.name, p.level, dark, mn, mx, min_len)?;
+            let (mut walls, mut stairs) = crate::drawings::trace_walls(s, &p.name, p.level, dark, mn, mx, min_len)?;
             let total_m: f64 = walls.iter().map(|w| ((w.b[0] - w.a[0]).powi(2) + (w.b[1] - w.a[1]).powi(2)).sqrt()).sum::<f64>() / 1000.0;
             let summary = json!({
                 "walls": walls.len(),
                 "load_bearing": walls.iter().filter(|w| w.load_bearing).count(),
                 "total_length_m": total_m.round(),
+                "stair_flights": stairs.len(),
             });
             if p.add.unwrap_or(false) {
                 let levels = p.levels.clone().unwrap_or_else(|| vec![p.level]);
@@ -471,9 +473,49 @@ static COMMANDS: &[CommandSpec] = &[
                     w.validate(b.storeys.len())?;
                 }
                 b.interior_walls.extend(walls);
-                return Ok(json!({"traced": summary, "added": b.interior_walls.len() - start}));
+                let added = b.interior_walls.len() - start;
+                let mut stairs_added = 0;
+                if p.stairs.unwrap_or(true) {
+                    let s0 = b.stairs.len();
+                    for (k, st) in stairs.iter_mut().enumerate() {
+                        st.levels = levels.clone();
+                        st.id = format!("{}.stair{}", b.id, s0 + k);
+                    }
+                    stairs_added = stairs.len();
+                    b.stairs.extend(stairs);
+                }
+                return Ok(json!({"traced": summary, "added": added, "stairs_added": stairs_added}));
             }
-            Ok(json!({"traced": summary, "walls": walls}))
+            Ok(json!({"traced": summary, "walls": walls, "stairs": stairs}))
+        },
+    },
+    CommandSpec {
+        id: "drawing.to_site",
+        summary: "Convert drawing pixels on a registered plan to site mm (x east, y north), to place walls, stairs and rooms read \
+                  off the drawing.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<ToSite>,
+        run: |s, v| {
+            let p: ToSite = parse("drawing.to_site", v)?;
+            let d = s.doc.drawings.iter().find(|d| d.name == p.name).ok_or_else(|| ModelError::NotFound(format!("drawing {}", p.name)))?;
+            let reg = d
+                .plans
+                .iter()
+                .find(|r| r.levels.contains(&p.level))
+                .ok_or_else(|| ModelError::NotFound(format!("drawing {} has no plan registered for level {}", p.name, p.level)))?;
+            if p.points.len() > 10_000 || p.points.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(ModelError::Invalid("give up to 10000 finite points".into()).into());
+            }
+            Ok(json!(
+                p.points
+                    .iter()
+                    .map(|q| {
+                        let r = reg.to_site(*q);
+                        [r[0].round(), r[1].round()]
+                    })
+                    .collect::<Vec<_>>()
+            ))
         },
     },
     CommandSpec {
@@ -527,7 +569,17 @@ static COMMANDS: &[CommandSpec] = &[
                 }
                 b.stairs.push(st);
             }
-            Ok(json!({"stairs": b.stairs.len()}))
+            let mut removed = 0;
+            if p.clear_walls_inside.unwrap_or(false) {
+                let stairs: Vec<trigon_model::Stair> = b.stairs[start..].to_vec();
+                let before = b.interior_walls.len();
+                b.interior_walls.retain(|w| {
+                    let m = [(w.a[0] + w.b[0]) / 2.0, (w.a[1] + w.b[1]) / 2.0];
+                    !stairs.iter().any(|st| st.levels.iter().any(|l| w.levels.contains(l)) && crate::drawings::inside(&st.outline, m))
+                });
+                removed = before - b.interior_walls.len();
+            }
+            Ok(json!({"stairs": b.stairs.len(), "walls_removed": removed}))
         },
     },
     CommandSpec {
@@ -852,6 +904,16 @@ struct DrawingRegister {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct ToSite {
+    name: String,
+    /// A storey the plan is registered for.
+    level: usize,
+    /// Drawing pixels [x, y].
+    points: Vec<[f64; 2]>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TraceWalls {
     name: String,
     level: usize,
@@ -864,6 +926,8 @@ struct TraceWalls {
     add: Option<bool>,
     /// Storeys the added walls stand on (default: the traced one).
     levels: Option<Vec<usize>>,
+    /// Also add the stair flights found (default true).
+    stairs: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -878,6 +942,8 @@ struct AddWalls {
 struct AddStairs {
     building: Option<String>,
     stairs: Vec<trigon_model::Stair>,
+    /// Remove interior walls on the same storeys whose middle lies inside a staircase (traced rails and stringers).
+    clear_walls_inside: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
