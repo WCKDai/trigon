@@ -13,6 +13,7 @@ use trigon_model::{Document, ModelError};
 
 mod commands;
 mod drawings;
+mod elevation;
 mod facade_image;
 mod plan;
 mod plan_output;

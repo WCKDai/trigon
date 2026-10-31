@@ -957,6 +957,28 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "elevation.sheet",
+        summary: "Draw a facade elevation as a presentation sheet: the model seen square-on to one facade (walls, windows, doors, \
+                  balconies, roof behind the eaves), each balcony labelled with its size (\"Ca. depth x width\") and each staircase \
+                  with its entrance (\"TV 7 TH\", mirrored when seen from behind). from_mm/to_mm crop along the facade. .pdf, .png or .svg.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<ElevationSheet>,
+        run: |s, v| {
+            let p: ElevationSheet = parse("elevation.sheet", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::elevation::sheet(
+                &s.doc,
+                &p.facade,
+                view,
+                (p.from_mm, p.to_mm),
+                p.title.as_deref().unwrap_or("Facade"),
+                p.caption.as_deref().unwrap_or_default(),
+                PathBuf::from(p.path),
+            )
+        },
+    },
+    CommandSpec {
         id: "export.gltf",
         summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up. `phase` and `filter` choose the view (default: the \
                   active phase, complete); demolished elements are translucent red.",
@@ -1284,6 +1306,24 @@ struct PlanSheet {
     region: Option<Vec<[f64; 2]>>,
     rotate_deg: Option<f64>,
     /// Street or drawing caption; defaults to the building name.
+    caption: Option<String>,
+    phase: Option<String>,
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ElevationSheet {
+    /// Facade id, e.g. "b1.f31".
+    facade: String,
+    /// .pdf, .png or .svg.
+    path: String,
+    /// Start and end along the facade, mm from its start (default: all of it plus 1.5 m either side).
+    from_mm: Option<f64>,
+    to_mm: Option<f64>,
+    /// Title in the box at the top left (default "Facade").
+    title: Option<String>,
+    /// Caption under the drawing.
     caption: Option<String>,
     phase: Option<String>,
     filter: Option<String>,

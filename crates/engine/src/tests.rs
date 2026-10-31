@@ -600,6 +600,34 @@ fn presentation_sheets_are_vector_composed_and_leave_the_model_unchanged() {
 }
 
 #[test]
+fn elevation_sheets_project_the_model_and_label_balconies() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 2})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.cantilever", "levels": [1], "bays": [0]})).unwrap();
+    let before = s.doc.clone();
+    let dir = std::env::temp_dir().join(format!("trigon-elevation-{}", std::process::id()));
+    let result = s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.svg"), "title": "Gårdfacade"})).unwrap();
+    assert!(result["triangles"].as_u64().unwrap() > 10, "{result}");
+    assert_eq!(result["balcony_labels"], 1);
+    let svg = std::fs::read_to_string(dir.join("e.svg")).unwrap();
+    assert!(svg.contains("Ca. 1200 × 3000") && svg.contains("Gårdfacade") && !svg.contains("data:image"));
+    s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.pdf")})).unwrap();
+    assert_eq!(lopdf::Document::load(dir.join("e.pdf")).unwrap().get_pages().len(), 1);
+    assert_eq!(s.doc, before);
+    for request in [
+        json!({"facade": "nope", "path": dir.join("bad.svg")}),
+        json!({"facade": facade, "path": dir.join("bad.svg"), "from_mm": 500.0, "to_mm": 600.0}),
+        json!({"facade": facade, "path": dir.join("bad.svg"), "from_mm": f64::MAX}),
+        json!({"facade": facade, "path": dir.join("bad.txt")}),
+    ] {
+        assert!(s.execute("elevation.sheet", request).is_err());
+    }
+    assert!(!dir.join("bad.svg").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn floor_plans_from_a_registered_sheet() {
     let mut s = session();
     let sheet = with_sheet(&mut s);

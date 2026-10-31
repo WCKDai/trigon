@@ -60,9 +60,27 @@ enum Surface {
 }
 
 enum Prim {
-    Poly { pts: Vec<[f64; 2]>, fill: [u8; 3], surface: Surface },
-    Line { a: [f64; 2], b: [f64; 2], color: [u8; 3], width: f64, dashed: bool },
-    Text { at: [f64; 2], text: String, color: [u8; 3], size: f64, angle: Option<f64> },
+    Poly {
+        pts: Vec<[f64; 2]>,
+        fill: [u8; 3],
+        surface: Surface,
+    },
+    Line {
+        a: [f64; 2],
+        b: [f64; 2],
+        color: [u8; 3],
+        width: f64,
+        dashed: bool,
+    },
+    /// `away`: the unit direction a label may step out along when it collides with another.
+    Text {
+        at: [f64; 2],
+        text: String,
+        color: [u8; 3],
+        size: f64,
+        angle: Option<f64>,
+        away: Option<[f64; 2]>,
+    },
 }
 
 fn status_color(s: Status, normal: [u8; 3]) -> [u8; 3] {
@@ -76,6 +94,26 @@ fn status_color(s: Status, normal: [u8; 3]) -> [u8; 3] {
 fn pt(fr: &FacadeFrame, u: f64, w: f64) -> [f64; 2] {
     let p = fr.point(u, w, 0.0);
     [p[0], p[1]]
+}
+
+/// Distance along the ray from `from` in direction `dir` (unit) to the first footprint edge it
+/// crosses.
+fn facade_crossing(ring: &[[f64; 2]], from: [f64; 2], dir: [f64; 2]) -> Option<f64> {
+    let n = ring.len();
+    (0..n)
+        .filter_map(|i| {
+            let (a, b) = (ring[i], ring[(i + 1) % n]);
+            let e = [b[0] - a[0], b[1] - a[1]];
+            let den = dir[0] * e[1] - dir[1] * e[0];
+            if den.abs() < 1e-9 {
+                return None;
+            }
+            let w = [a[0] - from[0], a[1] - from[1]];
+            let t = (w[0] * e[1] - w[1] * e[0]) / den;
+            let s = (w[0] * dir[1] - w[1] * dir[0]) / den;
+            (t > 0.0 && (0.0..=1.0).contains(&s)).then_some(t)
+        })
+        .min_by(f64::total_cmp)
 }
 
 fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&trigon_model::Stair> {
@@ -219,12 +257,14 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 }
                 if status != Status::Demolished {
                     let label_at = pt(fr, (u0 + u1) / 2.0, -depth - 450.0);
+                    let out = pt(fr, (u0 + u1) / 2.0, -depth - 1450.0);
                     prims.push(Prim::Text {
                         at: label_at,
                         text: format!("Ca. {:.0} x {:.0}", depth, slab_width),
                         color,
                         size: 280.0,
                         angle: presentation.then(|| fr.t[1].atan2(fr.t[0])),
+                        away: Some([(out[0] - label_at[0]) / 1000.0, (out[1] - label_at[1]) / 1000.0]),
                     });
                 }
             }
@@ -290,34 +330,32 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             let left = [f.run[1], -f.run[0]];
             let units: Vec<&trigon_model::Unit> = e.units.iter().filter(|u| u.level(b.ground_level) == Some(level)).collect();
             if presentation {
-                let nearest = (0..b.footprint.len())
-                    .filter_map(|i| {
-                        let fr = FacadeFrame::new(b.footprint[i], b.footprint[(i + 1) % b.footprint.len()])?;
-                        let u = ((e.point[0] - fr.origin[0]) * fr.t[0] + (e.point[1] - fr.origin[1]) * fr.t[1]).clamp(0.0, fr.length);
-                        let p = pt(&fr, u, 0.0);
-                        let d = (e.point[0] - p[0]).hypot(e.point[1] - p[1]);
-                        Some((d, fr, u))
+                // On the stair's axis, just outside the facade it meets on the entrance's side, and
+                // aligned with the wing (across the flights) so stepped facades don't tilt it.
+                let core = f.at(f.length / 2.0, f.width / 2.0);
+                let label = [f.run, [-f.run[0], -f.run[1]]]
+                    .into_iter()
+                    .filter_map(|dir| {
+                        let t = facade_crossing(&b.footprint, core, dir)?;
+                        let hit = [core[0] + dir[0] * t, core[1] + dir[1] * t];
+                        Some(((hit[0] - e.point[0]).hypot(hit[1] - e.point[1]), [hit[0] + dir[0] * 1100.0, hit[1] + dir[1] * 1100.0]))
                     })
                     .min_by(|a, b| a.0.total_cmp(&b.0));
-                if let Some((_, fr, u)) = nearest {
-                    // Keep the street edge chosen by the registered entrance, but centre the label
-                    // on its actual stair core rather than the approximate address point.
-                    let core = f.at(f.length / 2.0, f.width / 2.0);
-                    let projected = (core[0] - fr.origin[0]) * fr.t[0] + (core[1] - fr.origin[1]) * fr.t[1];
-                    let u = if (-1000.0..=fr.length + 1000.0).contains(&projected) { projected.clamp(0.0, fr.length) } else { u };
+                if let Some((_, at)) = label {
                     let tv = if units.iter().any(|u| u.door == "tv") { "TV  " } else { "" };
                     let th = if units.iter().any(|u| u.door == "th") { "  TH" } else { "" };
                     prims.push(Prim::Text {
-                        at: pt(&fr, u, -1050.0),
+                        at,
                         text: format!("{tv}{}{th}", e.number),
                         color: LINE,
                         size: 380.0,
-                        angle: Some(fr.t[1].atan2(fr.t[0])),
+                        angle: Some(f.across[1].atan2(f.across[0])),
+                        away: None,
                     });
                 }
                 continue;
             }
-            prims.push(Prim::Text { at: landing, text: e.number.clone(), color: LINE, size: 380.0, angle: None });
+            prims.push(Prim::Text { at: landing, text: e.number.clone(), color: LINE, size: 380.0, angle: None, away: None });
             let mut others = Vec::new();
             let mut unnamed = 0;
             for u in &units {
@@ -329,7 +367,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 match side {
                     Some(k) => {
                         let at = [landing[0] + left[0] * 1700.0 * k, landing[1] + left[1] * 1700.0 * k];
-                        prims.push(Prim::Text { at, text: u.door.to_uppercase(), color: LINE, size: 320.0, angle: None });
+                        prims.push(Prim::Text { at, text: u.door.to_uppercase(), color: LINE, size: 320.0, angle: None, away: None });
                     }
                     None if u.door.is_empty() => unnamed += 1,
                     None => others.push(u.door.to_uppercase()),
@@ -340,7 +378,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             }
             if !others.is_empty() {
                 let at = [landing[0] - f.run[0] * 450.0, landing[1] - f.run[1] * 450.0];
-                prims.push(Prim::Text { at, text: others.join(" "), color: LINE, size: 240.0, angle: None });
+                prims.push(Prim::Text { at, text: others.join(" "), color: LINE, size: 240.0, angle: None, away: None });
             }
         }
         for r in &b.rooms {
@@ -350,10 +388,11 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             let Some(c) = room_label_point(&r.polygon) else { continue };
             let area = trigon_model::doc::polygon_area(&r.polygon) / 1e6;
             if r.name.is_empty() {
-                prims.push(Prim::Text { at: c, text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None });
+                prims.push(Prim::Text { at: c, text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None });
             } else {
-                prims.push(Prim::Text { at: [c[0], c[1] + 220.0], text: r.name.clone(), color: LINE, size: 240.0, angle: None });
-                prims.push(Prim::Text { at: [c[0], c[1] - 150.0], text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None });
+                prims.push(Prim::Text { at: [c[0], c[1] + 220.0], text: r.name.clone(), color: LINE, size: 240.0, angle: None, away: None });
+                prims
+                    .push(Prim::Text { at: [c[0], c[1] - 150.0], text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None });
             }
         }
     }
@@ -440,7 +479,7 @@ fn hex(c: [u8; 3]) -> String {
     format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
-fn write_output(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_output(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::Io(format!("{}: {e}", dir.display())))?;
     }
@@ -466,7 +505,7 @@ fn write_output(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -474,6 +513,45 @@ fn region_corners(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     match points {
         [a, b] => vec![*a, [b[0], a[1]], *b, [a[0], b[1]]],
         _ => points.to_vec(),
+    }
+}
+
+/// A sheet label in pixels: centre, rotation (degrees, clockwise) and font size.
+#[derive(Clone)]
+pub(crate) struct Label {
+    pub(crate) at: [f64; 2],
+    pub(crate) alt: Option<[f64; 2]>,
+    pub(crate) deg: f64,
+    pub(crate) fs: f64,
+    pub(crate) text: String,
+    pub(crate) balcony: bool,
+}
+
+impl Label {
+    /// Corners of the text's box (Liberation Sans averages about 0.56 em per character), with a
+    /// little air around it.
+    fn corners(&self) -> [[f64; 2]; 4] {
+        let (hw, hh) = (0.28 * self.fs * self.text.chars().count() as f64 + 4.0, 0.6 * self.fs + 2.0);
+        let (s, c) = self.deg.to_radians().sin_cos();
+        [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(|[x, y]| [self.at[0] + x * c - y * s, self.at[1] + x * s + y * c])
+    }
+
+    /// Separating-axis test of the two rotated boxes.
+    pub(crate) fn overlaps(&self, other: &Label) -> bool {
+        let (a, b) = (self.corners(), other.corners());
+        let axes = [
+            [a[1][0] - a[0][0], a[1][1] - a[0][1]],
+            [a[3][0] - a[0][0], a[3][1] - a[0][1]],
+            [b[1][0] - b[0][0], b[1][1] - b[0][1]],
+            [b[3][0] - b[0][0], b[3][1] - b[0][1]],
+        ];
+        axes.iter().all(|ax| {
+            let span = |r: &[[f64; 2]; 4]| {
+                r.iter().map(|p| p[0] * ax[0] + p[1] * ax[1]).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)))
+            };
+            let ((a0, a1), (b0, b1)) = (span(&a), span(&b));
+            a0 < b1 && b0 < a1
+        })
     }
 }
 
@@ -585,6 +663,7 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
             );
         }
     }
+    let mut labels: Vec<Label> = Vec::new();
     for p in &prims {
         match p {
             Prim::Poly { .. } => {}
@@ -605,7 +684,7 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
                     a[0], a[1], b[0], b[1]
                 );
             }
-            Prim::Text { at, text, size, angle, .. } => {
+            Prim::Text { at, text, size, angle, away, .. } => {
                 let p = f.px(*at);
                 if !(80.0..=1520.0).contains(&p[0]) || !(140.0..=790.0).contains(&p[1]) {
                     continue;
@@ -615,20 +694,60 @@ fn sheet_svg(doc: &Document, level: usize, view: View, rotation: f64, region: Op
                     deg += 180.0;
                 }
                 let fs = if *size >= 380.0 { 18.0 } else { 14.0 };
-                let label = text.replace(" x ", " × ");
-                let _ = writeln!(
-                    out,
-                    r##"<text x="{:.3}" y="{:.3}" text-anchor="middle" dominant-baseline="middle" font-size="{fs}" transform="rotate({deg:.3} {:.3} {:.3})" paint-order="stroke fill" stroke="white" stroke-width="4" stroke-linejoin="round">{}</text>"##,
-                    p[0],
-                    p[1],
-                    p[0],
-                    p[1],
-                    escape(&label)
-                );
+                // One text line further out, for a label that collides where it is.
+                let alt = away.and_then(|d| {
+                    let q = f.px([at[0] + d[0] * 1000.0, at[1] + d[1] * 1000.0]);
+                    let l = (q[0] - p[0]).hypot(q[1] - p[1]);
+                    (l > 1e-6).then(|| [p[0] + (q[0] - p[0]) / l * fs * 1.7, p[1] + (q[1] - p[1]) / l * fs * 1.7])
+                });
+                labels.push(Label { at: p, alt, deg, fs, text: text.replace(" x ", " × "), balcony: text.starts_with("Ca. ") });
             }
         }
     }
+    // Labels never overlap: entrance labels first, then balcony sizes. When the balcony sizes don't
+    // fit side by side at this scale they move to one line under the drawing instead.
+    labels.sort_by_key(|l| l.balcony);
+    let mut sizes: Vec<(String, usize)> = Vec::new();
+    for l in labels.iter().filter(|l| l.balcony) {
+        match sizes.iter_mut().find(|(t, _)| *t == l.text) {
+            Some((_, n)) => *n += 1,
+            None => sizes.push((l.text.clone(), 1)),
+        }
+    }
+    let mut placed: Vec<Label> = Vec::new();
+    let mut crowded = false;
+    for l in labels {
+        let fits = |l: &Label| !placed.iter().any(|q| q.overlaps(l));
+        if fits(&l) {
+            placed.push(l);
+            continue;
+        }
+        match l.alt {
+            Some(at) if fits(&Label { at, alt: None, ..l.clone() }) => placed.push(Label { at, alt: None, ..l }),
+            _ => crowded |= l.balcony,
+        }
+    }
+    if !crowded {
+        sizes.clear();
+    }
+    for l in placed.iter().filter(|l| !(crowded && l.balcony)) {
+        let _ = writeln!(
+            out,
+            r##"<text x="{:.3}" y="{:.3}" text-anchor="middle" dominant-baseline="middle" font-size="{}" transform="rotate({:.3} {:.3} {:.3})" paint-order="stroke fill" stroke="white" stroke-width="4" stroke-linejoin="round">{}</text>"##,
+            l.at[0],
+            l.at[1],
+            l.fs,
+            l.deg,
+            l.at[0],
+            l.at[1],
+            escape(&l.text)
+        );
+    }
     out.push_str("</g>\n");
+    if !sizes.is_empty() {
+        let list: Vec<String> = sizes.iter().map(|(t, n)| format!("{n} stk. {t}")).collect();
+        let _ = writeln!(out, r##"<text x="80" y="812" font-size="15">Altaner: {}</text>"##, escape(&list.join(", ")));
+    }
     let _ = writeln!(
         out,
         r##"<text x="800" y="847" text-anchor="middle" font-size="28">{}</text><text x="80" y="886" font-size="12" fill="#777">Mål og tegninger er vejledende</text><text x="1520" y="886" text-anchor="end" font-size="12" fill="#777">Trigon · {}</text></g></svg>"##,
@@ -805,6 +924,25 @@ mod tests {
         }
         let (prims, _) = scene(&doc, 1, View::latest(&doc), true).unwrap();
         assert!(prims.iter().any(|p| matches!(p, Prim::Poly { surface: Surface::Stair, .. })));
+    }
+
+    #[test]
+    fn labels_collide_as_rotated_boxes() {
+        let label = |at: [f64; 2], deg: f64| Label { at, alt: None, deg, fs: 14.0, text: "Ca. 1300 × 2700".into(), balcony: true };
+        // Side by side 80 px apart: the 15-character labels overlap; 140 px apart they don't.
+        assert!(label([100., 100.], 0.).overlaps(&label([180., 100.], 0.)));
+        assert!(!label([100., 100.], 0.).overlaps(&label([240., 100.], 0.)));
+        // One line further out clears it; turned 90° the boxes are narrow across the line.
+        assert!(!label([100., 100.], 0.).overlaps(&label([180., 124.], 0.)));
+        assert!(!label([100., 100.], 90.).overlaps(&label([130., 100.], 90.)));
+    }
+
+    #[test]
+    fn entrance_labels_find_the_facade_on_a_stair_axis() {
+        let square = [[0., 0.], [10000., 0.], [10000., 8000.], [0., 8000.]];
+        assert_eq!(facade_crossing(&square, [4000., 3000.], [0., -1.]), Some(3000.));
+        assert_eq!(facade_crossing(&square, [4000., 3000.], [1., 0.]), Some(6000.));
+        assert_eq!(facade_crossing(&square, [-100., 3000.], [-1., 0.]), None);
     }
 
     #[test]
