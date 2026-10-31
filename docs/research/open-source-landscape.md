@@ -226,3 +226,21 @@ Revit, ArchiCAD, Vectorworks, Rhino+VisualARQ, **Snaptrude**, **Arcol**, **Motif
 | ML inference | **ort** (ONNX Runtime), candle | MIT/Apache | CoreML/DirectML execution providers |
 | PDF raster/vector | pdfium-render (PDFium BSD/Apache), lopdf | MIT/Apache | Archive plans |
 | USD | usd (bindings, C++) | ? | Immature; PolyCore RFC 0002 plans its own USD path |
+
+## 15. Kernel claims checked (2026-10-31)
+
+An AI-generated overview of Rust and BIM kernels was checked against crates.io, GitHub and web
+search. Three of its projects could not be found and are treated as non-existent until someone
+shows a repository: **Aetheris**, **Spare Kit** and **ConstructCAD `cc_geom`**.
+
+| Project | Found | Licence | First release / last update | Downloads | Fit for Trigon |
+|---|---|---|---|---|---|
+| solidcore | crates.io 1.0.1 | Apache-2.0 | 2026-10-13 / 2026-10-30 | 55 | Already in PolyCore's plan (port source, watched) |
+| vcad / vcad_kernel | crates.io 0.10.0 | MIT (PolyCore's survey read Apache-2.0 in the repo) | 2026-01 / 2026-09 | 689 | PolyCore survey: skip (broad, no evidence on blends or SSI) |
+| **arris** | crates.io 0.9.1 | MIT OR Apache-2.0 | 2026-09-05 / 2026-10-24 | 232 | New, not in PolyCore's survey: B-rep with tolerance-carrying topology, booleans with provenance, blends, STEP. Bench it |
+| **geomcore** | crates.io 0.42.0 | MIT OR Apache-2.0 | 2026-07-02 / 2026-10-30 | 549 | New, not in the survey: curves and surfaces only. Bench its evaluators |
+| BREP_kernel (next.BREP) | crates.io 0.11.0 | Custom (modifications assigned to Autodrop3d) | 2026-08 / 2026-10 | 579 | Excluded: not open source in our sense |
+| ifc-lite (core, geometry) | crates.io 27.1.0 | MPL-2.0 | 2026-01 / 2026-10-30 | 35k | IFC import candidate; MPL policy decision still open |
+| bimifc (geometry) | crates.io 0.3.0 | MPL-2.0 | 2026-03 / 2026-05 | 588 | Second IFC reader to compare; slower-moving |
+| OpenSCAD | GitHub | GPL-2.0 | | | Code-first CSG. Can't be linked; its CSG speed comes from Manifold (Apache-2.0), already on PolyCore's list |
+| O3DE | o3de.org | Apache-2.0 OR MIT | | | C++ game engine. Not a kernel; at most a glTF/USD visualisation target |
