@@ -220,7 +220,15 @@ pub(crate) fn register(s: &mut Session, name: &str, reg: FacadeRegistration) -> 
 }
 
 /// The registered elevation straightened into the facade's frame, with the model over it.
-pub(crate) fn facade_image(s: &mut Session, facade: &str, drawing: &str, mm_per_px: f64, overlay: bool, out: Option<PathBuf>) -> Result<Value> {
+pub(crate) fn facade_image(
+    s: &mut Session,
+    facade: &str,
+    drawing: &str,
+    mm_per_px: f64,
+    overlay: bool,
+    out: Option<PathBuf>,
+    view: trigon_model::build::View,
+) -> Result<Value> {
     let d = find(s, drawing)?.clone();
     let reg =
         d.facades.iter().find(|r| r.facade == facade).cloned().ok_or_else(|| {
@@ -253,7 +261,7 @@ pub(crate) fn facade_image(s: &mut Session, facade: &str, drawing: &str, mm_per_
         }
     }
     if overlay {
-        draw_model(doc, b, facade, &fr, &mut Pen { rgb: &mut rgb, width, height, du, dv, h })?;
+        draw_model(doc, b, facade, &fr, &mut Pen { rgb: &mut rgb, width, height, du, dv, h }, view)?;
     }
     let path = out.unwrap_or_else(|| default_path(s.path.as_deref(), facade, &format!("drawing-{drawing}")));
     write_png(&path, width, height, &rgb)?;

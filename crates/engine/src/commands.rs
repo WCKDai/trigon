@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use trigon_model::build::{FacadeFrame, even_bays, resolve_facade};
+use trigon_model::build::{FacadeFrame, PhaseFilter, View, even_bays, resolve_facade};
 use trigon_model::{Building, ComponentType, Document, FacadeKind, ModelError, Placement, Site};
 
 use crate::{EngineError, Result, Session, time};
@@ -228,6 +228,67 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| place(s, parse("facade.place", v)?),
     },
     CommandSpec {
+        id: "facade.demolish",
+        summary: "Demolish facade elements in a phase (default: the active phase), as in Revit: they stay in earlier phases, show \
+                  red in demolition views and are gone afterwards. `what`: all, openings (windows and doors; the wall closes) or \
+                  balconies. Elements built in that same phase are simply removed.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<Demolish>,
+        run: |s, v| demolish(s, parse("facade.demolish", v)?),
+    },
+    CommandSpec {
+        id: "phase.list",
+        summary: "List the phases (time order), the active phase and how many placements each phase builds and demolishes.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("phase.list", v)?;
+            Ok(phase_list(&s.doc))
+        },
+    },
+    CommandSpec {
+        id: "phase.set",
+        summary: "Set the phases in time order, for example [1938 built, 2026 existing, forslag proposal]. Elements without a \
+                  phase belong to the first. Every phase an element refers to must stay in the list.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<PhaseSet>,
+        run: |s, v| {
+            let p: PhaseSet = parse("phase.set", v)?;
+            if p.phases.is_empty() || p.phases.len() > 50 {
+                return Err(ModelError::Invalid("give 1 to 50 phases".into()).into());
+            }
+            for (i, ph) in p.phases.iter().enumerate() {
+                if ph.id.trim().is_empty() || p.phases[..i].iter().any(|o| o.id == ph.id) {
+                    return Err(ModelError::Invalid(format!("phase ids must be unique and not empty ({:?})", ph.id)).into());
+                }
+            }
+            s.doc.phases = p.phases;
+            if s.doc.active_phase.as_deref().is_some_and(|a| s.doc.phase_index(a).is_err()) {
+                s.doc.active_phase = None;
+            }
+            for b in s.doc.buildings.clone() {
+                check_building(&s.doc, Some(&b.id))?;
+            }
+            Ok(phase_list(&s.doc))
+        },
+    },
+    CommandSpec {
+        id: "phase.activate",
+        summary: "Make a phase the active one: new placements are built in it and views default to it.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<PhaseId>,
+        run: |s, v| {
+            let p: PhaseId = parse("phase.activate", v)?;
+            s.doc.phase_index(&p.id)?;
+            s.doc.active_phase = Some(p.id);
+            Ok(phase_list(&s.doc))
+        },
+    },
+    CommandSpec {
         id: "facade.clear",
         summary: "Remove placements from facade slots (`levels` and `bays` omitted = all).",
         mutates: true,
@@ -294,9 +355,12 @@ static COMMANDS: &[CommandSpec] = &[
                 if p.photo.is_some() {
                     return Err(EngineError::Params { command: "evidence.facade_image".into(), message: "give photo or drawing, not both".into() });
                 }
-                return crate::drawings::facade_image(s, &p.facade, d, p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out);
+                let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+                return crate::drawings::facade_image(s, &p.facade, d, p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out, view);
             }
-            let img = crate::facade_image::render(s, &p.facade, p.photo.as_deref(), p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            let img =
+                crate::facade_image::render(s, &p.facade, p.photo.as_deref(), p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out, view)?;
             Ok(json!({
                 "image_path": img.path,
                 "photo": img.photo.id,
@@ -366,30 +430,34 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "export.gltf",
-        summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up.",
+        summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up. `phase` and `filter` choose the view (default: the \
+                  active phase, complete); demolished elements are translucent red.",
         mutates: false,
         journaled: false,
-        schema: schema::<PathParams>,
+        schema: schema::<ExportParams>,
         run: |s, v| {
-            let p: PathParams = parse("export.gltf", v)?;
+            let p: ExportParams = parse("export.gltf", v)?;
             let path = checked_path(&p.path, "glb")?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let refs = reference_meshes(&s.doc)?;
-            let bytes = trigon_io::glb::write(&trigon_model::build(&s.doc)?, &refs);
+            let bytes = trigon_io::glb::write(&trigon_model::build::build_view(&s.doc, view)?, &refs);
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
     },
     CommandSpec {
         id: "export.ifc",
-        summary: "Export the model as IFC4 (.ifc), georeferenced to EPSG:25832.",
+        summary: "Export the model as IFC4 (.ifc), georeferenced to EPSG:25832. `phase` and `filter` choose the view; with \
+                  phases, every window, door, railing and balcony carries Pset_*Common.Status (EXISTING, NEW, DEMOLISH).",
         mutates: false,
         journaled: false,
-        schema: schema::<PathParams>,
+        schema: schema::<ExportParams>,
         run: |s, v| {
-            let p: PathParams = parse("export.ifc", v)?;
+            let p: ExportParams = parse("export.ifc", v)?;
             let path = checked_path(&p.path, "ifc")?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model.ifc").to_string();
-            let text = trigon_io::ifc::write(&s.doc, &trigon_model::build(&s.doc)?, &name, &time::now_utc());
+            let text = trigon_io::ifc::write(&s.doc, &trigon_model::build::build_view(&s.doc, view)?, &name, &time::now_utc());
             write_file(&path, text.as_bytes())?;
             Ok(json!({"written": path, "bytes": text.len()}))
         },
@@ -462,6 +530,45 @@ struct FacadeImageParams {
     path: Option<String>,
     /// Use a linked drawing (registered to this facade with drawing.register_facade) instead of a photo.
     drawing: Option<String>,
+    /// Phase to show (default: the active phase).
+    phase: Option<String>,
+    /// complete (default), demolition, new or all.
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExportParams {
+    path: String,
+    /// Phase to export (default: the active phase).
+    phase: Option<String>,
+    /// complete (default), demolition, new or all.
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PhaseSet {
+    /// The phases in time order, for example 1938 (built), 2026 (existing), forslag (proposal).
+    phases: Vec<trigon_model::Phase>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PhaseId {
+    id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Demolish {
+    facade: String,
+    levels: Option<Vec<usize>>,
+    bays: Option<Vec<usize>>,
+    /// all (default), openings or balconies.
+    what: Option<String>,
+    /// Phase the demolition happens in (default: the active phase).
+    phase: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -621,6 +728,9 @@ struct Place {
     sill: Option<f64>,
     /// Allow the opening to run past the floor above (stairwell and landing windows).
     spans_storeys: Option<bool>,
+    /// Phase the new element is built in (default: the active phase). Whatever stood in the slot
+    /// before that phase is demolished in it, not deleted.
+    phase: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -719,6 +829,8 @@ fn info(doc: &Document) -> Value {
             "evidence": b.evidence,
         })).collect::<Vec<_>>(),
         "types": doc.types.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        "phases": doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        "active_phase": doc.phases.get(doc.active_index()).map(|p| p.id.as_str()),
         "journal_entries": doc.journal.len(),
     })
 }
@@ -840,8 +952,76 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
     Ok(json!({"facade": p.facade, "bays": centres.iter().map(|c| c.round()).collect::<Vec<_>>()}))
 }
 
+/// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
+fn phase_list(doc: &Document) -> Value {
+    let active = doc.active_index();
+    let mut built = vec![0usize; doc.phases.len()];
+    let mut torn = vec![0usize; doc.phases.len()];
+    for b in &doc.buildings {
+        for f in &b.facades {
+            for pl in &f.placements {
+                if let Ok((c, d)) = doc.lifetime(pl) {
+                    if let Some(x) = built.get_mut(c) {
+                        *x += 1;
+                    }
+                    if let Some(x) = torn.get_mut(d) {
+                        *x += 1;
+                    }
+                }
+            }
+        }
+    }
+    json!({
+        "active": doc.phases.get(active).map(|p| p.id.clone()),
+        "phases": doc.phases.iter().enumerate().map(|(i, p)| json!({"id": p.id, "name": p.name, "builds": built[i], "demolishes": torn[i]})).collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn view_of(doc: &Document, phase: Option<&str>, filter: Option<&str>) -> Result<View> {
+    let phase = match phase {
+        Some(id) => doc.phase_index(id)?,
+        None => doc.active_index(),
+    };
+    let filter = match filter.unwrap_or("complete") {
+        "complete" => PhaseFilter::Complete,
+        "demolition" => PhaseFilter::Demolition,
+        "new" => PhaseFilter::New,
+        "all" => PhaseFilter::All,
+        other => return Err(ModelError::Invalid(format!("filter {other}: use complete, demolition, new or all")).into()),
+    };
+    Ok(View { phase, filter })
+}
+
+/// For each type id, whether it cuts an opening (else it's a balcony hung on the wall).
+fn opening_types(doc: &Document) -> std::collections::BTreeMap<String, bool> {
+    doc.types.iter().map(|t| (t.id.clone(), t.kind.is_opening())).collect()
+}
+
+/// Ends a placement's life in phase `k` (Revit's "demolish"): removed outright if it was built in
+/// `k`, otherwise marked demolished in `k`. Returns true if it was standing in `k`.
+fn end_in(doc_phases: &[trigon_model::Phase], pl: &mut Placement, k: usize) -> Option<bool> {
+    let idx = |id: &Option<String>, default: usize| id.as_deref().and_then(|i| doc_phases.iter().position(|p| p.id == i)).unwrap_or(default);
+    let (c, d) = (idx(&pl.created, 0), idx(&pl.demolished, doc_phases.len()));
+    if !(c <= k && k < d) {
+        return None;
+    }
+    if c == k {
+        Some(true) // remove
+    } else {
+        pl.demolished = doc_phases.get(k).map(|p| p.id.clone());
+        Some(false)
+    }
+}
+
 fn place(s: &mut Session, p: Place) -> Result<Value> {
-    s.doc.component(&p.type_id)?;
+    let new_is_opening = s.doc.component(&p.type_id)?.kind.is_opening();
+    let k = match p.phase.as_deref() {
+        Some(id) => s.doc.phase_index(id)?,
+        None => s.doc.active_index(),
+    };
+    let phases = s.doc.phases.clone();
+    let created = if k == 0 { None } else { phases.get(k).map(|ph| ph.id.clone()) };
+    let layers = opening_types(&s.doc);
     let b = s.doc.building_of_facade_mut(&p.facade)?;
     let levels = b.storeys.len();
     let id = b.id.clone();
@@ -861,10 +1041,22 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
             return Err(ModelError::Invalid(format!("bay {bay} doesn't exist (facade {} has {} bays)", p.facade, f.bays.len())).into());
         }
     }
-    let mut count = 0;
+    let (mut count, mut demolished) = (0, 0);
     for &level in &level_list {
         for &bay in &bay_list {
-            f.placements.retain(|pl| !(pl.level == level && pl.bay == bay));
+            // A slot holds one opening and one balcony. Whatever of the same kind stands there in
+            // this phase is replaced: deleted if built in this phase, demolished if older.
+            let mut keep = Vec::with_capacity(f.placements.len());
+            for mut pl in std::mem::take(&mut f.placements) {
+                let same_slot = pl.level == level && pl.bay == bay && layers.get(&pl.type_id).copied().unwrap_or(true) == new_is_opening;
+                match same_slot.then(|| end_in(&phases, &mut pl, k)).flatten() {
+                    Some(true) => continue,
+                    Some(false) => demolished += 1,
+                    None => {}
+                }
+                keep.push(pl);
+            }
+            f.placements = keep;
             f.placements.push(Placement {
                 level,
                 bay,
@@ -873,13 +1065,49 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
                 height: p.height,
                 sill: p.sill,
                 spans_storeys: p.spans_storeys.unwrap_or(false),
+                created: created.clone(),
+                demolished: None,
             });
             count += 1;
         }
     }
     f.placements.sort_by_key(|pl| (pl.level, pl.bay));
     check_building(&s.doc, Some(&id))?;
-    Ok(json!({"facade": p.facade, "placed": count, "type": p.type_id}))
+    Ok(json!({"facade": p.facade, "placed": count, "type": p.type_id, "phase": phases.get(k).map(|ph| ph.id.clone()), "demolished": demolished}))
+}
+
+fn demolish(s: &mut Session, p: Demolish) -> Result<Value> {
+    let k = match p.phase.as_deref() {
+        Some(id) => s.doc.phase_index(id)?,
+        None => s.doc.active_index(),
+    };
+    let what = p.what.as_deref().unwrap_or("all");
+    if !matches!(what, "all" | "openings" | "balconies") {
+        return Err(ModelError::Invalid(format!("what {what}: use all, openings or balconies")).into());
+    }
+    let phases = s.doc.phases.clone();
+    let layers = opening_types(&s.doc);
+    let b = s.doc.building_of_facade_mut(&p.facade)?;
+    let id = b.id.clone();
+    let f = b.facade_mut(&p.facade)?;
+    let (mut removed, mut demolished) = (0, 0);
+    let mut keep = Vec::with_capacity(f.placements.len());
+    for mut pl in std::mem::take(&mut f.placements) {
+        let opening = layers.get(&pl.type_id).copied().unwrap_or(true);
+        let picked = selected(&p.levels, pl.level) && selected(&p.bays, pl.bay) && (what == "all" || (what == "openings") == opening);
+        match picked.then(|| end_in(&phases, &mut pl, k)).flatten() {
+            Some(true) => {
+                removed += 1;
+                continue;
+            }
+            Some(false) => demolished += 1,
+            None => {}
+        }
+        keep.push(pl);
+    }
+    f.placements = keep;
+    check_building(&s.doc, Some(&id))?;
+    Ok(json!({"facade": p.facade, "phase": phases.get(k).map(|ph| ph.id.clone()), "demolished": demolished, "removed_new_in_this_phase": removed}))
 }
 
 fn photos(s: &mut Session, p: BuildingParam) -> Result<Value> {
@@ -965,10 +1193,8 @@ fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f
     for b in trigon_model::build(doc)? {
         for w in &b.walls {
             add(&w.id, vec![&w.mesh]);
-            for o in &w.openings {
-                for e in std::iter::once(&o.fill).chain(&o.attached) {
-                    add(&e.id, e.parts.iter().map(|(_, m)| m).collect());
-                }
+            for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
+                add(&e.id, e.parts.iter().map(|(_, m)| m).collect());
             }
         }
         for s in &b.slabs {

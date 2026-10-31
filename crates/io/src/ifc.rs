@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use trigon_model::build::Status;
 use trigon_model::{Built, BuiltElement, ComponentKind, Document, ElementClass, Mesh, SlabKind};
 
 const ALPHABET: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
@@ -266,6 +267,13 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
                     }
                 }
             }
+            for a in &wall.attachments {
+                let level = a.level.min(contained.len().saturating_sub(1));
+                let id = element(&mut w, body, wcs, lp_of(level), a, doc);
+                if let Some(c) = contained.get_mut(level) {
+                    c.push(id);
+                }
+            }
         }
 
         for s in &b.slabs {
@@ -336,7 +344,7 @@ fn element(w: &mut W, body: usize, wcs: usize, storey_lp: usize, e: &BuiltElemen
     let name = string(&e.name);
     let tag = string(&e.id);
     let kind = doc.component(&e.type_id).map(|t| t.kind.clone()).ok();
-    match e.class {
+    let id = match e.class {
         ElementClass::Window => w.add(format!(
             "IFCWINDOW({g},$,{name},$,$,#{lp},#{shape},{tag},{},{},.WINDOW.,{},$)",
             real(e.height),
@@ -351,7 +359,25 @@ fn element(w: &mut W, body: usize, wcs: usize, storey_lp: usize, e: &BuiltElemen
         )),
         ElementClass::Railing => w.add(format!("IFCRAILING({g},$,{name},$,$,#{lp},#{shape},{tag},.GUARDRAIL.)")),
         ElementClass::BalconySlab => w.add(format!("IFCSLAB({g},$,{name},$,'Balcony',#{lp},#{shape},{tag},.USERDEFINED.)")),
+    };
+    // With phases, the IFC4 common property sets carry the element's status.
+    if doc.phases.len() > 1 {
+        let pset = match e.class {
+            ElementClass::Window => "Pset_WindowCommon",
+            ElementClass::Door => "Pset_DoorCommon",
+            ElementClass::Railing => "Pset_RailingCommon",
+            ElementClass::BalconySlab => "Pset_SlabCommon",
+        };
+        let value = match e.status {
+            Status::Existing => "EXISTING",
+            Status::New => "NEW",
+            Status::Demolished => "DEMOLISH",
+        };
+        let prop = w.add(format!("IFCPROPERTYSINGLEVALUE('Status',$,IFCLABEL('{value}'),$)"));
+        let ps = w.add(format!("IFCPROPERTYSET({},$,'{pset}',$,(#{prop}))", string(&guid(&format!("trigon:{}.status", e.id)))));
+        w.add(format!("IFCRELDEFINESBYPROPERTIES({},$,$,$,(#{id}),#{ps})", string(&guid(&format!("trigon:{}.status.rel", e.id)))));
     }
+    id
 }
 
 #[cfg(test)]

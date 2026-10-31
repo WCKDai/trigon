@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use trigon_data::{Camera, Photo};
-use trigon_model::build::{FacadeFrame, resolve_facade};
+use trigon_model::build::{FacadeFrame, Status, View, resolve_facade};
 use trigon_model::{Building, Document, ModelError, Site};
 
 use crate::{EngineError, Result, Session};
@@ -63,7 +63,15 @@ pub(crate) fn facade_frame(b: &Building, facade: &str) -> Result<FacadeFrame> {
     Ok(FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid(format!("facade {facade} has zero length")))?)
 }
 
-pub fn render(s: &Session, facade: &str, photo_id: Option<&str>, mm_per_px: f64, overlay: bool, out: Option<PathBuf>) -> Result<FacadeImage> {
+pub fn render(
+    s: &Session,
+    facade: &str,
+    photo_id: Option<&str>,
+    mm_per_px: f64,
+    overlay: bool,
+    out: Option<PathBuf>,
+    view: View,
+) -> Result<FacadeImage> {
     let doc: &Document = &s.doc;
     let site = doc.site.as_ref().ok_or_else(|| ModelError::NotFound("no site yet; run site.load_address".into()))?;
     let b =
@@ -136,7 +144,7 @@ pub fn render(s: &Session, facade: &str, photo_id: Option<&str>, mm_per_px: f64,
     }
 
     if overlay {
-        draw_model(doc, b, facade, &fr, &mut Pen { rgb: &mut rgb, width, height, du, dv, h })?;
+        draw_model(doc, b, facade, &fr, &mut Pen { rgb: &mut rgb, width, height, du, dv, h }, view)?;
     }
 
     let path = out.unwrap_or_else(|| default_path(s.path.as_deref(), facade, &photo.id));
@@ -153,8 +161,9 @@ pub fn render(s: &Session, facade: &str, photo_id: Option<&str>, mm_per_px: f64,
     })
 }
 
-/// The model's storey lines (cyan), bay lines (yellow) and openings (magenta).
-pub(crate) fn draw_model(doc: &Document, b: &Building, facade: &str, fr: &FacadeFrame, pen: &mut Pen<'_>) -> Result<()> {
+/// The model's storey lines (cyan), bay lines (yellow) and, in a phase view, its openings and
+/// balconies coloured by status: existing magenta, new green, demolished red.
+pub(crate) fn draw_model(doc: &Document, b: &Building, facade: &str, fr: &FacadeFrame, pen: &mut Pen<'_>, view: View) -> Result<()> {
     let f = b.facade(facade)?;
     let h = b.height();
     for st in &b.storeys {
@@ -163,13 +172,25 @@ pub(crate) fn draw_model(doc: &Document, b: &Building, facade: &str, fr: &Facade
     for c in &f.bays {
         pen.vline(*c, 0.0, h, [255, 210, 0]);
     }
-    if let Ok(openings) = resolve_facade(doc, b, f) {
-        for o in openings {
+    if let Ok(items) = resolve_facade(doc, b, f) {
+        for o in items {
+            let Some(status) = view.status(o.lifetime) else { continue };
+            let c = match status {
+                Status::Existing => [255, 0, 200],
+                Status::New => [120, 200, 20],
+                Status::Demolished => [235, 30, 30],
+            };
             let r = o.rect;
-            pen.hline(r.v0, r.u0, r.u1, [255, 0, 200]);
-            pen.hline(r.v1, r.u0, r.u1, [255, 0, 200]);
-            pen.vline(r.u0, r.v0, r.v1, [255, 0, 200]);
-            pen.vline(r.u1, r.v0, r.v1, [255, 0, 200]);
+            pen.hline(r.v0, r.u0, r.u1, c);
+            pen.hline(r.v1, r.u0, r.u1, c);
+            pen.vline(r.u0, r.v0, r.v1, c);
+            pen.vline(r.u1, r.v0, r.v1, c);
+            if !o.is_opening() {
+                // The deck line, and a cross so balconies read apart from openings.
+                pen.hline(r.v0 + 160.0, r.u0, r.u1, c);
+                pen.line((r.u0, r.v0), (r.u1, r.v1), c);
+                pen.line((r.u0, r.v1), (r.u1, r.v0), c);
+            }
         }
     }
     Ok(())
@@ -192,6 +213,17 @@ pub(crate) struct Pen<'a> {
 }
 
 impl Pen<'_> {
+    /// A straight line between two facade points (u, v) in mm.
+    pub(crate) fn line(&mut self, a: (f64, f64), b: (f64, f64), c: [u8; 3]) {
+        let (ia, ja) = (a.0 / self.du, (self.h - a.1) / self.dv);
+        let (ib, jb) = (b.0 / self.du, (self.h - b.1) / self.dv);
+        let n = (ib - ia).abs().max((jb - ja).abs()).ceil().clamp(1.0, 20_000.0) as i64;
+        for s in 0..=n {
+            let t = s as f64 / n as f64;
+            self.dot((ia + (ib - ia) * t).round() as i64, (ja + (jb - ja) * t).round() as i64, c);
+        }
+    }
+
     pub(crate) fn dot(&mut self, i: i64, j: i64, c: [u8; 3]) {
         if i < 0 || j < 0 || i >= i64::from(self.width) || j >= i64::from(self.height) {
             return;

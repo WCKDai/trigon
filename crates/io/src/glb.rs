@@ -97,11 +97,13 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
     for b in built {
         for wall in &b.walls {
             add(&mut w, &wall.id, &[(Material::Wall, &wall.mesh)]);
-            for o in &wall.openings {
-                for e in std::iter::once(&o.fill).chain(&o.attached) {
-                    let parts: Vec<(Material, &Mesh)> = e.parts.iter().map(|(m, mesh)| (*m, mesh)).collect();
-                    add(&mut w, &e.id, &parts);
-                }
+            let elements = wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments);
+            for e in elements {
+                // What a phase tears down is drawn in translucent red, as in Revit's demolition views.
+                let demolished = e.status == trigon_model::build::Status::Demolished;
+                let parts: Vec<(Material, &Mesh)> =
+                    e.parts.iter().map(|(m, mesh)| (if demolished { Material::Demolished } else { *m }, mesh)).collect();
+                add(&mut w, &e.id, &parts);
             }
         }
         for s in &b.slabs {

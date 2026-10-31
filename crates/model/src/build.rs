@@ -3,7 +3,7 @@
 //! Walls are 2.5D: one prism per facade between the outer wall line and its mitred inward
 //! offset, with openings cut as 2D holes in the wall faces. No 3D booleans are needed.
 
-use crate::component::{ComponentKind, ComponentType};
+use crate::component::{ComponentKind, ComponentType, Deck, Finish, Railing, Screens};
 use crate::doc::{Building, Document, Facade, FacadeKind, Placement, Storey};
 use crate::mesh::{Material, Mesh};
 use crate::{ModelError, Result};
@@ -76,6 +76,73 @@ pub enum ElementClass {
     BalconySlab,
 }
 
+/// An element's state in the phase being viewed (Revit's phase status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// Built in an earlier phase (or in the first phase) and still standing.
+    Existing,
+    /// Built in the phase being viewed.
+    New,
+    /// Torn down in the phase being viewed.
+    Demolished,
+}
+
+impl Status {
+    pub fn name(self) -> &'static str {
+        match self {
+            Status::Existing => "existing",
+            Status::New => "new",
+            Status::Demolished => "demolished",
+        }
+    }
+}
+
+/// Which elements a view shows, as Revit's phase filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseFilter {
+    /// Existing and new: the building as it stands at the end of the phase.
+    Complete,
+    /// Existing and what this phase tears down.
+    Demolition,
+    /// Only what this phase builds.
+    New,
+    /// Existing, new and demolished.
+    All,
+}
+
+/// A phase and a filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub phase: usize,
+    pub filter: PhaseFilter,
+}
+
+impl View {
+    /// The complete building at the end of the last phase.
+    pub fn latest(doc: &Document) -> Self {
+        View { phase: doc.phases.len().saturating_sub(1), filter: PhaseFilter::Complete }
+    }
+
+    /// The status of an element living in phases `c..d` in this view, or `None` if hidden.
+    pub fn status(&self, (c, d): (usize, usize)) -> Option<Status> {
+        let k = self.phase;
+        let status = if c <= k && k < d {
+            if c == k && k > 0 { Status::New } else { Status::Existing }
+        } else if d == k {
+            Status::Demolished
+        } else {
+            return None;
+        };
+        let shown = match self.filter {
+            PhaseFilter::Complete => status != Status::Demolished,
+            PhaseFilter::Demolition => status != Status::New,
+            PhaseFilter::New => status == Status::New,
+            PhaseFilter::All => true,
+        };
+        shown.then_some(status)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuiltElement {
     pub id: String,
@@ -86,6 +153,7 @@ pub struct BuiltElement {
     pub width: f64,
     pub height: f64,
     pub parts: Vec<(Material, Mesh)>,
+    pub status: Status,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +165,7 @@ pub struct BuiltOpening {
     pub fill: BuiltElement,
     /// Railings and balcony slabs that belong to the opening.
     pub attached: Vec<BuiltElement>,
+    pub status: Status,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +179,8 @@ pub struct BuiltWall {
     pub plan: [[f64; 2]; 4],
     pub mesh: Mesh,
     pub openings: Vec<BuiltOpening>,
+    /// Balconies hung on the wall without an opening of their own.
+    pub attachments: Vec<BuiltElement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,9 +209,17 @@ pub struct Built {
     pub slabs: Vec<BuiltSlab>,
 }
 
-/// Builds every building in the document.
+/// Builds every building as it stands at the end of the last phase.
 pub fn build(doc: &Document) -> Result<Vec<Built>> {
-    doc.buildings.iter().map(|b| build_building(doc, b)).collect()
+    build_view(doc, View::latest(doc))
+}
+
+/// Builds every building as seen in a phase view.
+pub fn build_view(doc: &Document, view: View) -> Result<Vec<Built>> {
+    if view.phase >= doc.phases.len().max(1) {
+        return Err(ModelError::Invalid(format!("phase {} doesn't exist", view.phase)));
+    }
+    doc.buildings.iter().map(|b| build_building(doc, b, view)).collect()
 }
 
 /// The inner wall line: each footprint vertex moved inward by `d` along the mitre of its two
@@ -174,8 +253,29 @@ pub fn inner_ring(ring: &[[f64; 2]], d: f64) -> Vec<[f64; 2]> {
 pub struct Resolved {
     pub placement: Placement,
     pub ty: ComponentType,
+    /// In the facade's (u, v) plane: the opening, or for an attachment its extent from the
+    /// underside of the slab to the top of the railing.
     pub rect: Rect,
+    /// Phases it exists in (`c..d`).
+    pub lifetime: (usize, usize),
 }
+
+impl Resolved {
+    pub fn is_opening(&self) -> bool {
+        self.ty.kind.is_opening()
+    }
+}
+
+/// Underside of an attachment below its storey's floor, mm.
+fn attachment_drop(kind: &ComponentKind) -> f64 {
+    match kind {
+        ComponentKind::BalconySlab { thickness, .. } => *thickness,
+        ComponentKind::SteelBalcony { .. } => STEEL_FRAME,
+        _ => 0.0,
+    }
+}
+
+const STEEL_FRAME: f64 = 160.0;
 
 /// Resolves and checks a facade's placements: each must fit its storey and the wall, and none
 /// may overlap another. The errors say which slot is wrong and why.
@@ -198,6 +298,7 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
     let mut out: Vec<Resolved> = Vec::with_capacity(f.placements.len());
     for p in &f.placements {
         let slot = format!("{} level {} bay {}", f.id, p.level, p.bay);
+        let lifetime = doc.lifetime(p).map_err(|e| ModelError::Invalid(format!("{slot}: {e}")))?;
         let ty = doc.component(&p.type_id)?.clone();
         let storey = b.storeys.get(p.level).ok_or_else(|| ModelError::Invalid(format!("{slot}: the building has {} storeys", b.storeys.len())))?;
         let c = *f.bays.get(p.bay).ok_or_else(|| ModelError::Invalid(format!("{slot}: the facade has {} bays", f.bays.len())))?;
@@ -215,47 +316,66 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
                 ty_eff.sill, storey.elevation
             )));
         }
-        let rect = Rect {
-            u0: c - ty_eff.width / 2.0,
-            u1: c + ty_eff.width / 2.0,
-            v0: storey.elevation + ty_eff.sill,
-            v1: storey.elevation + ty_eff.sill + ty_eff.height,
+        let opening = ty_eff.kind.is_opening();
+        let rect = if opening {
+            Rect {
+                u0: c - ty_eff.width / 2.0,
+                u1: c + ty_eff.width / 2.0,
+                v0: storey.elevation + ty_eff.sill,
+                v1: storey.elevation + ty_eff.sill + ty_eff.height,
+            }
+        } else {
+            let deck = storey.elevation + ty_eff.sill;
+            Rect { u0: c - ty_eff.width / 2.0, u1: c + ty_eff.width / 2.0, v0: deck - attachment_drop(&ty_eff.kind), v1: deck + ty_eff.height }
         };
-        if rect.u0 < lo || rect.u1 > hi {
+        if opening {
+            if rect.u0 < lo || rect.u1 > hi {
+                return Err(ModelError::Invalid(format!(
+                    "{slot}: {} mm wide at {c:.0} mm doesn't fit the wall ({lo:.0} to {hi:.0} mm along the facade)",
+                    ty_eff.width
+                )));
+            }
+            let top = if p.spans_storeys { b.height() } else { storey.elevation + storey.height };
+            if rect.v1 > top - LINTEL {
+                return Err(ModelError::Invalid(if p.spans_storeys {
+                    format!("{slot}: the opening runs to {:.0} mm, less than {LINTEL} mm below the eaves ({:.0} mm)", rect.v1, b.height())
+                } else {
+                    format!(
+                        "{slot}: sill {} + height {} leaves less than {LINTEL} mm below the storey above (storey height {}); \
+                         stairwell windows that cross a floor need spans_storeys",
+                        ty_eff.sill, ty_eff.height, storey.height
+                    )
+                }));
+            }
+        } else if rect.u0 < 0.0 || rect.u1 > frame.length {
             return Err(ModelError::Invalid(format!(
-                "{slot}: {} mm wide at {c:.0} mm doesn't fit the wall ({lo:.0} to {hi:.0} mm along the facade)",
-                ty_eff.width
+                "{slot}: the {} mm balcony at {c:.0} mm runs past the facade ends (0 to {:.0} mm)",
+                ty_eff.width, frame.length
             )));
-        }
-        let top = if p.spans_storeys { b.height() } else { storey.elevation + storey.height };
-        if rect.v1 > top - LINTEL {
-            return Err(ModelError::Invalid(if p.spans_storeys {
-                format!("{slot}: the opening runs to {:.0} mm, less than {LINTEL} mm below the eaves ({:.0} mm)", rect.v1, b.height())
-            } else {
-                format!(
-                    "{slot}: sill {} + height {} leaves less than {LINTEL} mm below the storey above (storey height {}); \
-                     stairwell windows that cross a floor need spans_storeys",
-                    ty_eff.sill, ty_eff.height, storey.height
-                )
-            }));
         }
         if let ComponentKind::Balcony { slab_width, .. } = ty_eff.kind
             && (c - slab_width / 2.0 < 0.0 || c + slab_width / 2.0 > frame.length)
         {
             return Err(ModelError::Invalid(format!("{slot}: the {slab_width} mm balcony slab runs past the facade end")));
         }
-        if let Some(other) = out.iter().find(|o| o.rect.overlaps(&rect, GAP)) {
-            return Err(ModelError::Invalid(format!(
-                "{slot}: overlaps the opening at level {} bay {} (keep {GAP} mm between openings)",
-                other.placement.level, other.placement.bay
-            )));
+        // Only things that stand at the same time can collide: openings with openings,
+        // balconies with balconies.
+        let together = |o: &Resolved| o.lifetime.0 < lifetime.1 && lifetime.0 < o.lifetime.1 && o.is_opening() == opening;
+        let gap = if opening { GAP } else { 0.0 };
+        if let Some(other) = out.iter().find(|o| together(o) && o.rect.overlaps(&rect, gap)) {
+            let what = if opening {
+                format!("the opening at level {} bay {} (keep {GAP} mm between openings)", other.placement.level, other.placement.bay)
+            } else {
+                format!("the balcony at level {} bay {}", other.placement.level, other.placement.bay)
+            };
+            return Err(ModelError::Invalid(format!("{slot}: overlaps {what}")));
         }
-        out.push(Resolved { placement: p.clone(), ty: ty_eff, rect });
+        out.push(Resolved { placement: p.clone(), ty: ty_eff, rect, lifetime });
     }
     Ok(out)
 }
 
-fn build_building(doc: &Document, b: &Building) -> Result<Built> {
+fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
     let h = b.height();
     let d = b.wall_thickness;
     let inner = inner_ring(&b.footprint, d);
@@ -270,10 +390,15 @@ fn build_building(doc: &Document, b: &Building) -> Result<Built> {
         };
         let along = |q: [f64; 2]| (q[0] - a[0]) * fr.t[0] + (q[1] - a[1]) * fr.t[1];
         let (in0, in1) = (along(qs), along(qe));
-        let resolved = resolve_facade(doc, b, f)?;
+        let all = resolve_facade(doc, b, f)?;
+        // What this view shows, with each element's status.
+        let shown: Vec<(&Resolved, Status)> = all.iter().filter_map(|r| view.status(r.lifetime).map(|s| (r, s))).collect();
+        let resolved: Vec<(&Resolved, Status)> = shown.iter().filter(|(r, _)| r.is_opening()).copied().collect();
 
-        let holes: Vec<Vec<[f64; 2]>> =
-            resolved.iter().map(|r| vec![[r.rect.u0, r.rect.v0], [r.rect.u0, r.rect.v1], [r.rect.u1, r.rect.v1], [r.rect.u1, r.rect.v0]]).collect();
+        let holes: Vec<Vec<[f64; 2]>> = resolved
+            .iter()
+            .map(|(r, _)| vec![[r.rect.u0, r.rect.v0], [r.rect.u0, r.rect.v1], [r.rect.u1, r.rect.v1], [r.rect.u1, r.rect.v0]])
+            .collect();
         let mut mesh = Mesh::default();
         let outer_ok = mesh.polygon(&[[0.0, 0.0], [fr.length, 0.0], [fr.length, h], [0.0, h]], &holes, |p| fr.point(p[0], 0.0, p[1]));
         let inner_ok = mesh.polygon(&[[in0, 0.0], [in1, 0.0], [in1, h], [in0, h]], &holes, |p| fr.point(p[0], d, p[1]));
@@ -282,7 +407,7 @@ fn build_building(doc: &Document, b: &Building) -> Result<Built> {
         }
         mesh.quad(fr.point(0.0, 0.0, h), fr.point(fr.length, 0.0, h), fr.point(in1, d, h), fr.point(in0, d, h));
         mesh.quad(fr.point(0.0, 0.0, 0.0), fr.point(in0, d, 0.0), fr.point(in1, d, 0.0), fr.point(fr.length, 0.0, 0.0));
-        for r in &resolved {
+        for (r, _) in &resolved {
             let Rect { u0, u1, v0, v1 } = r.rect;
             mesh.quad(fr.point(u0, 0.0, v0), fr.point(u1, 0.0, v0), fr.point(u1, d, v0), fr.point(u0, d, v0));
             mesh.quad(fr.point(u0, 0.0, v1), fr.point(u0, d, v1), fr.point(u1, d, v1), fr.point(u1, 0.0, v1));
@@ -290,15 +415,33 @@ fn build_building(doc: &Document, b: &Building) -> Result<Built> {
             mesh.quad(fr.point(u1, 0.0, v0), fr.point(u1, 0.0, v1), fr.point(u1, d, v1), fr.point(u1, d, v0));
         }
 
+        let elevation_of = |r: &Resolved| b.storeys.get(r.placement.level).map_or(0.0, |s| s.elevation);
         let openings = resolved
             .iter()
-            .map(|r| {
+            .map(|(r, status)| {
                 let id = format!("{}.L{}.B{}", f.id, r.placement.level, r.placement.bay);
-                let elevation = b.storeys.get(r.placement.level).map_or(0.0, |s| s.elevation);
-                component(&fr, &id, r, elevation)
+                component(&fr, &id, r, elevation_of(r), *status)
             })
             .collect();
-        walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, thickness: d, height: h, plan: [a, e, qe, qs], mesh, openings });
+        let attachments = shown
+            .iter()
+            .filter(|(r, _)| !r.is_opening())
+            .flat_map(|(r, status)| {
+                let id = format!("{}.L{}.B{}.balcony", f.id, r.placement.level, r.placement.bay);
+                attachment(&fr, &id, r, elevation_of(r), *status)
+            })
+            .collect();
+        walls.push(BuiltWall {
+            id: f.id.clone(),
+            frame: fr,
+            kind: f.kind,
+            thickness: d,
+            height: h,
+            plan: [a, e, qe, qs],
+            mesh,
+            openings,
+            attachments,
+        });
     }
 
     let mut slabs = Vec::with_capacity(b.storeys.len() + 1);
@@ -396,6 +539,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind) -> Vec<(Materi
             }
             glass.append(&fbox(fr, (iu0, iu1), glass_w, (v0 + panel, v1 - FRAME)));
         }
+        ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
     }
     parts.push((Material::Frame, frame));
     if !glass.is_empty() {
@@ -432,7 +576,7 @@ fn rail_run(fr: &FacadeFrame, from: (f64, f64), to: (f64, f64), z0: f64, height:
     m
 }
 
-fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64) -> BuiltOpening {
+fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> BuiltOpening {
     let ty = &r.ty;
     let class = if ty.kind.is_door() { ElementClass::Door } else { ElementClass::Window };
     let level = r.placement.level;
@@ -445,30 +589,175 @@ fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64) -> BuiltO
         width: ty.width,
         height: ty.height,
         parts: fill_parts(fr, r.rect, &ty.kind),
+        status,
     };
     let mut attached = Vec::new();
     let Rect { u0, u1, v0, .. } = r.rect;
     match ty.kind {
         ComponentKind::FrenchBalcony { rail_height, .. } => {
             let rail = rail_run(fr, (u0 - 50.0, -130.0), (u1 + 50.0, -130.0), v0, rail_height);
-            attached.push(element(id, "rail", "French balcony rail", ElementClass::Railing, ty, level, rail));
+            attached.push(element(id, "rail", "French balcony rail", ElementClass::Railing, ty, level, rail, status));
         }
         ComponentKind::Balcony { depth, slab_width, rail_height, .. } => {
             let c = (u0 + u1) / 2.0;
             let (s0, s1) = (c - slab_width / 2.0, c + slab_width / 2.0);
             let slab = fbox(fr, (s0, s1), (-depth, 0.0), (elevation - BALCONY_SLAB, elevation));
-            attached.push(element(id, "slab", "Balcony slab", ElementClass::BalconySlab, ty, level, slab));
+            attached.push(element(id, "slab", "Balcony slab", ElementClass::BalconySlab, ty, level, slab, status));
             let mut rail = rail_run(fr, (s0 + 40.0, -depth + 40.0), (s1 - 40.0, -depth + 40.0), elevation, rail_height);
             rail.append(&rail_run(fr, (s0 + 40.0, -depth + 40.0), (s0 + 40.0, -60.0), elevation, rail_height));
             rail.append(&rail_run(fr, (s1 - 40.0, -depth + 40.0), (s1 - 40.0, -60.0), elevation, rail_height));
-            attached.push(element(id, "rail", "Balcony rail", ElementClass::Railing, ty, level, rail));
+            attached.push(element(id, "rail", "Balcony rail", ElementClass::Railing, ty, level, rail, status));
         }
         _ => {}
     }
-    BuiltOpening { id: format!("{id}.opening"), level, rect: r.rect, fill, attached }
+    BuiltOpening { id: format!("{id}.opening"), level, rect: r.rect, fill, attached, status }
 }
 
-fn element(id: &str, suffix: &str, name: &str, class: ElementClass, ty: &ComponentType, level: usize, mesh: Mesh) -> BuiltElement {
+/// A straight rod between two facade points `(u, w, v)` with a square section `r` mm wide.
+fn rod(fr: &FacadeFrame, a: (f64, f64, f64), b: (f64, f64, f64), r: f64) -> Mesh {
+    let mut m = Mesh::default();
+    let (pa, pb) = (fr.point(a.0, a.1, a.2), fr.point(b.0, b.1, b.2));
+    let d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if !(len > 1.0) {
+        return m;
+    }
+    let t = [d[0] / len, d[1] / len, d[2] / len];
+    // Two directions across the rod.
+    let helper = if t[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+    let cross = |x: [f64; 3], y: [f64; 3]| [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    let norm = |x: [f64; 3]| {
+        let l = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt().max(1e-12);
+        [x[0] / l, x[1] / l, x[2] / l]
+    };
+    let s1 = norm(cross(t, helper));
+    let s2 = cross(t, s1);
+    let h = r / 2.0;
+    let corner =
+        |p: [f64; 3], i: f64, j: f64| [p[0] + (s1[0] * i + s2[0] * j) * h, p[1] + (s1[1] * i + s2[1] * j) * h, p[2] + (s1[2] * i + s2[2] * j) * h];
+    let ring = |p: [f64; 3]| [corner(p, -1.0, -1.0), corner(p, 1.0, -1.0), corner(p, 1.0, 1.0), corner(p, -1.0, 1.0)];
+    m.hexahedron(ring(pa), ring(pb));
+    m
+}
+
+/// A railing run in facade coordinates with MinAltan profiles: corner posts, balusters at
+/// about 110 mm centres and the style's flat rails.
+fn styled_rail(fr: &FacadeFrame, from: (f64, f64), to: (f64, f64), z0: f64, height: f64, style: Railing) -> Mesh {
+    let mut m = Mesh::default();
+    let (du, dw) = (to.0 - from.0, to.1 - from.1);
+    let len = (du * du + dw * dw).sqrt();
+    if !(len > 1.0) {
+        return m;
+    }
+    let along_u = du.abs() >= dw.abs();
+    // (baluster size along the run, across it), rails as (height of their top above z0, rail height, rail depth).
+    let (bal, rails): ((f64, f64), Vec<(f64, f64, f64)>) = match style {
+        Railing::Frederiksberg => ((12.0, 12.0), vec![(height, 50.0, 10.0), (150.0, 50.0, 10.0)]),
+        Railing::Norrebro => ((30.0, 6.0), vec![(height, 60.0, 15.0)]),
+        Railing::Vesterbro => ((30.0, 6.0), vec![(height, 50.0, 10.0), (150.0, 50.0, 10.0)]),
+        Railing::Osterbro => ((30.0, 6.0), vec![]),
+    };
+    let at = |s: f64| (from.0 + du * s / len, from.1 + dw * s / len);
+    let bar = |m: &mut Mesh, s: f64, size: (f64, f64), v: (f64, f64)| {
+        let (u, w) = at(s);
+        let (su, sw) = if along_u { size } else { (size.1, size.0) };
+        m.append(&fbox(fr, (u - su / 2.0, u + su / 2.0), (w - sw / 2.0, w + sw / 2.0), v));
+    };
+    bar(&mut m, 20.0, (40.0, 40.0), (z0, z0 + height));
+    bar(&mut m, len - 20.0, (40.0, 40.0), (z0, z0 + height));
+    let count = (len / 110.0).ceil().max(1.0) as u32;
+    for k in 1..count {
+        bar(&mut m, len * f64::from(k) / f64::from(count), bal, (z0 + 60.0, z0 + height));
+    }
+    for (top, rh, rd) in rails {
+        let (ua, ub) = (from.0.min(to.0) - 20.0, from.0.max(to.0) + 20.0);
+        let (wa, wb) = (from.1.min(to.1) - 20.0, from.1.max(to.1) + 20.0);
+        let (ua, ub, wa, wb) = if along_u { (ua, ub, from.1 - rd / 2.0, from.1 + rd / 2.0) } else { (from.0 - rd / 2.0, from.0 + rd / 2.0, wa, wb) };
+        m.append(&fbox(fr, (ua, ub), (wa, wb), (z0 + top - rh, z0 + top)));
+    }
+    m
+}
+
+/// A balcony hung on the wall without an opening: slab and railing elements.
+fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> Vec<BuiltElement> {
+    let ty = &r.ty;
+    let level = r.placement.level;
+    let Rect { u0, u1, .. } = r.rect;
+    let deck_top = elevation + ty.sill;
+    let mk = |suffix: &str, name: &str, class: ElementClass, parts: Vec<(Material, Mesh)>| BuiltElement {
+        id: format!("{id}.{suffix}"),
+        name: name.to_string(),
+        class,
+        type_id: ty.id.clone(),
+        level,
+        width: ty.width,
+        height: ty.height,
+        parts,
+        status,
+    };
+    match ty.kind {
+        ComponentKind::BalconySlab { depth, thickness } => {
+            let slab = fbox(fr, (u0, u1), (-depth, 0.0), (deck_top - thickness, deck_top));
+            let mut rail = rail_run(fr, (u0 + 40.0, -depth + 40.0), (u1 - 40.0, -depth + 40.0), deck_top, ty.height);
+            rail.append(&rail_run(fr, (u0 + 40.0, -depth + 40.0), (u0 + 40.0, -60.0), deck_top, ty.height));
+            rail.append(&rail_run(fr, (u1 - 40.0, -depth + 40.0), (u1 - 40.0, -60.0), deck_top, ty.height));
+            vec![
+                mk("slab", &ty.name, ElementClass::BalconySlab, vec![(Material::Slab, slab)]),
+                mk("rail", &format!("{} rail", ty.name), ElementClass::Railing, vec![(Material::Railing, rail)]),
+            ]
+        }
+        ComponentKind::SteelBalcony { depth, railing, finish, deck, handrail, screens, tie_rods } => {
+            let metal = match finish {
+                Finish::Galvanised => Material::Steel,
+                Finish::White => Material::Frame,
+                Finish::Anthracite => Material::Railing,
+            };
+            let deck_material = if deck == Deck::FibreConcrete { Material::Slab } else { Material::Deck };
+            let (f, web, gap) = (STEEL_FRAME, 60.0, 30.0);
+            // UPE frame: front, sides and back beams; the deck sits inside it, 10 mm below the edge.
+            let mut frame = fbox(fr, (u0, u1), (-depth, -depth + web), (deck_top - f, deck_top + 10.0));
+            frame.append(&fbox(fr, (u0, u0 + web), (-depth + web, -gap), (deck_top - f, deck_top + 10.0)));
+            frame.append(&fbox(fr, (u1 - web, u1), (-depth + web, -gap), (deck_top - f, deck_top + 10.0)));
+            frame.append(&fbox(fr, (u0 + web, u1 - web), (-gap - web, -gap), (deck_top - f, deck_top)));
+            let floor = fbox(fr, (u0 + web, u1 - web), (-depth + web, -gap - web), (deck_top - 35.0, deck_top));
+            let underside = fbox(fr, (u0 + web, u1 - web), (-depth + web, -gap - web), (deck_top - f, deck_top - f + 3.0));
+            let mut slab_parts = vec![(metal, frame), (deck_material, floor), (Material::Sill, underside)];
+            if tie_rods {
+                let mut rods = rod(fr, (u0 + 30.0, -depth + 30.0, deck_top), (u0 + 30.0, 0.0, deck_top + 2400.0), 24.0);
+                rods.append(&rod(fr, (u1 - 30.0, -depth + 30.0, deck_top), (u1 - 30.0, 0.0, deck_top + 2400.0), 24.0));
+                slab_parts.push((metal, rods));
+            }
+            let z = deck_top + 10.0;
+            let mut rail = styled_rail(fr, (u0 + 25.0, -depth + 25.0), (u1 - 25.0, -depth + 25.0), z, ty.height, railing);
+            rail.append(&styled_rail(fr, (u0 + 25.0, -depth + 25.0), (u0 + 25.0, -gap - 20.0), z, ty.height, railing));
+            rail.append(&styled_rail(fr, (u1 - 25.0, -depth + 25.0), (u1 - 25.0, -gap - 20.0), z, ty.height, railing));
+            let mut rail_parts = vec![(metal, rail)];
+            if handrail {
+                let mut wood = fbox(fr, (u0, u1), (-depth, -depth + 70.0), (z + ty.height, z + ty.height + 40.0));
+                wood.append(&fbox(fr, (u0, u0 + 70.0), (-depth + 70.0, -gap), (z + ty.height, z + ty.height + 40.0)));
+                wood.append(&fbox(fr, (u1 - 70.0, u1), (-depth + 70.0, -gap), (z + ty.height, z + ty.height + 40.0)));
+                rail_parts.push((Material::Deck, wood));
+            }
+            let mut glass = Mesh::default();
+            if matches!(screens, Screens::Left | Screens::Both) {
+                glass.append(&fbox(fr, (u0 + 45.0, u0 + 55.0), (-depth + web, -gap), (z, z + 1800.0)));
+            }
+            if matches!(screens, Screens::Right | Screens::Both) {
+                glass.append(&fbox(fr, (u1 - 55.0, u1 - 45.0), (-depth + web, -gap), (z, z + 1800.0)));
+            }
+            if !glass.is_empty() {
+                rail_parts.push((Material::Glass, glass));
+            }
+            vec![
+                mk("slab", &ty.name, ElementClass::BalconySlab, slab_parts),
+                mk("rail", &format!("{} railing", ty.name), ElementClass::Railing, rail_parts),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn element(id: &str, suffix: &str, name: &str, class: ElementClass, ty: &ComponentType, level: usize, mesh: Mesh, status: Status) -> BuiltElement {
     let material = if class == ElementClass::Railing { Material::Railing } else { Material::Slab };
     BuiltElement {
         id: format!("{id}.{suffix}"),
@@ -479,6 +768,7 @@ fn element(id: &str, suffix: &str, name: &str, class: ElementClass, ty: &Compone
         width: ty.width,
         height: ty.height,
         parts: vec![(material, mesh)],
+        status,
     }
 }
 
@@ -509,7 +799,17 @@ mod tests {
                     (_, 4) => "balcony.french",
                     _ => "window.casement.2",
                 };
-                f.placements.push(Placement { level, bay, type_id: ty.into(), width: None, height: None, sill: None, spans_storeys: false });
+                f.placements.push(Placement {
+                    level,
+                    bay,
+                    type_id: ty.into(),
+                    width: None,
+                    height: None,
+                    sill: None,
+                    spans_storeys: false,
+                    created: None,
+                    demolished: None,
+                });
             }
         }
         doc.buildings.push(b);
@@ -560,6 +860,8 @@ mod tests {
             height: Some(950.0),
             sill: Some(2580.0),
             spans_storeys: false,
+            created: None,
+            demolished: None,
         };
         f.placements.push(landing.clone());
         let err = build(&doc).unwrap_err().to_string();
@@ -568,11 +870,110 @@ mod tests {
         let built = build(&doc).unwrap();
         assert_eq!(built[0].walls[0].openings[0].rect.v0, 900.0 + 2580.0);
         // A door down to the courtyard: below the floor is fine, below the terrain is not.
-        let door = Placement { level: 0, bay: 0, type_id: "door.french".into(), width: None, height: None, sill: Some(-500.0), spans_storeys: false };
+        let door = Placement {
+            level: 0,
+            bay: 0,
+            type_id: "door.french".into(),
+            width: None,
+            height: None,
+            sill: Some(-500.0),
+            spans_storeys: false,
+            created: None,
+            demolished: None,
+        };
         doc.buildings[0].facades[0].placements.push(door);
         assert_eq!(build(&doc).unwrap()[0].walls[0].openings[1].rect.v0, 400.0);
         doc.buildings[0].facades[0].placements[1].sill = Some(-1000.0);
         assert!(build(&doc).unwrap_err().to_string().contains("below the terrain"));
+    }
+
+    fn put(doc: &mut Document, level: usize, bay: usize, ty: &str, created: Option<&str>, demolished: Option<&str>) {
+        doc.buildings[0].facades[0].placements.push(Placement {
+            level,
+            bay,
+            type_id: ty.into(),
+            width: None,
+            height: None,
+            sill: None,
+            spans_storeys: false,
+            created: created.map(str::to_string),
+            demolished: demolished.map(str::to_string),
+        });
+    }
+
+    #[test]
+    fn phases_replace_an_old_balcony_with_a_larger_centred_one() {
+        let mut doc = doc_with_block();
+        doc.phases = vec![
+            crate::doc::Phase { id: "1938".into(), name: "Opført".into() },
+            crate::doc::Phase { id: "2026".into(), name: "Eksisterende".into() },
+            crate::doc::Phase { id: "forslag".into(), name: "Forslag".into() },
+        ];
+        let f = &mut doc.buildings[0].facades[0];
+        f.placements.clear();
+        // Old balcony under bay 2's door; the new one is centred between bays 2 and 3 and overlaps it.
+        f.bays.push((f.bays[2] + f.bays[3]) / 2.0);
+        let new_bay = f.bays.len() - 1;
+        doc.types.push(ComponentType {
+            id: "balcony.old".into(),
+            name: "Old balcony".into(),
+            width: 2000.0,
+            height: 1000.0,
+            sill: 0.0,
+            kind: ComponentKind::BalconySlab { depth: 1000.0, thickness: 150.0 },
+        });
+        put(&mut doc, 1, 2, "door.french", None, None);
+        put(&mut doc, 1, 2, "balcony.old", None, Some("forslag"));
+        put(&mut doc, 1, new_bay, "balcony.minaltan", Some("forslag"), None);
+        let count = |doc: &Document, phase: usize, filter: PhaseFilter| {
+            let b = build_view(doc, View { phase, filter }).unwrap();
+            b[0].walls[0].attachments.iter().map(|e| (e.type_id.clone(), e.status)).collect::<Vec<_>>()
+        };
+        // 1938 and 2026: only the old balcony (slab + rail).
+        assert_eq!(count(&doc, 0, PhaseFilter::Complete), vec![("balcony.old".into(), Status::Existing); 2]);
+        assert_eq!(count(&doc, 1, PhaseFilter::Complete).len(), 2);
+        // Forslag, complete: only the new one, marked new.
+        assert_eq!(count(&doc, 2, PhaseFilter::Complete), vec![("balcony.minaltan".into(), Status::New); 2]);
+        // Forslag, demolition: the old one, marked demolished; the door stays existing.
+        assert_eq!(count(&doc, 2, PhaseFilter::Demolition), vec![("balcony.old".into(), Status::Demolished); 2]);
+        let b = build_view(&doc, View { phase: 2, filter: PhaseFilter::Demolition }).unwrap();
+        assert_eq!(b[0].walls[0].openings[0].status, Status::Existing);
+        // The overlap is fine because they never stand at the same time; keeping the old one is not.
+        doc.buildings[0].facades[0].placements[1].demolished = None;
+        let err = build(&doc).unwrap_err().to_string();
+        assert!(err.contains("overlaps the balcony"), "{err}");
+        // A phase that doesn't exist, or demolition before creation, is refused.
+        doc.buildings[0].facades[0].placements[1].demolished = Some("1938".into());
+        assert!(build(&doc).is_err());
+        doc.buildings[0].facades[0].placements[1].demolished = Some("later".into());
+        assert!(build(&doc).is_err());
+    }
+
+    #[test]
+    fn steel_balcony_geometry_has_frame_deck_and_rail() {
+        let mut doc = doc_with_block();
+        let f = &mut doc.buildings[0].facades[0];
+        f.placements.clear();
+        put(&mut doc, 2, 2, "balcony.minaltan", None, None);
+        let b = build(&doc).unwrap();
+        let att = &b[0].walls[0].attachments;
+        assert_eq!(att.len(), 2);
+        let (lo, hi) = att.iter().flat_map(|e| e.parts.iter()).fold(([f64::MAX; 3], [f64::MIN; 3]), |(mut lo, mut hi), (_, m)| {
+            if let Some((a, z)) = m.bounds() {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(a[k]);
+                    hi[k] = hi[k].max(z[k]);
+                }
+            }
+            (lo, hi)
+        });
+        // South-facing test facade: the balcony projects 1300 mm towards -y and is 2700 wide.
+        assert!((hi[0] - lo[0] - 2700.0).abs() < 1.0, "{lo:?} {hi:?}");
+        assert!((lo[1] + 1300.0).abs() < 1.0, "{lo:?}");
+        // Deck top at the storey floor (6000), frame 160 below, railing 1000 above (+10 edge).
+        assert!((lo[2] - (6000.0 - 160.0)).abs() < 1.0 && (hi[2] - 7010.0).abs() < 1.0, "{lo:?} {hi:?}");
+        // No hole in the wall for an attachment.
+        assert!(b[0].walls[0].openings.is_empty());
     }
 
     #[test]

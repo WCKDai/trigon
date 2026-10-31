@@ -15,10 +15,16 @@ pub enum Material {
     Railing,
     /// Linked reference models.
     Reference,
+    /// Galvanised steel.
+    Steel,
+    /// Hardwood, composite or bamboo decking.
+    Deck,
+    /// Shown in a demolition view: what a phase tears down.
+    Demolished,
 }
 
 impl Material {
-    pub const ALL: [Material; 9] = [
+    pub const ALL: [Material; 12] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -28,6 +34,9 @@ impl Material {
         Material::Sill,
         Material::Railing,
         Material::Reference,
+        Material::Steel,
+        Material::Deck,
+        Material::Demolished,
     ];
 
     pub fn name(self) -> &'static str {
@@ -41,6 +50,9 @@ impl Material {
             Material::Sill => "sill",
             Material::Railing => "railing",
             Material::Reference => "reference",
+            Material::Steel => "steel",
+            Material::Deck => "deck",
+            Material::Demolished => "demolished",
         }
     }
 
@@ -56,6 +68,9 @@ impl Material {
             Material::Sill => [0.80, 0.78, 0.74, 1.0],
             Material::Railing => [0.12, 0.12, 0.12, 1.0],
             Material::Reference => [0.78, 0.80, 0.84, 1.0],
+            Material::Steel => [0.62, 0.64, 0.66, 1.0],
+            Material::Deck => [0.55, 0.33, 0.18, 1.0],
+            Material::Demolished => [0.90, 0.10, 0.10, 0.45],
         }
     }
 }

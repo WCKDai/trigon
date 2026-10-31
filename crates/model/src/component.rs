@@ -37,11 +37,87 @@ pub enum ComponentKind {
     FrenchBalcony { leaves: u32, rail_height: f64 },
     /// Cantilever balcony: a French door, a slab of `depth` × `slab_width` and a guard rail.
     Balcony { leaves: u32, depth: f64, slab_width: f64, rail_height: f64 },
+    /// A balcony on its own, hung on the wall in front of an opening: a slab `depth` deep and the
+    /// type's `width` wide, with a plain guard rail. Doesn't cut the wall. For existing balconies.
+    BalconySlab { depth: f64, thickness: f64 },
+    /// A MinAltan steel balcony (stålaltan): hot-dip galvanised frame on a 160 mm UPE profile, a
+    /// sunken deck, an Ibond underside and a railing style named after the districts. The type's
+    /// `width` is the balcony width and its `height` the railing height. Doesn't cut the wall.
+    SteelBalcony {
+        depth: f64,
+        railing: Railing,
+        finish: Finish,
+        deck: Deck,
+        /// Hardwood handrail on top of the railing.
+        #[serde(default)]
+        handrail: bool,
+        /// Matt-glass privacy screens, 1800 mm high, the full depth.
+        #[serde(default)]
+        screens: Screens,
+        /// Tie rods from the front corners up to the wall; otherwise wall anchoring.
+        #[serde(default)]
+        tie_rods: bool,
+    },
+}
+
+/// MinAltan railing styles (balusters, rails).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Railing {
+    /// Ø12 mm balusters, two 50 × 10 mm rails.
+    Frederiksberg,
+    /// 30 × 6 mm balusters, one 60 × 15 mm rail.
+    Norrebro,
+    /// 30 × 6 mm balusters, two 50 × 10 mm rails.
+    Vesterbro,
+    /// 30 × 6 mm balusters only.
+    Osterbro,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Finish {
+    Galvanised,
+    White,
+    Anthracite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Deck {
+    Cumaru,
+    FibreConcrete,
+    Composite,
+    Bamboo,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Screens {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
 }
 
 impl ComponentKind {
     pub fn is_door(&self) -> bool {
-        !matches!(self, Self::Window { .. } | Self::FixedWindow)
+        matches!(self, Self::EntranceDoor | Self::FrenchDoor { .. } | Self::FrenchBalcony { .. } | Self::Balcony { .. })
+    }
+
+    /// Cuts an opening in the wall (windows and doors). Attachments (balconies hung on the
+    /// wall) don't, and a slot can hold one opening and one attachment.
+    pub fn is_opening(&self) -> bool {
+        !matches!(self, Self::BalconySlab { .. } | Self::SteelBalcony { .. })
+    }
+
+    /// Projection from the wall, mm, for attachments.
+    pub fn depth(&self) -> Option<f64> {
+        match self {
+            Self::BalconySlab { depth, .. } | Self::SteelBalcony { depth, .. } | Self::Balcony { depth, .. } => Some(*depth),
+            _ => None,
+        }
     }
 }
 
@@ -66,6 +142,15 @@ impl ComponentType {
                 checked("slab_width", *slab_width, self.width, 12000.0)?;
                 checked("rail_height", *rail_height, 900.0, 1500.0).map(|_| ())
             }
+            ComponentKind::BalconySlab { depth, thickness } => {
+                checked("depth", *depth, 300.0, 3000.0)?;
+                checked("thickness", *thickness, 60.0, 400.0)?;
+                checked("rail height (the type's height)", self.height, 900.0, 1500.0).map(|_| ())
+            }
+            ComponentKind::SteelBalcony { depth, .. } => {
+                checked("depth", *depth, 300.0, 3000.0)?;
+                checked("railing height (the type's height)", self.height, 900.0, 1500.0).map(|_| ())
+            }
             _ => Ok(()),
         }
     }
@@ -89,6 +174,22 @@ pub fn default_types() -> Vec<ComponentType> {
         t("door.entrance", "Entrance door", 1200.0, 2300.0, 0.0, ComponentKind::EntranceDoor),
         t("door.french", "French door, 2 leaves", 1200.0, 2250.0, 0.0, ComponentKind::FrenchDoor { leaves: 2 }),
         t("balcony.french", "French balcony", 1200.0, 2250.0, 0.0, ComponentKind::FrenchBalcony { leaves: 2, rail_height: 1000.0 }),
+        t(
+            "balcony.minaltan",
+            "MinAltan steel balcony, Vesterbro railing",
+            2700.0,
+            1000.0,
+            0.0,
+            ComponentKind::SteelBalcony {
+                depth: 1300.0,
+                railing: Railing::Vesterbro,
+                finish: Finish::Galvanised,
+                deck: Deck::Cumaru,
+                handrail: false,
+                screens: Screens::None,
+                tie_rods: false,
+            },
+        ),
         t(
             "balcony.cantilever",
             "Cantilever balcony",

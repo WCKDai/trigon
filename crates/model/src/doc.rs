@@ -26,6 +26,24 @@ pub struct Document {
     /// Linked drawings (scanned plans, sections, elevations). Only the link is stored.
     #[serde(default)]
     pub drawings: Vec<Drawing>,
+    /// Phases in time order, as in Revit: every placement is created in one and may be
+    /// demolished in a later one.
+    #[serde(default = "default_phases")]
+    pub phases: Vec<Phase>,
+    /// The phase new work goes into; the last phase when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_phase: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Phase {
+    pub id: String,
+    pub name: String,
+}
+
+pub fn default_phases() -> Vec<Phase> {
+    vec![Phase { id: "existing".into(), name: "Eksisterende".into() }]
 }
 
 /// A page of a drawing PDF used as an underlay, in its upright orientation.
@@ -108,6 +126,8 @@ impl Default for Document {
             journal: Vec::new(),
             references: Vec::new(),
             drawings: Vec::new(),
+            phases: default_phases(),
+            active_phase: None,
         }
     }
 }
@@ -194,6 +214,12 @@ pub struct Placement {
     /// stay below the eaves.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spans_storeys: bool,
+    /// Phase id the element is created in; the first phase when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    /// Phase id the element is demolished in, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demolished: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,6 +358,37 @@ impl Document {
     /// The building that owns a facade id (`b1.f3` belongs to `b1`).
     pub fn building_of_facade_mut(&mut self, facade: &str) -> Result<&mut Building> {
         self.buildings.iter_mut().find(|b| b.facades.iter().any(|f| f.id == facade)).ok_or_else(|| ModelError::NotFound(format!("facade {facade}")))
+    }
+
+    pub fn phase_index(&self, id: &str) -> Result<usize> {
+        self.phases.iter().position(|p| p.id == id).ok_or_else(|| {
+            let known: Vec<&str> = self.phases.iter().map(|p| p.id.as_str()).collect();
+            ModelError::NotFound(format!("phase {id} (phases: {})", known.join(", ")))
+        })
+    }
+
+    /// The phase new work goes into (the last phase unless one is activated).
+    pub fn active_index(&self) -> usize {
+        self.active_phase.as_deref().and_then(|a| self.phases.iter().position(|p| p.id == a)).unwrap_or(self.phases.len().saturating_sub(1))
+    }
+
+    /// The phases a placement exists in: from its creation up to (not including) its demolition.
+    pub fn lifetime(&self, p: &Placement) -> Result<(usize, usize)> {
+        let c = match &p.created {
+            Some(id) => self.phase_index(id)?,
+            None => 0,
+        };
+        let d = match &p.demolished {
+            Some(id) => self.phase_index(id)?,
+            None => self.phases.len(),
+        };
+        if d <= c {
+            return Err(ModelError::Invalid(format!(
+                "level {} bay {}: demolished in a phase before or equal to the one it's created in",
+                p.level, p.bay
+            )));
+        }
+        Ok((c, d))
     }
 
     pub fn component(&self, id: &str) -> Result<&ComponentType> {

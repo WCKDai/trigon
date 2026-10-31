@@ -379,3 +379,56 @@ fn drawings_register_straighten_and_view() {
     assert!(s.execute("drawing.add", json!({"path": "/etc/hosts"})).is_err(), "only .pdf files");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn phases_past_present_future() {
+    let mut s = session();
+    let south = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": south, "count": 6})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "door.french", "levels": [1], "bays": [2]})).unwrap();
+    s.execute(
+        "types.define",
+        json!({"id": "balcony.old", "name": "Old balcony", "width": 2000.0, "height": 1000.0, "sill": 0.0, "kind": {"family": "balcony_slab", "depth": 1000.0, "thickness": 150.0}}),
+    )
+    .unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "balcony.old", "levels": [1], "bays": [2]})).unwrap();
+    // Phases: 1938 → 2026 → forslag. Everything so far belongs to the first.
+    let v = s
+        .execute(
+            "phase.set",
+            json!({"phases": [{"id": "1938", "name": "Opført"}, {"id": "2026", "name": "Eksisterende"}, {"id": "forslag", "name": "Forslag"}]}),
+        )
+        .unwrap();
+    assert_eq!(v["active"], "forslag", "the last phase is active by default");
+    // In the proposal, a MinAltan balcony replaces the old one in the same slot: the old is demolished, not deleted.
+    let v = s.execute("facade.place", json!({"facade": south, "type": "balcony.minaltan", "levels": [1], "bays": [2]})).unwrap();
+    assert_eq!(v["demolished"], 1);
+    let f = s.doc.building(None).unwrap().facade(&south).unwrap().clone();
+    assert_eq!(f.placements.len(), 3, "door, old balcony (demolished in forslag), new balcony");
+    // Placing again in the same phase replaces the new one outright.
+    let v = s.execute("facade.place", json!({"facade": south, "type": "balcony.minaltan", "levels": [1], "bays": [2], "width": 2400.0})).unwrap();
+    assert_eq!(v["demolished"], 0);
+    assert_eq!(s.doc.building(None).unwrap().facade(&south).unwrap().placements.len(), 3);
+    // Demolishing the door in the proposal closes the wall there afterwards, but not before.
+    s.execute("facade.demolish", json!({"facade": south, "levels": [1], "bays": [2], "what": "openings"})).unwrap();
+    let doors_in = |s: &Session, phase: &str| {
+        let view = crate::commands::view_of(&s.doc, Some(phase), None).unwrap();
+        trigon_model::build::build_view(&s.doc, view).unwrap()[0].walls.iter().map(|w| w.openings.len()).sum::<usize>()
+    };
+    assert_eq!(doors_in(&s, "2026"), 1);
+    assert_eq!(doors_in(&s, "forslag"), 0);
+    // A phase that elements still use can't be dropped.
+    assert!(s.execute("phase.set", json!({"phases": [{"id": "1938", "name": "x"}]})).is_err());
+    // IFC: status per element.
+    let dir = std::env::temp_dir().join(format!("trigon-phase-{}", std::process::id()));
+    let ifc = dir.join("demo.ifc");
+    s.execute("export.ifc", json!({"path": ifc, "phase": "forslag", "filter": "all"})).unwrap();
+    let text = std::fs::read_to_string(&ifc).unwrap();
+    assert!(text.contains("IFCLABEL('NEW')") && text.contains("IFCLABEL('DEMOLISH')"), "status properties");
+    s.execute("export.gltf", json!({"path": dir.join("demo.glb"), "phase": "forslag", "filter": "demolition"})).unwrap();
+    assert!(s.execute("export.gltf", json!({"path": dir.join("x.glb"), "filter": "sideways"})).is_err());
+    let list = s.execute("phase.list", json!({})).unwrap();
+    assert_eq!(list["phases"][2]["builds"], 1);
+    assert_eq!(list["phases"][2]["demolishes"], 2, "old balcony and door");
+    let _ = std::fs::remove_dir_all(dir);
+}
