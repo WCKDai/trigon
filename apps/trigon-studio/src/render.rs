@@ -1,4 +1,5 @@
-//! The 3D viewport on the GPU: the scene is drawn with 4x MSAA into a texture of the app's own,
+//! The 3D viewport on the GPU: the scene is drawn with 4x MSAA (when the adapter offers it) into
+//! a texture of the app's own,
 //! which egui then shows as an image. Drawing offscreen keeps egui's own surface at one sample
 //! (no sample-count matching with egui-wgpu) and gives `ui.screenshot` the same pixels.
 //!
@@ -12,6 +13,7 @@ use wgpu::util::DeviceExt;
 
 use crate::scene::{EDGE_FLOATS, Scene, VERTEX_FLOATS};
 
+/// Samples per pixel wanted; adapters that can't (some OpenGL ones) draw with one.
 const MSAA: u32 = 4;
 const COLOR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -141,7 +143,8 @@ pub struct View {
 
 struct Targets {
     size: [u32; 2],
-    msaa: wgpu::TextureView,
+    /// The multisampled colour target, or `None` when drawing straight into `resolve`.
+    msaa: Option<wgpu::TextureView>,
     depth: wgpu::TextureView,
     resolve: wgpu::Texture,
     resolve_view: wgpu::TextureView,
@@ -151,7 +154,7 @@ struct Targets {
 }
 
 impl Targets {
-    fn new(device: &wgpu::Device, size: [u32; 2]) -> Targets {
+    fn new(device: &wgpu::Device, size: [u32; 2], samples: u32) -> Targets {
         let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
         let tex = |label, format, samples, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -165,8 +168,8 @@ impl Targets {
                 view_formats: if samples == 1 { &[EGUI_FORMAT] } else { &[] },
             })
         };
-        let msaa = tex("trigon viewport msaa", COLOR, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let depth = tex("trigon viewport depth", DEPTH, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let msaa = (samples > 1).then(|| tex("trigon viewport msaa", COLOR, samples, wgpu::TextureUsages::RENDER_ATTACHMENT));
+        let depth = tex("trigon viewport depth", DEPTH, samples, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let resolve = tex(
             "trigon viewport",
             COLOR,
@@ -175,7 +178,7 @@ impl Targets {
         );
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
         let egui_view = resolve.create_view(&wgpu::TextureViewDescriptor { format: Some(EGUI_FORMAT), ..Default::default() });
-        Targets { size, msaa: view(&msaa), depth: view(&depth), resolve_view: view(&resolve), egui_view, resolve }
+        Targets { size, msaa: msaa.as_ref().map(view), depth: view(&depth), resolve_view: view(&resolve), egui_view, resolve }
     }
 }
 
@@ -215,10 +218,13 @@ pub struct Viewport3d {
     selection: Option<Geometry>,
     targets: Option<Targets>,
     texture: Option<egui::TextureId>,
+    samples: u32,
 }
 
 impl Viewport3d {
-    pub fn new(device: &wgpu::Device) -> Viewport3d {
+    pub fn new(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Viewport3d {
+        let supported = |f| adapter.get_texture_format_features(f).flags.sample_count_supported(MSAA);
+        let samples = if supported(COLOR) && supported(DEPTH) { MSAA } else { 1 };
         let module = device
             .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("trigon viewport"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -266,7 +272,7 @@ impl Viewport3d {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState { constant: bias, slope_scale: if bias > 0 { 1.0 } else { 0.0 }, clamp: 0.0 },
                 }),
-                multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+                multisample: wgpu::MultisampleState { count: samples, mask: !0, alpha_to_coverage_enabled: false },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: Some(fs),
@@ -315,6 +321,7 @@ impl Viewport3d {
             selection: None,
             targets: None,
             texture: None,
+            samples,
         }
     }
 
@@ -356,10 +363,14 @@ impl Viewport3d {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("trigon viewport"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &t.msaa,
+                view: t.msaa.as_ref().unwrap_or(&t.resolve_view),
                 depth_slice: None,
-                resolve_target: Some(&t.resolve_view),
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(BACKGROUND), store: wgpu::StoreOp::Discard },
+                resolve_target: t.msaa.as_ref().map(|_| &t.resolve_view),
+                // Multisampled pixels are resolved and then dropped; a single-sample target is kept.
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(BACKGROUND),
+                    store: if t.msaa.is_some() { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store },
+                },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &t.depth,
@@ -407,7 +418,7 @@ impl Viewport3d {
     pub fn render(&mut self, rs: &egui_wgpu::RenderState, v: &View) -> Option<egui::TextureId> {
         let size = [v.size[0].clamp(1, MAX_SIDE), v.size[1].clamp(1, MAX_SIDE)];
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
-            let t = Targets::new(&rs.device, size);
+            let t = Targets::new(&rs.device, size, self.samples);
             let mut renderer = rs.renderer.write();
             match self.texture {
                 Some(id) => renderer.update_egui_texture_from_wgpu_texture(&rs.device, &t.egui_view, wgpu::FilterMode::Linear, id),
@@ -426,7 +437,7 @@ impl Viewport3d {
     /// Draw the view offscreen and read it back: RGBA8 (sRGB), `size` pixels.
     pub fn capture(&mut self, rs: &egui_wgpu::RenderState, v: &View) -> Result<([u32; 2], Vec<u8>), String> {
         let size = [v.size[0].clamp(16, MAX_SIDE), v.size[1].clamp(16, MAX_SIDE)];
-        let t = Targets::new(&rs.device, size);
+        let t = Targets::new(&rs.device, size, self.samples);
         self.write_uniforms(&rs.queue, &View { size, ..*v });
         let padded = (size[0] * 4).div_ceil(256) * 256;
         let buffer = rs.device.create_buffer(&wgpu::BufferDescriptor {

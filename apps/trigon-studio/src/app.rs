@@ -165,6 +165,10 @@ impl StudioApp {
     pub fn new(cc: &eframe::CreationContext<'_>, launch: Launch) -> StudioApp {
         let ctx = cc.egui_ctx.clone();
         let wake = ctx.clone();
+        if let Some(rs) = &cc.wgpu_render_state {
+            // wgpu panics on a validation error by default; a driver quirk is reported instead.
+            rs.device.on_uncaptured_error(Arc::new(|e| eprintln!("trigon-studio: GPU error: {e}")));
+        }
         let mut app = StudioApp {
             session: Session::new(Box::new(Live::new(Credentials::from_env()))),
             feed: Feed::default(),
@@ -195,7 +199,7 @@ impl StudioApp {
             camera: Orbit::default(),
             fit_pending: true,
             render_state: cc.wgpu_render_state.clone(),
-            viewport: cc.wgpu_render_state.as_ref().map(|rs| Viewport3d::new(&rs.device)),
+            viewport: cc.wgpu_render_state.as_ref().map(|rs| Viewport3d::new(&rs.device, &rs.adapter)),
             texture: None,
             texture_size: [0, 0],
             ppp: cc.egui_ctx.pixels_per_point(),
