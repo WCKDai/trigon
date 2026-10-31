@@ -92,6 +92,114 @@ fn session() -> Session {
     s
 }
 
+#[test]
+fn clearing_stair_walls_preserves_the_other_storeys() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[{"id":"shared", "levels":[0,1,2], "a":[-1000,0],"b":[1000,0],"thickness":100,"load_bearing":false}]}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs":[{"id":"s","levels":[1],"outline":[[-2000,-1000],[2000,-1000],[2000,1000],[-2000,1000]]}],"clear_walls_inside":true}),
+    )
+    .unwrap();
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.len(), 1);
+    assert_eq!(walls[0].levels, vec![0, 2]);
+}
+
+#[test]
+fn stairs_and_basement_keep_levels_and_export_real_floor_openings() {
+    let mut s = session();
+    s.execute("interior.add_stairs",json!({"stairs":[{"id":"core","levels":[0,1,2,3,4],"outline":[[-2000,-1000],[0,-1000],[0,1000],[-2000,1000]],"kind":"u_turn","landing":1000,"rounded":false}]})).unwrap();
+    s.execute("building.add_basement", json!({"floor":-2480})).unwrap();
+    assert_eq!(s.doc.buildings[0].ground_level, 1);
+    assert_eq!(s.doc.buildings[0].stairs[0].levels, vec![1, 2, 3, 4, 5]);
+    assert_eq!(s.doc.buildings[0].storeys[1].elevation, 0.0);
+    let built = trigon_model::build(&s.doc).unwrap();
+    assert!(built[0].slabs[0].holes.is_empty());
+    assert!(built[0].slabs[1].holes.is_empty());
+    assert_eq!(built[0].slabs[2].holes.len(), 1);
+    let text = trigon_io::ifc::write(&s.doc, &built, "test.ifc", "2000-01-01T00:00:00Z");
+    let slab = &built[0].slabs[2];
+    let expected = trigon_model::doc::polygon_area(&slab.polygon) - 6_000_000.0;
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        let id = trigon_io::ifc::guid(&format!("trigon:{}", slab.id));
+        let m = &read.elements.iter().find(|e| e.global_id == id).unwrap().mesh;
+        let top = m.bounds().unwrap().1[2];
+        let area: f64 = m
+            .triangles
+            .iter()
+            .filter_map(|t| {
+                let [a, b, c] = t.map(|i| m.positions[i as usize]);
+                ([a, b, c].iter().all(|p| (p[2] - top).abs() < 1e-3))
+                    .then_some(((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0)
+            })
+            .sum();
+        assert!((area - expected).abs() < expected * 1e-6, "{} filled stair shaft: {area} vs {expected}", read.reader.name());
+    }
+}
+
+#[test]
+fn malformed_stairs_are_rejected_without_mutating_the_document() {
+    let mut s = session();
+    for stair in [
+        json!({"levels":[0],"outline":[[0,0],[2000,0],[2000,2000]]}),
+        json!({"levels":[0],"outline":[[0,0],[2000,0],[2400,2000],[0,2000]]}),
+        json!({"levels":[],"outline":[[0,0],[2000,0],[2000,2000],[0,2000]]}),
+        json!({"levels":[0],"outline":[[0,0],[2000,0],[2000,2000],[0,2000]],"winders":20000000}),
+    ] {
+        let before = s.doc.clone();
+        assert!(s.execute("interior.add_stairs", json!({"stairs":[stair]})).is_err());
+        assert_eq!(s.doc, before);
+    }
+    let valid = json!({"levels":[0],"outline":[[0,0],[2000,0],[2000,2000],[0,2000]]});
+    s.execute("interior.add_stairs", json!({"stairs":[valid.clone()]})).unwrap();
+    let before = s.doc.clone();
+    assert!(s.execute("interior.add_stairs", json!({"stairs":[valid]})).is_err(), "overlapping shafts");
+    assert_eq!(s.doc, before);
+    assert!(
+        s.execute("interior.add_stairs", json!({"stairs":[{"levels":[0],"outline":[[20000,0],[22000,0],[22000,2000],[20000,2000]]}]})).is_err(),
+        "outside building"
+    );
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn thick_gray_masonry_is_not_mistaken_for_its_own_paper_background() {
+    let mut s = session();
+    let (w, h) = (3000u32, 2200u32);
+    let mut data = vec![210u8; (w * h) as usize];
+    for y in 1150..1250 {
+        for x in 700..2300 {
+            data[(y * w + x) as usize] = 120;
+        }
+    }
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "thick".into(),
+        path: "/virtual/thick.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: w,
+        height: h,
+        note: String::new(),
+        facades: Vec::new(),
+        plans: vec![trigon_model::PlanRegistration::fit(vec![1], &[([300., 1800.], [-12000., -6000.]), ([2700., 1800.], [12000., -6000.])]).unwrap()],
+    });
+    s.drawing_cache = Some((("/virtual/thick.pdf".into(), 1, 0), std::sync::Arc::new(trigon_drawing::Gray { width: w, height: h, data })));
+    let v = s.execute("drawing.trace_walls", json!({"name":"thick","level":1,"contrast":45,"max_mm":1100})).unwrap();
+    let walls = v["walls"].as_array().unwrap();
+    assert!(
+        walls.iter().any(|w| {
+            let (a, b) = (&w["a"], &w["b"]);
+            w["thickness"].as_f64().unwrap() > 850.0 && (a[0].as_f64().unwrap() - b[0].as_f64().unwrap()).abs() > 15000.0
+        }),
+        "the solid 1m wall was split or lost: {walls:?}"
+    );
+}
+
 fn first_facade_facing(s: &mut Session, faces: &str) -> String {
     let list = s.execute("facade.list", json!({})).unwrap();
     list.as_array().unwrap().iter().find(|f| f["faces"] == faces).unwrap()["id"].as_str().unwrap().to_string()
@@ -435,6 +543,98 @@ fn phases_past_present_future() {
 }
 
 #[test]
+fn wall_regularization_is_explicit_undoable_and_atomic() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [
+            {"id":"measured", "levels":[1], "a":[0.,0.], "b":[4000.,80.], "thickness":100.}
+        ]}),
+    )
+    .unwrap();
+    let original = s.doc.clone();
+    assert!(s.execute("interior.regularize", json!({"axes_deg":[0.], "tolerance_mm": -1.})).is_err());
+    assert_eq!(s.doc, original);
+    let result = s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    assert_eq!(result["moved"], 1);
+    let wall = &s.doc.buildings[0].interior_walls[0];
+    assert!((wall.a[1] - wall.b[1]).abs() < 1e-8);
+    assert!(s.undo());
+    assert_eq!(s.doc.buildings, original.buildings);
+}
+
+#[test]
+fn presentation_sheets_are_vector_composed_and_leave_the_model_unchanged() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 2})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.cantilever", "levels": [1], "bays": [0]})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.french", "levels": [1], "bays": [1]})).unwrap();
+    let before = s.doc.clone();
+    let dir = std::env::temp_dir().join(format!("trigon-sheet-{}", std::process::id()));
+    let request = json!({"levels": [1], "path": dir.join("sheet.svg"), "caption": "Frederikssundsvej & gård"});
+    let result = s.execute("plan.sheet", request).unwrap();
+    assert_eq!(result["pages"], 1);
+    let svg = std::fs::read_to_string(dir.join("sheet.svg")).unwrap();
+    assert!(svg.contains("url(#masonry)") && svg.contains("fill-rule=\"evenodd\""));
+    assert!(svg.contains("Frederikssundsvej &amp; gård") && svg.contains("Liberation Sans"));
+    assert!(svg.contains("Ca. 1200 × 3000"), "the balcony's slab width differs from its 1000 mm door opening");
+    assert!(!svg.contains("data:image") && !svg.contains(" m²"), "offer sheets have neither a scan nor derived room-area clutter");
+    s.execute("plan.sheet", json!({"levels": [1], "path": dir.join("sheet.png")})).unwrap();
+    let reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join("sheet.png")).unwrap())).read_info().unwrap();
+    assert_eq!((reader.info().width, reader.info().height), (1600, 900));
+    s.execute("plan.sheet", json!({"levels": [1, 2], "path": dir.join("set.pdf")})).unwrap();
+    let pdf = lopdf::Document::load(dir.join("set.pdf")).unwrap();
+    assert_eq!(pdf.get_pages().len(), 2);
+    assert_eq!(s.doc, before);
+    for request in [
+        json!({"levels": [], "path": dir.join("bad.pdf")}),
+        json!({"levels": [1, 2], "path": dir.join("bad.png")}),
+        json!({"levels": [1], "path": dir.join("bad.pdf"), "region": [[0.,0.],[0.,0.]]}),
+        json!({"levels": [999], "path": dir.join("bad.pdf")}),
+    ] {
+        assert!(s.execute("plan.sheet", request).is_err());
+    }
+    assert!(!dir.join("bad.pdf").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn elevation_sheets_project_the_model_and_label_balconies() {
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": facade, "count": 2})).unwrap();
+    s.execute("facade.place", json!({"facade": facade, "type": "balcony.cantilever", "levels": [1], "bays": [0]})).unwrap();
+    let before = s.doc.clone();
+    let dir = std::env::temp_dir().join(format!("trigon-elevation-{}", std::process::id()));
+    let result = s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.svg"), "title": "Gårdfacade"})).unwrap();
+    assert!(result["triangles"].as_u64().unwrap() > 10, "{result}");
+    assert_eq!(result["balcony_labels"], 1);
+    let svg = std::fs::read_to_string(dir.join("e.svg")).unwrap();
+    assert!(svg.contains("Ca. 1200 × 3000") && svg.contains("Gårdfacade") && !svg.contains("data:image"));
+    s.execute("elevation.sheet", json!({"facade": facade, "path": dir.join("e.pdf")})).unwrap();
+    // Square-on to a line instead of a facade (a stepped street front): south of the building, looking north.
+    let along = s.execute("elevation.sheet", json!({"along": [[-60000., -60000.], [60000., -60000.]], "path": dir.join("s.svg")})).unwrap();
+    assert!(along["triangles"].as_u64().unwrap() > 10, "{along}");
+    assert_eq!(lopdf::Document::load(dir.join("e.pdf")).unwrap().get_pages().len(), 1);
+    assert_eq!(s.doc, before);
+    for request in [
+        json!({"facade": "nope", "path": dir.join("bad.svg")}),
+        json!({"facade": facade, "path": dir.join("bad.svg"), "from_mm": 500.0, "to_mm": 600.0}),
+        json!({"facade": facade, "path": dir.join("bad.svg"), "from_mm": f64::MAX}),
+        json!({"facade": facade, "path": dir.join("bad.txt")}),
+        json!({"path": dir.join("bad.svg")}),
+        json!({"facade": facade, "along": [[0., 0.], [5000., 0.]], "path": dir.join("bad.svg")}),
+        json!({"along": [[0., 0.], [0., 0.]], "path": dir.join("bad.svg")}),
+        json!({"along": [[0., 0.], [f64::MAX, 0.]], "path": dir.join("bad.svg")}),
+    ] {
+        assert!(s.execute("elevation.sheet", request).is_err());
+    }
+    assert!(!dir.join("bad.svg").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn floor_plans_from_a_registered_sheet() {
     let mut s = session();
     let sheet = with_sheet(&mut s);
@@ -467,17 +667,107 @@ fn floor_plans_from_a_registered_sheet() {
     assert!((v["px_per_m"].as_f64().unwrap() - 100.0).abs() < 0.01, "{v}");
     assert_eq!(v["residuals_mm"], json!([0.0, 0.0]));
     let dir = std::env::temp_dir().join(format!("trigon-plan-{}", std::process::id()));
-    let png = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.png"), "mm_per_px": 50.0})).unwrap();
+    let png = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.png"), "mm_per_px": 50.0, "show_scan": true})).unwrap();
     assert_eq!(png["underlay"], "sheet");
+    let clean = s.execute("plan.image", json!({"level": 1, "path": dir.join("clean.png"), "mm_per_px": 50.0})).unwrap();
+    assert!(clean["underlay"].is_null(), "output material shows no scan by default");
     assert_eq!(png["labelled_balconies"], 2);
-    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg"), "mm_per_px": 50.0})).unwrap();
+    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg"), "mm_per_px": 50.0, "show_scan": true})).unwrap();
     let text = std::fs::read_to_string(svg["written"].as_str().unwrap()).unwrap();
     assert!(text.contains("Ca. 1300 x 2700") && text.contains("<polygon") && text.contains("data:image/png;base64,"));
     // No plan registered for the ground floor: a plain plan, or a clear error when a drawing is asked for.
     assert!(s.execute("plan.image", json!({"level": 0, "path": dir.join("g.png")})).unwrap()["underlay"].is_null());
-    assert!(s.execute("plan.image", json!({"level": 0, "drawing": sheet, "path": dir.join("g.png")})).is_err());
+    assert!(s.execute("plan.image", json!({"level": 0, "drawing": sheet, "show_scan": true, "path": dir.join("g.png")})).is_err());
+    let plain = s.execute("plan.image", json!({"level": 1, "path": dir.join("plain.svg")})).unwrap();
+    assert!(!std::fs::read_to_string(plain["written"].as_str().unwrap()).unwrap().contains("base64"), "no scan in the SVG");
     assert!(s.execute("plan.image", json!({"level": 9, "path": dir.join("x.png")})).is_err());
     assert!(s.execute("plan.image", json!({"level": 1, "path": dir.join("x.pdf")})).is_err());
     assert!(s.execute("drawing.register_plan", json!({"name": sheet, "levels": [1], "points": [{"px": 1, "py": 1, "x": 0.0, "y": 0.0}]})).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn interior_walls_traced_from_a_plan_sheet() {
+    let mut s = session();
+    // A 1:100 plan at 100 px/m, north up: site (x, y) mm ↔ pixel (1500 + x/10, 1200 − y/10).
+    let (w, h) = (3000u32, 2400u32);
+    let mut data = vec![215u8; (w * h) as usize];
+    // A 200 mm wall along x at y = 0 from x = −8 m to +8 m, drawn with a 1 px step half way (as scans do), and a 100 mm
+    // partition along y at x = 4 m.
+    for x in 700..2300 {
+        let shift = if x < 1500 { 0 } else { 1 };
+        for y in 1190 + shift..1210 + shift {
+            data[(y * w + x) as usize] = 30;
+        }
+    }
+    for y in 700..1190 {
+        for x in 1895..1905 {
+            data[(y * w + x) as usize] = 40;
+        }
+    }
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "plan".into(),
+        path: "/virtual/plan.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: w,
+        height: h,
+        note: String::new(),
+        facades: Vec::new(),
+        plans: Vec::new(),
+    });
+    s.drawing_cache = Some((("/virtual/plan.pdf".into(), 1, 0), std::sync::Arc::new(trigon_drawing::Gray { width: w, height: h, data })));
+    s.execute(
+        "drawing.register_plan",
+        json!({"name": "plan", "levels": [1, 2], "points": [{"px": 300, "py": 1800, "x": -12000.0, "y": -6000.0}, {"px": 2700, "py": 1800, "x": 12000.0, "y": -6000.0}]}),
+    )
+    .unwrap();
+    let v = s.execute("drawing.trace_walls", json!({"name": "plan", "level": 1})).unwrap();
+    let walls = v["walls"].as_array().unwrap();
+    let main = walls.iter().find(|w| w["thickness"].as_f64().unwrap() >= 150.0).expect("the 200 mm wall");
+    let (a, b) = (main["a"].as_array().unwrap(), main["b"].as_array().unwrap());
+    let len = ((b[0].as_f64().unwrap() - a[0].as_f64().unwrap()).powi(2) + (b[1].as_f64().unwrap() - a[1].as_f64().unwrap()).powi(2)).sqrt();
+    assert!((len - 16000.0).abs() < 200.0, "length {len}");
+    assert!(a[1].as_f64().unwrap().abs() < 30.0 && b[1].as_f64().unwrap().abs() < 30.0, "on y = 0 after merging the stepped pieces: {main}");
+    assert_eq!(main["load_bearing"], true);
+    assert!(walls.iter().any(|w| (w["thickness"].as_f64().unwrap() - 100.0).abs() <= 30.0), "the partition: {v}");
+    // Add them on two storeys; they export as IfcWall and draw in the plan.
+    let v = s.execute("drawing.trace_walls", json!({"name": "plan", "level": 1, "add": true, "levels": [1, 2]})).unwrap();
+    assert!(v["added"].as_u64().unwrap() >= 2);
+    let list = s.execute("interior.list", json!({})).unwrap();
+    assert!(list[1]["load_bearing"].as_u64().unwrap() >= 1 && list[2]["partitions"].as_u64().unwrap() >= 1);
+    s.execute(
+        "interior.add_rooms",
+        json!({"rooms": [{"levels": [1], "name": "Stue", "polygon": [[-8000.0, 0.0], [4000.0, 0.0], [4000.0, 5000.0], [-8000.0, 5000.0]]}]}),
+    )
+    .unwrap();
+    // drawing.to_site: pixel (1500, 1200) is the site origin on this sheet.
+    let q = s.execute("drawing.to_site", json!({"name": "plan", "level": 1, "points": [[1500.0, 1200.0], [1600.0, 1100.0]]})).unwrap();
+    assert_eq!(q, json!([[0.0, 0.0], [1000.0, 1000.0]]));
+    // A wall drawn inside a staircase (a traced rail) goes when the stair is added with clear_walls_inside.
+    s.execute("interior.add_walls", json!({"walls": [{"levels": [1], "a": [5500.0, 1500.0], "b": [7500.0, 1500.0], "thickness": 80.0}]})).unwrap();
+    let before = s.doc.building(None).unwrap().interior_walls.len();
+    let v = s
+        .execute(
+            "interior.add_stairs",
+            json!({"stairs": [{"levels": [1, 2], "outline": [[5000.0, 500.0], [8000.0, 500.0], [8000.0, 2700.0], [5000.0, 2700.0]]}], "clear_walls_inside": true}),
+        )
+        .unwrap();
+    assert_eq!(v["walls_removed"], 1);
+    assert_eq!(s.doc.building(None).unwrap().interior_walls.len(), before - 1);
+    assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["rooms"][0]["area_m2"], 60.0);
+    let dir = std::env::temp_dir().join(format!("trigon-interior-{}", std::process::id()));
+    s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();
+    let ifc = std::fs::read_to_string(dir.join("m.ifc")).unwrap();
+    assert!(ifc.contains(".PARTITIONING.") && ifc.contains("Interior wall (load-bearing)"));
+    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg")})).unwrap();
+    let text = std::fs::read_to_string(svg["written"].as_str().unwrap()).unwrap();
+    assert!(text.contains(">Stue<") && text.contains("60.0 m²"));
+    // Bad input is refused.
+    assert!(s.execute("interior.add_walls", json!({"walls": [{"levels": [9], "a": [0.0, 0.0], "b": [1000.0, 0.0], "thickness": 100.0}]})).is_err());
+    assert!(s.execute("interior.add_walls", json!({"walls": [{"levels": [1], "a": [0.0, 0.0], "b": [0.0, 0.0], "thickness": 100.0}]})).is_err());
+    assert!(s.execute("drawing.trace_walls", json!({"name": "plan", "level": 3})).is_err(), "no plan registered for level 3");
+    s.execute("interior.clear", json!({})).unwrap();
+    assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["load_bearing"], 0);
     let _ = std::fs::remove_dir_all(dir);
 }

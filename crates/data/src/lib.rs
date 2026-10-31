@@ -110,6 +110,31 @@ pub trait Provider: Send {
     fn register(&self, bbr_id: &str) -> Result<Option<Register>>;
     /// Full-resolution pixels `[x0, x1) × [y0, y1)` of a photo.
     fn photo_region(&self, photo: &Photo, window: [u32; 4]) -> Result<Region>;
+    /// The building's entrances (BBR opgange) with their house number, access point and units.
+    fn entrances(&self, _bbr_id: &str) -> Result<Vec<EntranceData>> {
+        Err(DataError::Unavailable("no unit register configured".into()))
+    }
+}
+
+/// An entrance (staircase) of a building with the units reached from it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EntranceData {
+    pub street: String,
+    pub number: String,
+    /// Access point, ETRS89 / UTM 32N metres.
+    pub point_utm: [f64; 2],
+    pub units: Vec<UnitData>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct UnitData {
+    /// DAR floor designation: "st", "1", "2", … or "kl".
+    pub floor: String,
+    /// DAR door designation: "tv", "th", "mf", a number, or empty.
+    pub door: String,
+    pub area_m2: Option<f64>,
+    pub rooms: Option<i64>,
+    pub use_code: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -341,6 +366,122 @@ impl Live {
         best.map(|(_, f)| f).ok_or_else(|| DataError::NotFound(format!("no GeoDanmark building within 15 m of {}", at.text)))
     }
 
+    /// One GraphQL query against a Datafordeler register (BBR or DAR); errors never show the key.
+    fn graphql(&self, register: &str, query: &str) -> Result<Value> {
+        let key = self.creds.datafordeler.as_deref().ok_or_else(|| DataError::Unavailable("no Datafordeler key".into()))?;
+        let body = serde_json::json!({ "query": query }).to_string();
+        let url = format!("https://graphql.datafordeler.dk/{register}/v2");
+        let resp = self
+            .agent
+            .post(&url)
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", "application/json")
+            .query("apiKey", key)
+            .send(body.as_bytes());
+        let mut resp = resp.map_err(|e| match e {
+            ureq::Error::StatusCode(c) => DataError::Unavailable(format!("{register} (Datafordeler) answered HTTP {c}")),
+            _ => DataError::Unavailable(format!("{register} (Datafordeler) could not be reached")),
+        })?;
+        let v: Value = serde_json::from_slice(
+            &resp.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|_| DataError::BadResponse(register.into()))?,
+        )
+        .map_err(|_| DataError::BadResponse(register.into()))?;
+        if let Some(e) = v.pointer("/errors/0/message").and_then(Value::as_str) {
+            return Err(DataError::BadResponse(format!("{register}: {}", e.chars().take(160).collect::<String>())));
+        }
+        Ok(v)
+    }
+
+    fn entrances_of(&self, bbr_id: &str) -> Result<Vec<EntranceData>> {
+        let id_ok = |s: &str| s.len() <= 64 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        if !id_ok(bbr_id) {
+            return Err(DataError::BadResponse("BBR id".into()));
+        }
+        let t = "virkningstid: \"2100-01-01T00:00:00Z\"";
+        let nodes = |v: &Value, path: &str| v.pointer(path).and_then(Value::as_array).cloned().unwrap_or_default();
+        let s = |n: &Value, k: &str| n.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let ids = |list: Vec<String>| {
+            serde_json::to_string(&list.into_iter().filter(|x| id_ok(x)).collect::<std::collections::BTreeSet<_>>()).unwrap_or_default()
+        };
+        let op = self.graphql(
+            "BBR",
+            &format!(
+                "{{ BBR_Opgang(first: 500, {t}, where: {{ bygning: {{ eq: \"{bbr_id}\" }} }}) {{ nodes {{ id_lokalId adgangFraHusnummer }} }} }}"
+            ),
+        )?;
+        let opgange: BTreeMap<String, String> =
+            nodes(&op, "/data/BBR_Opgang/nodes").iter().map(|n| (s(n, "id_lokalId"), s(n, "adgangFraHusnummer"))).collect();
+        let en = self.graphql("BBR", &format!(
+            "{{ BBR_Enhed(first: 1000, {t}, where: {{ bygning: {{ eq: \"{bbr_id}\" }} }}) {{ nodes {{ id_lokalId adresseIdentificerer opgang enh020EnhedensAnvendelse enh026EnhedensSamledeAreal enh031AntalVaerelser }} }} }}"
+        ))?;
+        let mut units: BTreeMap<String, Value> = BTreeMap::new();
+        for n in nodes(&en, "/data/BBR_Enhed/nodes") {
+            units.insert(s(&n, "id_lokalId"), n);
+        }
+        let hn = self.graphql("DAR", &format!(
+            "{{ DAR_Husnummer(first: 500, {t}, where: {{ id_lokalId: {{ in: {} }} }}) {{ nodes {{ id_lokalId husnummertekst adgangspunkt navngivenVej }} }} }}",
+            ids(opgange.values().cloned().collect())
+        ))?;
+        let husnumre: BTreeMap<String, Value> = nodes(&hn, "/data/DAR_Husnummer/nodes").into_iter().map(|n| (s(&n, "id_lokalId"), n)).collect();
+        let ap = self.graphql(
+            "DAR",
+            &format!(
+                "{{ DAR_Adressepunkt(first: 500, {t}, where: {{ id_lokalId: {{ in: {} }} }}) {{ nodes {{ id_lokalId position {{ wkt }} }} }} }}",
+                ids(husnumre.values().map(|h| s(h, "adgangspunkt")).collect())
+            ),
+        )?;
+        let points: BTreeMap<String, [f64; 2]> = nodes(&ap, "/data/DAR_Adressepunkt/nodes")
+            .iter()
+            .filter_map(|n| {
+                let wkt = n.pointer("/position/wkt")?.as_str()?;
+                let inner = wkt.trim().strip_prefix("POINT")?.trim().trim_start_matches('(').trim_end_matches(')');
+                let mut it = inner.split_whitespace().filter_map(|x| x.parse::<f64>().ok());
+                Some((s(n, "id_lokalId"), [it.next()?, it.next()?]))
+            })
+            .collect();
+        let vj = self.graphql(
+            "DAR",
+            &format!(
+                "{{ DAR_NavngivenVej(first: 100, {t}, where: {{ id_lokalId: {{ in: {} }} }}) {{ nodes {{ id_lokalId vejnavn }} }} }}",
+                ids(husnumre.values().map(|h| s(h, "navngivenVej")).collect())
+            ),
+        )?;
+        let veje: BTreeMap<String, String> =
+            nodes(&vj, "/data/DAR_NavngivenVej/nodes").iter().map(|n| (s(n, "id_lokalId"), s(n, "vejnavn"))).collect();
+        let ad = self.graphql("DAR", &format!(
+            "{{ DAR_Adresse(first: 1000, {t}, where: {{ id_lokalId: {{ in: {} }} }}) {{ nodes {{ id_lokalId etagebetegnelse doerbetegnelse }} }} }}",
+            ids(units.values().map(|u| s(u, "adresseIdentificerer")).collect())
+        ))?;
+        let adresser: BTreeMap<String, Value> = nodes(&ad, "/data/DAR_Adresse/nodes").into_iter().map(|n| (s(&n, "id_lokalId"), n)).collect();
+        let mut out = Vec::new();
+        for (opgang, hid) in &opgange {
+            let Some(h) = husnumre.get(hid) else { continue };
+            let Some(&point_utm) = points.get(&s(h, "adgangspunkt")) else { continue };
+            let mut us: Vec<UnitData> = units
+                .values()
+                .filter(|u| s(u, "opgang") == *opgang)
+                .map(|u| {
+                    let a = adresser.get(&s(u, "adresseIdentificerer"));
+                    UnitData {
+                        floor: a.map(|a| s(a, "etagebetegnelse")).unwrap_or_default(),
+                        door: a.map(|a| s(a, "doerbetegnelse")).unwrap_or_default(),
+                        area_m2: u.get("enh026EnhedensSamledeAreal").and_then(Value::as_f64),
+                        rooms: u.get("enh031AntalVaerelser").and_then(Value::as_i64),
+                        use_code: u.get("enh020EnhedensAnvendelse").and_then(Value::as_str).map(str::to_string),
+                    }
+                })
+                .collect();
+            us.sort_by_key(|a| (a.floor.clone(), a.door.clone()));
+            out.push(EntranceData {
+                street: veje.get(&s(h, "navngivenVej")).cloned().unwrap_or_default(),
+                number: s(h, "husnummertekst"),
+                point_utm,
+                units: us,
+            });
+        }
+        Ok(out)
+    }
+
     /// The BBR record of a building, through Datafordeler's GraphQL service.
     fn bbr(&self, bbr_id: &str) -> Result<Register> {
         let key = self.creds.datafordeler.as_deref().ok_or_else(|| DataError::Unavailable("no Datafordeler key".into()))?;
@@ -418,6 +559,10 @@ impl Provider for Live {
         }
         let reader = skraafoto::RangeReader::open(&self.agent, photo.href.clone())?;
         skraafoto::read_region(reader, w[0], w[1], w[2], w[3])
+    }
+
+    fn entrances(&self, bbr_id: &str) -> Result<Vec<EntranceData>> {
+        self.entrances_of(bbr_id)
     }
 
     fn heights(&self, ring: &[[f64; 2]]) -> Result<Heights> {

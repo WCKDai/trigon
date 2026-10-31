@@ -300,6 +300,148 @@ pub struct Building {
     pub attributes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub roof: crate::roof::Roof,
+    /// Walls inside the outer walls, per storey.
+    #[serde(default)]
+    pub interior_walls: Vec<InteriorWall>,
+    #[serde(default)]
+    pub stairs: Vec<Stair>,
+    #[serde(default)]
+    pub rooms: Vec<Room>,
+    /// Entrances (staircases) with their address and units, from the registers.
+    #[serde(default)]
+    pub entrances: Vec<Entrance>,
+    /// Index of the ground storey ("stueetage"); storeys below it are basements.
+    #[serde(default)]
+    pub ground_level: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Entrance {
+    pub street: String,
+    pub number: String,
+    /// Access point, site mm.
+    pub point: [f64; 2],
+    /// The staircase serving it.
+    #[serde(default)]
+    pub stair: Option<String>,
+    pub units: Vec<Unit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Unit {
+    /// "st", "1", "2", … or "kl".
+    pub floor: String,
+    /// "tv", "th", "mf", a number or empty.
+    pub door: String,
+    #[serde(default)]
+    pub area_m2: Option<f64>,
+    #[serde(default)]
+    pub rooms: Option<i64>,
+}
+
+impl Unit {
+    /// The storey index of the unit's floor, given the ground storey's index: "st" is the ground
+    /// storey, "1" the one above, "kl" the one below.
+    pub fn level(&self, ground: usize) -> Option<usize> {
+        match self.floor.as_str() {
+            "st" => Some(ground),
+            "kl" => ground.checked_sub(1),
+            f => f.parse::<usize>().ok().map(|n| ground + n),
+        }
+    }
+}
+
+/// A straight interior wall, centre line `a`–`b` in site mm, on the listed storeys (full storey height).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InteriorWall {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub a: [f64; 2],
+    pub b: [f64; 2],
+    pub thickness: f64,
+    #[serde(default)]
+    pub load_bearing: bool,
+}
+
+/// A staircase: its outline in plan (site mm) and the direction it climbs (unit vector), on the listed storeys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Stair {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    /// The flights' rectangle `[p0, p1, p2, p3]`: p0→p1 runs along the flights from the floor end to the
+    /// landing end, p1→p2 across them.
+    pub outline: Vec<[f64; 2]>,
+    /// Tread depth, mm (default: the run divided evenly).
+    #[serde(default)]
+    pub tread: Option<f64>,
+    #[serde(default)]
+    pub kind: StairKind,
+    /// Depth of the half landing beyond the p1–p2 edge, mm (U-turn stairs; default half the width).
+    #[serde(default)]
+    pub landing: Option<f64>,
+    /// Gap between the two flights, mm (U-turn stairs; default 150).
+    #[serde(default)]
+    pub well: Option<f64>,
+    /// Half landing drawn and built as a half circle (default true).
+    #[serde(default = "yes")]
+    pub rounded: bool,
+    /// Turning steps instead of a flat landing (2–16), split between the turns for a double quarter turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winders: Option<usize>,
+    /// Depths of the two quarter turns beyond the straight flight, mm; defaults to flight width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_depths: Option<[f64; 2]>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StairKind {
+    /// One flight along p0→p1.
+    #[default]
+    Straight,
+    /// Two flights side by side with a half landing at the p1–p2 end: up along p0→p1, back along p2→p3.
+    UTurn,
+    /// One straight flight with a quarter turn at each end, both turning towards p3.
+    DoubleQuarterTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Room {
+    #[serde(default)]
+    pub id: String,
+    pub levels: Vec<usize>,
+    pub name: String,
+    pub polygon: Vec<[f64; 2]>,
+}
+
+impl InteriorWall {
+    pub fn validate(&self, storeys: usize) -> Result<()> {
+        let pts = [self.a[0], self.a[1], self.b[0], self.b[1]];
+        if pts.iter().any(|v| !v.is_finite() || v.abs() > 1e8) {
+            return Err(ModelError::Invalid("wall ends must be finite site coordinates".into()));
+        }
+        let len = ((self.b[0] - self.a[0]).powi(2) + (self.b[1] - self.a[1]).powi(2)).sqrt();
+        checked("wall length", len, 100.0, 200_000.0)?;
+        checked("wall thickness", self.thickness, 40.0, 1000.0)?;
+        if self.levels.is_empty() || self.levels.iter().any(|l| *l >= storeys) {
+            return Err(ModelError::Invalid(format!("wall levels must be storey indices below {storeys}")));
+        }
+        Ok(())
+    }
+}
+
+/// Area of a simple polygon, mm².
+pub fn polygon_area(p: &[[f64; 2]]) -> f64 {
+    crate::footprint::signed_area2(p).abs() / 2.0
 }
 
 pub const MIN_WALL: f64 = 100.0;
@@ -321,6 +463,11 @@ impl Building {
             evidence: Vec::new(),
             attributes: Default::default(),
             roof: Default::default(),
+            interior_walls: Vec::new(),
+            stairs: Vec::new(),
+            rooms: Vec::new(),
+            entrances: Vec::new(),
+            ground_level: 0,
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())
@@ -371,6 +518,38 @@ impl Building {
         self.storeys = levels.windows(2).enumerate().map(|(i, w)| Storey { name: storey_name(i), elevation: w[0], height: w[1] - w[0] }).collect();
         for f in &mut self.facades {
             f.placements.retain(|p| p.level < count);
+        }
+        Ok(())
+    }
+
+    /// Bottom of the outer walls, mm (below the terrain when there is a basement).
+    pub fn bottom(&self) -> f64 {
+        self.storeys.first().map_or(0.0, |s| (s.elevation - 200.0).min(0.0))
+    }
+
+    /// Adds a basement storey below the lowest one, with its floor at `floor` mm (below the terrain),
+    /// and shifts every storey reference (placements, interior, plans) up by one.
+    pub fn add_basement(&mut self, floor: f64, name: &str) -> Result<()> {
+        let first = self.storeys.first().cloned().ok_or_else(|| ModelError::Invalid("the building has no storeys".into()))?;
+        let floor = checked("basement floor", floor, -15_000.0, first.elevation - 2000.0)?;
+        if self.storeys.len() >= 60 {
+            return Err(ModelError::Invalid("at most 60 storeys".into()));
+        }
+        self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor });
+        self.ground_level += 1;
+        for f in &mut self.facades {
+            for p in &mut f.placements {
+                p.level += 1;
+            }
+        }
+        for w in &mut self.interior_walls {
+            w.levels.iter_mut().for_each(|l| *l += 1);
+        }
+        for s in &mut self.stairs {
+            s.levels.iter_mut().for_each(|l| *l += 1);
+        }
+        for r in &mut self.rooms {
+            r.levels.iter_mut().for_each(|l| *l += 1);
         }
         Ok(())
     }

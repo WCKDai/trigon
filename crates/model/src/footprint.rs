@@ -77,6 +77,36 @@ pub fn clean(points: &[[f64; 2]]) -> Result<Vec<[f64; 2]>> {
     Ok(ring)
 }
 
+/// Union wall-cut polygons into continuous bands, preserving enclosed holes.
+/// Inputs are solid contours, irrespective of winding; this does not simplify or move walls.
+pub fn union(polygons: &[Vec<[f64; 2]>]) -> Result<Vec<Vec<Vec<[f64; 2]>>>> {
+    if polygons.len() > 10_000 || polygons.iter().map(Vec::len).sum::<usize>() > 100_000 {
+        return Err(ModelError::Invalid("too many cut-wall vertices".into()));
+    }
+    if polygons.iter().flatten().flatten().any(|x| !x.is_finite() || x.abs() > 1e8) {
+        return Err(ModelError::Invalid("cut-wall coordinates must be finite site coordinates".into()));
+    }
+    let solid: Vec<_> = polygons
+        .iter()
+        .filter(|p| p.len() >= 3 && signed_area2(p).abs() > 1e-6)
+        .map(|p| {
+            let mut p = p.clone();
+            if signed_area2(&p) < 0.0 {
+                p.reverse();
+            }
+            p
+        })
+        .collect();
+    if solid.is_empty() {
+        return Ok(Vec::new());
+    }
+    use i_overlay::{
+        core::{fill_rule::FillRule, overlay_rule::OverlayRule},
+        float::overlay::FloatOverlay,
+    };
+    Ok(FloatOverlay::with_subj(&solid).overlay(OverlayRule::Union, FillRule::NonZero))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +125,16 @@ mod tests {
         assert!(clean(&[[0.0, 0.0], [1.0, 1.0]]).is_err());
         assert!(clean(&[[0.0, 0.0], [f64::NAN, 0.0], [0.0, 1.0]]).is_err());
         assert!(clean(&[[0.0, 0.0], [100.0, 0.0], [0.0, 100.0]]).is_err(), "too small");
+    }
+
+    #[test]
+    fn wall_band_union_removes_junction_seams_without_filling_door_gaps() {
+        let rect = |x0, y0, x1, y1| vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+        let walls = vec![rect(0., 0., 1000., 200.), rect(800., 0., 1000., 1500.), rect(1800., 0., 3000., 200.)];
+        let united = union(&walls).unwrap();
+        assert_eq!(united.len(), 2, "the T junction is one band; the 800 mm door stays open");
+        let area: f64 = united.iter().flatten().map(|r| signed_area2(r)).sum::<f64>().abs() / 2.;
+        assert!((area - 700_000.).abs() < 1.);
+        assert!(union(&[vec![[f64::NAN, 0.], [1., 0.], [1., 1.]]]).is_err());
     }
 }
