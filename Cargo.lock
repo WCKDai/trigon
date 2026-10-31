@@ -1831,6 +1831,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trigon-control"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde_json",
+ "trigon-data",
+ "trigon-engine",
+]
+
+[[package]]
 name = "trigon-data"
 version = "0.1.0"
 dependencies = [
