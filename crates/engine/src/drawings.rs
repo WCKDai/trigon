@@ -562,6 +562,7 @@ pub(crate) fn trace_walls(
                 b: pb,
                 thickness,
                 load_bearing: thickness >= 200.0,
+                doors: Vec::new(),
             });
         }
     }
@@ -587,7 +588,7 @@ pub(crate) fn trace_walls(
             !flights.iter().any(|f| inside_poly(&shrink(&f.outline, 120.0), m))
         })
         .collect();
-    let inner = b.inner_line(level);
+    let inner = b.storey_inner(level);
     Ok((snap_ends(clean_walls(walls, &grids), &inner), flights))
 }
 
@@ -673,6 +674,7 @@ fn clean_walls(walls: Vec<trigon_model::InteriorWall>, grids: &[f64]) -> Vec<tri
                     b: p(s1),
                     thickness,
                     load_bearing: a.load_bearing || b.load_bearing,
+                    doors: Vec::new(),
                 };
                 kept.remove(j);
                 kept[i] = w;

@@ -322,6 +322,23 @@ pub struct Building {
     /// Index of the ground storey ("stueetage"); storeys below it are basements.
     #[serde(default)]
     pub ground_level: usize,
+    /// A plinth (sokkel) along the foot of every facade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plinth: Option<Plinth>,
+    /// Below the ground storey, the walls run straight along the inner corners of facade steps
+    /// up to this deep (bays and stepped fronts that start at the ground floor), mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basement_straighten_mm: Option<f64>,
+}
+
+/// A rendered or concrete plinth (sokkel) at the foot of the facades.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Plinth {
+    /// Its top, mm above the terrain.
+    pub height: f64,
+    /// How far it stands proud of the brickwork, mm.
+    pub projection: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -372,6 +389,26 @@ pub struct InteriorWall {
     pub thickness: f64,
     #[serde(default)]
     pub load_bearing: bool,
+    /// Doors in the wall, on every storey it stands on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doors: Vec<WallDoor>,
+}
+
+/// A door in an interior wall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WallDoor {
+    /// The opening's centre, mm along the wall from its start `a`.
+    pub at: f64,
+    /// Clear width of the opening, mm.
+    pub width: f64,
+    /// Height of the opening above the floor, mm (default 2100).
+    #[serde(default = "door_height")]
+    pub height: f64,
+}
+
+pub fn door_height() -> f64 {
+    2100.0
 }
 
 /// A staircase: its outline in plan (site mm) and the direction it climbs (unit vector), on the listed storeys.
@@ -441,6 +478,22 @@ impl InteriorWall {
         let len = ((self.b[0] - self.a[0]).powi(2) + (self.b[1] - self.a[1]).powi(2)).sqrt();
         checked("wall length", len, 100.0, 200_000.0)?;
         checked("wall thickness", self.thickness, 40.0, 1000.0)?;
+        if self.doors.len() > 50 {
+            return Err(ModelError::Invalid("at most 50 doors in one wall".into()));
+        }
+        let mut spans: Vec<(f64, f64)> = Vec::with_capacity(self.doors.len());
+        for d in &self.doors {
+            checked("door width", d.width, 300.0, 4000.0)?;
+            checked("door height", d.height, 1000.0, 4000.0)?;
+            let (lo, hi) = (d.at - d.width / 2.0, d.at + d.width / 2.0);
+            if !d.at.is_finite() || lo < -1.0 || hi > len + 1.0 {
+                return Err(ModelError::Invalid(format!("a {:.0} mm door at {:.0} mm doesn't fit the {len:.0} mm wall", d.width, d.at)));
+            }
+            if spans.iter().any(|&(a, b)| lo < b && a < hi) {
+                return Err(ModelError::Invalid("doors in a wall may not overlap".into()));
+            }
+            spans.push((lo, hi));
+        }
         if self.levels.is_empty() || self.levels.iter().any(|l| *l >= storeys) {
             return Err(ModelError::Invalid(format!("wall levels must be storey indices below {storeys}")));
         }
@@ -492,6 +545,8 @@ impl Building {
             rooms: Vec::new(),
             entrances: Vec::new(),
             ground_level: 0,
+            plinth: None,
+            basement_straighten_mm: None,
         };
         b.set_storeys(storeys, storey_height)?;
         b.facades = (0..b.footprint.len())
@@ -576,6 +631,34 @@ impl Building {
     /// at its own thickness.
     pub fn inner_line(&self, level: usize) -> Vec<[f64; 2]> {
         crate::build::inner_ring_by(&self.footprint, |e| self.edge_thickness(e, level))
+    }
+
+    /// The wall line on a storey and, for each of its edges, the footprint edge it starts at: the
+    /// footprint, or below the ground storey with `basement_straighten_mm` the footprint with
+    /// outward steps up to that deep cut off.
+    pub fn storey_ring(&self, level: usize) -> (Vec<[f64; 2]>, Vec<usize>) {
+        let n = self.footprint.len();
+        // Only steps in street fronts: gables and the corners of wings keep their basement walls.
+        let street = |edge: usize| self.facades.iter().any(|f| f.edge == edge && f.kind == FacadeKind::Street);
+        let kept = match self.basement_straighten_mm {
+            Some(d) if level < self.ground_level && n > 0 => footprint::inner_outline(&self.footprint, d, |k| street(k) || street((k + n - 1) % n)),
+            _ => (0..n).collect(),
+        };
+        (kept.iter().filter_map(|&i| self.footprint.get(i).copied()).collect(), kept)
+    }
+
+    /// The inner face of the walls on a storey, one vertex per corner of `storey_ring(level)`.
+    pub fn storey_inner(&self, level: usize) -> Vec<[f64; 2]> {
+        let (ring, kept) = self.storey_ring(level);
+        crate::build::inner_ring_by(&ring, |i| kept.get(i).map_or(self.wall_thickness, |&e| self.edge_thickness(e, level)))
+    }
+
+    /// Whether footprint edge `edge` has its own wall on a storey (not where a straight basement
+    /// wall cuts a step off).
+    pub fn edge_on_storey(&self, edge: usize, level: usize) -> bool {
+        let n = self.footprint.len();
+        let (_, kept) = self.storey_ring(level);
+        kept.iter().enumerate().any(|(i, &k)| k == edge && kept.get((i + 1) % kept.len()) == Some(&((edge + 1) % n)))
     }
 
     /// Gives facades their own thickness per storey (one value per storey), or with an empty

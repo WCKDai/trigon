@@ -196,7 +196,9 @@ static COMMANDS: &[CommandSpec] = &[
         id: "building.set_roof",
         summary: "Set the roof: flat, or pitched from the eaves (the top of the walls) at `pitch_deg`, or at the pitch that puts \
                   the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
-                  gable (wing ends, walls against neighbours). `source` records where the values came from.",
+                  gable (wing ends, walls against neighbours). A pitched roof can carry on past the walls (`overhang_mm` at the \
+                  eaves, `verge_mm` at the gables), have a build-up (`thickness_mm`, with fascia, soffit and verge boards) and \
+                  `gutters`. `source` records where the values came from.",
         mutates: true,
         journaled: true,
         schema: schema::<SetRoof>,
@@ -258,6 +260,51 @@ static COMMANDS: &[CommandSpec] = &[
             Ok(json!({
                 "schedule": b.storeys.iter().enumerate().map(|(i, st)| json!({"storey": st.name, "thickness_mm": b.facade_thickness(i)})).collect::<Vec<_>>()
             }))
+        },
+    },
+    CommandSpec {
+        id: "building.set_basement_line",
+        summary: "Below the ground storey, run the walls straight along the inner corners of facade steps up to \
+                  `straighten_mm` deep (bays and stepped fronts that begin at the ground floor stand on a straight basement \
+                  wall in most Copenhagen blocks; check the basement plan). The steps above run down into the ground on \
+                  their own foundation. `straighten_mm: 0` makes the basement follow the footprint again.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetBasementLine>,
+        run: |s, v| {
+            let p: SetBasementLine = parse("building.set_basement_line", v)?;
+            let d = trigon_model::checked("straighten_mm", p.straighten_mm, 0.0, 5000.0)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.basement_straighten_mm = (d > 0.0).then_some(d);
+            check_building(&s.doc, p.building.as_deref())?;
+            trigon_model::build(&s.doc)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let cut: Vec<String> =
+                b.facades.iter().filter(|f| (0..b.ground_level).any(|l| !b.edge_on_storey(f.edge, l))).map(|f| f.id.clone()).collect();
+            Ok(json!({"straighten_mm": b.basement_straighten_mm, "facades_without_basement_wall": cut}))
+        },
+    },
+    CommandSpec {
+        id: "building.set_plinth",
+        summary: "Give the facades a plinth (sokkel): rendered or concrete, from below the terrain up to `height_mm` above it, \
+                  standing `projection_mm` proud of the brickwork (default 20). Openings in the plinth band (basement windows) \
+                  are cut through it. `remove: true` takes it away.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetPlinth>,
+        run: |s, v| {
+            let p: SetPlinth = parse("building.set_plinth", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            b.plinth = match (p.remove.unwrap_or(false), p.height_mm) {
+                (true, None) => None,
+                (false, Some(h)) => Some(trigon_model::doc::Plinth {
+                    height: trigon_model::checked("height_mm", h, 100.0, 5000.0)?,
+                    projection: trigon_model::checked("projection_mm", p.projection_mm.unwrap_or(20.0), 0.0, 300.0)?,
+                }),
+                _ => return Err(ModelError::Invalid("give height_mm, or remove: true".into()).into()),
+            };
+            trigon_model::build(&s.doc)?;
+            Ok(json!({"plinth": s.doc.building(p.building.as_deref())?.plinth}))
         },
     },
     CommandSpec {
@@ -662,6 +709,44 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "interior.doors_from_gaps",
+        summary: "Turn door-sized gaps in interior walls into doors (traced plans show doors as gaps): two collinear pieces \
+                  of one wall either side of a `min_mm`–`max_mm` gap (default 600–1300) become one wall with a door, and a \
+                  wall that stops a door's width short of another wall runs on to it with the door at its end. Gaps \
+                  crossed by another wall stay. Doors are drawn as a closed leaf (no swing) and exported as doors in their \
+                  wall. `levels` limits it to walls on those storeys. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<DoorsFromGaps>,
+        run: |s, v| {
+            let p: DoorsFromGaps = parse("interior.doors_from_gaps", v)?;
+            let rules = trigon_model::doors::Rules {
+                min: trigon_model::checked("min_mm", p.min_mm.unwrap_or(600.0), 300.0, 4000.0)?,
+                max: trigon_model::checked("max_mm", p.max_mm.unwrap_or(1300.0), 300.0, 4000.0)?,
+                height: trigon_model::checked("height_mm", p.height_mm.unwrap_or(trigon_model::doc::door_height()), 1000.0, 4000.0)?,
+            };
+            if rules.max < rules.min {
+                return Err(ModelError::Invalid("max_mm must be at least min_mm".into()).into());
+            }
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let storeys = b.storeys.len();
+            let before = b.interior_walls.len();
+            let found = trigon_model::doors::doors_from_gaps(&mut b.interior_walls, p.levels.as_deref(), &rules);
+            for w in &b.interior_walls {
+                w.validate(storeys)?;
+            }
+            let doors: usize = b.interior_walls.iter().map(|w| w.doors.len()).sum();
+            trigon_model::build(&s.doc)?;
+            Ok(json!({
+                "doors_between_pieces": found.between,
+                "doors_at_wall_ends": found.at_ends,
+                "walls_before": before,
+                "walls_after": s.doc.building(p.building.as_deref())?.interior_walls.len(),
+                "doors_in_walls": doors,
+            }))
+        },
+    },
+    CommandSpec {
         id: "interior.regularize",
         summary: "Straighten measured interior walls onto explicit building axes, co-align fragments, merge duplicates and \
                   repair small junction gaps. Preserves door-size gaps and storey boundaries. Undoable; refresh derived room \
@@ -1031,16 +1116,27 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "export.gltf",
         summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up. `phase` and `filter` choose the view (default: the \
-                  active phase, complete); demolished elements are translucent red.",
+                  active phase, complete); demolished elements are translucent red. `cut_level` makes a 3D plan cut: everything \
+                  above `cut_mm` (default 1200) over that storey's floor is left out, walls are closed at the cut, so the \
+                  storey's rooms, doors and stairs can be seen from above.",
         mutates: false,
         journaled: false,
-        schema: schema::<ExportParams>,
+        schema: schema::<ExportGltf>,
         run: |s, v| {
-            let p: ExportParams = parse("export.gltf", v)?;
+            let p: ExportGltf = parse("export.gltf", v)?;
             let path = checked_path(&p.path, "glb")?;
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let refs = reference_meshes(&s.doc)?;
-            let bytes = trigon_io::glb::write(&trigon_model::build::build_view(&s.doc, view)?, &refs);
+            let cut = match p.cut_level {
+                Some(level) => {
+                    let b = s.doc.building(None)?;
+                    let storey = b.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("level {level} doesn't exist")))?;
+                    Some(storey.elevation + trigon_model::checked("cut_mm", p.cut_mm.unwrap_or(1200.0), 100.0, storey.height)?)
+                }
+                None if p.cut_mm.is_some() => return Err(ModelError::Invalid("cut_mm needs cut_level".into()).into()),
+                None => None,
+            };
+            let bytes = trigon_io::glb::write(&trigon_model::build::build_cut(&s.doc, view, cut)?, &refs);
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
@@ -1482,6 +1578,15 @@ struct SetRoof {
     gables: Option<Vec<String>>,
     /// Facade steps up to this deep (mm) get no roof faces of their own; the eave runs straight (default 1200, 0 = follow every step).
     straighten_mm: Option<f64>,
+    /// How far the roof runs past the walls at the eaves, mm (default 0).
+    overhang_mm: Option<f64>,
+    /// How far it runs past the gable walls, mm (default 0).
+    verge_mm: Option<f64>,
+    /// Build-up square to the roof (rafters, battens, tiles), mm (default 0: a surface). Its underside rests on the
+    /// wall line at the eaves.
+    thickness_mm: Option<f64>,
+    /// Gutters along the eaves (default false).
+    gutters: Option<bool>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -1491,6 +1596,52 @@ struct SetRoof {
 struct SetWallThickness {
     building: Option<String>,
     thickness: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ExportGltf {
+    /// .glb file to write.
+    path: String,
+    phase: Option<String>,
+    filter: Option<String>,
+    /// Cut the model above this storey (a 3D plan cut).
+    cut_level: Option<usize>,
+    /// Height of the cut above that storey's floor, mm (default 1200).
+    cut_mm: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetBasementLine {
+    building: Option<String>,
+    /// Deepest facade step the basement wall runs straight past, mm (0: follow the footprint).
+    straighten_mm: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetPlinth {
+    building: Option<String>,
+    /// Top of the plinth, mm above the terrain.
+    height_mm: Option<f64>,
+    /// How far it stands proud of the brickwork, mm (default 20).
+    projection_mm: Option<f64>,
+    remove: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DoorsFromGaps {
+    building: Option<String>,
+    /// Only walls standing on one of these storeys.
+    levels: Option<Vec<usize>>,
+    /// Narrowest gap taken for a door, mm (default 600).
+    min_mm: Option<f64>,
+    /// Widest gap taken for a door, mm (default 1300).
+    max_mm: Option<f64>,
+    /// Door height, mm (default 2100).
+    height_mm: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1797,7 +1948,15 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
                 }
             };
-            trigon_model::Roof::Pitched { pitch_deg: pitch, gables, straighten_mm: p.straighten_mm.unwrap_or(1200.0) }
+            trigon_model::Roof::Pitched {
+                pitch_deg: pitch,
+                gables,
+                straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                overhang_mm: trigon_model::checked("overhang_mm", p.overhang_mm.unwrap_or(0.0), 0.0, 2000.0)?,
+                verge_mm: trigon_model::checked("verge_mm", p.verge_mm.unwrap_or(0.0), 0.0, 1500.0)?,
+                thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,
+                gutters: p.gutters.unwrap_or(false),
+            }
         }
         other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
     };

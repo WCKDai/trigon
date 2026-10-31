@@ -25,8 +25,38 @@ pub enum Roof {
         /// straight along the outer corners (a stepped street facade under one roof plane).
         #[serde(default = "default_steps")]
         straighten_mm: f64,
+        /// How far the roof runs past the walls at the eaves, mm (0: it stops at the wall line).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        overhang_mm: f64,
+        /// How far it runs past the gable walls (the verge), mm.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        verge_mm: f64,
+        /// The roof's build-up (rafters, battens, tiles) measured square to the roof, mm (0: a
+        /// surface with no thickness). It rests on the walls: its underside meets the outer wall
+        /// line at the eaves height.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        thickness_mm: f64,
+        /// Gutters along the eaves.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        gutters: bool,
     },
 }
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// A pitched roof's build-up beyond its planes (see `Roof::Pitched`), mm.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Buildup {
+    pub overhang: f64,
+    pub verge: f64,
+    pub thickness: f64,
+    pub gutters: bool,
+}
+
+/// Gutter (half-round, zinc) width and depth, mm.
+const GUTTER: (f64, f64) = (150.0, 110.0);
 
 fn default_steps() -> f64 {
     1200.0
@@ -67,8 +97,10 @@ pub fn eave_outline(ring: &[[f64; 2]], tolerance: f64) -> Vec<usize> {
 /// A pitched roof's geometry, in site mm.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PitchedRoof {
-    /// The roof surface (tiles, slates).
+    /// The roof: its surface, or with a build-up a closed slab (surface, soffit, fascia and verges).
     pub cover: Mesh,
+    /// Gutters along the eaves.
+    pub gutters: Mesh,
     /// Vertical gable triangles above gable walls.
     pub gables: Mesh,
     /// Highest point, mm above the terrain.
@@ -142,10 +174,113 @@ pub fn pitched(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edges: &[
         }
     }
     roof.ridge = roof.cover.positions.iter().map(|p| p[2]).fold(eaves, f64::max);
+    // Faces point up and out.
+    for t in &mut roof.cover.triangles {
+        let p = |i: u32| roof.cover.positions.get(i as usize).copied().unwrap_or_default();
+        let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+        if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) < 0.0 {
+            t.swap(1, 2);
+        }
+    }
     if roof.cover.is_empty() {
         return Err(ModelError::Invalid("the roof came out empty".into()));
     }
     Ok(roof)
+}
+
+/// A pitched roof with a build-up: the same roof planes carried out past the walls by the
+/// overhang (eaves) and verge (gables), given a thickness with fascia, soffit and verge boards,
+/// and gutters along the eaves. The gable triangles stay in the gable walls.
+pub fn pitched_with(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edges: &[usize], b: &Buildup) -> Result<PitchedRoof> {
+    let base = pitched(outline, eaves, pitch_deg, gable_edges)?;
+    let overhang = crate::checked("roof overhang", b.overhang, 0.0, 2000.0)?;
+    let verge = crate::checked("roof verge", b.verge, 0.0, 1500.0)?;
+    let thickness = crate::checked("roof thickness", b.thickness, 0.0, 1000.0)?;
+    if overhang == 0.0 && verge == 0.0 && thickness == 0.0 && !b.gutters {
+        return Ok(base);
+    }
+    let rise = pitch_deg.to_radians().tan();
+    // The roof planes pass through the wall line at the eaves: moving an eave edge out by the
+    // overhang and down by overhang × rise keeps every plane where it was.
+    let n = outline.len();
+    let out: Vec<[f64; 2]> = crate::build::inner_ring_by(outline, |e| if gable_edges.contains(&e) { -verge } else { -overhang });
+    if out.len() != n {
+        return Err(ModelError::Invalid("the roof outline could not be carried out past the walls".into()));
+    }
+    let low = eaves - overhang * rise;
+    let under = pitched(&out, low, pitch_deg, gable_edges)?;
+    let lift = thickness / pitch_deg.to_radians().cos();
+    let mut cover = Mesh::default();
+    if thickness > 0.0 {
+        // Top surface, soffit (facing down) and the boards round the edge (vertical).
+        let mut top = under.cover.clone();
+        for p in &mut top.positions {
+            p[2] += lift;
+        }
+        let mut bottom = under.cover.clone();
+        for t in &mut bottom.triangles {
+            t.swap(1, 2);
+        }
+        cover.append(&top);
+        cover.append(&bottom);
+        for (a, b) in boundary(&under.cover) {
+            cover.quad([a[0], a[1], a[2]], [b[0], b[1], b[2]], [b[0], b[1], b[2] + lift], [a[0], a[1], a[2] + lift]);
+        }
+    } else {
+        cover = under.cover.clone();
+    }
+    let mut gutters = Mesh::default();
+    if b.gutters {
+        for k in (0..n).filter(|k| !gable_edges.contains(k)) {
+            let (Some(&p), Some(&q)) = (out.get(k), out.get((k + 1) % n)) else { continue };
+            let Some(fr) = crate::build::FacadeFrame::new(p, q) else { continue };
+            let (w, d) = GUTTER;
+            // Counter-clockwise seen from above: outside the fascia first, then back along it.
+            let ring = |z: f64| [fr.point(0.0, -w, z), fr.point(fr.length, -w, z), fr.point(fr.length, 0.0, z), fr.point(0.0, 0.0, z)];
+            let (lo, hi) = (ring(low - d / 2.0), ring(low + d / 2.0));
+            gutters.hexahedron(lo, hi);
+        }
+    }
+    let ridge = cover.positions.iter().map(|p| p[2]).fold(eaves, f64::max);
+    Ok(PitchedRoof { cover, gutters, gables: base.gables, ridge, max_depth: base.max_depth })
+}
+
+/// The edges of a triangle mesh that belong to one triangle only, once vertices at the same
+/// place are taken as one, oriented as in their triangle.
+fn boundary(m: &Mesh) -> Vec<([f64; 3], [f64; 3])> {
+    use std::collections::HashMap;
+    let key = |p: [f64; 3]| ((p[0] * 10.0).round() as i64, (p[1] * 10.0).round() as i64, (p[2] * 10.0).round() as i64);
+    let mut ids: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut at: Vec<[f64; 3]> = Vec::new();
+    let mut id = |p: [f64; 3]| {
+        *ids.entry(key(p)).or_insert_with(|| {
+            at.push(p);
+            at.len() - 1
+        })
+    };
+    let welded: Vec<[usize; 3]> = m.triangles.iter().map(|t| t.map(|i| id(m.positions.get(i as usize).copied().unwrap_or_default()))).collect();
+    let mut count: HashMap<(usize, usize), usize> = HashMap::new();
+    for t in &welded {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            *count.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for t in &welded {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            // Triangles run counter-clockwise seen from above, so the outside of edge a→b is on
+            // its right, where a quad a, b, b↑, a↑ faces.
+            if a != b
+                && count.get(&(a.min(b), a.max(b))) == Some(&1)
+                && let (Some(&pa), Some(&pb)) = (at.get(a), at.get(b))
+            {
+                out.push((pa, pb));
+            }
+        }
+    }
+    out
 }
 
 fn push_triangulated(m: &mut Mesh, pts: &[[f64; 3]], flat: &[f64]) {
@@ -182,6 +317,30 @@ mod tests {
         assert!(at_ends.iter().any(|x| x.abs() < 1.0) && at_ends.iter().any(|x| (x - 30000.0).abs() < 1.0), "{at_ends:?}");
         // The gable triangles stand in the end walls' planes.
         assert!(r.gables.positions.iter().all(|p| p[0].abs() < 1.0 || (p[0] - 30000.0).abs() < 1.0));
+    }
+
+    #[test]
+    fn a_built_up_roof_keeps_its_planes_and_overhangs_the_walls() {
+        let b = Buildup { overhang: 400.0, verge: 150.0, thickness: 250.0, gutters: true };
+        let plain = pitched(&WING, 16000.0, 40.0, &[1, 3]).unwrap();
+        let r = pitched_with(&WING, 16000.0, 40.0, &[1, 3], &b).unwrap();
+        let (rise, lift) = (40f64.to_radians().tan(), 250.0 / 40f64.to_radians().cos());
+        // The top surface is the plain roof lifted square to the roof by the build-up.
+        assert!((r.ridge - (plain.ridge + lift)).abs() < 1.0, "{} vs {}", r.ridge, plain.ridge + lift);
+        // It reaches 400 mm past the eaves walls (y = −400) at 400 × tan 40° below the eaves, and 150 past the gables.
+        let (lo, hi) = r.cover.bounds().unwrap();
+        assert!((lo[1] + 400.0).abs() < 1.0 && (hi[1] - 12400.0).abs() < 1.0, "{lo:?} {hi:?}");
+        assert!((lo[0] + 150.0).abs() < 1.0 && (hi[0] - 30150.0).abs() < 1.0, "{lo:?} {hi:?}");
+        assert!((lo[2] - (16000.0 - 400.0 * rise)).abs() < 1.0, "{lo:?}");
+        // A closed slab: soffit and boards as well as the surface; gable triangles stay in the walls.
+        assert!(r.cover.triangles.len() > 2 * plain.cover.triangles.len());
+        assert!(r.gables.positions.iter().all(|p| p[0].abs() < 1.0 || (p[0] - 30000.0).abs() < 1.0));
+        // Gutters along the two eaves.
+        let (glo, ghi) = r.gutters.bounds().unwrap();
+        assert!(glo[1] < -400.0 && ghi[1] > 12400.0);
+        // Nothing asked: the plain roof.
+        assert_eq!(pitched_with(&WING, 16000.0, 40.0, &[1, 3], &Buildup::default()).unwrap(), plain);
+        assert!(pitched_with(&WING, 16000.0, 40.0, &[], &Buildup { overhang: f64::NAN, ..b }).is_err());
     }
 
     #[test]

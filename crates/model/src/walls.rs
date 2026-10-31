@@ -51,7 +51,7 @@ const EPS: f64 = 0.5;
 type Shapes = Vec<Vec<Vec<[f64; 2]>>>;
 
 /// `outer` minus every polygon in `cuts`, as shapes (an outer contour and its holes).
-fn cut(outer: &[[f64; 2]], cuts: &[Vec<[f64; 2]>]) -> Shapes {
+pub(crate) fn cut(outer: &[[f64; 2]], cuts: &[Vec<[f64; 2]>]) -> Shapes {
     if cuts.is_empty() {
         return vec![vec![outer.to_vec()]];
     }
