@@ -592,12 +592,27 @@ fn sheet_frame(doc: &Document, region: Option<&[[f64; 2]]>, rotation: f64) -> Re
     Ok(f)
 }
 
-/// The layer a presentation plan line belongs to, from the widths `scene` draws each family with:
-/// door leaves 45, balcony outlines 30, window lines 25 and 15, rails and decks 14, boards 7,
-/// dimension lines 10 and ticks 18.
-fn line_layer(width: f64) -> Layer {
+/// The layer a presentation plan line from `a` to `b` belongs to, from the widths `scene` draws
+/// each family with: door leaves 45 (and 30 inside the building: interior doors), balcony outlines
+/// 30, window lines 25 and 15, rails and decks 14, boards 7, dimension lines 10 and ticks 18.
+fn line_layer(doc: &Document, width: f64, a: [f64; 2], b: [f64; 2]) -> Layer {
+    let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    // Well inside a footprint, away from its facades (where balconies hang).
+    let indoors = || {
+        doc.buildings.iter().any(|bd| {
+            let ring = &bd.footprint;
+            crate::drawings::inside(ring, mid)
+                && (0..ring.len()).all(|i| {
+                    let (p, q) = (ring[i], ring[(i + 1) % ring.len()]);
+                    let d = [q[0] - p[0], q[1] - p[1]];
+                    let t = (((mid[0] - p[0]) * d[0] + (mid[1] - p[1]) * d[1]) / (d[0] * d[0] + d[1] * d[1]).max(1e-12)).clamp(0.0, 1.0);
+                    (mid[0] - p[0] - t * d[0]).hypot(mid[1] - p[1] - t * d[1]) > 150.0
+                })
+        })
+    };
     match width.round() as i64 {
         40.. => Layer::Door,
+        28..=39 if indoors() => Layer::Door,
         28..=39 => Layer::Balcony,
         20..=27 | 15 | 16 => Layer::Glazing,
         13 | 14 | ..=9 => Layer::Balcony,
@@ -674,7 +689,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                 } else {
                     0.13
                 };
-                sc.line(line_layer(*width), f.rot(*a), f.rot(*b), Stroke { pen, colour, dashed: *dashed });
+                sc.line(line_layer(doc, *width, *a, *b), f.rot(*a), f.rot(*b), Stroke { pen, colour, dashed: *dashed });
             }
             Prim::Text { at, text, size, angle, away, .. } => {
                 let p = f.px(*at);
@@ -913,6 +928,19 @@ mod tests {
         }
         let (prims, _) = scene(&doc, 1, View::latest(&doc), true).unwrap();
         assert!(prims.iter().any(|p| matches!(p, Prim::Poly { surface: Surface::Stair, .. })));
+    }
+
+    #[test]
+    fn plan_lines_find_their_layers() {
+        let mut doc = Document::default();
+        doc.buildings.push(trigon_model::Building::new("b", "test", &[[0., 0.], [10000., 0.], [10000., 8000.], [0., 8000.]], 2, 3000.).unwrap());
+        // A balcony's outline hangs off the facade; an interior door leaf is well inside.
+        assert_eq!(line_layer(&doc, 30.0, [2000., 0.], [2000., -1300.]), Layer::Balcony);
+        assert_eq!(line_layer(&doc, 30.0, [2000., 0.], [4000., 0.]), Layer::Balcony);
+        assert_eq!(line_layer(&doc, 30.0, [4000., 4000.], [4900., 4000.]), Layer::Door);
+        assert_eq!(line_layer(&doc, 45.0, [0., 2000.], [0., 2900.]), Layer::Door);
+        assert_eq!(line_layer(&doc, 25.0, [0., 2000.], [0., 2900.]), Layer::Glazing);
+        assert_eq!(line_layer(&doc, 10.0, [0., -1600.], [900., -1600.]), Layer::Annotation);
     }
 
     #[test]
