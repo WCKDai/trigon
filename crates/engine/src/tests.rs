@@ -293,6 +293,9 @@ fn hostile_params_never_panic() {
         json!({"count": usize::MAX}),
         json!({"path": "/etc/passwd"}),
         json!({"id": "x", "name": "x", "width": 1e300, "height": 1.0, "sill": 0.0, "kind": {"family": "window", "lights": 0}}),
+        json!({"thickness": [f64::MAX, -1.0, 0.0]}),
+        json!({"preset": "copenhagen_masonry", "facades": [south]}),
+        json!({"facades": [south, "b9.f9"], "thickness": []}),
     ];
     for c in commands() {
         for p in &hostile {
@@ -881,4 +884,181 @@ fn interior_walls_traced_from_a_plan_sheet() {
     s.execute("interior.clear", json!({})).unwrap();
     assert_eq!(s.execute("interior.list", json!({})).unwrap()[1]["load_bearing"], 0);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn masonry_walls_step_inside_at_every_floor_and_interior_walls_join_them() {
+    let mut s = session();
+    s.execute("building.add_basement", json!({"floor": -2480})).unwrap();
+    let storeys = s.doc.buildings[0].storeys.len();
+    let v = s.execute("building.set_wall_schedule", json!({"preset": "copenhagen_masonry"})).unwrap();
+    let schedule: Vec<f64> = v["schedule"].as_array().unwrap().iter().map(|e| e["thickness_mm"].as_f64().unwrap()).collect();
+    assert_eq!(schedule.len(), storeys);
+    // Thinner going up; the basement is half a brick more than the ground storey; 360 on top.
+    assert!(schedule.windows(2).all(|w| w[0] >= w[1]), "{schedule:?}");
+    assert_eq!(schedule[0], schedule[1] + 100.0, "{schedule:?}");
+    assert_eq!(*schedule.last().unwrap(), 360.0);
+
+    // Each facade is one closed piece per storey at that storey's thickness; the floors rest on the steps.
+    let built = trigon_model::build(&s.doc).unwrap();
+    for w in &built[0].walls {
+        let t: Vec<f64> = w.segments.iter().map(|g| g.thickness).collect();
+        assert_eq!(t, schedule, "{}", w.id);
+    }
+    let area = |l: usize| trigon_model::doc::polygon_area(&built[0].slabs[l].polygon);
+    assert!(area(0) < area(1) && area(1) < area(storeys - 1));
+
+    // An interior wall drawn 650 mm in from the facade's outer face ends on the inner face on
+    // every storey: trimmed where the wall is thicker (700), extended where it is thinner.
+    let south = first_facade_facing(&mut s, "S");
+    let b = &s.doc.buildings[0];
+    let f = b.facade(&south).unwrap();
+    let (a, e) = b.edge(f.edge).unwrap();
+    let fr = trigon_model::FacadeFrame::new(a, e).unwrap();
+    let start = fr.point(fr.length / 2.0, 650.0, 0.0);
+    let end = fr.point(fr.length / 2.0, 4000.0, 0.0);
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [{"id": "x", "levels": [0, 1, 2], "a": [start[0], start[1]], "b": [end[0], end[1]], "thickness": 120, "load_bearing": false}]}),
+    )
+    .unwrap();
+    let built = trigon_model::build(&s.doc).unwrap();
+    for (level, thickness) in schedule.iter().enumerate().take(3) {
+        let iw = built[0].interior.iter().find(|w| w.id == format!("x.L{level}")).unwrap();
+        let depth = |p: [f64; 2]| (p[0] - a[0]) * -fr.n[0] + (p[1] - a[1]) * -fr.n[1];
+        assert!((depth(iw.axis[0]) - thickness).abs() < 1e-6, "level {level}: {:?}", iw.axis);
+        assert!(matches!(iw.ends[0], Some(trigon_model::joins::Join { target: trigon_model::joins::Target::Facade(_), .. })));
+    }
+
+    // A fire gable keeps its own thickness; the IFC has one wall per facade and storey.
+    s.execute("building.set_wall_schedule", json!({"facades": [south.clone()], "thickness": vec![360.0; storeys]})).unwrap();
+    let b = &s.doc.buildings[0];
+    let edge = b.facade(&south).unwrap().edge;
+    assert!((0..storeys).all(|l| b.edge_thickness(edge, l) == 360.0));
+    let built = trigon_model::build(&s.doc).unwrap();
+    let text = trigon_io::ifc::write(&s.doc, &built, "t.ifc", "2000-01-01T00:00:00Z");
+    assert_eq!(text.matches("IFCWALL(").count(), built[0].walls.len() * storeys + built[0].interior.len());
+
+    // Refused: wrong count, hostile values, preset with facades. The document is unchanged.
+    let before = s.doc.clone();
+    for bad in [
+        json!({"thickness": [500.0]}),
+        json!({"thickness": vec![f64::MAX; storeys]}),
+        json!({"preset": "copenhagen_masonry", "thickness": vec![400.0; storeys]}),
+        json!({"facades": [south], "preset": "copenhagen_masonry"}),
+        json!({"facades": ["b1.f999"], "thickness": vec![400.0; storeys]}),
+        json!({}),
+    ] {
+        assert!(s.execute("building.set_wall_schedule", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn door_gaps_become_doors_in_one_wall() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [
+            {"id": "w1", "levels": [1], "a": [-4000, 0], "b": [-400, 0], "thickness": 120},
+            {"id": "w2", "levels": [1], "a": [400, 0], "b": [4000, 0], "thickness": 120}
+        ]}),
+    )
+    .unwrap();
+    let v = s.execute("interior.doors_from_gaps", json!({})).unwrap();
+    assert_eq!(v["doors_between_pieces"], 1, "{v}");
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.len(), 1);
+    assert_eq!(walls[0].doors.len(), 1);
+    assert!((walls[0].doors[0].width - 800.0).abs() < 1e-6 && (walls[0].doors[0].at - 4000.0).abs() < 1e-6);
+
+    // Built: one wall with a door (frame and leaf), the plan cut left open at the door.
+    let built = trigon_model::build(&s.doc).unwrap();
+    let w = built[0].interior.iter().find(|w| w.id == "w1.L1").unwrap();
+    assert_eq!(w.doors.len(), 1);
+    assert_eq!(w.cut.len(), 2, "the cut plan is two pieces either side of the door");
+    assert_eq!(w.doors[0].fill.class, trigon_model::ElementClass::Door);
+    assert!(s.execute("plan.image", json!({"level": 1, "path": std::env::temp_dir().join("trigon-doors.svg")})).is_ok());
+
+    // Undo restores the two pieces; a second run finds nothing more.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc.buildings[0].interior_walls.len(), 2);
+    s.execute("edit.redo", json!({})).unwrap();
+    let again = s.execute("interior.doors_from_gaps", json!({})).unwrap();
+    assert_eq!(again["doors_between_pieces"], 0);
+    // Refused: max below min, hostile numbers.
+    for bad in [json!({"min_mm": 900, "max_mm": 700}), json!({"min_mm": f64::MAX}), json!({"height_mm": -1})] {
+        assert!(s.execute("interior.doors_from_gaps", bad.clone()).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn plinth_and_roof_build_up_are_part_of_the_model() {
+    let mut s = session();
+    let gable = s.doc.buildings[0].facades[0].id.clone();
+    s.execute(
+        "building.set_roof",
+        json!({"kind": "pitched", "pitch_deg": 40, "gables": [gable], "overhang_mm": 300, "verge_mm": 100, "thickness_mm": 250, "gutters": true}),
+    )
+    .unwrap();
+    s.execute("building.set_plinth", json!({"height_mm": 600})).unwrap();
+    let built = trigon_model::build(&s.doc).unwrap();
+    let roof = built[0].roof.as_ref().unwrap();
+    assert!(!roof.gutters.is_empty());
+    // The roof reaches past the footprint; the plinth stands proud of every wall up to 600 mm.
+    let (lo, hi) = roof.cover.bounds().unwrap();
+    let fp = &s.doc.buildings[0].footprint;
+    let minx = fp.iter().map(|p| p[0]).fold(f64::MAX, f64::min);
+    assert!(lo[0] < minx - 50.0 && hi[2] > lo[2]);
+    for w in &built[0].walls {
+        let (plo, phi) = w.plinth.bounds().unwrap();
+        assert!((phi[2] - 600.0).abs() < 1e-6 && plo[2] < 0.0, "{}", w.id);
+    }
+    // Both export.
+    let dir = std::env::temp_dir().join(format!("trigon-plinth-{}", std::process::id()));
+    s.execute("export.gltf", json!({"path": dir.join("m.glb")})).unwrap();
+    s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    // Removed again; refused when unclear or hostile.
+    s.execute("building.set_plinth", json!({"remove": true})).unwrap();
+    assert!(trigon_model::build(&s.doc).unwrap()[0].walls.iter().all(|w| w.plinth.is_empty()));
+    for bad in [json!({}), json!({"height_mm": 600, "remove": true}), json!({"height_mm": f64::MAX}), json!({"height_mm": 600, "projection_mm": -5})]
+    {
+        assert!(s.execute("building.set_plinth", bad.clone()).is_err(), "{bad}");
+    }
+    assert!(s.execute("building.set_roof", json!({"kind": "pitched", "pitch_deg": 40, "overhang_mm": -1})).is_err());
+}
+
+#[test]
+fn a_3d_plan_cut_closes_the_walls_at_the_cut_and_leaves_out_what_is_above() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [{"id": "w", "levels": [0, 1, 2], "a": [-3000, 0], "b": [3000, 0], "thickness": 120, "doors": [{"at": 3000, "width": 900}]}]}),
+    )
+    .unwrap();
+    let b = &s.doc.buildings[0];
+    let z = b.storeys[1].elevation + 1200.0;
+    let view = trigon_model::build::View::latest(&s.doc);
+    let cut = trigon_model::build::build_cut(&s.doc, view, Some(z)).unwrap();
+    let top = |m: &trigon_model::Mesh| m.bounds().map_or(f64::MIN, |(_, hi)| hi[2]);
+    assert!(cut[0].roof.is_none());
+    assert!(cut[0].walls.iter().all(|w| w.segments.iter().all(|g| g.level <= 1 && g.z1 <= z + 1e-6) && top(&w.mesh) <= z + 1e-6));
+    assert!(cut[0].slabs.iter().all(|sl| sl.level <= 1));
+    let wall = cut[0].interior.iter().find(|w| w.id == "w.L1").unwrap();
+    assert!((top(&wall.mesh) - z).abs() < 1e-6 && wall.doors.len() == 1);
+    assert!(!cut[0].interior.iter().any(|w| w.id == "w.L2"));
+    // The door stays open through the cut.
+    assert!(wall.doors[0].rect.v1 > z);
+    // Exported; refused with a storey that doesn't exist or a height without a storey.
+    let path = std::env::temp_dir().join(format!("trigon-cut-{}.glb", std::process::id()));
+    assert!(s.execute("export.gltf", json!({"path": path, "cut_level": 1})).is_ok());
+    let _ = std::fs::remove_file(path);
+    for bad in [
+        json!({"path": "x.glb", "cut_level": 99}),
+        json!({"path": "x.glb", "cut_mm": 1200}),
+        json!({"path": "x.glb", "cut_level": 1, "cut_mm": f64::MAX}),
+    ] {
+        assert!(s.execute("export.gltf", bad.clone()).is_err(), "{bad}");
+    }
 }

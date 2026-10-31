@@ -139,17 +139,20 @@ fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&trigon_model
 fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result<(Vec<Prim>, String)> {
     let mut prims = Vec::new();
     let mut title = String::new();
-    for b in build_view(doc, view)? {
+    let built = build_view(doc, view)?;
+    for b in &built {
         let storey = b.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("level {level} doesn't exist")))?;
         title = format!("{} — {}", b.name, storey.name);
         let cut = storey.elevation + CUT;
         for w in &b.walls {
             let fr = &w.frame;
-            let d = w.thickness;
+            // The facade wall as it is on this storey (thicker lower down).
+            let Some(seg) = w.segment(level) else { continue };
+            let d = seg.thickness;
             // Openings crossing the cut, by position along the wall.
             let mut cuts: Vec<_> = w.openings.iter().filter(|o| o.rect.v0 <= cut && o.rect.v1 >= cut).collect();
             cuts.sort_by(|x, y| x.rect.u0.total_cmp(&y.rect.u0));
-            let [a, e, qe, qs] = w.plan;
+            let [a, e, qe, qs] = seg.plan;
             let mut start = (a, qs);
             for o in &cuts {
                 let (u0, u1) = (o.rect.u0, o.rect.u1);
@@ -271,18 +274,21 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             }
         }
     }
-    // Interior: walls cut at this storey, stairs with treads, room names and areas.
-    for b in &doc.buildings {
-        for w in &b.interior_walls {
-            if !w.levels.contains(&level) {
-                continue;
+    // Interior: walls cut at this storey (joined to each other and to the facade), stairs with
+    // treads, room names and areas.
+    for built in &built {
+        for w in built.interior.iter().filter(|w| w.level == level) {
+            for pts in &w.cut {
+                prims.push(Prim::Poly { pts: pts.clone(), fill: if w.load_bearing { WALL } else { PARTITION }, surface: Surface::Interior });
             }
-            let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
-            let len = (dx * dx + dy * dy).sqrt().max(1e-9);
-            let (nx, ny) = (-dy / len * w.thickness / 2.0, dx / len * w.thickness / 2.0);
-            let pts = vec![[w.a[0] + nx, w.a[1] + ny], [w.b[0] + nx, w.b[1] + ny], [w.b[0] - nx, w.b[1] - ny], [w.a[0] - nx, w.a[1] - ny]];
-            prims.push(Prim::Poly { pts, fill: if w.load_bearing { WALL } else { PARTITION }, surface: Surface::Interior });
+            // Doors as a closed leaf across the opening: no swing, no opening direction.
+            for d in &w.doors {
+                let mid = w.thickness / 2.0;
+                prims.push(Prim::Line { a: pt(&w.frame, d.rect.u0, mid), b: pt(&w.frame, d.rect.u1, mid), color: LINE, width: 30.0, dashed: false });
+            }
         }
+    }
+    for b in &doc.buildings {
         let visible = visible_stairs(b, level);
         for st in &visible {
             if presentation {

@@ -8,17 +8,20 @@
 pub mod build;
 pub mod component;
 pub mod doc;
+pub mod doors;
 pub mod footprint;
+pub mod joins;
 pub mod mesh;
 pub mod roof;
 pub mod stair;
 pub mod wall_cleanup;
+pub mod walls;
 
 pub use build::{Built, BuiltElement, BuiltOpening, BuiltSlab, BuiltWall, ElementClass, FacadeFrame, Rect, SlabKind, build};
 pub use component::{ComponentKind, ComponentType, default_types};
 pub use doc::{
     Building, Document, Drawing, Entrance, Evidence, FORMAT, Facade, FacadeKind, FacadeRegistration, GeoPoint, InteriorWall, Phase, Placement,
-    PlanRegistration, Reference, Room, Site, Stair, StairKind, Storey, Unit,
+    PlanRegistration, Reference, Room, Site, Stair, StairKind, Storey, Unit, WallDoor,
 };
 pub use mesh::{Material, Mesh};
 pub use roof::Roof;

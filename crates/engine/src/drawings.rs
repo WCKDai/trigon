@@ -318,7 +318,7 @@ pub(crate) fn trace_walls(
     let paper_block = (3.0 * max_mm * reg.px_per_m() / 1000.0).ceil().clamp(128.0, 2048.0) as u32;
     let bg = img.background(paper_block, 0.8);
     let b = s.doc.building(None)?.clone();
-    let inside = trigon_model::build::inner_ring(&b.footprint, b.wall_thickness + 60.0);
+    let inside = trigon_model::build::inner_ring_by(&b.footprint, |e| b.edge_thickness(e, level) + 60.0);
     // Wall directions: the building's grids, i.e. facade directions (modulo 90°) clustered within 2.5°, weighted
     // by facade length; a grid needs at least 20 m of facade. Each grid is traced along both of its axes.
     let n = b.footprint.len();
@@ -562,6 +562,7 @@ pub(crate) fn trace_walls(
                 b: pb,
                 thickness,
                 load_bearing: thickness >= 200.0,
+                doors: Vec::new(),
             });
         }
     }
@@ -587,7 +588,7 @@ pub(crate) fn trace_walls(
             !flights.iter().any(|f| inside_poly(&shrink(&f.outline, 120.0), m))
         })
         .collect();
-    let inner = trigon_model::build::inner_ring(&b.footprint, b.wall_thickness);
+    let inner = b.inner_line(level);
     Ok((snap_ends(clean_walls(walls, &grids), &inner), flights))
 }
 
@@ -673,6 +674,7 @@ fn clean_walls(walls: Vec<trigon_model::InteriorWall>, grids: &[f64]) -> Vec<tri
                     b: p(s1),
                     thickness,
                     load_bearing: a.load_bearing || b.load_bearing,
+                    doors: Vec::new(),
                 };
                 kept.remove(j);
                 kept[i] = w;
