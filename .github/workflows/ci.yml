@@ -1,0 +1,61 @@
+name: CI
+
+# Every push is checked on the org's trusted Linux runner (alpha). The repository is private and
+# forking is off, so only collaborators' code reaches the runner.
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  gates:
+    name: fmt, Clippy, tests, release build (alpha)
+    runs-on: [self-hosted, linux, x64, rust-16, trusted]
+    timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: ${{ vars.R2_CONFIGURED == 'true' && 'sccache' || '' }}
+      SCCACHE_BUCKET: ${{ vars.R2_BUCKET }}
+      SCCACHE_ENDPOINT: ${{ vars.R2_ENDPOINT }}
+      SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+      SCCACHE_S3_USE_SSL: "true"
+      SCCACHE_S3_KEY_PREFIX: trigon
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Install sccache
+        if: vars.R2_CONFIGURED == 'true'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: trigon-trusted-linux
+          cache-on-failure: true
+          cache-targets: false
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+      - name: Release build
+        run: cargo build --release --locked --bin trigon
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: trigon-linux-x64
+          path: target/release/trigon
+          retention-days: 7
+          if-no-files-found: error
