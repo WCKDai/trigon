@@ -216,6 +216,23 @@ fn accept(listener: TcpListener, shared: Arc<Shared>) {
             shared.open.fetch_sub(1, Ordering::Relaxed);
             let mut refused = stream;
             let _ = writeln!(refused, "{}", json!({"ok": false, "error": "too many connections"}));
+            // As with an unauthorized request, send EOF and drain a bounded amount of input.
+            // Dropping unread request bytes can reset the socket before the reply arrives.
+            let _ = refused.shutdown(Shutdown::Write);
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut left = 64 * 1024;
+            let mut buffer = [0_u8; 4096];
+            while left > 0 {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                if wait.is_zero() || refused.set_read_timeout(Some(wait)).is_err() {
+                    break;
+                }
+                let limit = left.min(buffer.len());
+                match refused.read(&mut buffer[..limit]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => left -= n,
+                }
+            }
             continue;
         }
         let shared2 = shared.clone();
