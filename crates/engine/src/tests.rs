@@ -848,13 +848,14 @@ fn masonry_walls_step_inside_at_every_floor_and_interior_walls_join_them() {
 
 #[test]
 fn a_bim_export_reads_back_the_same_in_both_readers() {
-    // Stepped masonry, a pitched roof with a gable, a steel balcony with tie rods, a cantilever
-    // balcony, a staircase, interior walls and rooms, in two phases.
+    // Stepped masonry, a pitched roof with a gable and gutters, a steel balcony with tie rods, a
+    // cantilever balcony, a staircase, interior walls with a door and rooms, in two phases; then
+    // a basement with a cellar stair, a rendered facade with a band, and a plinth.
     let mut s = session();
     let (south, north, east) = (first_facade_facing(&mut s, "S"), first_facade_facing(&mut s, "N"), first_facade_facing(&mut s, "E"));
     s.execute("phase.set", json!({"phases": [{"id": "1940", "name": "Opført"}, {"id": "forslag", "name": "Forslag"}]})).unwrap();
     s.execute("building.set_wall_schedule", json!({"preset": "copenhagen_masonry"})).unwrap();
-    s.execute("building.set_roof", json!({"kind": "pitched", "pitch_deg": 40.0, "gables": [east]})).unwrap();
+    s.execute("building.set_roof", json!({"kind": "pitched", "pitch_deg": 40.0, "gables": [east], "gutters": true})).unwrap();
     s.execute(
         "types.define",
         json!({"id": "balcony.steel", "name": "Stålaltan", "width": 2400.0, "height": 1000.0, "sill": 0.0,
@@ -872,7 +873,8 @@ fn a_bim_export_reads_back_the_same_in_both_readers() {
     s.execute(
         "interior.add_walls",
         json!({"walls": [{"id": "spine", "levels": [0, 1, 2, 3, 4], "a": [-11000.0, 0.0], "b": [11000.0, 0.0], "thickness": 240.0, "load_bearing": true},
-                         {"id": "p", "levels": [1, 2], "a": [3000.0, 200.0], "b": [3000.0, 5000.0], "thickness": 100.0}]}),
+                         {"id": "p", "levels": [1, 2], "a": [3000.0, 200.0], "b": [3000.0, 5000.0], "thickness": 100.0,
+                          "doors": [{"at": 2400.0, "width": 900.0}]}]}),
     )
     .unwrap();
     s.execute(
@@ -884,6 +886,15 @@ fn a_bim_export_reads_back_the_same_in_both_readers() {
     s.execute(
         "interior.add_rooms",
         json!({"rooms": [{"levels": [1, 2], "name": "Stue", "polygon": [[-2000.0, -5000.0], [2800.0, -5000.0], [2800.0, -200.0], [-2000.0, -200.0]]}]}),
+    )
+    .unwrap();
+    s.execute("building.add_basement", json!({"floor": -2480})).unwrap();
+    s.execute("facade.set_finish", json!({"facades": [north], "finish": "render"})).unwrap();
+    s.execute("facade.set_bands", json!({"facades": [north], "bands": [{"levels": [2], "bottom": -450, "top": 500}]})).unwrap();
+    s.execute("building.set_plinth", json!({"height_mm": 600})).unwrap();
+    s.execute(
+        "building.set_cellar_stairs",
+        json!({"stairs": [{"facade": east, "from": 1000, "to": 6000, "width": 1500, "top": 1200, "bottom": 4000, "floor": -2480, "door_at": 5000}]}),
     )
     .unwrap();
     let dir = std::env::temp_dir().join(format!("trigon-bim-{}", std::process::id()));
@@ -903,6 +914,11 @@ fn a_bim_export_reads_back_the_same_in_both_readers() {
         "IFCPRESENTATIONLAYERASSIGNMENT(",
         "IFCSTYLEDITEM(",
         "Qto_WallBaseQuantities",
+        "IFCPIPESEGMENT(",
+        ".MOLDING.)",
+        ".CLADDING.)",
+        "pudset mur",
+        "'K\\X2\\00E6\\X0\\ldernedgang'",
     ] {
         assert!(text.contains(class), "{class}");
     }

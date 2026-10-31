@@ -2,11 +2,13 @@
 //! straight or winding) and half landing (`IfcSlab` LANDING), with the step counts in
 //! Pset_StairCommon and Pset_StairFlightCommon.
 
+use trigon_model::build::BuiltElement;
 use trigon_model::stair::PartKind;
-use trigon_model::{Building, Built, StairKind};
+use trigon_model::{Building, Built, FacadeFrame, Material, StairKind};
 
-use super::catalog::{self, Val};
-use super::part21::{gid, real, refs, string};
+use super::catalog::{self, Qty, Val};
+use super::fills::facade_frame_at;
+use super::part21::{gid, real, refs, string, volume};
 use super::split;
 use super::{Floors, Ifc};
 
@@ -90,5 +92,109 @@ impl Ifc<'_> {
             self.common("Pset_StairCommon", stair, "Trappe", None, props);
             fl.contain(st.level, stair);
         }
+    }
+}
+
+impl Ifc<'_> {
+    /// An outdoor cellar stair: an IfcStair of its flight, the pit's retaining walls and the
+    /// railing on the kerb, contained in the storey it leads down to.
+    pub(super) fn cellar_stair(&mut self, e: &BuiltElement, fr: &FacadeFrame, fl: &mut Floors) {
+        let pieces = split::cellar(e);
+        let frame = facade_frame_at(fr, pieces.iter().map(|(_, _, m)| m));
+        let placed = self.w.place(Some(fl.at(e.level)), frame);
+        let stair = self.w.add(format!(
+            "IFCSTAIR({},$,{},$,'Kældernedgang',#{},$,{},.STRAIGHT_RUN_STAIR.)",
+            gid(&e.id),
+            string(&e.name),
+            placed.id,
+            string(&e.id)
+        ));
+        let (mut parts, mut steps) = (Vec::new(), (0usize, 0.0, 0.0));
+        for (key, m, mesh) in &pieces {
+            let lp = self.w.place(Some(placed), frame);
+            let Some(item) = self.w.faceset(mesh, &frame) else { continue };
+            let mat = if *m == Material::Railing { catalog::RAIL } else { catalog::of(*m) };
+            self.cat.paint(&mut self.w, item, mat);
+            let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_STAIR) else { continue };
+            let (g, tag) = (gid(key), string(key));
+            let id = match m {
+                Material::Sill => {
+                    // One block per riser, from the pit floor up to the terrain.
+                    let risers = split::boxes(mesh).len().max(1);
+                    let run = mesh
+                        .positions
+                        .iter()
+                        .map(|p| frame.local(*p)[0])
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+                    let (rise, going) = (e.height / risers as f64, (run.1 - run.0).max(0.0) / risers as f64);
+                    steps = (risers, rise, going);
+                    let id = self.w.add(format!(
+                        "IFCSTAIRFLIGHT({g},$,'Trappeløb',$,$,#{},#{shape},{tag},{risers},{},{},{},.STRAIGHT.)",
+                        lp.id,
+                        risers.saturating_sub(1),
+                        real(rise),
+                        real(going)
+                    ));
+                    self.common(
+                        "Pset_StairFlightCommon",
+                        id,
+                        &e.name,
+                        Some(e.status),
+                        vec![("NumberOfRiser", Val::Count(risers as f64)), ("RiserHeight", Val::Length(rise))],
+                    );
+                    id
+                }
+                Material::Railing => {
+                    let id = self.w.add(format!("IFCRAILING({g},$,'Rækværk',$,$,#{},#{shape},{tag},.GUARDRAIL.)", lp.id));
+                    self.common(
+                        "Pset_RailingCommon",
+                        id,
+                        &e.name,
+                        Some(e.status),
+                        vec![("IsExternal", Val::Bool(true)), ("Height", Val::Length(900.0))],
+                    );
+                    id
+                }
+                _ => {
+                    let (name, what) = (string("Støttemur, beton"), string("Støttemur"));
+                    let id = self.w.add(format!("IFCWALL({g},$,{name},$,{what},#{},#{shape},{tag},.USERDEFINED.)", lp.id));
+                    self.common(
+                        "Pset_WallCommon",
+                        id,
+                        &e.name,
+                        Some(e.status),
+                        vec![("IsExternal", Val::Bool(true)), ("LoadBearing", Val::Bool(true))],
+                    );
+                    let v = volume(mesh);
+                    self.cat.quantities(
+                        &mut self.w,
+                        key,
+                        "Qto_WallBaseQuantities",
+                        &[Qty::Volume("GrossVolume", v / 1e9), Qty::Volume("NetVolume", v / 1e9)],
+                        id,
+                    );
+                    id
+                }
+            };
+            self.made_of(id, mat);
+            parts.push(id);
+        }
+        if !parts.is_empty() {
+            self.w.add(format!("IFCRELAGGREGATES({},$,$,$,#{stair},({}))", gid(&format!("{}.parts", e.id)), refs(&parts)));
+        }
+        let (risers, rise, going) = steps;
+        let mut props = vec![("IsExternal", Val::Bool(true))];
+        if risers > 0 {
+            props.extend([
+                ("NumberOfRiser", Val::Count(risers as f64)),
+                ("NumberOfTreads", Val::Count(risers.saturating_sub(1) as f64)),
+                ("RiserHeight", Val::Length(rise)),
+            ]);
+            if going > 0.0 {
+                props.push(("TreadLength", Val::Length(going)));
+            }
+        }
+        self.common("Pset_StairCommon", stair, &e.name, Some(e.status), props);
+        fl.contain(e.level, stair);
     }
 }

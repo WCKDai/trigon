@@ -52,7 +52,10 @@ impl Ifc<'_> {
     /// The balconies hung on a facade wall without an opening of their own.
     pub(super) fn wall_balconies(&mut self, wall: &BuiltWall, fl: &mut Floors) {
         for (key, group) in split::attachment_groups(wall) {
-            self.balcony(&key, &group, &wall.frame, fl);
+            match group.first() {
+                Some(e) if e.class == trigon_model::ElementClass::Stair => self.cellar_stair(e, &wall.frame, fl),
+                _ => self.balcony(&key, &group, &wall.frame, fl),
+            }
         }
     }
 

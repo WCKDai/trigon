@@ -23,7 +23,7 @@ fn the_sample_has_every_kind_of_building_element() {
     // Every facade piece and interior wall is a wall; the two gables are walls too.
     assert_eq!(count(&text, "IFCWALLSTANDARDCASE") + count(&text, "IFCWALL"), pieces + b.interior.len() + 2);
     assert_eq!(count(&text, "IFCWALL"), 2, "only the gables are plain walls");
-    assert_eq!(count(&text, "IFCWALLTYPE"), 6, "480 and 360 facades, the 360 fire gable, 240 and 120 masonry, 100 partitions");
+    assert_eq!(count(&text, "IFCWALLTYPE"), 8, "480 and 360 facades, rendered too, the 360 fire gable, 240 and 120 masonry, 100 partitions");
     assert_eq!(count(&text, "IFCROOF"), 1);
     // Two storeys of a U-turn stair: two flights and a landing each.
     assert_eq!((count(&text, "IFCSTAIR"), count(&text, "IFCSTAIRFLIGHT")), (2, 4));
@@ -41,8 +41,11 @@ fn the_sample_has_every_kind_of_building_element() {
     assert_eq!(text.matches("IFCRELFILLSELEMENT(").count(), fills + doors);
     // The stairwell windows cross a floor: they void two pieces each.
     assert_eq!(count(&text, "IFCOPENINGELEMENT"), fills + 2 + doors);
-    // A plinth on every facade, a gutter on every eave, roof planes with the roof's build-up.
-    assert_eq!(count(&text, "IFCCOVERING"), b.walls.len());
+    // A plinth on every facade and the street front's bands, a gutter on every eave, roof planes
+    // with the roof's build-up, the rendered courtyard side as its own wall type.
+    assert_eq!(count(&text, "IFCCOVERING"), b.walls.len() + 1);
+    assert_eq!(text.matches(".MOLDING.)").count(), 1);
+    assert!(text.contains("'Yderv\\X2\\00E6\\X0\\g, pudset mur 1\\X2\\00BD\\X0\\ sten, 360 mm'"));
     assert_eq!(count(&text, "IFCPIPESEGMENT"), 4);
     assert!(text.contains("'Tag, tegl p\\X2\\00E5\\X0\\ sp\\X2\\00E6\\X0\\r 250 mm'"));
     for layer in [

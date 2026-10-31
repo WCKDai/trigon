@@ -13,9 +13,9 @@ use super::{Floors, Ifc};
 
 pub(crate) fn window_partitioning(kind: &ComponentKind) -> &'static str {
     match kind {
-        ComponentKind::Window { lights: 1 } | ComponentKind::FixedWindow => ".SINGLE_PANEL.",
-        ComponentKind::Window { lights: 2 } => ".DOUBLE_PANEL_VERTICAL.",
-        ComponentKind::Window { lights: 3 } => ".TRIPLE_PANEL_VERTICAL.",
+        ComponentKind::Window { lights: 1, .. } | ComponentKind::FixedWindow => ".SINGLE_PANEL.",
+        ComponentKind::Window { lights: 2, .. } => ".DOUBLE_PANEL_VERTICAL.",
+        ComponentKind::Window { lights: 3, .. } => ".TRIPLE_PANEL_VERTICAL.",
         _ => ".NOTDEFINED.",
     }
 }

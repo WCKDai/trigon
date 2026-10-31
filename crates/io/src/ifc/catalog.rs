@@ -42,6 +42,8 @@ pub const STEEL: Mat = mat("Stål, varmforzinket", "steel", [0.66, 0.68, 0.70]);
 pub const DECK: Mat = mat("Træ, terrassebrædder", "wood", [0.55, 0.35, 0.20]);
 pub const STAIR: Mat = mat("Trappe", "stair", [0.70, 0.62, 0.52]);
 pub const PLINTH: Mat = mat("Sokkel, puds", "plaster", [0.55, 0.55, 0.53]);
+pub const RENDER: Mat = mat("Facadepuds", "plaster", [0.91, 0.90, 0.87]);
+pub const BRICK_RED: Mat = mat("Tegl, røde sten", "brick", [0.62, 0.25, 0.17]);
 pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
 /// Spaces: a translucent volume, no material.
 pub const SPACE: Mat = Mat { name: "Rum", category: "space", rgb: [0.55, 0.75, 0.95], transparency: 0.75 };
@@ -61,6 +63,8 @@ pub fn of(m: Material) -> Mat {
         Material::Deck => DECK,
         Material::Plinth => PLINTH,
         Material::Plaster => PLASTER,
+        Material::Render => RENDER,
+        Material::BrickRed => BRICK_RED,
     }
 }
 
@@ -141,19 +145,23 @@ fn mm(t: f64) -> String {
     format!("{t:.0} mm")
 }
 
-/// A facade wall: brick with interior plaster. Party walls are fire gables.
-pub fn facade(t: f64, party: bool) -> BuildUp {
+/// A facade wall: brick with interior plaster, its outside in the facade's finish (`Wall` for the
+/// building's facing brick, `BrickRed` or `Render`). Party walls are fire gables.
+pub fn facade(t: f64, party: bool, finish: Material) -> BuildUp {
     let what = if party { "Brandgavl" } else { "Ydervæg" };
-    let name = match sten(t) {
-        Some(s) => format!("{what}, massiv mur {s} sten, {}", mm(t)),
-        None => format!("{what}, massiv mur, {}", mm(t)),
+    let (wall, brick, render) = match finish {
+        Material::Render => ("pudset mur", BRICK, true),
+        Material::BrickRed => ("massiv mur, røde sten", BRICK_RED, false),
+        _ => ("massiv mur", BRICK, false),
     };
-    let mut layers = sandwich(t, (PLASTER, 15.0), BRICK, None);
-    // From the outside in: brick, then the plaster.
+    let name = match sten(t) {
+        Some(s) => format!("{what}, {wall} {s} sten, {}", mm(t)),
+        None => format!("{what}, {wall}, {}", mm(t)),
+    };
+    let outside = render.then_some((RENDER, 15.0));
+    // From the outside in: render if any, brick, then the interior plaster.
+    let mut layers = sandwich(t, (PLASTER, 15.0), brick, outside);
     layers.reverse();
-    if let Some(l) = layers.first_mut() {
-        l.category = "LoadBearing";
-    }
     BuildUp { name, layers, predefined: "SOLIDWALL" }
 }
 
@@ -433,17 +441,29 @@ mod tests {
 
     #[test]
     fn masonry_is_named_in_bricks_and_layers_add_up() {
-        assert_eq!(facade(600.0, false).name, "Ydervæg, massiv mur 2½ sten, 600 mm");
-        assert_eq!(facade(700.0, false).name, "Ydervæg, massiv mur 3 sten, 700 mm");
-        assert_eq!(facade(360.0, true).name, "Brandgavl, massiv mur 1½ sten, 360 mm");
-        assert_eq!(facade(555.0, false).name, "Ydervæg, massiv mur, 555 mm");
+        let brick = Material::Wall;
+        assert_eq!(facade(600.0, false, brick).name, "Ydervæg, massiv mur 2½ sten, 600 mm");
+        assert_eq!(facade(700.0, false, brick).name, "Ydervæg, massiv mur 3 sten, 700 mm");
+        assert_eq!(facade(360.0, true, brick).name, "Brandgavl, massiv mur 1½ sten, 360 mm");
+        assert_eq!(facade(555.0, false, brick).name, "Ydervæg, massiv mur, 555 mm");
+        assert_eq!(facade(480.0, false, Material::BrickRed).name, "Ydervæg, massiv mur, røde sten 2 sten, 480 mm");
+        let rendered = facade(480.0, false, Material::Render);
+        assert_eq!(rendered.name, "Ydervæg, pudset mur 2 sten, 480 mm");
+        assert_eq!(rendered.layers.iter().map(|l| l.mat).collect::<Vec<_>>(), vec![RENDER, BRICK, PLASTER]);
         assert_eq!(interior(120.0, true).name, "Bærende indervæg, massiv mur ½ sten, 120 mm");
-        for b in [facade(600.0, false), facade(45.0, false), interior(100.0, false), interior(40.0, false), floor(200.0, false), flat_roof(300.0)] {
+        for b in [
+            facade(600.0, false, brick),
+            facade(45.0, false, brick),
+            interior(100.0, false),
+            interior(40.0, false),
+            floor(200.0, false),
+            flat_roof(300.0),
+        ] {
             let t = b.layers.iter().map(|l| l.thickness).sum::<f64>();
             assert!((t - b.thickness()).abs() < 1e-9 && b.layers.iter().all(|l| l.thickness > 0.0), "{}", b.name);
         }
         // Brick on the outside, plaster on the inside.
-        let f = facade(480.0, false);
+        let f = facade(480.0, false, brick);
         assert_eq!((f.layers[0].mat, f.layers[1].mat), (BRICK, PLASTER));
         assert!((f.thickness() - 480.0).abs() < 1e-9);
     }

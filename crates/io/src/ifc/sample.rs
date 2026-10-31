@@ -2,11 +2,11 @@
 //! L-shaped block of three storeys on a raised ground floor, masonry walls stepping from 480 to
 //! 360 mm, a fire gable, a pitched roof with two gables, a U-turn staircase with a stairwell
 //! window across the floors, windows and doors, a steel balcony with tie rods (new in the
-//! proposal phase) and a cantilever balcony, interior walls with doors, a plinth, gutters and
-//! rooms. Not any real address.
+//! proposal phase) and a cantilever balcony, interior walls with doors, a plinth, a rendered
+//! courtyard facade, rendered bands on the street front, gutters and rooms. Not any real address.
 
 use trigon_model::component::{Deck, Finish, Railing, Screens};
-use trigon_model::doc::Plinth;
+use trigon_model::doc::{Band, Plinth, WallFinish};
 use trigon_model::{
     Building, ComponentKind, ComponentType, Document, FacadeKind, GeoPoint, InteriorWall, Phase, Placement, Result, Roof, Room, Site, Stair,
     StairKind, WallDoor,
@@ -95,6 +95,13 @@ pub fn document() -> Result<Document> {
         gutters: true,
     };
     b.plinth = Some(Plinth { height: 500.0, projection: 30.0 });
+    // A rendered courtyard side, and rendered bands at the floors of the street front.
+    if let Some(f) = b.facades.get_mut(2) {
+        f.finish = Some(WallFinish::Render);
+    }
+    if let Some(f) = b.facades.get_mut(0) {
+        f.bands = vec![Band { levels: vec![1, 2], bottom: -300.0, top: 100.0, projection: 40.0 }];
+    }
     let bays: [Vec<f64>; 5] = [
         trigon_model::build::even_bays(18000.0, 5, 900.0),
         trigon_model::build::even_bays(10000.0, 3, 900.0),

@@ -38,7 +38,10 @@ impl Ifc<'_> {
                 }
             }
             let foot = pieces.iter().find(|p| p.wall == wall.id).map(|p| (p.id, p.seg.level));
-            self.plinth(wall, foot, fl);
+            self.covering(wall, &wall.plinth, "plinth", "Sokkel", ".CLADDING.", catalog::PLINTH, foot, fl);
+            // Bands stand proud of the pieces they run along; the covering relates to the first.
+            let band = band_piece(wall, &pieces);
+            self.covering(wall, &wall.trim, "trim", "Bånd", ".MOLDING.", catalog::RENDER, band, fl);
         }
         let mut interior = BTreeMap::new();
         for iw in &b.interior {
@@ -68,7 +71,7 @@ impl Ifc<'_> {
         if ring.len() < 3 || !(area(&ring) > 1.0) || !(h > 1.0) {
             return None;
         }
-        let up = catalog::facade(t, wall.kind == FacadeKind::Party);
+        let up = catalog::facade(t, wall.kind == FacadeKind::Party, wall.finish);
         let placed = self.w.place(Some(fl.at(seg.level)), frame);
         let axis = self.w.polyline(&[[0.0, 0.0], [len, 0.0]], false);
         let solid = self.extruded(&ring, &[], h, up.face());
@@ -175,22 +178,33 @@ impl Ifc<'_> {
         }
     }
 
-    /// A facade's plinth (sokkel): a cladding in front of the foot of the wall.
-    fn plinth(&mut self, wall: &BuiltWall, foot: Option<(usize, usize)>, fl: &mut Floors) {
-        if wall.plinth.is_empty() {
+    /// A covering on a facade (the plinth, the rendered bands): `<facade>.<what>`, covering the
+    /// wall piece `on` and contained in that piece's storey.
+    fn covering(
+        &mut self,
+        wall: &BuiltWall,
+        mesh: &trigon_model::Mesh,
+        what: &str,
+        name: &str,
+        kind: &str,
+        mat: catalog::Mat,
+        on: Option<(usize, usize)>,
+        fl: &mut Floors,
+    ) {
+        if mesh.is_empty() {
             return;
         }
-        let Some((piece, level)) = foot else { return };
-        let key = format!("{}.plinth", wall.id);
-        let frame = fills::facade_frame_at(&wall.frame, std::iter::once(&wall.plinth));
+        let Some((piece, level)) = on else { return };
+        let key = format!("{}.{what}", wall.id);
+        let frame = fills::facade_frame_at(&wall.frame, std::iter::once(mesh));
         let placed = self.w.place(Some(fl.at(level)), frame);
-        let Some(item) = self.w.faceset(&wall.plinth, &frame) else { return };
-        self.cat.paint(&mut self.w, item, catalog::PLINTH);
+        let Some(item) = self.w.faceset(mesh, &frame) else { return };
+        self.cat.paint(&mut self.w, item, mat);
         let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_FACADE) else { return };
-        let id = self.w.add(format!("IFCCOVERING({},$,'Sokkel',$,$,#{},#{shape},{},.CLADDING.)", gid(&key), placed.id, string(&key)));
+        let id = self.w.add(format!("IFCCOVERING({},$,{},$,$,#{},#{shape},{},{kind})", gid(&key), string(name), placed.id, string(&key)));
         self.w.add(format!("IFCRELCOVERSBLDGELEMENTS({},$,$,$,#{piece},(#{id}))", gid(&format!("{key}.covers"))));
-        self.common("Pset_CoveringCommon", id, "Sokkel", None, vec![("IsExternal", Val::Bool(true))]);
-        self.made_of(id, catalog::PLINTH);
+        self.common("Pset_CoveringCommon", id, name, None, vec![("IsExternal", Val::Bool(true))]);
+        self.made_of(id, mat);
         fl.contain(level, id);
     }
 
@@ -267,6 +281,13 @@ impl Ifc<'_> {
             }
         }
     }
+}
+
+/// The piece a facade's bands start on: the one their lowest point stands in front of.
+fn band_piece(wall: &BuiltWall, pieces: &[Piece]) -> Option<(usize, usize)> {
+    let low = wall.trim.positions.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
+    let mine: Vec<&Piece> = pieces.iter().filter(|p| p.wall == wall.id).collect();
+    mine.iter().find(|p| low < p.seg.z1).or(mine.last()).map(|p| (p.id, p.seg.level))
 }
 
 /// The area of a piece's openings in the wall's elevation, mm².

@@ -17,8 +17,9 @@ A made-up sample is in [`examples/sample-building.ifc`](../examples/sample-build
 block of three storeys on a 300 mm raised ground floor, masonry stepping from 480 to 360 mm, a fire
 gable, a 40° roof with two gables, a U-turn staircase with stairwell windows across the floors, a
 steel balcony with tie rods on two floors (new in the phase "forslag"), a cantilever balcony and a
-French balcony, interior walls with doors, a 500 mm plinth, a roof build-up (250 mm, 300 mm overhang,
-100 mm verges) with gutters, and rooms. Regenerate it with
+French balcony, interior walls with doors, a 500 mm plinth, a rendered courtyard facade, rendered
+bands at the floors of the street front, a roof build-up (250 mm, 300 mm overhang, 100 mm verges)
+with gutters, and rooms. Regenerate it with
 `TRIGON_WRITE_SAMPLE=1 cargo test -p trigon-io --test sample_building`.
 
 ## The file
@@ -36,7 +37,7 @@ French balcony, interior walls with doors, a 500 mm plinth, a roof build-up (250
 
 | Trigon | IFC | Geometry and placement | Type, material, properties |
 |---|---|---|---|
-| Facade wall, one piece per storey (`<facade>.L<level>`) | `IfcWallStandardCase` .SOLIDWALL. | Placed at the outer face's start at the bottom of the piece, x along the facade, y into the building. `Axis` `Curve2D`: the outer face (the reference line), (0,0)–(length,0). `Body` `SweptSolid`: the plan outline (mitred at corners, stepping inside at every floor) extruded up the piece's height | `IfcWallType` per build-up, e.g. "Ydervæg, massiv mur 2½ sten, 600 mm" = brick 585 + lime plaster 15; a party wall is "Brandgavl, …". `IfcMaterialLayerSetUsage` AXIS2, POSITIVE, offset 0 (layers from the outer face in). `Pset_WallCommon` (Reference = type name, IsExternal, LoadBearing), `Qto_WallBaseQuantities` (Length, Width, Height, footprint, side and volume quantities, net of openings) |
+| Facade wall, one piece per storey (`<facade>.L<level>`) | `IfcWallStandardCase` .SOLIDWALL. | Placed at the outer face's start at the bottom of the piece, x along the facade, y into the building. `Axis` `Curve2D`: the outer face (the reference line), (0,0)–(length,0). `Body` `SweptSolid`: the plan outline (mitred at corners, stepping inside at every floor) extruded up the piece's height | `IfcWallType` per build-up and finish, e.g. "Ydervæg, massiv mur 2½ sten, 600 mm" = brick 585 + lime plaster 15; "Ydervæg, pudset mur …" = render 15 + brick + plaster 15; "Ydervæg, massiv mur, røde sten …"; a party wall is "Brandgavl, …". The body has the finish's colour. `IfcMaterialLayerSetUsage` AXIS2, POSITIVE, offset 0 (layers from the outer face in). `Pset_WallCommon` (Reference = type name, IsExternal, LoadBearing), `Qto_WallBaseQuantities` (Length, Width, Height, footprint, side and volume quantities, net of openings) |
 | Facade piece that isn't a straight band (a wedge where a short jog collapses the inner line) | `IfcWall` | As above, the plan outline as it is | Same type; the material layer set itself (no usage) |
 | Interior wall per storey (`<id>.L<level>`) | `IfcWallStandardCase` .SOLIDWALL. (load-bearing) or .PARTITIONING. | Placed at the joined centre line's start, x along it. `Axis`: the centre line. `Body`: the joined outline (ends cut on the faces they meet) | "Bærende indervæg, massiv mur 1 sten, 240 mm" (plaster 10 + brick + plaster 10) or "Let skillevæg, 100 mm" (gypsum 13 + studs and mineral wool + gypsum 13). Usage AXIS2, POSITIVE, offset −thickness/2 |
 | Wall joins | `IfcRelConnectsPathElements` | Facade pieces at each footprint corner (ATEND–ATSTART); an interior wall end on a facade (ATSTART/ATEND–ATPATH) or on another wall (ATPATH in its middle, ATSTART/ATEND at its ends) | |
@@ -53,6 +54,8 @@ French balcony, interior walls with doors, a 500 mm plinth, a roof build-up (250
 | French balcony rail | `IfcRailing` .GUARDRAIL. | Triangulated | `Pset_RailingCommon` (Height) |
 | Door in an interior wall | `IfcOpeningElement` through the wall + `IfcDoor` (`IfcDoorType` 'door.interior') | The opening placed at the door's bottom corner on the wall's right side, through the wall; the door (frame and closed leaf) placed in it | `Pset_DoorCommon` IsExternal false; the wall's NetVolume and NetSideArea are net of its doors |
 | Plinth (sokkel) | `IfcCovering` .CLADDING. 'Sokkel' per facade + `IfcRelCoversBldgElements` to the facade's lowest piece | Triangulated, in front of the wall's foot, with the facade's openings cut through it | Rendered plinth material, `Pset_CoveringCommon` |
+| Rendered bands | `IfcCovering` .MOLDING. 'Bånd' per facade, covering the piece where the lowest band runs | Triangulated, proud of the wall, openings cut through | Facade render |
+| Cellar stair (kældernedgang) | `IfcStair` .STRAIGHT_RUN_STAIR. 'Kældernedgang' aggregating an `IfcStairFlight` (one riser per step), the pit's retaining walls as `IfcWall` .USERDEFINED. 'Støttemur' and the kerb railing as `IfcRailing` | Triangulated, along the facade; its door is an ordinary opening and door in the basement wall | `Pset_StairCommon`, `Qto_WallBaseQuantities` volumes for the retaining walls |
 | Stair balustrade (U-turn stairs) | `IfcRailing` .BALUSTRADE. 'Trappeværn', part of the stair | Triangulated | `Pset_RailingCommon` |
 
 Why these choices:
@@ -97,7 +100,7 @@ Every shape is on an `IfcPresentationLayerAssignment` (Vectorworks turns these i
   schema and where-rule errors (`ifcopenshell.validate` with EXPRESS rules), whether a shape is built
   for every product, and each wall's volume from IfcOpenShell (openings cut) against its
   `NetVolume`. It exits 0 when there are no errors, every product has a shape and every wall is
-  within 0.5 %. For the sample: 0 errors, 205 of 205 shapes, 34 walls within 3·10⁻¹¹, and each roof plane's
+  within 0.5 %. For the sample: 0 errors, 206 of 206 shapes, 34 walls within 3·10⁻¹¹, and each roof plane's
   volume equals its NetVolume.
 
 ## Limits
@@ -129,19 +132,21 @@ Open `examples/sample-building.ifc` (and then a real export) and tick off:
 3. Windows and doors sit in cut openings; their type names are Trigon's ("Casement window, 2
    sashes", …). The stairwell windows on the wing's east side cut through the floor line. Interior
    walls have 11 doors in cut openings.
-4. Floors per storey; the first floor has the stair hole. The roof is one roof of four planes,
+4. The courtyard side of the main block is "Ydervæg, pudset mur …" in render white; the street
+   front has rendered bands at the first and second floors.
+5. Floors per storey; the first floor has the stair hole. The roof is one roof of four planes,
    250 mm thick, 300 mm past the walls at the eaves, with two gable walls and four gutters. A
    plinth runs along the foot of every facade.
-5. Two stairs (ground to first, first to second floor), each two flights, a landing and a
+6. Two stairs (ground to first, first to second floor), each two flights, a landing and a
    balustrade along the well; the stair's IFC parameters give NumberOfRiser and RiserHeight.
-6. Rooms (with Open IFC or Link IFC, depending on the Revit version they come in as rooms or as
+7. Rooms (with Open IFC or Link IFC, depending on the Revit version they come in as rooms or as
    generic elements): 14, numbered "0.01" … with names Butik, Lager, Kontor, Stue, Værelse, Køkken,
    Bad, Trapperum.
-7. Balconies: on the street side two steel balconies, each an assembly of a deck, a railing, four
+8. Balconies: on the street side two steel balconies, each an assembly of a deck, a railing, four
    beams and two tie rods (the parts should land in Floors, Railings and Structural Framing or
    Generic Models), Status NEW; at the back a cantilever balcony and a French balcony.
-8. Colours: brick walls, white frames, transparent glass, red roof.
-9. Manage → Coordinates → Report Shared Coordinates on the survey point (after Acquire Coordinates
+9. Colours: brick walls, white frames, transparent glass, red roof.
+10. Manage → Coordinates → Report Shared Coordinates on the survey point (after Acquire Coordinates
    if needed): E 724 321.791, N 6 178 467.512 in EPSG:25832 for the sample.
 
 **Vectorworks 2024 or later**: File → Import → Import IFC, with the option to convert IFC entities

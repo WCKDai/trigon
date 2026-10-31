@@ -283,7 +283,6 @@ impl W {
 }
 
 /// Volume of a closed, consistently oriented mesh (divergence theorem), mm³.
-#[cfg(test)]
 pub fn volume(m: &Mesh) -> f64 {
     let v: f64 = m
         .triangles

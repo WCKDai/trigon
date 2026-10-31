@@ -164,7 +164,7 @@ pub fn balcony(elements: &[&BuiltElement], kind: Option<&ComponentKind>) -> Vec<
                 }
                 out.push(Product { key: e.id.clone(), class: Class::Slab, name: e.name.clone(), parts });
             }
-            ElementClass::Window | ElementClass::Door => {}
+            ElementClass::Window | ElementClass::Door | ElementClass::Stair => {}
         }
     }
     out
@@ -460,17 +460,34 @@ pub fn stairs(bd: &Building) -> Vec<StairPieces<'_>> {
     out
 }
 
-/// Wall attachments grouped per balcony (`<slot>.balcony.slab`, `<slot>.balcony.rail` → `<slot>.balcony`).
+/// Wall attachments grouped per balcony (`<slot>.balcony.slab`, `<slot>.balcony.rail` →
+/// `<slot>.balcony`); a cellar stair is a group of its own.
 pub fn attachment_groups(wall: &BuiltWall) -> Vec<(String, Vec<&BuiltElement>)> {
     let mut groups: Vec<(String, Vec<&BuiltElement>)> = Vec::new();
     for a in &wall.attachments {
-        let key = a.id.rsplit_once('.').map_or(a.id.as_str(), |(k, _)| k).to_string();
+        let key = if a.class == ElementClass::Stair { a.id.clone() } else { a.id.rsplit_once('.').map_or(a.id.as_str(), |(k, _)| k).to_string() };
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(a),
             None => groups.push((key, vec![a])),
         }
     }
     groups
+}
+
+/// A cellar stair's pieces: the pit's retaining walls, the flight and the railing, by key.
+pub fn cellar(e: &BuiltElement) -> Vec<(String, Material, Mesh)> {
+    e.parts
+        .iter()
+        .filter_map(|(m, mesh)| {
+            let what = match m {
+                Material::Slab => "pit",
+                Material::Sill => "flight",
+                Material::Railing => "railing",
+                _ => return None,
+            };
+            Some((format!("{}.{what}", e.id), *m, mesh.clone()))
+        })
+        .collect()
 }
 
 /// Every product the IFC export gives its own body, by Trigon id (the GlobalId seed), with
@@ -499,6 +516,9 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 }
             }
             for (_, group) in attachment_groups(w) {
+                for e in group.iter().filter(|e| e.class == ElementClass::Stair) {
+                    out.extend(cellar(e).into_iter().map(|(k, _, m)| (k, m)));
+                }
                 let kind = group.first().and_then(|e| kind_of(e));
                 for p in balcony(&group, kind.as_ref()) {
                     out.push((p.key, merged(&p.parts)));
@@ -522,6 +542,7 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
         }
         for w in &b.walls {
             out.push((format!("{}.plinth", w.id), w.plinth.clone()));
+            out.push((format!("{}.trim", w.id), w.trim.clone()));
         }
         if let Some(bd) = doc.buildings.iter().find(|x| x.id == b.building_id) {
             for st in stairs(bd) {

@@ -203,7 +203,7 @@ impl Ifc<'_> {
         if ring.len() < 3 || !(area(&ring) > 1.0) || !(t > 0.0) {
             return None;
         }
-        let up = catalog::facade(t, wall.kind == trigon_model::FacadeKind::Party);
+        let up = catalog::facade(t, wall.kind == trigon_model::FacadeKind::Party, wall.finish);
         let placed = self.w.place(Some(fl.at(top)), frame);
         let profile = self.w.profile(&ring, &[]);
         // The profile stands in the x–z plane and is extruded into the building (+y).
