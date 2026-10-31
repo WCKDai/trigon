@@ -217,10 +217,74 @@ pub struct DrawingPreview {
     pub transform: DrawingTransform,
     /// Visible path segments in drawing-plane mm, for precise endpoint/midpoint/intersection snaps.
     pub segments: Vec<[[f64; 2]; 2]>,
+    pub element_segments: Vec<DrawingElementSegment>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrawingElementKind {
+    Opening,
+    InteriorWall,
+    FacadeWall,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct DrawingElementSegment {
+    pub id: String,
+    pub kind: DrawingElementKind,
+    pub segment: [[f64; 2]; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct DrawingElementHit {
+    pub id: String,
+    pub kind: DrawingElementKind,
+    pub point: [f64; 2],
+    pub distance_mm: f64,
+}
+
+impl DrawingPreview {
+    pub fn pick_element(&self, point: [f64; 2], tolerance_mm: f64) -> Option<DrawingElementHit> {
+        if point.iter().any(|value| !value.is_finite() || value.abs() > 1_000_000.0)
+            || !tolerance_mm.is_finite()
+            || !(0.0..=100_000.0).contains(&tolerance_mm)
+        {
+            return None;
+        }
+        self.element_segments
+            .iter()
+            .filter_map(|element| {
+                let [start, end] = element.segment;
+                if element.id.is_empty() || element.segment.iter().flatten().any(|value| !value.is_finite() || value.abs() > 1e8) {
+                    return None;
+                }
+                let direction = [end[0] - start[0], end[1] - start[1]];
+                let length2 = direction[0] * direction[0] + direction[1] * direction[1];
+                if length2 <= 1e-16 {
+                    return None;
+                }
+                let along = (((point[0] - start[0]) * direction[0] + (point[1] - start[1]) * direction[1]) / length2).clamp(0.0, 1.0);
+                let nearest = [start[0] + along * direction[0], start[1] + along * direction[1]];
+                let distance_mm = (point[0] - nearest[0]).hypot(point[1] - nearest[1]);
+                (distance_mm <= tolerance_mm).then(|| DrawingElementHit { id: element.id.clone(), kind: element.kind, point: nearest, distance_mm })
+            })
+            .min_by(|left, right| {
+                left.distance_mm
+                    .total_cmp(&right.distance_mm)
+                    .then(left.kind.cmp(&right.kind))
+                    .then(left.id.cmp(&right.id))
+                    .then(left.point[0].total_cmp(&right.point[0]))
+                    .then(left.point[1].total_cmp(&right.point[1]))
+            })
+    }
 }
 
 fn preview(sheet: Sheet) -> DrawingPreview {
     let mut segments = Vec::new();
+    let mut element_segments = Vec::new();
+    let [left, top, width, height] = sheet.clip;
+    let [x0, y1] = sheet.vp.at([left, top]);
+    let [x1, y0] = sheet.vp.at([left + width, top + height]);
     for item in &sheet.scene.items {
         let Item::Path(path) = item else { continue };
         for ring in &path.rings {
@@ -229,8 +293,45 @@ fn preview(sheet: Sheet) -> DrawingPreview {
                 segments.push([ring[ring.len() - 1], ring[0]]);
             }
         }
+        if path.stroke.is_some() {
+            for element in &path.element_segments {
+                for segment in path.segments() {
+                    if let Some([start, end]) = crate::sheet::overlap(segment, element.segment, 0.5)
+                        && let Some((start, end)) = crate::sheet::clip_segment(start, end, [x0, y0, x1, y1])
+                    {
+                        let segment = [start, end].map(|point| {
+                            point.map(|coordinate| {
+                                let coordinate = (coordinate * 100_000_000.0).round() / 100_000_000.0;
+                                if coordinate == 0.0 { 0.0 } else { coordinate }
+                            })
+                        });
+                        let segment = if segment[0] <= segment[1] { segment } else { [segment[1], segment[0]] };
+                        if segment[0] != segment[1] {
+                            element_segments.push(DrawingElementSegment { segment, ..element.clone() });
+                        }
+                    }
+                }
+            }
+        }
     }
-    DrawingPreview { svg: sheet.svg(), transform: DrawingTransform { x0: sheet.vp.x0, y1: sheet.vp.y1, mm_per_px: sheet.vp.mm }, segments }
+    element_segments.sort_by(|left, right| {
+        left.kind.cmp(&right.kind).then(left.id.cmp(&right.id)).then_with(|| {
+            left.segment
+                .iter()
+                .flatten()
+                .zip(right.segment.iter().flatten())
+                .map(|(left, right)| left.total_cmp(right))
+                .find(|order| !order.is_eq())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    element_segments.dedup();
+    DrawingPreview {
+        svg: sheet.svg(),
+        transform: DrawingTransform { x0: sheet.vp.x0, y1: sheet.vp.y1, mm_per_px: sheet.vp.mm },
+        segments,
+        element_segments,
+    }
 }
 
 pub fn drawing_view(doc: &Document, id: &str, phase: View) -> Result<DrawingPreview> {
@@ -394,6 +495,25 @@ pub(crate) struct SnapRequest {
     pub filter: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PickRequest {
+    pub id: String,
+    pub point: [f64; 2],
+    pub tolerance_mm: f64,
+    pub phase: Option<String>,
+    pub filter: Option<String>,
+}
+
+pub(crate) fn pick(doc: &Document, request: PickRequest, view: View) -> Result<Value> {
+    for coordinate in request.point {
+        trigon_model::checked("point", coordinate, -1_000_000.0, 1_000_000.0)?;
+    }
+    trigon_model::checked("tolerance_mm", request.tolerance_mm, 0.0, 100_000.0)?;
+    let preview = drawing_view(doc, &request.id, view)?;
+    Ok(json!({"hit":preview.pick_element(request.point, request.tolerance_mm)}))
+}
+
 pub(crate) fn snap(doc: &Document, p: SnapRequest, view: View) -> Result<Value> {
     for coordinate in p.point {
         trigon_model::checked("point", coordinate, -1_000_000.0, 1_000_000.0)?;
@@ -405,6 +525,356 @@ pub(crate) fn snap(doc: &Document, p: SnapRequest, view: View) -> Result<Value> 
     let preview = drawing_view(doc, &p.id, view)?;
     let snapped = snap_drawing(&preview.segments, p.point, p.tolerance_mm, p.options);
     Ok(json!({"point":snapped.map_or(p.point,|s|s.point),"snap":snapped}))
+}
+
+#[cfg(test)]
+mod picking_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut session = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        session.doc.buildings.push(
+            trigon_model::Building::new("b", "Picking fixture", &[[0.0, 0.0], [12000.0, 0.0], [12000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap(),
+        );
+        for (command, params) in [
+            ("facade.set_bays", json!({"facade":"b.f1","count":3})),
+            ("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[0],"bays":[0]})),
+            ("facade.place", json!({"facade":"b.f1","type":"door.entrance","levels":[0],"bays":[2]})),
+            (
+                "interior.add_walls",
+                json!({"walls":[{"id":"partition","a":[2000,4000],"b":[10000,4000],"thickness":150,"levels":[0],"doors":[{"at":4000,"width":900}]}]}),
+            ),
+            ("view.define", json!({"id":"plan","name":"Plan","kind":{"view":"plan","level":0}})),
+            ("view.define", json!({"id":"facade","name":"Facade","kind":{"view":"facade","facade":"b.f1"}})),
+            ("view.define", json!({"id":"section","name":"Section","kind":{"view":"section","from":[0,2000],"to":[12000,2000]}})),
+        ] {
+            session.execute(command, params).unwrap();
+        }
+        session
+    }
+
+    fn fingerprint(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+    }
+
+    #[test]
+    fn drawing_outputs_retain_baseline_bytes() {
+        let session = session();
+        for (id, expected) in [
+            ("plan", [10244507659954298824, 11109581394211914227]),
+            ("facade", [12304697737480228178, 7625715272030178447]),
+            ("section", [13566637633045740336, 3463606591175843950]),
+        ] {
+            let sheet = sheet(&session.doc, id, View::latest(&session.doc)).unwrap();
+            let dxf = crate::sheet::dxf::write(
+                &sheet.scene,
+                &crate::sheet::dxf::TitleBlock { title: &sheet.title, project: &sheet.project, caption: &sheet.caption, note: sheet.note.clone() },
+            );
+            let legacy_segments: Vec<_> = sheet
+                .scene
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Path(path) => Some(path.rings.iter().flat_map(move |ring| {
+                        ring.windows(2).map(|pair| [pair[0], pair[1]]).chain((path.closed && ring.len() > 2).then(|| [ring[ring.len() - 1], ring[0]]))
+                    })),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            let preview = preview(sheet);
+            assert_eq!(
+                [fingerprint(preview.svg.as_bytes()), fingerprint(dxf.as_bytes())],
+                expected,
+                "{id} SVG and DXF must retain their baseline bytes"
+            );
+            assert_eq!(
+                serde_json::to_vec(&preview.segments).unwrap(),
+                serde_json::to_vec(&legacy_segments).unwrap(),
+                "{id} preserves baseline segment extraction byte-for-byte"
+            );
+        }
+    }
+
+    fn assert_pick(preview: &DrawingPreview, point: [f64; 2], id: &str, kind: DrawingElementKind) {
+        let hit = preview.pick_element(point, 1.0).unwrap_or_else(|| panic!("no hit at {point:?} for {id}"));
+        assert_eq!((hit.id.as_str(), hit.kind), (id, kind), "at {point:?}");
+        assert!(hit.distance_mm <= 1.0);
+    }
+
+    #[test]
+    fn plans_pick_window_door_facade_and_interior_semantic_ids() {
+        let session = session();
+        let preview = plan_drawing(&session.doc, 0, View::latest(&session.doc)).unwrap();
+        let facade = &session.doc.buildings[0].facades[0];
+        for (point, id, kind) in [
+            ([facade.bays[0], 140.0], "b.f1.L0.B0", DrawingElementKind::Opening),
+            ([facade.bays[2], 200.0], "b.f1.L0.B2", DrawingElementKind::Opening),
+            ([6000.0, 0.0], "b.f1", DrawingElementKind::FacadeWall),
+            ([3000.0, 3925.0], "partition.L0", DrawingElementKind::InteriorWall),
+            ([6000.0, 4000.0], "partition.L0.D0", DrawingElementKind::Opening),
+        ] {
+            assert_pick(&preview, point, id, kind);
+        }
+        let near = preview.pick_element([3000.0, 3920.0], 5.0).unwrap();
+        assert_eq!(near.id, "partition.L0");
+        assert_eq!(near.point, [3000.0, 3925.0]);
+        assert_eq!(near.distance_mm, 5.0);
+        assert!(preview.pick_element([3000.0, 3920.0], 4.99).is_none());
+        assert!(preview.pick_element([6000.0, 6500.0], 10.0).is_none());
+    }
+
+    #[test]
+    fn facades_and_sections_pick_visible_fill_and_host_ids() {
+        let mut session = session();
+        let phase = View::latest(&session.doc);
+        let facade = drawing_view(&session.doc, "facade", phase).unwrap();
+        let bays = &session.doc.buildings[0].facades[0].bays;
+        assert_pick(&facade, [bays[0], 850.0], "b.f1.L0.B0", DrawingElementKind::Opening);
+        assert_pick(&facade, [bays[2], 2300.0], "b.f1", DrawingElementKind::FacadeWall);
+        assert_pick(&facade, [bays[2], 2240.0], "b.f1.L0.B2", DrawingElementKind::Opening);
+        assert_pick(&facade, [0.0, 3000.0], "b.f1", DrawingElementKind::FacadeWall);
+        assert!(!facade.element_segments.iter().any(|element| element.id.starts_with("partition")));
+        let section = drawing_view(&session.doc, "section", phase).unwrap();
+        assert_pick(&section, [0.0, 1500.0], "b.f4", DrawingElementKind::FacadeWall);
+        assert_pick(&section, [2000.0, 1500.0], "partition.L0", DrawingElementKind::InteriorWall);
+        assert_pick(&section, [6000.0, 2100.0], "partition.L0.D0", DrawingElementKind::Opening);
+        session.execute("view.define", json!({"id":"cut","name":"Cut","kind":{"view":"section","from":[0,4000],"to":[12000,4000]}})).unwrap();
+        let cut = drawing_view(&session.doc, "cut", phase).unwrap();
+        assert_pick(&cut, [2000.0, 1500.0], "partition.L0", DrawingElementKind::InteriorWall);
+        assert_pick(&cut, [6000.0, 2100.0], "partition.L0.D0", DrawingElementKind::Opening);
+        assert!(section.pick_element([6000.0, 4500.0], 1.0).is_none());
+    }
+
+    #[test]
+    fn unioned_wall_boundaries_preserve_owners_without_pickable_internal_seams() {
+        let mut session = session();
+        session
+            .execute(
+                "interior.add_walls",
+                json!({"walls":[
+                    {"id":"left","a":[2000,6000],"b":[6000,6000],"thickness":150,"levels":[0]},
+                    {"id":"right","a":[6000,6000],"b":[10000,6000],"thickness":150,"levels":[0]}
+                ]}),
+            )
+            .unwrap();
+        let preview = plan_drawing(&session.doc, 0, View::latest(&session.doc)).unwrap();
+        assert_pick(&preview, [4000.0, 5925.0], "left.L0", DrawingElementKind::InteriorWall);
+        assert_pick(&preview, [8000.0, 5925.0], "right.L0", DrawingElementKind::InteriorWall);
+        assert!(preview.pick_element([6000.0, 6000.0], 10.0).is_none());
+    }
+
+    #[test]
+    fn picks_are_order_independent_nearest_first_with_explicit_ties() {
+        let segment = [[0.0, 0.0], [100.0, 0.0]];
+        let mut preview = DrawingPreview {
+            svg: String::new(),
+            transform: DrawingTransform { x0: 0.0, y1: 0.0, mm_per_px: 1.0 },
+            segments: Vec::new(),
+            element_segments: vec![
+                DrawingElementSegment { id: "a-host".into(), kind: DrawingElementKind::FacadeWall, segment },
+                DrawingElementSegment { id: "a-interior".into(), kind: DrawingElementKind::InteriorWall, segment },
+                DrawingElementSegment { id: "z-opening".into(), kind: DrawingElementKind::Opening, segment },
+                DrawingElementSegment { id: "a-opening".into(), kind: DrawingElementKind::Opening, segment },
+            ],
+        };
+        let hit = preview.pick_element([50.0, 5.0], 5.0).unwrap();
+        assert_eq!(hit.id, "a-opening");
+        assert_eq!(hit.point, [50.0, 0.0]);
+        assert_eq!(hit.distance_mm, 5.0);
+        preview.element_segments.reverse();
+        for element in &mut preview.element_segments {
+            element.segment.reverse();
+        }
+        assert_eq!(preview.pick_element([50.0, 5.0], 5.0), Some(hit));
+        preview.element_segments.retain(|element| element.kind != DrawingElementKind::Opening);
+        assert_eq!(preview.pick_element([50.0, 0.0], 0.0).unwrap().id, "a-interior");
+        preview.element_segments.push(DrawingElementSegment {
+            id: "near-host".into(),
+            kind: DrawingElementKind::FacadeWall,
+            segment: [[0.0, 4.0], [100.0, 4.0]],
+        });
+        assert_eq!(preview.pick_element([50.0, 5.0], 5.0).unwrap().id, "near-host");
+        assert_eq!(preview.pick_element([-3.0, 0.0], 3.0).unwrap().point, [0.0, 0.0]);
+        assert!(preview.pick_element([-3.0, 0.0], 2.99).is_none());
+    }
+
+    #[test]
+    fn picking_ignores_hostile_geometry_and_refuses_invalid_queries() {
+        let session = session();
+        let mut preview = plan_drawing(&session.doc, 0, View::latest(&session.doc)).unwrap();
+        let point = [3000.0, 3925.0];
+        let expected = preview.pick_element(point, 0.0);
+        for segment in [[[f64::NAN, 0.0], point], [[f64::INFINITY, 0.0], point], [[f64::MAX, 0.0], point], [point, point]] {
+            preview.element_segments.push(DrawingElementSegment { id: "hostile".into(), kind: DrawingElementKind::Opening, segment });
+        }
+        preview.element_segments.push(DrawingElementSegment {
+            id: String::new(),
+            kind: DrawingElementKind::Opening,
+            segment: [[0.0, 3925.0], [4000.0, 3925.0]],
+        });
+        assert_eq!(preview.pick_element(point, 0.0), expected);
+        for coordinate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 1_000_001.0, -1_000_001.0] {
+            assert!(preview.pick_element([coordinate, 0.0], 10.0).is_none());
+            assert!(preview.pick_element([0.0, coordinate], 10.0).is_none());
+        }
+        for tolerance in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -0.001, 100_000.001] {
+            assert!(preview.pick_element(point, tolerance).is_none());
+        }
+    }
+
+    #[test]
+    fn pick_command_is_additive_read_only_and_checks_hostile_params() {
+        let mut session = session();
+        let before = session.doc.clone();
+        let history = (session.undo.len(), session.redo.len(), session.dirty);
+        let spec = crate::commands().iter().find(|command| command.id == "view.pick").unwrap();
+        assert!(!spec.mutates && !spec.journaled);
+        let result = session.execute("view.pick", json!({"id":"plan","point":[3000,3920],"tolerance_mm":5})).unwrap();
+        assert_eq!(result, json!({"hit":{"id":"partition.L0","kind":"interior_wall","point":[3000.0,3925.0],"distance_mm":5.0}}));
+        assert_eq!(session.execute("view.pick", json!({"id":"plan","point":[6000,6500],"tolerance_mm":1})).unwrap(), json!({"hit":null}));
+        for params in [
+            json!({"id":"plan","point":[1e300,0],"tolerance_mm":5}),
+            json!({"id":"plan","point":[0,1e300],"tolerance_mm":5}),
+            json!({"id":"plan","point":[0,0],"tolerance_mm":-1}),
+            json!({"id":"plan","point":[0,0],"tolerance_mm":100001}),
+            json!({"id":"plan","point":[0,0],"tolerance_mm":1e300}),
+            json!({"id":"missing","point":[0,0],"tolerance_mm":1}),
+            json!({"id":"plan","point":[0,0],"tolerance_mm":1,"phase":"missing"}),
+            json!({"id":"plan","point":[0,0],"tolerance_mm":1,"filter":"missing"}),
+            json!({"id":"plan","point":[0,0],"tolerance_mm":1,"extra":true}),
+        ] {
+            let error = session.execute("view.pick", params).unwrap_err();
+            assert!(!matches!(error, crate::EngineError::Internal(_)));
+        }
+        assert_eq!(session.doc, before);
+        assert_eq!((session.undo.len(), session.redo.len(), session.dirty), history);
+    }
+
+    #[test]
+    fn picking_follows_each_drawings_phase_and_filter_visibility() {
+        use trigon_model::build::PhaseFilter;
+        let mut session = session();
+        session
+            .execute(
+                "view.define",
+                json!({"id":"front-section","name":"Front section","kind":{"view":"section","from":[0,-1000],"to":[12000,-1000]}}),
+            )
+            .unwrap();
+        session.execute("phase.set", json!({"phases":[{"id":"existing","name":"Existing"},{"id":"proposal","name":"Proposal"}]})).unwrap();
+        session.execute("facade.demolish", json!({"facade":"b.f1","levels":[0],"bays":[0],"what":"openings"})).unwrap();
+        session.execute("facade.place", json!({"facade":"b.f1","type":"window.fixed","levels":[0],"bays":[1]})).unwrap();
+        for id in ["plan", "facade", "front-section"] {
+            for (phase, filter, old_visible, new_visible) in [
+                (0, PhaseFilter::Complete, true, false),
+                (1, PhaseFilter::Complete, false, true),
+                (1, PhaseFilter::New, false, true),
+                (1, PhaseFilter::All, id == "plan", true),
+                (1, PhaseFilter::Demolition, id == "plan", false),
+            ] {
+                let preview = drawing_view(&session.doc, id, View { phase, filter }).unwrap();
+                let has = |element_id: &str| preview.element_segments.iter().any(|element| element.id == element_id);
+                assert_eq!(has("b.f1.L0.B0"), old_visible, "{id}, {phase}, {filter:?}");
+                assert_eq!(has("b.f1.L0.B1"), new_visible, "{id}, {phase}, {filter:?}");
+            }
+            let old = session.execute("view.pick", json!({"id":id,"point":[session.doc.buildings[0].facades[0].bays[0],if id == "plan" {140.0} else {850.0}],"tolerance_mm":1,"phase":"existing"})).unwrap();
+            assert_eq!(old["hit"]["id"], "b.f1.L0.B0");
+        }
+    }
+
+    #[test]
+    fn picking_metadata_is_deterministic_clipped_and_lies_on_stroked_paths() {
+        let session = session();
+        for id in ["plan", "facade", "section"] {
+            let drawing = sheet(&session.doc, id, View::latest(&session.doc)).unwrap();
+            let strokes: Vec<_> = drawing
+                .scene
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Path(path) if path.stroke.is_some() => Some(path.segments()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            let first = preview(drawing);
+            for _ in 0..8 {
+                let repeated = drawing_view(&session.doc, id, View::latest(&session.doc)).unwrap();
+                assert_eq!(first.element_segments, repeated.element_segments, "{id}");
+            }
+            assert!(!first.element_segments.is_empty(), "{id}");
+            for element in &first.element_segments {
+                assert!(
+                    strokes.iter().any(|stroke| crate::sheet::overlap(element.segment, *stroke, 1e-6).is_some_and(|overlap| {
+                        overlap.iter().flatten().zip(element.segment.iter().flatten()).all(|(actual, expected)| (actual - expected).abs() < 1e-6)
+                    })),
+                    "{id}: {element:?}"
+                );
+            }
+        }
+        let mut cropped = sheet(&session.doc, "plan", View::latest(&session.doc)).unwrap();
+        let top_left = cropped.vp.px([2000.0, 5000.0]);
+        let bottom_right = cropped.vp.px([4000.0, 3000.0]);
+        cropped.clip = [top_left[0], top_left[1], bottom_right[0] - top_left[0], bottom_right[1] - top_left[1]];
+        let cropped = preview(cropped);
+        assert_pick(&cropped, [3000.0, 3925.0], "partition.L0", DrawingElementKind::InteriorWall);
+        assert!(cropped.pick_element([8000.0, 3925.0], 1.0).is_none());
+        assert!(
+            cropped
+                .element_segments
+                .iter()
+                .flat_map(|element| element.segment)
+                .all(|point| (1999.999..=4000.001).contains(&point[0]) && (2999.999..=5000.001).contains(&point[1]))
+        );
+    }
+
+    #[test]
+    fn annotations_levels_and_section_direction_do_not_invent_owners() {
+        let mut session = session();
+        let phase = View::latest(&session.doc);
+        let before = drawing_view(&session.doc, "plan", phase).unwrap();
+        session.execute("annotation.define", json!({"id":"note","view":"plan","kind":{"annotation":"leader","tip":[9000,6000],"elbow":[9500,6500],"at":[10000,6500],"text":"Only annotation"}})).unwrap();
+        let after = drawing_view(&session.doc, "plan", phase).unwrap();
+        assert_eq!(before.element_segments, after.element_segments);
+        assert!(after.segments.len() > before.segments.len());
+        assert!(after.pick_element([9000.0, 6000.0], 10.0).is_none());
+        let upper = plan_drawing(&session.doc, 1, phase).unwrap();
+        assert!(upper.element_segments.iter().all(|element| element.kind == DrawingElementKind::FacadeWall));
+        session
+            .execute("view.define", json!({"id":"flipped","name":"Flipped","kind":{"view":"section","from":[0,2000],"to":[12000,2000],"flip":true}}))
+            .unwrap();
+        let flipped = drawing_view(&session.doc, "flipped", phase).unwrap();
+        assert_pick(&flipped, [0.0, 1500.0], "b.f2", DrawingElementKind::FacadeWall);
+        assert!(!flipped.element_segments.iter().any(|element| element.id.starts_with("partition")));
+    }
+
+    #[test]
+    fn metadata_precision_removes_projection_noise_without_rewriting_paths() {
+        let session = session();
+        for offset in [0.0, 4e-12, -4e-12] {
+            let mut drawing = sheet(&session.doc, "plan", View::latest(&session.doc)).unwrap();
+            drawing.scene.items.clear();
+            let segment = [[1000.0 + offset, 2000.0 + offset], [2000.0 + offset, 2000.0 + offset]];
+            drawing.scene.line(Layer::Wall, segment[0], segment[1], Stroke::new(0.25));
+            drawing.scene.attribute_last(&[DrawingElementSegment { id: "wall".into(), kind: DrawingElementKind::FacadeWall, segment }]);
+            let Item::Path(path) = &drawing.scene.items[0] else { panic!("expected a stroked path") };
+            assert_eq!(path.rings[0], segment);
+            let preview = preview(drawing);
+            assert_eq!(preview.segments, vec![segment]);
+            assert_eq!(
+                preview.element_segments,
+                vec![DrawingElementSegment {
+                    id: "wall".into(),
+                    kind: DrawingElementKind::FacadeWall,
+                    segment: [[1000.0, 2000.0], [2000.0, 2000.0]]
+                }]
+            );
+            assert_eq!(
+                preview.pick_element([1500.0, 2005.0], 5.0),
+                Some(DrawingElementHit { id: "wall".into(), kind: DrawingElementKind::FacadeWall, point: [1500.0, 2000.0], distance_mm: 5.0 })
+            );
+        }
+    }
 }
 
 #[cfg(test)]

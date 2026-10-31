@@ -97,5 +97,14 @@ It is read-only and returns `point` and `snap` (null if none is close). The opti
 `{"mode":"drawing","drawing":"ground","fit":true}`. Its returned `drawing_mapping`, when
 ready, maps drawing coordinates to window points with `screen_x = origin.x + x * points_per_mm`
 and `screen_y = origin.y - y * points_per_mm`. It is updated after pan/zoom and omitted while a
-new drawing is being prepared. Full direct selection and manipulation of model elements from
-2D linework is a separate step; the current canvas picking authors/selects drafting annotations.
+new drawing is being prepared.
+
+Click visible wall, window or door linework in a generated plan, facade or section to select its
+model element. Studio highlights the owned strokes in orange and opens its normal Properties.
+**Edit elements** exposes the existing Move, Copy and Align tools while retaining the drawing
+viewport. Clicking blank paper clears the picked element. Saved annotations have selection
+priority in Document mode; starting a Text/Dimension/Leader/Level pick fills annotation coordinates
+instead of selecting model geometry. The editing command still decides which element classes
+support a change; facade hosts and individual interior door leaves remain inspection targets.
+See [the drawing-picking contract](drawing-picking.md) for boundary-only hit testing, exact IDs,
+phase visibility and the read-only `view.pick` command.

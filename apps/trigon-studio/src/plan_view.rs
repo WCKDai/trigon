@@ -10,7 +10,7 @@ use eframe::egui;
 
 use crate::theme;
 use trigon_engine::resvg::{self, tiny_skia, usvg};
-use trigon_engine::{DrawingSnap, DrawingTransform, SnapOptions, snap_drawing};
+use trigon_engine::{DrawingElementHit, DrawingPreview, DrawingSnap, SnapOptions, snap_drawing};
 
 /// The part of the sheet a picture shows: its top-left in sheet pixels and its scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,7 +44,7 @@ pub fn rasterize(tree: &usvg::Tree, origin: [f32; 2], scale: f32, size: [u32; 2]
 
 pub struct PlanView {
     tree: Option<(u64, Arc<usvg::Tree>)>,
-    geometry: Option<(DrawingTransform, Vec<[[f64; 2]; 2]>)>,
+    geometry: Option<DrawingPreview>,
     /// Sheet pixel at the middle of the view, and screen points per sheet pixel.
     centre: [f32; 2],
     zoom: f32,
@@ -85,7 +85,12 @@ impl PlanView {
 
     pub fn set_drawing(&mut self, generation: u64, drawing: crate::worker::PreparedDrawing) {
         self.set_tree(generation, drawing.tree);
-        self.geometry = Some((drawing.transform, drawing.segments));
+        self.geometry = Some(DrawingPreview {
+            svg: String::new(),
+            transform: drawing.transform,
+            segments: drawing.segments,
+            element_segments: drawing.element_segments,
+        });
     }
 
     pub fn fail(&mut self, error: String) {
@@ -97,7 +102,7 @@ impl PlanView {
     }
 
     pub fn screen_to_model(&self, rect: egui::Rect, p: egui::Pos2) -> Option<[f64; 2]> {
-        let (transform, _) = self.geometry.as_ref()?;
+        let transform = self.geometry.as_ref()?.transform;
         let sheet = [
             f64::from(self.centre[0]) + f64::from(p.x - rect.center().x) / f64::from(self.zoom),
             f64::from(self.centre[1]) + f64::from(p.y - rect.center().y) / f64::from(self.zoom),
@@ -106,7 +111,7 @@ impl PlanView {
     }
 
     pub fn model_to_screen(&self, rect: egui::Rect, p: [f64; 2]) -> Option<egui::Pos2> {
-        let (transform, _) = self.geometry.as_ref()?;
+        let transform = self.geometry.as_ref()?.transform;
         let q = transform.to_sheet(p);
         Some(egui::pos2(rect.center().x + (q[0] as f32 - self.centre[0]) * self.zoom, rect.center().y + (q[1] as f32 - self.centre[1]) * self.zoom))
     }
@@ -114,7 +119,7 @@ impl PlanView {
     /// Affine model-mm → window-point mapping for remote point picking. y points up in the
     /// drawing and down in the window; `origin` is where drawing [0,0] lands on screen.
     pub fn screen_mapping(&self, rect: egui::Rect) -> Option<serde_json::Value> {
-        let (t, _) = self.geometry.as_ref()?;
+        let t = self.geometry.as_ref()?.transform;
         let scale = f64::from(self.zoom) / t.mm_per_px;
         let origin = [
             f64::from(rect.center().x) - t.x0 * scale - f64::from(self.centre[0] * self.zoom),
@@ -124,14 +129,32 @@ impl PlanView {
     }
 
     pub fn tolerance_mm(&self) -> Option<f64> {
-        self.geometry.as_ref().map(|(t, _)| (10.0 * t.mm_per_px / f64::from(self.zoom)).min(100_000.0))
+        self.geometry.as_ref().map(|drawing| (10.0 * drawing.transform.mm_per_px / f64::from(self.zoom)).min(100_000.0))
     }
 
     pub fn cursor(&self, rect: egui::Rect, p: egui::Pos2, options: Option<SnapOptions>) -> Option<([f64; 2], Option<DrawingSnap>)> {
         let point = self.screen_to_model(rect, p)?;
-        let (_, segments) = self.geometry.as_ref()?;
+        let segments = &self.geometry.as_ref()?.segments;
         let snap = options.and_then(|settings| snap_drawing(segments, point, self.tolerance_mm()?, settings));
         Some((snap.map_or(point, |s| s.point), snap))
+    }
+
+    /// Pick the actual visible model linework within ten window points of the cursor.
+    /// The caller waits for the current generation and raster before exposing interaction.
+    pub fn pick_element(&self, rect: egui::Rect, p: egui::Pos2) -> Option<DrawingElementHit> {
+        if !rect.contains(p) {
+            return None;
+        }
+        self.geometry.as_ref()?.pick_element(self.screen_to_model(rect, p)?, self.tolerance_mm()?)
+    }
+
+    pub fn highlight_element(&self, painter: &egui::Painter, rect: egui::Rect, id: &str) {
+        let Some(drawing) = &self.geometry else { return };
+        for line in drawing.element_segments.iter().filter(|line| line.id == id) {
+            if let (Some(a), Some(b)) = (self.model_to_screen(rect, line.segment[0]), self.model_to_screen(rect, line.segment[1])) {
+                painter.line_segment([a, b], egui::Stroke::new(2.0, theme::ACCENT));
+            }
+        }
     }
 
     pub fn fit(&mut self) {
@@ -242,7 +265,12 @@ mod tests {
     #[test]
     fn picking_inverts_the_real_drawing_transform_after_pan_and_zoom() {
         let mut view = PlanView::new(egui::Context::default());
-        view.geometry = Some((DrawingTransform { x0: -24000.0, y1: 18000.0, mm_per_px: 40.0 }, vec![]));
+        view.geometry = Some(DrawingPreview {
+            svg: String::new(),
+            transform: trigon_engine::DrawingTransform { x0: -24000.0, y1: 18000.0, mm_per_px: 40.0 },
+            segments: vec![],
+            element_segments: vec![],
+        });
         view.centre = [860.0, 380.0];
         view.zoom = 3.5;
         let rect = egui::Rect::from_min_size(egui::pos2(240.0, 80.0), egui::vec2(1000.0, 700.0));
@@ -262,6 +290,39 @@ mod tests {
         assert_eq!(snap.unwrap().point, [11000.0, 3000.0]);
         view.fail("invalid drawing".into());
         assert!(view.screen_to_model(rect, screen).is_none(), "a failed view must not pick stale geometry");
+    }
+
+    #[test]
+    fn semantic_picking_keeps_a_screen_sized_tolerance_after_pan_and_zoom() {
+        use trigon_engine::{DrawingElementKind, DrawingElementSegment, DrawingTransform};
+        let mut view = PlanView::new(egui::Context::default());
+        view.geometry = Some(DrawingPreview {
+            svg: String::new(),
+            transform: DrawingTransform { x0: 0.0, y1: 1000.0, mm_per_px: 10.0 },
+            segments: vec![],
+            element_segments: vec![DrawingElementSegment {
+                id: "b1.f1.L0.B0".into(),
+                kind: DrawingElementKind::Opening,
+                segment: [[200.0, 200.0], [700.0, 200.0]],
+            }],
+        });
+        view.centre = [45.0, 55.0];
+        view.zoom = 4.0;
+        let rect = egui::Rect::from_min_size(egui::pos2(240.0, 80.0), egui::vec2(1000.0, 700.0));
+        let near = view.model_to_screen(rect, [400.0, 224.0]).unwrap();
+        let hit = view.pick_element(rect, near).unwrap();
+        assert_eq!(hit.id, "b1.f1.L0.B0");
+        assert!((hit.point[1] - 200.0).abs() < 1e-8);
+        let far = view.model_to_screen(rect, [400.0, 226.0]).unwrap();
+        assert!(view.pick_element(rect, far).is_none());
+        assert!(view.pick_element(rect, rect.min - egui::vec2(1.0, 1.0)).is_none());
+        view.zoom = 8.0;
+        let zoomed = view.model_to_screen(rect, [400.0, 224.0]).unwrap();
+        assert!(view.pick_element(rect, zoomed).is_none(), "zooming in narrows the model-space tolerance");
+        let closer = view.model_to_screen(rect, [400.0, 212.0]).unwrap();
+        assert!(view.pick_element(rect, closer).is_some());
+        view.fail("view changed".into());
+        assert!(view.pick_element(rect, closer).is_none(), "a failed drawing cannot expose old element IDs");
     }
 
     #[test]

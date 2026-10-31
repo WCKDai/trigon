@@ -2,6 +2,7 @@
 //! leaves, balconies with their size, phase colours) over the registered archive plan, as a
 //! PNG (for agents) or an SVG (vector, for drawing sets and offers).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -9,7 +10,8 @@ use serde_json::{Value, json};
 use trigon_model::build::{FacadeFrame, Status, View, build_view};
 use trigon_model::{ComponentKind, Document, ModelError};
 
-use crate::sheet::{Fill, Halo, Layer, MM_PER_PX, PAGE_MM, Scene, Stroke, Text, Viewport, dxf, scale_text, sheet_scale, svg};
+use crate::sheet::{Element, Fill, Halo, Layer, MM_PER_PX, PAGE_MM, Scene, Stroke, Text, Viewport, dxf, scale_text, sheet_scale, svg};
+use crate::views::DrawingElementKind;
 use crate::{EngineError, Result, Session};
 
 const CUT: f64 = 1000.0;
@@ -136,8 +138,9 @@ fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&trigon_model
 }
 
 /// The storey's cut as primitives in site mm.
-fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result<(Vec<Prim>, String)> {
+fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result<(Vec<Prim>, String, BTreeMap<usize, Element>)> {
     let mut prims = Vec::new();
+    let mut elements = BTreeMap::new();
     let mut title = String::new();
     let built = build_view(doc, view)?;
     for b in &built {
@@ -156,8 +159,10 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             let mut start = (a, qs);
             for o in &cuts {
                 let (u0, u1) = (o.rect.u0, o.rect.u1);
+                elements.insert(prims.len(), Element::new(&w.id, DrawingElementKind::FacadeWall));
                 prims.push(Prim::Poly { pts: vec![start.0, pt(fr, u0, 0.0), pt(fr, u0, d), start.1], fill: WALL, surface: Surface::Exterior });
                 start = (pt(fr, u1, 0.0), pt(fr, u1, d));
+                let opening_start = prims.len();
                 let color = status_color(o.status, LINE);
                 let kind = doc.component(&o.fill.type_id).map(|t| t.kind.clone()).ok();
                 let french_rail = matches!(&kind, Some(ComponentKind::FrenchBalcony { .. }));
@@ -212,6 +217,9 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     }
                     _ => door(&mut prims, u0, u1),
                 }
+                for index in opening_start..prims.len() {
+                    elements.insert(index, Element::new(&o.fill.id, DrawingElementKind::Opening));
+                }
                 if french_rail {
                     for depth in [-110.0, -150.0] {
                         prims.push(Prim::Line {
@@ -224,6 +232,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     }
                 }
             }
+            elements.insert(prims.len(), Element::new(&w.id, DrawingElementKind::FacadeWall));
             prims.push(Prim::Poly { pts: vec![start.0, e, qe, start.1], fill: WALL, surface: Surface::Exterior });
             // Balconies on this storey, from the facade's resolved placements.
             let Some(model_b) = doc.buildings.iter().find(|x| x.id == b.building_id) else { continue };
@@ -329,11 +338,13 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
     for built in &built {
         for w in built.interior.iter().filter(|w| w.level == level) {
             for pts in &w.cut {
+                elements.insert(prims.len(), Element::new(&w.id, DrawingElementKind::InteriorWall));
                 prims.push(Prim::Poly { pts: pts.clone(), fill: if w.load_bearing { WALL } else { PARTITION }, surface: Surface::Interior });
             }
             // Doors as a closed leaf across the opening: no swing, no opening direction.
             for d in &w.doors {
                 let mid = w.thickness / 2.0;
+                elements.insert(prims.len(), Element::new(&d.fill.id, DrawingElementKind::Opening));
                 prims.push(Prim::Line { a: pt(&w.frame, d.rect.u0, mid), b: pt(&w.frame, d.rect.u1, mid), color: LINE, width: 30.0, dashed: false });
             }
         }
@@ -453,7 +464,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             }
         }
     }
-    Ok((prims, title))
+    Ok((prims, title, elements))
 }
 
 /// Maps site mm to output pixels: rotated by `rot` (degrees, counter-clockwise) about the
@@ -684,7 +695,7 @@ struct PlanSheet {
 }
 
 fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<PlanSheet> {
-    let (prims, _) = scene(doc, level, view, true)?;
+    let (prims, _, elements) = scene(doc, level, view, true)?;
     let f = sheet_frame(doc, region, rotation)?;
     let vp = Viewport { x0: f.x0, y1: f.y1, mm: f.mm };
     let floor = doc.buildings.first().and_then(|b| b.storeys.get(level)).map(|s| s.name.clone()).unwrap_or_default();
@@ -716,6 +727,17 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                 _ => None,
             })
             .collect();
+        let mut sources = Vec::new();
+        for (index, primitive) in prims.iter().enumerate() {
+            if let Prim::Poly { pts, surface: family, .. } = primitive
+                && *family == surface
+                && let Some(element) = elements.get(&index)
+            {
+                for corner in 0..pts.len() {
+                    sources.push(element.segment([f.rot(pts[corner]), f.rot(pts[(corner + 1) % pts.len()])]));
+                }
+            }
+        }
         let (layer, fill, pen) = match surface {
             Surface::Exterior => (Layer::WallCut, Fill::Masonry, 0.35),
             Surface::Interior => (Layer::WallCut, Fill::Solid([0xd6, 0xd6, 0xd6]), 0.35),
@@ -724,10 +746,11 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         for shape in trigon_model::footprint::union(&polys)? {
             let rings = shape.iter().map(|ring| ring.iter().map(|p| f.rot(*p)).collect()).collect();
             sc.polygon(layer, rings, Some(fill), Some(Stroke { pen, colour: [0x33, 0x33, 0x33], dashed: false }));
+            sc.attribute_last(&sources);
         }
     }
     let mut labels: Vec<Label> = Vec::new();
-    for p in &prims {
+    for (index, p) in prims.iter().enumerate() {
         match p {
             Prim::Poly { .. } => {}
             Prim::Line { a, b, width, dashed, color } => {
@@ -740,6 +763,9 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                     0.13
                 };
                 sc.line(line_layer(doc, *width, *a, *b), f.rot(*a), f.rot(*b), Stroke { pen, colour, dashed: *dashed });
+                if let Some(element) = elements.get(&index) {
+                    sc.attribute_last(&[element.segment([f.rot(*a), f.rot(*b)])]);
+                }
             }
             Prim::Text { at, text, size, angle, away, .. } => {
                 let p = f.px(*at);
@@ -925,7 +951,7 @@ pub(crate) fn render(
 ) -> Result<Value> {
     let mm = trigon_model::checked("mm_per_px", mm, 5.0, 200.0)?;
     let rot_deg = trigon_model::checked("rotate_deg", rot_deg, -360.0, 360.0)?;
-    let (mut prims, title) = scene(&s.doc, level, view, false)?;
+    let (mut prims, title, _) = scene(&s.doc, level, view, false)?;
     if show_scan {
         // Check views: the model in colour so it stands apart from the scan's greys.
         for p in &mut prims {
@@ -989,7 +1015,7 @@ mod tests {
             let q = frame.px(p);
             assert!((70.0..=1530.0).contains(&q[0]) && (130.0..=800.0).contains(&q[1]));
         }
-        let (prims, _) = scene(&doc, 1, View::latest(&doc), true).unwrap();
+        let (prims, _, _) = scene(&doc, 1, View::latest(&doc), true).unwrap();
         assert!(prims.iter().any(|p| matches!(p, Prim::Poly { surface: Surface::Stair, .. })));
     }
 

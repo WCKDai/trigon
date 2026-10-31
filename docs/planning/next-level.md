@@ -13,7 +13,7 @@ and see it work; CI and compiling on the alpha runner.
 | Masonry walls by storey, wall joins, doors, roof build-up, plinth, 3D plan cuts | `crates/model` (`walls`, `joins`, `doors`, `roof`), branch `next/bim-core` | done, tested |
 | IFC for Revit and Vectorworks (wall standard cases with layer sets and axes, typed doors/windows, slabs, roof, stairs, spaces, balconies, layers, colours) | `crates/io`, [export contract](../ifc-export.md) | implemented; commercial application import checks remain open |
 | Drawings: shared plan/section/elevation scene, DXF, saved views, persistent annotations and snapping | `crates/engine`, `crates/model/src/annotation.rs`, [drawing workflow](../annotations.md) | implemented; associative annotations remain open |
-| Trigon Studio: branded native workspace, families, groups, templates, precise edits and drawing authoring | `apps/trigon-studio`, [editing contract](../editing.md) | implemented; semantic model picking from 2D is in progress |
+| Trigon Studio: branded native workspace, families, groups, templates, precise edits and drawing authoring | `apps/trigon-studio`, [editing contract](../editing.md) | semantic 2D picking integrated and covered by worker/edit/undo tests; native OS click verification remains open |
 | CI on the trusted runner (alpha) | `.github/workflows/ci.yml` | done |
 
 ## Product acceptance workflows

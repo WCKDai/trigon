@@ -85,7 +85,10 @@ In Studio:
 - **3D**: drag to orbit, Shift-drag or right-drag to pan, scroll or pinch to zoom at the pointer,
   double-click or F to fit. "Up to level" cuts the model 1.2 m above a floor. Click an element to
   see its id, type and properties.
-- **Plan**: the level's plan sheet, as `plan.sheet` draws it; drag to pan, scroll to zoom.
+- **Plan and saved drawings**: click visible wall, window or door lines to select the same element
+  used by 3D and Properties; drag to pan and scroll to zoom. The orange outline follows the
+  selected linework. **Edit elements** switches a saved drawing to the model editing tools;
+  annotation tools retain their own selection. See [drawing picking](docs/drawing-picking.md).
 - **Activity**: newest first; click an entry for its full JSON. Undo and Redo (⌘Z, ⇧⌘Z) apply to
   your changes and the agent's alike.
 - **Commands…** (⌘K): search every command, edit its parameters (prefilled from its schema) and

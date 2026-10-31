@@ -9,6 +9,48 @@ pub(crate) mod project;
 pub(crate) mod style;
 pub(crate) mod svg;
 
+use crate::views::{DrawingElementKind, DrawingElementSegment};
+
+#[derive(Clone, Debug)]
+pub(crate) struct Element {
+    pub(crate) id: String,
+    pub(crate) kind: DrawingElementKind,
+}
+
+impl Element {
+    pub(crate) fn new(id: &str, kind: DrawingElementKind) -> Self {
+        Self { id: id.into(), kind }
+    }
+
+    pub(crate) fn segment(&self, segment: [[f64; 2]; 2]) -> DrawingElementSegment {
+        DrawingElementSegment { id: self.id.clone(), kind: self.kind, segment }
+    }
+}
+
+pub(crate) fn overlap<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; DIM]; 2], epsilon: f64) -> Option<[[f64; DIM]; 2]> {
+    if drawn.iter().chain(source.iter()).flatten().any(|value| !value.is_finite() || value.abs() > 1e8) {
+        return None;
+    }
+    let direction: [f64; DIM] = std::array::from_fn(|axis| drawn[1][axis] - drawn[0][axis]);
+    let length2: f64 = direction.iter().map(|value| value * value).sum();
+    if length2 <= 1e-16 {
+        return None;
+    }
+    let parameters = source.map(|point| (0..DIM).map(|axis| (point[axis] - drawn[0][axis]) * direction[axis]).sum::<f64>() / length2);
+    for (point, parameter) in source.iter().zip(parameters) {
+        let distance2: f64 = (0..DIM).map(|axis| (point[axis] - drawn[0][axis] - parameter * direction[axis]).powi(2)).sum();
+        if distance2 > epsilon * epsilon {
+            return None;
+        }
+    }
+    let start = parameters[0].min(parameters[1]).max(0.0);
+    let end = parameters[0].max(parameters[1]).min(1.0);
+    if end <= start || (end - start) * length2.sqrt() <= 1e-8 {
+        return None;
+    }
+    Some([start, end].map(|parameter| std::array::from_fn(|axis| drawn[0][axis] + parameter * direction[axis])))
+}
+
 /// The shared presentation scene, used both by file exports and live drafting workspaces.
 pub(crate) struct Sheet {
     pub(crate) scene: Scene,
@@ -193,6 +235,27 @@ pub(crate) struct Path {
     pub(crate) closed: bool,
     pub(crate) fill: Option<Fill>,
     pub(crate) stroke: Option<Stroke>,
+    pub(crate) element_segments: Vec<DrawingElementSegment>,
+}
+
+impl Path {
+    pub(crate) fn segments(&self) -> impl Iterator<Item = [[f64; 2]; 2]> + '_ {
+        self.rings.iter().flat_map(|ring| {
+            ring.windows(2).map(|pair| [pair[0], pair[1]]).chain((self.closed && ring.len() > 2).then(|| [ring[ring.len() - 1], ring[0]]))
+        })
+    }
+
+    pub(crate) fn attribute(&mut self, sources: &[DrawingElementSegment]) {
+        let elements: Vec<_> = self
+            .segments()
+            .flat_map(|drawn| {
+                sources
+                    .iter()
+                    .filter_map(move |source| overlap(drawn, source.segment, 0.5).map(|segment| DrawingElementSegment { segment, ..source.clone() }))
+            })
+            .collect();
+        self.element_segments.extend(elements);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,18 +316,31 @@ impl Scene {
 
     pub(crate) fn polygon(&mut self, layer: Layer, rings: Vec<Vec<[f64; 2]>>, fill: Option<Fill>, stroke: Option<Stroke>) {
         if !rings.is_empty() {
-            self.items.push(Item::Path(Path { layer, rings, closed: true, fill, stroke }));
+            self.items.push(Item::Path(Path { layer, rings, closed: true, fill, stroke, element_segments: Vec::new() }));
         }
     }
 
     pub(crate) fn polyline(&mut self, layer: Layer, points: Vec<[f64; 2]>, stroke: Stroke) {
         if points.len() >= 2 {
-            self.items.push(Item::Path(Path { layer, rings: vec![points], closed: false, fill: None, stroke: Some(stroke) }));
+            self.items.push(Item::Path(Path {
+                layer,
+                rings: vec![points],
+                closed: false,
+                fill: None,
+                stroke: Some(stroke),
+                element_segments: Vec::new(),
+            }));
         }
     }
 
     pub(crate) fn line(&mut self, layer: Layer, a: [f64; 2], b: [f64; 2], stroke: Stroke) {
         self.polyline(layer, vec![a, b], stroke);
+    }
+
+    pub(crate) fn attribute_last(&mut self, sources: &[DrawingElementSegment]) {
+        if let Some(Item::Path(path)) = self.items.last_mut() {
+            path.attribute(sources);
+        }
     }
 
     pub(crate) fn text(&mut self, t: Text) {

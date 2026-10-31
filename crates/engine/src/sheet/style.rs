@@ -7,7 +7,8 @@ use trigon_model::build::{Built, ElementClass, Status};
 use trigon_model::mesh::{Material, Mesh};
 
 use super::project::{Class, Projection, Source};
-use super::{Fill, INK, Layer, Rgb, Scene, Stroke, thinner};
+use super::{Element, Fill, INK, Layer, Rgb, Scene, Stroke, thinner};
+use crate::views::DrawingElementKind;
 
 /// What an element's part is drawn as.
 pub(crate) fn class_of(element: ElementClass, m: Material) -> Class {
@@ -39,8 +40,8 @@ pub(crate) struct Part<'a> {
     pub(crate) role: Role,
 }
 
-fn part(mesh: &Mesh, class: Class, group: usize, material: Material, role: Role) -> Part<'_> {
-    Part { source: Source { mesh, class, group }, material, role }
+fn part(mesh: &Mesh, class: Class, group: usize, material: Material, role: Role, element: Option<Element>) -> Part<'_> {
+    Part { source: Source { mesh, class, group, element }, material, role }
 }
 
 /// The meshes of the buildings as a view shows them. A facade wall is seen as one surface and
@@ -57,41 +58,51 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
     for b in built {
         let walls = next();
         for w in &b.walls {
-            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, Role::Seen));
+            let element = Element::new(&w.id, DrawingElementKind::FacadeWall);
+            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, Role::Seen, Some(element.clone())));
             for seg in &w.segments {
-                out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut));
+                out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut, Some(element.clone())));
             }
-            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both));
+            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both, Some(element)));
             for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
                 if e.status == Status::Demolished {
                     continue;
                 }
                 for (m, mesh) in &e.parts {
-                    out.push(part(mesh, class_of(e.class, *m), next(), *m, Role::Both));
+                    let element =
+                        matches!(e.class, ElementClass::Window | ElementClass::Door).then(|| Element::new(&e.id, DrawingElementKind::Opening));
+                    out.push(part(mesh, class_of(e.class, *m), next(), *m, Role::Both, element));
                 }
             }
         }
         if let Some(r) = &b.roof {
-            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both));
-            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both));
-            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both));
+            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both, None));
+            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both, None));
+            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both, None));
         }
         if inside {
             for s in &b.slabs {
-                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both));
+                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both, None));
             }
             for iw in &b.interior {
                 let class = if iw.load_bearing { Class::Wall } else { Class::Partition };
-                out.push(part(&iw.mesh, class, next(), Material::Plaster, Role::Both));
+                out.push(part(&iw.mesh, class, next(), Material::Plaster, Role::Both, Some(Element::new(&iw.id, DrawingElementKind::InteriorWall))));
                 for d in iw.doors.iter().filter(|d| d.status != Status::Demolished) {
                     for (m, mesh) in &d.fill.parts {
-                        out.push(part(mesh, class_of(d.fill.class, *m), next(), *m, Role::Both));
+                        out.push(part(
+                            mesh,
+                            class_of(d.fill.class, *m),
+                            next(),
+                            *m,
+                            Role::Both,
+                            Some(Element::new(&d.fill.id, DrawingElementKind::Opening)),
+                        ));
                     }
                 }
             }
             for st in &b.stairs {
-                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both));
-                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both));
+                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both, None));
+                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both, None));
             }
         }
     }
@@ -181,8 +192,10 @@ pub(crate) fn edges(scene: &mut Scene, p: &Projection) {
         let pen = if e.class == Class::Railing { base } else { thinner(base, b) };
         styled.push((e.a, e.b, layer(e.class), Stroke { pen, colour, dashed: false }));
     }
+    let elements: Vec<_> = p.edges.iter().flat_map(|edge| edge.element_segments.iter().cloned()).collect();
     for (a, b, layer, stroke) in merge(styled) {
         scene.line(layer, a, b, stroke);
+        scene.attribute_last(&elements);
     }
 }
 
