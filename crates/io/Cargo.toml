@@ -11,3 +11,7 @@ workspace = true
 [dependencies]
 trigon-model = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Both IFC readers check the export in tests (workspace crate).
+trigon-ifcread = { workspace = true }
