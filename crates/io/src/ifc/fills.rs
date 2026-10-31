@@ -6,7 +6,7 @@ use trigon_model::build::{BuiltElement, BuiltWall, Status};
 use trigon_model::component::Side;
 use trigon_model::{ComponentKind, ElementClass, FacadeFrame};
 
-use super::catalog::{self, Val};
+use super::catalog::{self, Qty, Val};
 use super::part21::{Frame, Placed, gid, real, string};
 use super::walls::Piece;
 use super::{Floors, Ifc};
@@ -131,6 +131,18 @@ impl Ifc<'_> {
         });
         let pset = if door { "Pset_DoorCommon" } else { "Pset_WindowCommon" };
         self.common(pset, id, reference, Some(e.status), vec![("IsExternal", Val::Bool(external))]);
+        if !matches!(kind, Some(ComponentKind::Loggia { .. })) {
+            let occurrence = self.cat.fill_quantity_counts.entry((e.id.clone(), e.type_id.clone())).or_default();
+            let quantity_key = format!("fill:{}:{}:{}:{}:{occurrence}", e.id.len(), e.id, e.type_id.len(), e.type_id);
+            *occurrence += 1;
+            self.cat.quantities(
+                &mut self.w,
+                &quantity_key,
+                if door { "Qto_DoorBaseQuantities" } else { "Qto_WindowBaseQuantities" },
+                &[Qty::Length("Height", e.height), Qty::Length("Width", e.width), Qty::Area("Area", e.width * e.height / 1e6)],
+                id,
+            );
+        }
         fl.contain(e.level, id);
         id
     }

@@ -262,6 +262,7 @@ pub struct Catalog {
     associations: BTreeMap<String, (usize, Vec<usize>)>,
     /// Element types by key: entity and the occurrences typed by it.
     pub types: BTreeMap<String, (usize, Vec<usize>)>,
+    pub fill_quantity_counts: BTreeMap<(String, String), usize>,
     psets: BTreeMap<String, (usize, Vec<usize>)>,
     status_enum: Option<usize>,
     layers: BTreeMap<&'static str, Vec<usize>>,
