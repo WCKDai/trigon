@@ -278,6 +278,8 @@ pub struct BuiltStair {
     pub kind: crate::StairKind,
     pub winding: bool,
     pub mesh: Mesh,
+    /// The balustrade along the well (empty for stairs between walls).
+    pub railing: Mesh,
 }
 
 /// Builds every building as it stands at the end of the last phase.
@@ -724,12 +726,12 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             if above(s.elevation) {
                 continue;
             }
-            let mesh = crate::stair::mesh(st, s.elevation, s.height)?;
-            let mesh = match cut {
-                Some(z) => mesh.below(z),
-                None => mesh,
+            let (mesh, railing) = (crate::stair::mesh(st, s.elevation, s.height)?, crate::stair::railing(st, s.elevation, s.height)?);
+            let (mesh, railing) = match cut {
+                Some(z) => (mesh.below(z), railing.below(z)),
+                None => (mesh, railing),
             };
-            stairs.push(BuiltStair { id: format!("{id}.L{level}"), level, kind: st.kind, winding: st.winders.is_some(), mesh });
+            stairs.push(BuiltStair { id: format!("{id}.L{level}"), level, kind: st.kind, winding: st.winders.is_some(), mesh, railing });
         }
     }
     Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })

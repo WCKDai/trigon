@@ -268,6 +268,48 @@ pub fn mesh(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
     Ok(m)
 }
 
+/// Balustrade height above the pitch line, mm.
+const BALUSTRADE: f64 = 900.0;
+const BALUSTRADE_THICKNESS: f64 = 30.0;
+
+/// The balustrade along the well of a U-turn stair: a panel on each flight's well edge following
+/// the pitch, and one across the well at the half landing. Other stairs run between walls and
+/// get none.
+pub fn railing(st: &Stair, floor: f64, storey_height: f64) -> Result<Mesh> {
+    crate::checked("stair floor", floor, -1e6, 1e6)?;
+    crate::checked("stair height", storey_height, 100.0, 20_000.0)?;
+    let f = frame(st)?;
+    let mut m = Mesh::default();
+    if st.kind != StairKind::UTurn {
+        return Ok(m);
+    }
+    let risers = (storey_height / RISER).round().max(2.0) as usize;
+    let well = st.well.unwrap_or(150.0).clamp(0.0, f.width / 3.0);
+    let flight = (f.width - well) / 2.0;
+    let (n, g) = treads_in(st, f.length, (risers / 2).max(2));
+    let turn = st.winders.unwrap_or(1);
+    let hr = storey_height / (2 * n + turn + 1) as f64;
+    let landing = floor + (n + 1) as f64 * hr;
+    let run = n as f64 * g;
+    let th = BALUSTRADE_THICKNESS;
+    // A panel from (s0, z0) to (s1, z1) between t0 and t1, BALUSTRADE high.
+    let panel = |m: &mut Mesh, (s0, z0): (f64, f64), (s1, z1): (f64, f64), (t0, t1): (f64, f64)| {
+        let lo = [(s0, t0, z0), (s1, t0, z1), (s1, t1, z1), (s0, t1, z0)].map(|(s, t, z)| {
+            let p = f.at(s, t);
+            [p[0], p[1], z]
+        });
+        let hi = lo.map(|p| [p[0], p[1], p[2] + BALUSTRADE]);
+        let ccw = crate::footprint::signed_area2(&lo.map(|p| [p[0], p[1]])) > 0.0;
+        if ccw { m.hexahedron(lo, hi) } else { m.hexahedron([lo[3], lo[2], lo[1], lo[0]], [hi[3], hi[2], hi[1], hi[0]]) }
+    };
+    // Up the first flight, along its well edge; back down the second from the landing.
+    panel(&mut m, (0.0, floor + hr), (run, landing), (flight - th, flight));
+    panel(&mut m, (f.length, landing), (f.length - run, floor + storey_height - hr), (flight + well, flight + well + th));
+    // Across the well where the flights turn.
+    panel(&mut m, (f.length, landing), (f.length + th, landing), (flight - th, flight + well + th));
+    Ok(m)
+}
+
 fn turn_point(f: &Frame, st: &Stair, angle: f64, inner: bool) -> [f64; 2] {
     let half = f.width / 2.0;
     let depth = st.landing.unwrap_or(half);
@@ -349,6 +391,19 @@ fn quarter_steps(st: &Stair, f: &Frame, height: f64) -> (Vec<Vec<[f64; 2]>>, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_u_turn_stair_has_a_balustrade_along_its_well_and_a_straight_one_none() {
+        let st = u();
+        let r = railing(&st, 0.0, 3000.0).unwrap();
+        let (lo, hi) = r.bounds().unwrap();
+        // From just above the floor to 900 mm over the top step, along the well (y ≈ 875–1025).
+        assert!(lo[2] > 0.0 && hi[2] <= 3000.0 + BALUSTRADE + 1e-6, "{lo:?} {hi:?}");
+        assert!(lo[1] > 800.0 && hi[1] < 1100.0, "{lo:?} {hi:?}");
+        let straight = Stair { kind: StairKind::Straight, ..u() };
+        assert!(railing(&straight, 0.0, 3000.0).unwrap().is_empty());
+        assert!(railing(&st, f64::NAN, 3000.0).is_err());
+    }
 
     fn u() -> Stair {
         Stair {
