@@ -172,12 +172,15 @@ impl Drafting {
     }
 
     pub fn opened(&mut self, doc: &Document, id: &str) {
-        if self.current_view != id {
+        let changed = self.current_view != id;
+        if changed {
             self.current_view = id.into();
             self.new_note(doc);
             self.export_path = format!("out/{id}.pdf");
         }
-        self.view_id = unique_id("drawing", |id| doc.views.iter().any(|v| v.id == id));
+        if changed || doc.views.iter().any(|v| v.id == self.view_id) {
+            self.view_id = unique_id("drawing", |id| doc.views.iter().any(|v| v.id == id));
+        }
     }
 
     pub fn new_note(&mut self, doc: &Document) {
@@ -434,6 +437,34 @@ impl Drafting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_the_same_drawing_preserves_a_custom_new_drawing_id() {
+        let mut doc = Document::default();
+        doc.views.push(trigon_model::annotation::DrawingView {
+            id: "drawing-1".into(),
+            name: "Ground floor".into(),
+            kind: DrawingViewKind::Plan { level: 0 },
+        });
+        let mut tool = Drafting::default();
+        tool.opened(&doc, "drawing-1");
+        assert_eq!(tool.view_id, "drawing-2");
+        tool.view_id = "measured-section".into();
+        for _ in 0..3 {
+            tool.opened(&doc, "drawing-1");
+            assert_eq!(tool.view_id, "measured-section");
+        }
+        doc.views.push(trigon_model::annotation::DrawingView {
+            id: "measured-section".into(),
+            name: "Measured section".into(),
+            kind: DrawingViewKind::Plan { level: 0 },
+        });
+        tool.opened(&doc, "drawing-1");
+        assert_eq!(tool.view_id, "drawing-2", "a newly taken ID must be replaced");
+        tool.view_id = "custom-elevation".into();
+        tool.opened(&doc, "measured-section");
+        assert_eq!(tool.view_id, "drawing-2", "switching views initializes a fresh drawing form");
+    }
 
     #[test]
     fn picking_fills_typed_points_without_mutating_the_document() {
