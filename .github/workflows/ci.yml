@@ -9,9 +9,11 @@ on:
 permissions:
   contents: read
 
+# One trusted runner is shared with PolyCore and Polykrom: a running check finishes, and only
+# the newest waiting push of a branch is kept.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
