@@ -81,6 +81,8 @@ pub enum ElementClass {
     Door,
     Railing,
     BalconySlab,
+    /// An outdoor stair (a cellar stair with its pit).
+    Stair,
 }
 
 /// An element's state in the phase being viewed (Revit's phase status).
@@ -191,6 +193,10 @@ pub struct BuiltWall {
     pub segments: Vec<WallSegment>,
     /// The plinth in front of the wall's foot (empty without one).
     pub plinth: Mesh,
+    /// Rendered bands standing proud of the wall (empty without any).
+    pub trim: Mesh,
+    /// The wall's outer finish: brick, red brick or render.
+    pub finish: Material,
     pub openings: Vec<BuiltOpening>,
     /// Balconies hung on the wall without an opening of their own.
     pub attachments: Vec<BuiltElement>,
@@ -582,12 +588,33 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         if spans.is_empty() {
             continue;
         }
+        let finish = match f.finish.unwrap_or(b.finish) {
+            crate::doc::WallFinish::Brick => Material::Wall,
+            crate::doc::WallFinish::RedBrick => Material::BrickRed,
+            crate::doc::WallFinish::Render => Material::Render,
+        };
         let all = resolve_facade(doc, b, f)?;
         // What this view shows, with each element's status.
         let shown: Vec<(&Resolved, Status)> =
             all.iter().filter(|r| !above(r.rect.v0)).filter_map(|r| view.status(r.lifetime).map(|s| (r, s))).collect();
         let resolved: Vec<(&Resolved, Status)> = shown.iter().filter(|(r, _)| r.is_opening()).copied().collect();
-        let holes: Vec<Rect> = resolved.iter().map(|(r, _)| r.rect).collect();
+        let mut holes: Vec<Rect> = resolved.iter().map(|(r, _)| r.rect).collect();
+        // Outdoor cellar stairs along this facade: each opens a door into the basement.
+        let cellars: Vec<(String, &crate::doc::CellarStair, usize, Rect)> = b
+            .cellar_stairs
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.facade == f.id)
+            .map(|(k, c)| {
+                c.validate(fr.length).map_err(|e| ModelError::Invalid(format!("cellar stair {k} on {}: {e}", f.id)))?;
+                let id = if c.id.is_empty() { format!("{}.cellar{k}", f.id) } else { c.id.clone() };
+                let level = (0..levels).rev().find(|&l| b.storeys.get(l).is_some_and(|s| s.elevation <= c.floor + 1.0)).unwrap_or(0);
+                let rect = Rect { u0: c.door_at - c.door_width / 2.0, u1: c.door_at + c.door_width / 2.0, v0: c.floor, v1: c.floor + CELLAR_DOOR };
+                Ok((id, c, level, rect))
+            })
+            .collect::<Result<_>>()?;
+        let cellars: Vec<_> = cellars.into_iter().filter(|(_, c, _, _)| !above(c.floor)).collect();
+        holes.extend(cellars.iter().map(|(_, _, _, r)| *r));
         let unbuildable = || ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id));
         let mesh = crate::walls::skin(&fr, &spans, &holes).ok_or_else(unbuildable)?;
         let segments = spans
@@ -600,7 +627,14 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             .iter()
             .map(|(r, status)| {
                 let id = format!("{}.L{}.B{}", f.id, r.placement.level, r.placement.bay);
-                let mut o = component(&fr, &id, r, elevation_of(r), *status);
+                let level = r.placement.level;
+                let at = Fill {
+                    wall: b.edge_thickness(f.edge, level),
+                    finish,
+                    floor: elevation_of(r),
+                    ceiling: b.storeys.get(level + 1).map_or(h, |s| s.elevation - FLOOR_SLAB),
+                };
+                let mut o = component(&fr, &id, r, elevation_of(r), *status, at);
                 if cut.is_some() {
                     o.fill = clip_element(o.fill, cut);
                     o.attached = o.attached.into_iter().map(|e| clip_element(e, cut)).collect();
@@ -608,7 +642,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 o
             })
             .collect();
-        let attachments = shown
+        let mut attachments: Vec<BuiltElement> = shown
             .iter()
             .filter(|(r, _)| !r.is_opening())
             .flat_map(|(r, status)| {
@@ -616,9 +650,38 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 attachment(&fr, &id, r, elevation_of(r), *status).into_iter().map(|e| clip_element(e, cut)).collect::<Vec<_>>()
             })
             .collect();
+        let mut openings: Vec<BuiltOpening> = openings;
+        for (id, c, level, rect) in &cellars {
+            let at = Fill {
+                wall: b.edge_thickness(f.edge, *level),
+                finish,
+                floor: c.floor,
+                ceiling: b.storeys.get(level + 1).map_or(h, |s| s.elevation - FLOOR_SLAB),
+            };
+            let fill = BuiltElement {
+                id: format!("{id}.door"),
+                name: "Kælderdør".into(),
+                class: ElementClass::Door,
+                type_id: "door.cellar".into(),
+                level: *level,
+                width: c.door_width,
+                height: CELLAR_DOOR,
+                parts: fill_parts(&fr, *rect, &ComponentKind::EntranceDoor, at),
+                status: Status::Existing,
+            };
+            openings.push(BuiltOpening {
+                id: format!("{id}.opening"),
+                level: *level,
+                rect: *rect,
+                fill: clip_element(fill, cut),
+                attached: Vec::new(),
+                status: Status::Existing,
+            });
+            attachments.push(clip_element(cellar_stair(&fr, id, c, *level), cut));
+        }
         let plinth = match (&b.plinth, &plinth_line) {
             (Some(p), Some(line)) => {
-                let m = plinth_piece(&fr, f, (a, e), line, p, &holes).ok_or_else(unbuildable)?;
+                let m = facing_piece(&fr, f, (a, e), line, p.projection.max(1.0), (-PLINTH_FOOT, p.height), &holes).ok_or_else(unbuildable)?;
                 match cut {
                     Some(z) => m.below(z),
                     None => m,
@@ -626,7 +689,34 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             }
             _ => Mesh::default(),
         };
-        walls.push(BuiltWall { id: f.id.clone(), frame: fr, kind: f.kind, height: h, bottom: zb, mesh, segments, plinth, openings, attachments });
+        // Rendered bands standing proud of the wall, on each of their storeys.
+        let mut trim = Mesh::default();
+        for band in &f.bands {
+            let projection = crate::checked("band projection", band.projection, 1.0, 500.0)?;
+            let line = inner_ring(&b.footprint, -projection);
+            for &level in &band.levels {
+                let Some(s) = b.storeys.get(level) else { continue };
+                let (z0, z1) = (s.elevation + band.bottom, s.elevation + band.top);
+                if !(z1 - z0 >= 10.0) || above(z0) {
+                    continue;
+                }
+                trim.append(&facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes).ok_or_else(unbuildable)?);
+            }
+        }
+        walls.push(BuiltWall {
+            id: f.id.clone(),
+            frame: fr,
+            kind: f.kind,
+            height: h,
+            bottom: zb,
+            mesh,
+            finish,
+            segments,
+            plinth,
+            trim,
+            openings,
+            attachments,
+        });
     }
 
     // Straight basement walls past cut-off steps: one wall per such run, on those storeys only.
@@ -661,8 +751,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 height: span.z1,
                 bottom: z0,
                 mesh,
+                finish: Material::Wall,
                 segments: vec![segment],
                 plinth: Mesh::default(),
+                trim: Mesh::default(),
                 openings: Vec::new(),
                 attachments: Vec::new(),
             });
@@ -796,14 +888,16 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
 /// The plinth runs this far below the terrain, mm.
 const PLINTH_FOOT: f64 = 300.0;
 
-/// The plinth in front of one facade: a closed piece from below the terrain to its top, between
-/// the wall's outer face and the plinth's face, with the facade's openings cut through it.
-fn plinth_piece(
+/// A facing in front of one facade (a plinth, a band): a closed piece from `z0` to `z1` between
+/// the wall's outer face and the facing's face `projection` mm out along `line` (the footprint
+/// carried out by that much), with the facade's openings cut through it.
+fn facing_piece(
     fr: &FacadeFrame,
     f: &Facade,
     (a, e): ([f64; 2], [f64; 2]),
     line: &[[f64; 2]],
-    p: &crate::doc::Plinth,
+    projection: f64,
+    (z0, z1): (f64, f64),
     holes: &[Rect],
 ) -> Option<Mesh> {
     let n = line.len();
@@ -813,8 +907,51 @@ fn plinth_piece(
     // Openings, from the wall's frame into the plinth's (which starts further out at the corner).
     let shift = along(fr.origin);
     let holes: Vec<Rect> = holes.iter().map(|r| Rect { u0: r.u0 + shift, u1: r.u1 + shift, ..*r }).collect();
-    let span = Span { level: 0, thickness: p.projection.max(1.0), z0: -PLINTH_FOOT, z1: p.height, in0: along(a), in1: along(e), qs: a, qe: e };
-    crate::walls::segment(&face, &format!("{}.plinth", f.id), &span, &holes).map(|seg| seg.mesh)
+    let span = Span { level: 0, thickness: projection, z0, z1, in0: along(a), in1: along(e), qs: a, qe: e };
+    crate::walls::segment(&face, &format!("{}.facing", f.id), &span, &holes).map(|seg| seg.mesh)
+}
+
+/// Cellar door height, mm.
+const CELLAR_DOOR: f64 = 2000.0;
+const RETAINING: f64 = 150.0;
+
+/// An outdoor cellar stair's pit in facade coordinates: retaining walls with a kerb, the pit
+/// floor, the flight down along the wall, and a railing on the walls except at the top of the
+/// flight, where the stair is entered.
+fn cellar_stair(fr: &FacadeFrame, id: &str, c: &crate::doc::CellarStair, level: usize) -> BuiltElement {
+    const KERB: f64 = 100.0;
+    let (out, foot) = (-c.width, c.floor - 200.0);
+    let entry_at_to = c.top > c.bottom;
+    let mut concrete = Mesh::default();
+    concrete.append(&fbox(fr, (c.from - RETAINING, c.to + RETAINING), (out - RETAINING, out), (foot, KERB)));
+    concrete.append(&fbox(fr, (c.from - RETAINING, c.from), (out, 0.0), (foot, if entry_at_to { KERB } else { 0.0 })));
+    concrete.append(&fbox(fr, (c.to, c.to + RETAINING), (out, 0.0), (foot, if entry_at_to { 0.0 } else { KERB })));
+    concrete.append(&fbox(fr, (c.from, c.to), (out, 0.0), (foot, c.floor)));
+    // Steps from the pit floor up to the terrain.
+    let risers = ((-c.floor) / 175.0).round().clamp(3.0, 40.0) as usize;
+    let rise = -c.floor / risers as f64;
+    let going = (c.top - c.bottom) / risers as f64;
+    let mut steps = Mesh::default();
+    for i in 0..risers {
+        let (s0, s1) = (c.bottom + going * i as f64, c.bottom + going * (i + 1) as f64);
+        steps.append(&fbox(fr, (s0.min(s1), s0.max(s1)), (out, 0.0), (c.floor, c.floor + rise * (i + 1) as f64)));
+    }
+    // Railing on the kerb: along the outer wall, and across the end away from the entry.
+    let rail_w = out - RETAINING / 2.0;
+    let mut rail = rail_run(fr, (c.from - RETAINING / 2.0, rail_w), (c.to + RETAINING / 2.0, rail_w), KERB, 900.0);
+    let closed_end = if entry_at_to { c.from - RETAINING / 2.0 } else { c.to + RETAINING / 2.0 };
+    rail.append(&rail_run(fr, (closed_end, rail_w), (closed_end, -100.0), KERB, 900.0));
+    BuiltElement {
+        id: id.to_string(),
+        name: "Kældernedgang".into(),
+        class: ElementClass::Stair,
+        type_id: "stair.cellar".into(),
+        level,
+        width: c.to - c.from,
+        height: -c.floor,
+        parts: vec![(Material::Slab, concrete), (Material::Sill, steps), (Material::Railing, rail)],
+        status: Status::Existing,
+    }
 }
 
 /// Door frame (karm) width, mm.
@@ -1013,60 +1150,164 @@ fn dividers(u0: f64, u1: f64, count: u32) -> Vec<f64> {
     (1..count).map(|k| u0 + (u1 - u0) * f64::from(k) / f64::from(count)).collect()
 }
 
-/// Frame, sashes or leaves and glazing for a window or door in `rect`.
-fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind) -> Vec<(Material, Mesh)> {
-    let Rect { u0, u1, v0, v1 } = rect;
-    let w = (REVEAL, REVEAL + FRAME_DEPTH);
+/// What a window or door needs to know about where it sits: the wall's thickness and finish,
+/// and the storey's floor and ceiling (underside of the floor above), mm.
+#[derive(Debug, Clone, Copy)]
+struct Fill {
+    wall: f64,
+    finish: Material,
+    floor: f64,
+    ceiling: f64,
+}
+
+/// A door leaf in `(u0, u1) × (v0, v1)`, `w` deep: white stiles and rails, glass in the upper
+/// part over a solid bottom panel (Danish balcony and stair doors). Returns (frame, glass).
+fn door_leaf(fr: &FacadeFrame, (u0, u1): (f64, f64), (v0, v1): (f64, f64), w: (f64, f64)) -> (Mesh, Mesh) {
+    let stile = 90.0_f64.min((u1 - u0) / 4.0);
+    let panel = v0 + 0.36 * (v1 - v0);
+    let mut frame = Mesh::default();
+    frame.append(&fbox(fr, (u0, u0 + stile), w, (v0, v1)));
+    frame.append(&fbox(fr, (u1 - stile, u1), w, (v0, v1)));
+    frame.append(&fbox(fr, (u0 + stile, u1 - stile), w, (v1 - stile, v1)));
+    frame.append(&fbox(fr, (u0 + stile, u1 - stile), (w.0 + 10.0, w.1 - 10.0), (v0, panel)));
+    frame.append(&fbox(fr, (u0 + stile, u1 - stile), w, (panel, panel + stile * 0.7)));
+    let glass = fbox(fr, (u0 + stile, u1 - stile), ((w.0 + w.1) / 2.0 - 3.0, (w.0 + w.1) / 2.0 + 3.0), (panel + stile * 0.7, v1 - stile));
+    (frame, glass)
+}
+
+/// A window's frame, sash bars and glass in `(u0, u1) × (v0, v1)`, `w` deep.
+fn window_lights(fr: &FacadeFrame, (u0, u1): (f64, f64), (v0, v1): (f64, f64), w: (f64, f64), lights: u32, top_light: f64) -> (Mesh, Mesh) {
     let mut frame = Mesh::default();
     frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
     frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
     frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
-    let (iu0, iu1) = (u0 + FRAME, u1 - FRAME);
+    frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v0, v0 + FRAME)));
+    for c in dividers(u0 + FRAME, u1 - FRAME, lights) {
+        frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (v0 + FRAME, v1 - FRAME)));
+    }
+    if top_light > 0.0 && v1 - v0 > top_light + 4.0 * FRAME {
+        let t = v1 - FRAME - top_light;
+        frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (t - FRAME / 2.0, t + FRAME / 2.0)));
+    }
+    let mid = (w.0 + w.1) / 2.0;
+    let glass = fbox(fr, (u0 + FRAME, u1 - FRAME), (mid - 3.0, mid + 3.0), (v0 + FRAME, v1 - FRAME));
+    (frame, glass)
+}
+
+/// Frame, sashes or leaves and glazing for a window or door in `rect`.
+fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> Vec<(Material, Mesh)> {
+    let Rect { u0, u1, v0, v1 } = rect;
+    let w = (REVEAL, REVEAL + FRAME_DEPTH);
+    let mut frame = Mesh::default();
     let mut glass = Mesh::default();
-    let glass_w = (REVEAL + 30.0, REVEAL + 36.0);
     let mut parts = Vec::new();
+    let sill = |parts: &mut Vec<(Material, Mesh)>, (a, b): (f64, f64), z: f64| {
+        parts.push((Material::Sill, fbox(fr, (a - 30.0, b + 30.0), (-40.0, REVEAL), (z - 40.0, z))))
+    };
     match kind {
-        ComponentKind::Window { lights } => {
-            frame.append(&fbox(fr, (iu0, iu1), w, (v0, v0 + FRAME)));
-            for c in dividers(iu0, iu1, *lights) {
-                frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (v0 + FRAME, v1 - FRAME)));
-            }
-            glass.append(&fbox(fr, (iu0, iu1), glass_w, (v0 + FRAME, v1 - FRAME)));
-            parts.push((Material::Sill, fbox(fr, (u0 - 30.0, u1 + 30.0), (-40.0, REVEAL), (v0 - 40.0, v0))));
+        ComponentKind::Window { lights, top_light } => {
+            let (f, g) = window_lights(fr, (u0, u1), (v0, v1), w, *lights, *top_light);
+            frame.append(&f);
+            glass.append(&g);
+            sill(&mut parts, (u0, u1), v0);
         }
         ComponentKind::FixedWindow => {
-            frame.append(&fbox(fr, (iu0, iu1), w, (v0, v0 + FRAME)));
-            glass.append(&fbox(fr, (iu0, iu1), glass_w, (v0 + FRAME, v1 - FRAME)));
-            parts.push((Material::Sill, fbox(fr, (u0 - 30.0, u1 + 30.0), (-40.0, REVEAL), (v0 - 40.0, v0))));
+            let (f, g) = window_lights(fr, (u0, u1), (v0, v1), w, 1, 0.0);
+            frame.append(&f);
+            glass.append(&g);
+            sill(&mut parts, (u0, u1), v0);
+        }
+        ComponentKind::EntranceDoor if u1 - u0 > 2000.0 => {
+            // A gateway: timber gates in a frame.
+            frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
+            frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
+            frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
+            parts.push((Material::Door, fbox(fr, (u0 + FRAME, u1 - FRAME), (REVEAL + 15.0, REVEAL + 60.0), (v0, v1 - FRAME))));
         }
         ComponentKind::EntranceDoor => {
-            parts.push((Material::Door, fbox(fr, (iu0, iu1), (REVEAL + 15.0, REVEAL + 60.0), (v0, v1 - FRAME))));
+            // A glazed stair or shop door with a top light over it.
+            frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
+            frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
+            frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
+            let top = (v1 - v0 - 2100.0).clamp(0.0, 600.0);
+            let door_top = v1 - FRAME - top;
+            if top > 0.0 {
+                frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (door_top - FRAME, door_top)));
+                glass.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), (REVEAL + 32.0, REVEAL + 38.0), (door_top, v1 - FRAME)));
+            }
+            let (f, g) =
+                door_leaf(fr, (u0 + FRAME, u1 - FRAME), (v0, door_top - if top > 0.0 { FRAME } else { 0.0 }), (REVEAL + 15.0, REVEAL + 60.0));
+            frame.append(&f);
+            glass.append(&g);
         }
         ComponentKind::FrenchDoor { leaves } | ComponentKind::FrenchBalcony { leaves, .. } | ComponentKind::Balcony { leaves, .. } => {
-            let panel = 400.0_f64.min((v1 - v0) / 3.0);
-            frame.append(&fbox(fr, (iu0, iu1), w, (v0, v0 + panel)));
-            for c in dividers(iu0, iu1, *leaves) {
-                frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (v0 + panel, v1 - FRAME)));
+            frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
+            frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
+            frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
+            let cuts: Vec<f64> =
+                std::iter::once(u0 + FRAME).chain(dividers(u0 + FRAME, u1 - FRAME, *leaves)).chain(std::iter::once(u1 - FRAME)).collect();
+            for pair in cuts.windows(2) {
+                let (f, g) = door_leaf(fr, (pair[0], pair[1]), (v0, v1 - FRAME), w);
+                frame.append(&f);
+                glass.append(&g);
             }
-            glass.append(&fbox(fr, (iu0, iu1), glass_w, (v0 + panel, v1 - FRAME)));
         }
         ComponentKind::DoorWindow { door_width, door_side, window_sill, lights } => {
-            // Split the opening: door leaf on one side, window over a brick panel on the other.
+            // Split the opening: a glazed door on one side, a window over a panel on the other.
             let (du0, du1, wu0, wu1) = match door_side {
                 Side::Left => (u0, u0 + door_width, u0 + door_width, u1),
                 Side::Right => (u1 - door_width, u1, u0, u1 - door_width),
             };
-            let mullion = if door_side == &Side::Left { wu0 } else { wu1 };
-            frame.append(&fbox(fr, (mullion - FRAME / 2.0, mullion + FRAME / 2.0), w, (v0, v1 - FRAME)));
-            parts.push((Material::Door, fbox(fr, (du0 + FRAME / 2.0, du1 - FRAME / 2.0), (REVEAL + 15.0, REVEAL + 60.0), (v0, v1 - FRAME))));
+            frame.append(&fbox(fr, (u0, u1), w, (v1 - FRAME, v1)));
+            let (f, g) = door_leaf(fr, (du0, du1), (v0, v1 - FRAME), w);
+            frame.append(&f);
+            glass.append(&g);
             let ws = v0 + window_sill;
-            parts.push((Material::Wall, fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
-            frame.append(&fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), w, (ws, ws + FRAME)));
-            for c in dividers(wu0 + FRAME / 2.0, wu1 - FRAME / 2.0, *lights) {
-                frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (ws + FRAME, v1 - FRAME)));
+            parts.push((at.finish, fbox(fr, (wu0, wu1), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
+            let (f, g) = window_lights(fr, (wu0, wu1), (ws, v1 - FRAME), w, *lights, 0.0);
+            frame.append(&f);
+            glass.append(&g);
+            sill(&mut parts, (wu0 + 30.0, wu1 - 30.0), ws);
+        }
+        ComponentKind::Loggia { depth, rail_height, door_width, door_side } => {
+            // Set back behind the facade: brick returns, a soffit, and the back wall with its
+            // glazed door and window; a guard rail across the opening.
+            let back = depth.max(at.wall + 300.0);
+            let (floor, ceiling) = (at.floor, at.ceiling.max(v1 + 1.0));
+            const RETURN: f64 = 110.0;
+            let mut brick = Mesh::default();
+            brick.append(&fbox(fr, (u0 - RETURN, u0), (at.wall, back + RETURN), (floor, ceiling)));
+            brick.append(&fbox(fr, (u1, u1 + RETURN), (at.wall, back + RETURN), (floor, ceiling)));
+            brick.append(&fbox(fr, (u0, u1), (back, back + RETURN), (v1, ceiling)));
+            parts.push((Material::BrickRed, brick));
+            parts.push((Material::Render, fbox(fr, (u0, u1), (at.wall, back), (v1, ceiling))));
+            let gw = (back - FRAME_DEPTH, back);
+            let (du0, du1, wu0, wu1) = match door_side {
+                Side::Left => (u0, u0 + door_width, u0 + door_width, u1),
+                Side::Right => (u1 - door_width, u1, u0, u1 - door_width),
+            };
+            frame.append(&fbox(fr, (u0, u1), gw, (v1 - FRAME, v1)));
+            let (f, g) = door_leaf(fr, (du0, du1), (floor, v1 - FRAME), gw);
+            frame.append(&f);
+            glass.append(&g);
+            let ws = floor + 800.0;
+            if wu1 - wu0 > 300.0 {
+                parts.push((Material::BrickRed, fbox(fr, (wu0, wu1), (back - 20.0, back + RETURN), (floor, ws))));
+                let (f, g) = window_lights(fr, (wu0, wu1), (ws, v1 - FRAME), gw, 2, 0.0);
+                frame.append(&f);
+                glass.append(&g);
             }
-            glass.append(&fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), glass_w, (ws + FRAME, v1 - FRAME)));
-            parts.push((Material::Sill, fbox(fr, (wu0, wu1), (-40.0, REVEAL), (ws - 40.0, ws))));
+            // Two white rails and end posts across the opening, over the parapet.
+            let (top, mid) = (floor + rail_height, (v0 + floor + rail_height) / 2.0);
+            let wr = at.wall * 0.4;
+            let mut rail = Mesh::default();
+            for z in [top, mid] {
+                rail.append(&fbox(fr, (u0, u1), (wr - 15.0, wr + 15.0), (z - 30.0, z)));
+            }
+            for u in [u0 + 15.0, u1 - 45.0] {
+                rail.append(&fbox(fr, (u, u + 30.0), (wr - 15.0, wr + 15.0), (v0, top)));
+            }
+            parts.push((Material::Frame, rail));
         }
         ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
     }
@@ -1105,7 +1346,7 @@ fn rail_run(fr: &FacadeFrame, from: (f64, f64), to: (f64, f64), z0: f64, height:
     m
 }
 
-fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> BuiltOpening {
+fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status, at: Fill) -> BuiltOpening {
     let ty = &r.ty;
     let class = if ty.kind.is_door() { ElementClass::Door } else { ElementClass::Window };
     let level = r.placement.level;
@@ -1117,7 +1358,7 @@ fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: S
         level,
         width: ty.width,
         height: ty.height,
-        parts: fill_parts(fr, r.rect, &ty.kind),
+        parts: fill_parts(fr, r.rect, &ty.kind, at),
         status,
     };
     let mut attached = Vec::new();

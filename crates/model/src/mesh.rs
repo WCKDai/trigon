@@ -25,10 +25,14 @@ pub enum Material {
     Plinth,
     /// Plastered interior walls.
     Plaster,
+    /// White render (pudset facade, bands).
+    Render,
+    /// Red brick, where a facade isn't the building's usual brick.
+    BrickRed,
 }
 
 impl Material {
-    pub const ALL: [Material; 14] = [
+    pub const ALL: [Material; 16] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -43,6 +47,8 @@ impl Material {
         Material::Demolished,
         Material::Plinth,
         Material::Plaster,
+        Material::Render,
+        Material::BrickRed,
     ];
 
     pub fn name(self) -> &'static str {
@@ -61,6 +67,8 @@ impl Material {
             Material::Demolished => "demolished",
             Material::Plinth => "plinth",
             Material::Plaster => "plaster",
+            Material::Render => "render",
+            Material::BrickRed => "brick_red",
         }
     }
 
@@ -81,6 +89,8 @@ impl Material {
             Material::Demolished => [0.90, 0.10, 0.10, 0.45],
             Material::Plinth => [0.42, 0.42, 0.41, 1.0],
             Material::Plaster => [0.93, 0.92, 0.89, 1.0],
+            Material::Render => [0.90, 0.90, 0.88, 1.0],
+            Material::BrickRed => [0.55, 0.22, 0.14, 1.0],
         }
     }
 }

@@ -120,9 +120,9 @@ fn compound(deg: f64) -> String {
 
 fn window_partitioning(kind: &ComponentKind) -> &'static str {
     match kind {
-        ComponentKind::Window { lights: 1 } | ComponentKind::FixedWindow => ".SINGLE_PANEL.",
-        ComponentKind::Window { lights: 2 } => ".DOUBLE_PANEL_VERTICAL.",
-        ComponentKind::Window { lights: 3 } => ".TRIPLE_PANEL_VERTICAL.",
+        ComponentKind::Window { lights: 1, .. } | ComponentKind::FixedWindow => ".SINGLE_PANEL.",
+        ComponentKind::Window { lights: 2, .. } => ".DOUBLE_PANEL_VERTICAL.",
+        ComponentKind::Window { lights: 3, .. } => ".TRIPLE_PANEL_VERTICAL.",
         _ => ".NOTDEFINED.",
     }
 }
@@ -447,6 +447,7 @@ fn element(w: &mut W, body: usize, wcs: usize, storey_lp: usize, e: &BuiltElemen
         )),
         ElementClass::Railing => w.add(format!("IFCRAILING({g},$,{name},$,$,#{lp},#{shape},{tag},.GUARDRAIL.)")),
         ElementClass::BalconySlab => w.add(format!("IFCSLAB({g},$,{name},$,'Balcony',#{lp},#{shape},{tag},.USERDEFINED.)")),
+        ElementClass::Stair => w.add(format!("IFCSTAIR({g},$,{name},$,'Cellar stair',#{lp},#{shape},{tag},.STRAIGHT_RUN_STAIR.)")),
     };
     // With phases, the IFC4 common property sets carry the element's status.
     if doc.phases.len() > 1 {
@@ -455,6 +456,7 @@ fn element(w: &mut W, body: usize, wcs: usize, storey_lp: usize, e: &BuiltElemen
             ElementClass::Door => "Pset_DoorCommon",
             ElementClass::Railing => "Pset_RailingCommon",
             ElementClass::BalconySlab => "Pset_SlabCommon",
+            ElementClass::Stair => "Pset_StairCommon",
         };
         let value = match e.status {
             Status::Existing => "EXISTING",

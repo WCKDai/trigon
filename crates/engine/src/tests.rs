@@ -951,3 +951,93 @@ fn a_3d_plan_cut_closes_the_walls_at_the_cut_and_leaves_out_what_is_above() {
         assert!(s.execute("export.gltf", bad.clone()).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn street_fronts_loggias_bands_finishes_and_cellar_stairs() {
+    let mut s = session();
+    s.execute("building.add_basement", json!({"floor": -2480})).unwrap();
+    let south = first_facade_facing(&mut s, "S");
+    let len = {
+        let b = &s.doc.buildings[0];
+        let (a, e) = b.edge(b.facade(&south).unwrap().edge).unwrap();
+        ((e[0] - a[0]).powi(2) + (e[1] - a[1]).powi(2)).sqrt()
+    };
+    s.execute(
+        "types.define",
+        json!({"id": "loggia.t", "name": "Loggia", "width": 2000, "height": 2050, "sill": 500,
+               "kind": {"family": "loggia", "depth": 1400, "rail_height": 1000, "door_width": 900, "door_side": "left"}}),
+    )
+    .unwrap();
+    s.execute(
+        "types.define",
+        json!({"id": "window.t", "name": "Window with top lights", "width": 2400, "height": 2050, "sill": 500, "kind": {"family": "window", "lights": 3, "top_light": 500}}),
+    )
+    .unwrap();
+    s.execute("facade.set_bays", json!({"facade": south, "centres": [len / 3.0, 2.0 * len / 3.0]})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "loggia.t", "levels": [2], "bays": [0]})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "window.t", "levels": [2], "bays": [1]})).unwrap();
+    s.execute("facade.set_finish", json!({"facades": [south], "finish": "render"})).unwrap();
+    s.execute("facade.set_bands", json!({"facades": [south], "bands": [{"levels": [2], "bottom": -450, "top": 500}]})).unwrap();
+    s.execute(
+        "building.set_cellar_stairs",
+        json!({"stairs": [{"facade": south, "from": 1000, "to": 6000, "width": 1500, "top": 1200, "bottom": 4000, "floor": -2480, "door_at": 5000}]}),
+    )
+    .unwrap();
+    let built = trigon_model::build(&s.doc).unwrap();
+    let w = built[0].walls.iter().find(|w| w.id == south).unwrap();
+    assert_eq!(w.finish, trigon_model::Material::Render);
+    assert!(!w.trim.is_empty());
+    // The loggia: brick returns, a white soffit, a rail; the cellar stair: a door into the basement and its pit.
+    let loggia = w.openings.iter().find(|o| o.fill.type_id == "loggia.t").unwrap();
+    let mats: Vec<trigon_model::Material> = loggia.fill.parts.iter().map(|(m, _)| *m).collect();
+    assert!(
+        mats.contains(&trigon_model::Material::BrickRed)
+            && mats.contains(&trigon_model::Material::Render)
+            && mats.contains(&trigon_model::Material::Glass)
+    );
+    let (_, hi) = loggia
+        .fill
+        .parts
+        .iter()
+        .filter_map(|(_, m)| m.bounds())
+        .fold(([0.0; 3], [f64::MIN; 3]), |acc, b| (acc.0, [acc.1[0].max(b.1[0]), acc.1[1].max(b.1[1]), acc.1[2].max(b.1[2])]));
+    assert!(hi[2] > 0.0);
+    let cellar_door = w.openings.iter().find(|o| o.fill.type_id == "door.cellar").unwrap();
+    assert_eq!(cellar_door.level, 0);
+    assert!(w.segment(0).unwrap().openings.contains(&(w.openings.len() - 1)));
+    assert!(w.attachments.iter().any(|a| a.class == trigon_model::ElementClass::Stair));
+    // Plans, glTF and IFC take them.
+    assert!(s.execute("plan.image", json!({"level": 0, "path": std::env::temp_dir().join("trigon-cellar.svg")})).is_ok());
+    assert!(s.execute("plan.image", json!({"level": 2, "path": std::env::temp_dir().join("trigon-loggia.svg")})).is_ok());
+    let dir = std::env::temp_dir().join(format!("trigon-street-{}", std::process::id()));
+    s.execute("export.gltf", json!({"path": dir.join("m.glb")})).unwrap();
+    s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    // Refused, and nothing changes.
+    let before = s.doc.clone();
+    for (cmd, bad) in [
+        ("facade.set_finish", json!({})),
+        ("facade.set_finish", json!({"facades": ["b1.f999"], "finish": "render"})),
+        ("facade.set_bands", json!({"facades": [south], "bands": [{"levels": [99], "bottom": 0, "top": 100}]})),
+        ("facade.set_bands", json!({"facades": [south], "bands": [{"levels": [1], "bottom": 0, "top": f64::MAX}]})),
+        (
+            "building.set_cellar_stairs",
+            json!({"stairs": [{"facade": south, "from": 0, "to": 900, "width": 1500, "top": 0, "bottom": 800, "floor": -2480, "door_at": 400}]}),
+        ),
+        (
+            "building.set_cellar_stairs",
+            json!({"stairs": [{"facade": south, "from": 1000, "to": 6000, "width": 1500, "top": 1200, "bottom": 4000, "floor": -2480, "door_at": 9000}]}),
+        ),
+        (
+            "types.define",
+            json!({"id": "x", "name": "x", "width": 1000, "height": 2000, "sill": 500, "kind": {"family": "loggia", "depth": 1400, "rail_height": 1000, "door_width": 900, "door_side": "left"}}),
+        ),
+        (
+            "types.define",
+            json!({"id": "y", "name": "y", "width": 1000, "height": 1000, "sill": 500, "kind": {"family": "window", "lights": 2, "top_light": 900}}),
+        ),
+    ] {
+        assert!(s.execute(cmd, bad.clone()).is_err(), "{cmd} {bad}");
+    }
+    assert_eq!(s.doc, before);
+}

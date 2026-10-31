@@ -25,8 +25,13 @@ pub struct ComponentType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "family", rename_all = "snake_case")]
 pub enum ComponentKind {
-    /// Casement window divided into `lights` side-hung sashes (1 = single sash).
-    Window { lights: u32 },
+    /// Casement window divided into `lights` side-hung sashes (1 = single sash), with a row of
+    /// top lights (overvinduer) `top_light` mm high across the top when it isn't 0.
+    Window {
+        lights: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        top_light: f64,
+    },
     /// Fixed glazing, no sash.
     FixedWindow,
     /// Solid entrance door.
@@ -44,6 +49,10 @@ pub enum ComponentKind {
     /// A balcony on its own, hung on the wall in front of an opening: a slab `depth` deep and the
     /// type's `width` wide, with a plain guard rail. Doesn't cut the wall. For existing balconies.
     BalconySlab { depth: f64, thickness: f64 },
+    /// A loggia: the facade is opened from the sill up and the glazing (a door and a window) is set
+    /// back `depth` mm from the outer face, between brick returns, under a soffit, with a guard
+    /// rail across the opening. The parapet below the sill is the facade wall.
+    Loggia { depth: f64, rail_height: f64, door_width: f64, door_side: Side },
     /// A MinAltan steel balcony (stålaltan): hot-dip galvanised frame on a 160 mm UPE profile, a
     /// sunken deck, an Ibond underside and a railing style named after the districts. The type's
     /// `width` is the balcony width and its `height` the railing height. Doesn't cut the wall.
@@ -62,6 +71,10 @@ pub enum ComponentKind {
         #[serde(default)]
         tie_rods: bool,
     },
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// Left or right, seen from outside.
@@ -115,7 +128,15 @@ pub enum Screens {
 
 impl ComponentKind {
     pub fn is_door(&self) -> bool {
-        matches!(self, Self::EntranceDoor | Self::FrenchDoor { .. } | Self::FrenchBalcony { .. } | Self::Balcony { .. } | Self::DoorWindow { .. })
+        matches!(
+            self,
+            Self::EntranceDoor
+                | Self::FrenchDoor { .. }
+                | Self::FrenchBalcony { .. }
+                | Self::Balcony { .. }
+                | Self::DoorWindow { .. }
+                | Self::Loggia { .. }
+        )
     }
 
     /// Cuts an opening in the wall (windows and doors). Attachments (balconies hung on the
@@ -140,8 +161,14 @@ impl ComponentType {
         checked("height", self.height, 300.0, 4000.0)?;
         checked("sill", self.sill, 0.0, 3000.0)?;
         match &self.kind {
-            ComponentKind::Window { lights } if *lights == 0 || *lights > 8 => {
+            ComponentKind::Window { lights, .. } if *lights == 0 || *lights > 8 => {
                 Err(crate::ModelError::Invalid(format!("lights must be 1 to 8 (got {lights})")))
+            }
+            ComponentKind::Window { top_light, .. } => checked("top_light", *top_light, 0.0, self.height / 2.0).map(|_| ()),
+            ComponentKind::Loggia { depth, rail_height, door_width, .. } => {
+                checked("depth", *depth, 300.0, 4000.0)?;
+                checked("rail_height", *rail_height, 600.0, 1500.0)?;
+                checked("door_width", *door_width, 500.0, (self.width - 300.0).max(500.0)).map(|_| ())
             }
             ComponentKind::FrenchDoor { leaves } | ComponentKind::FrenchBalcony { leaves, .. } | ComponentKind::Balcony { leaves, .. }
                 if *leaves == 0 || *leaves > 4 =>
@@ -187,9 +214,9 @@ pub fn default_types() -> Vec<ComponentType> {
         kind,
     };
     vec![
-        t("window.casement.1", "Casement window, 1 sash", 700.0, 1400.0, 850.0, ComponentKind::Window { lights: 1 }),
-        t("window.casement.2", "Casement window, 2 sashes", 1200.0, 1500.0, 850.0, ComponentKind::Window { lights: 2 }),
-        t("window.casement.3", "Casement window, 3 sashes", 1800.0, 1500.0, 850.0, ComponentKind::Window { lights: 3 }),
+        t("window.casement.1", "Casement window, 1 sash", 700.0, 1400.0, 850.0, ComponentKind::Window { lights: 1, top_light: 0.0 }),
+        t("window.casement.2", "Casement window, 2 sashes", 1200.0, 1500.0, 850.0, ComponentKind::Window { lights: 2, top_light: 0.0 }),
+        t("window.casement.3", "Casement window, 3 sashes", 1800.0, 1500.0, 850.0, ComponentKind::Window { lights: 3, top_light: 0.0 }),
         t("window.fixed", "Fixed window", 1200.0, 1500.0, 850.0, ComponentKind::FixedWindow),
         t("door.entrance", "Entrance door", 1200.0, 2300.0, 0.0, ComponentKind::EntranceDoor),
         t("door.french", "French door, 2 leaves", 1200.0, 2250.0, 0.0, ComponentKind::FrenchDoor { leaves: 2 }),
