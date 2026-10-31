@@ -1,0 +1,77 @@
+[
+ {
+  "command": "facade.set_bays",
+  "params": {
+   "facade": "b1.f31",
+   "centres": [
+    1500.0,
+    3200.0,
+    5050.0,
+    6900.0,
+    8000.0,
+    10300.0,
+    11500.0,
+    13400.0,
+    15300.0,
+    17100.0,
+    18300.0,
+    20500.0,
+    21700.0,
+    23500.0,
+    25500.0,
+    27350.0,
+    28500.0,
+    30800.0,
+    31950.0,
+    33850.0,
+    35700.0,
+    37600.0,
+    38800.0,
+    41000.0,
+    42200.0,
+    43950.0,
+    45950.0,
+    1995.0
+   ]
+  }
+ },
+ {
+  "command": "facade.clear",
+  "params": {
+   "facade": "b1.f31",
+   "levels": [
+    0
+   ],
+   "bays": [
+    1
+   ]
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "gateway.f28",
+   "name": "Frederikssundsvej 28: gateway (port) to the courtyard",
+   "width": 2870.0,
+   "height": 3460.0,
+   "sill": 0.0,
+   "kind": {
+    "family": "entrance_door"
+   }
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f31",
+   "type": "gateway.f28",
+   "levels": [
+    0
+   ],
+   "bays": [
+    27
+   ],
+   "sill": -350.0
+  }
+ }
+]

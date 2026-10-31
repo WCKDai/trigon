@@ -1,0 +1,284 @@
+[
+ {
+  "command": "building.set_storeys",
+  "params": {
+   "count": 5,
+   "height": 3000.0,
+   "ground_floor": 900.0
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "balcony.f28b",
+   "name": "Frederikssundsvej 28: narrow balcony door",
+   "width": 640.0,
+   "height": 2200.0,
+   "sill": 0.0,
+   "kind": {
+    "family": "balcony",
+    "leaves": 1,
+    "depth": 900.0,
+    "slab_width": 1600.0,
+    "rail_height": 1000.0
+   }
+  }
+ },
+ {
+  "command": "facade.set_kind",
+  "params": {
+   "facade": "b1.f33",
+   "kind": "courtyard"
+  }
+ },
+ {
+  "command": "facade.set_bays",
+  "params": {
+   "facade": "b1.f33",
+   "centres": [
+    900.0,
+    2250.0,
+    4240.0,
+    6380.0,
+    7320.0,
+    9600.0,
+    10530.0,
+    12650.0,
+    14640.0,
+    16780.0,
+    17720.0,
+    20000.0,
+    20930.0,
+    23050.0,
+    25040.0,
+    27180.0,
+    28120.0,
+    30400.0,
+    31330.0,
+    33450.0,
+    35440.0,
+    37580.0,
+    38520.0
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f33",
+   "type": "window.f28",
+   "bays": [
+    1,
+    2,
+    4,
+    5,
+    7,
+    8,
+    10,
+    11,
+    13,
+    14,
+    16,
+    17,
+    19,
+    20,
+    22
+   ],
+   "width": 1000.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f33",
+   "type": "window.casement.1",
+   "bays": [
+    0
+   ],
+   "width": 600.0,
+   "height": 1300.0,
+   "sill": 900.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f33",
+   "type": "balcony.f28b",
+   "levels": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "bays": [
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f33",
+   "type": "window.casement.1",
+   "levels": [
+    0
+   ],
+   "bays": [
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21
+   ],
+   "width": 600.0,
+   "height": 1300.0,
+   "sill": 900.0
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "window.f28.landing",
+   "name": "Frederikssundsvej 28: stairwell landing window",
+   "width": 1000.0,
+   "height": 950.0,
+   "sill": 0.0,
+   "kind": {
+    "family": "window",
+    "lights": 1
+   }
+  }
+ },
+ {
+  "command": "facade.set_kind",
+  "params": {
+   "facade": "b1.f32",
+   "kind": "courtyard"
+  }
+ },
+ {
+  "command": "facade.set_bays",
+  "params": {
+   "facade": "b1.f32",
+   "centres": [
+    3200.0,
+    5160.0,
+    7130.0,
+    7130.0
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "window.f28",
+   "levels": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "bays": [
+    0,
+    1
+   ],
+   "width": 1200.0,
+   "height": 1400.0,
+   "sill": 880.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "door.french",
+   "levels": [
+    0
+   ],
+   "bays": [
+    0,
+    1
+   ],
+   "height": 2300.0,
+   "sill": -520.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "window.f28.landing",
+   "levels": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "bays": [
+    2
+   ],
+   "sill": 2580.0,
+   "spans_storeys": true
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "window.f28.landing",
+   "levels": [
+    0
+   ],
+   "bays": [
+    3
+   ],
+   "sill": -320.0
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f31",
+   "path": "out/evidence/b1.f31-model.png",
+   "mm_per_px": 25
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f32",
+   "path": "out/evidence/b1.f32-model.png",
+   "mm_per_px": 20
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f33",
+   "path": "out/evidence/b1.f33-model.png",
+   "mm_per_px": 25
+  }
+ },
+ {
+  "command": "export.ifc",
+  "params": {
+   "path": "out/f28v3.ifc"
+  }
+ },
+ {
+  "command": "export.gltf",
+  "params": {
+   "path": "out/f28v3.glb"
+  }
+ }
+]

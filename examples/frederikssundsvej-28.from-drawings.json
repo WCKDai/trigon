@@ -1,0 +1,201 @@
+[
+ {
+  "command": "facade.clear",
+  "params": {
+   "facade": "b1.f32"
+  }
+ },
+ {
+  "command": "building.set_levels",
+  "params": {
+   "floors": [
+    350.0,
+    3960.0,
+    6960.0,
+    9960.0,
+    12960.0
+   ],
+   "top": 15960.0,
+   "source": "Københavns Kommune byggesagsarkiv, S505/39 'Gaardsider' with sections, 1:100, 12-10-38 (ing. Poul A. Berthelsen & Gert Jessen, ark. Holger Hjortenberg): section through the stairwell wing",
+   "attribution": "Københavns Kommune"
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "window.f28",
+   "name": "Frederikssundsvej 28: 2-sash window (drawing: 140 high, sill 75)",
+   "width": 1100.0,
+   "height": 1400.0,
+   "sill": 750.0,
+   "kind": {
+    "family": "window",
+    "lights": 2
+   }
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "balcony.f28",
+   "name": "Frederikssundsvej 28: cantilever balcony, single door",
+   "width": 800.0,
+   "height": 2150.0,
+   "sill": 0.0,
+   "kind": {
+    "family": "balcony",
+    "leaves": 1,
+    "depth": 1000.0,
+    "slab_width": 2000.0,
+    "rail_height": 1000.0
+   }
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "balcony.f28b",
+   "name": "Frederikssundsvej 28: narrow balcony door",
+   "width": 640.0,
+   "height": 2150.0,
+   "sill": 0.0,
+   "kind": {
+    "family": "balcony",
+    "leaves": 1,
+    "depth": 900.0,
+    "slab_width": 1600.0,
+    "rail_height": 1000.0
+   }
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f33",
+   "type": "window.casement.1",
+   "bays": [
+    0
+   ],
+   "width": 600.0,
+   "height": 1400.0,
+   "sill": 750.0
+  }
+ },
+ {
+  "command": "facade.set_bays",
+  "params": {
+   "facade": "b1.f32",
+   "centres": [
+    1180.0,
+    1180.0,
+    3200.0,
+    5160.0,
+    7130.0,
+    7130.0
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "window.f28",
+   "levels": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "bays": [
+    2,
+    3
+   ],
+   "width": 1200.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "door.french",
+   "levels": [
+    0
+   ],
+   "bays": [
+    2,
+    3
+   ],
+   "height": 2300.0,
+   "sill": 0.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "window.f28.landing",
+   "levels": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "bays": [
+    0,
+    4
+   ],
+   "sill": -480.0
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f32",
+   "type": "window.f28.landing",
+   "levels": [
+    0
+   ],
+   "bays": [
+    1,
+    5
+   ],
+   "sill": 230.0
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f31",
+   "path": "out/evidence/b1.f31-drawing.png",
+   "mm_per_px": 25
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f32",
+   "path": "out/evidence/b1.f32-drawing.png",
+   "mm_per_px": 20
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f33",
+   "path": "out/evidence/b1.f33-drawing.png",
+   "mm_per_px": 25
+  }
+ },
+ {
+  "command": "export.ifc",
+  "params": {
+   "path": "out/f28v4.ifc"
+  }
+ },
+ {
+  "command": "export.gltf",
+  "params": {
+   "path": "out/f28v4.glb"
+  }
+ }
+]

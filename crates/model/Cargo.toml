@@ -1,0 +1,20 @@
+[package]
+name = "trigon-model"
+description = "Trigon's building model: document, parametric components, facade layout and geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+earcutr = { workspace = true }
+schemars = "1"
+# Straight skeletons for pitched roofs (MIT OR Apache-2.0, no dependencies).
+geo-straight-skeleton = "0.1"
+# Union cut-wall bands without internal seams (MIT OR Apache-2.0; already used by the IFC reader).
+i_overlay = "8.1.2"

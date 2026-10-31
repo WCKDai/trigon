@@ -1,0 +1,34 @@
+[package]
+name = "trigon-engine"
+description = "Trigon's engine: every action is a command with a JSON schema, run the same way from the CLI, MCP and the UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trigon-model = { workspace = true }
+trigon-data = { workspace = true }
+trigon-io = { workspace = true }
+trigon-ifcread = { workspace = true }
+trigon-drawing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+schemars = "1"
+# Facade images (MIT OR Apache-2.0).
+png = "0.18"
+# One vector scene for crisp PNG and PDF drawings (MIT OR Apache-2.0).
+resvg = { version = "0.47", default-features = false, features = ["text", "raster-images"] }
+krilla = "0.8.2"
+krilla-svg = "0.8.1"
+# Poche: union and difference of cut regions (MIT OR Apache-2.0; already used by trigon-model).
+i_overlay = "8.1.2"
+# Caps over cut regions for hidden lines (ISC; already used by trigon-model).
+earcutr = { workspace = true }
+
+[dev-dependencies]
+# Parse generated PDFs in export tests (MIT; already used by trigon-drawing).
+lopdf = { version = "0.46", default-features = false }

@@ -1,0 +1,17 @@
+[package]
+name = "trigon-io"
+description = "Trigon's exporters: glTF 2.0 (GLB) and IFC4 (ISO 10303-21), written from the public specifications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trigon-model = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Both IFC readers check the export in tests (workspace crate).
+trigon-ifcread = { workspace = true }
