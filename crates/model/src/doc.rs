@@ -255,6 +255,88 @@ pub struct Facade {
     /// fire gable, for example, keeps one thickness all the way up), mm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wall_schedule: Vec<f64>,
+    /// The wall's outer finish where it isn't the building's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<WallFinish>,
+    /// Horizontal rendered bands standing proud of the wall (slab edges, spandrels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bands: Vec<Band>,
+}
+
+/// An outdoor stair down to the basement (kældernedgang): a pit along a facade, `from`–`to` mm
+/// along it and `width` mm out from it, between concrete retaining walls with a railing on top;
+/// a straight flight runs along the wall from `top` (at the terrain) down to `bottom` (at the
+/// pit floor, `floor` mm relative to the terrain); a door `door_width` wide at `door_at` opens
+/// into the basement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CellarStair {
+    #[serde(default)]
+    pub id: String,
+    pub facade: String,
+    pub from: f64,
+    pub to: f64,
+    pub width: f64,
+    pub top: f64,
+    pub bottom: f64,
+    pub floor: f64,
+    pub door_at: f64,
+    #[serde(default = "cellar_door")]
+    pub door_width: f64,
+}
+
+fn cellar_door() -> f64 {
+    900.0
+}
+
+impl CellarStair {
+    /// Checks the numbers against the facade's length.
+    pub fn validate(&self, length: f64) -> Result<()> {
+        for (what, v) in [("from", self.from), ("to", self.to), ("top", self.top), ("bottom", self.bottom), ("door_at", self.door_at)] {
+            checked(what, v, -1.0, length + 1.0)?;
+        }
+        checked("pit length", self.to - self.from, 1500.0, 20_000.0)?;
+        checked("width", self.width, 700.0, 4000.0)?;
+        checked("floor", self.floor, -6000.0, -600.0)?;
+        checked("door_width", self.door_width, 600.0, 2000.0)?;
+        let inside = |u: f64| u >= self.from - 1.0 && u <= self.to + 1.0;
+        if !inside(self.top) || !inside(self.bottom) || (self.top - self.bottom).abs() < 600.0 {
+            return Err(ModelError::Invalid("the flight's top and bottom must lie in the pit, at least 600 mm apart".into()));
+        }
+        if self.door_at - self.door_width / 2.0 < self.from || self.door_at + self.door_width / 2.0 > self.to {
+            return Err(ModelError::Invalid("the door must open onto the pit".into()));
+        }
+        Ok(())
+    }
+}
+
+/// A facade's outer finish.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WallFinish {
+    /// Facing brick in the building's brick (yellow on most Copenhagen blocks of the 1930s).
+    #[default]
+    Brick,
+    /// Red facing brick.
+    RedBrick,
+    /// White render.
+    Render,
+}
+
+/// A horizontal band on the listed storeys, from `bottom` to `top` mm relative to each storey's
+/// floor (negative reaches down past the floor), standing `projection` mm proud of the wall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Band {
+    pub levels: Vec<usize>,
+    pub bottom: f64,
+    pub top: f64,
+    #[serde(default = "band_projection")]
+    pub projection: f64,
+}
+
+fn band_projection() -> f64 {
+    40.0
 }
 
 /// A component type placed in one slot (storey × bay) of a facade grid.
@@ -325,6 +407,12 @@ pub struct Building {
     /// A plinth (sokkel) along the foot of every facade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plinth: Option<Plinth>,
+    /// Outdoor stairs down to the basement (kældernedgange) along facades.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cellar_stairs: Vec<CellarStair>,
+    /// The facades' outer finish unless a facade has its own.
+    #[serde(default, skip_serializing_if = "is_brick")]
+    pub finish: WallFinish,
     /// Below the ground storey, the walls run straight along the inner corners of facade steps
     /// up to this deep (bays and stepped fronts that start at the ground floor), mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,6 +493,10 @@ pub struct WallDoor {
     /// Height of the opening above the floor, mm (default 2100).
     #[serde(default = "door_height")]
     pub height: f64,
+}
+
+fn is_brick(f: &WallFinish) -> bool {
+    *f == WallFinish::Brick
 }
 
 pub fn door_height() -> f64 {
@@ -546,6 +638,8 @@ impl Building {
             entrances: Vec::new(),
             ground_level: 0,
             plinth: None,
+            cellar_stairs: Vec::new(),
+            finish: WallFinish::Brick,
             basement_straighten_mm: None,
         };
         b.set_storeys(storeys, storey_height)?;
@@ -557,6 +651,8 @@ impl Building {
                 bays: Vec::new(),
                 placements: Vec::new(),
                 wall_schedule: Vec::new(),
+                finish: None,
+                bands: Vec::new(),
             })
             .collect();
         Ok(b)

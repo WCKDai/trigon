@@ -20,8 +20,8 @@ pub mod walls;
 pub use build::{Built, BuiltElement, BuiltOpening, BuiltSlab, BuiltWall, ElementClass, FacadeFrame, Rect, SlabKind, build};
 pub use component::{ComponentKind, ComponentType, default_types};
 pub use doc::{
-    Building, Document, Drawing, Entrance, Evidence, FORMAT, Facade, FacadeKind, FacadeRegistration, GeoPoint, InteriorWall, Phase, Placement,
-    PlanRegistration, Reference, Room, Site, Stair, StairKind, Storey, Unit, WallDoor,
+    Building, CellarStair, Document, Drawing, Entrance, Evidence, FORMAT, Facade, FacadeKind, FacadeRegistration, GeoPoint, InteriorWall, Phase,
+    Placement, PlanRegistration, Reference, Room, Site, Stair, StairKind, Storey, Unit, WallDoor, WallFinish,
 };
 pub use mesh::{Material, Mesh};
 pub use roof::Roof;

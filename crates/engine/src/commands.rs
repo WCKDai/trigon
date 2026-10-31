@@ -285,6 +285,32 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.set_cellar_stairs",
+        summary: "Set the outdoor cellar stairs (kældernedgange), replacing any there were: each is a pit along a facade \
+                  (`from`–`to` mm along it, `width` mm out from it) between concrete retaining walls with a railing, a \
+                  straight flight along the wall from `top` (at the terrain) down to `bottom` (the pit floor, `floor` mm \
+                  relative to the terrain, e.g. the basement floor), and a door `door_width` wide (default 900) at `door_at` \
+                  into the basement. Read them off the basement plan. `stairs: []` removes them.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetCellarStairs>,
+        run: |s, v| {
+            let p: SetCellarStairs = parse("building.set_cellar_stairs", v)?;
+            if p.stairs.len() > 100 {
+                return Err(ModelError::Invalid("at most 100 cellar stairs".into()).into());
+            }
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            for c in &p.stairs {
+                let f = b.facade(&c.facade)?;
+                let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::NotFound(format!("facade {}", c.facade)))?;
+                c.validate(((e[0] - a[0]).powi(2) + (e[1] - a[1]).powi(2)).sqrt())?;
+            }
+            b.cellar_stairs = p.stairs;
+            trigon_model::build(&s.doc)?;
+            Ok(json!({"cellar_stairs": s.doc.building(p.building.as_deref())?.cellar_stairs.len()}))
+        },
+    },
+    CommandSpec {
         id: "building.set_plinth",
         summary: "Give the facades a plinth (sokkel): rendered or concrete, from below the terrain up to `height_mm` above it, \
                   standing `projection_mm` proud of the brickwork (default 20). Openings in the plinth band (basement windows) \
@@ -305,6 +331,66 @@ static COMMANDS: &[CommandSpec] = &[
             };
             trigon_model::build(&s.doc)?;
             Ok(json!({"plinth": s.doc.building(p.building.as_deref())?.plinth}))
+        },
+    },
+    CommandSpec {
+        id: "facade.set_finish",
+        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick or render (white). Without \
+                  `facades` it sets the building's default; `clear: true` makes the listed facades follow the building again.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetFinish>,
+        run: |s, v| {
+            let p: SetFinish = parse("facade.set_finish", v)?;
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            match (&p.facades, p.finish, p.clear.unwrap_or(false)) {
+                (None, Some(f), false) => b.finish = f,
+                (Some(ids), Some(f), false) if !ids.is_empty() => {
+                    for id in ids {
+                        b.facade_mut(id)?.finish = Some(f);
+                    }
+                }
+                (Some(ids), None, true) if !ids.is_empty() => {
+                    for id in ids {
+                        b.facade_mut(id)?.finish = None;
+                    }
+                }
+                _ => return Err(ModelError::Invalid("give `finish` (with or without `facades`), or `facades` with `clear: true`".into()).into()),
+            }
+            let b = s.doc.building(p.building.as_deref())?;
+            Ok(
+                json!({"building": b.finish, "facades": b.facades.iter().filter_map(|f| f.finish.map(|x| json!({"facade": f.id, "finish": x}))).collect::<Vec<_>>()}),
+            )
+        },
+    },
+    CommandSpec {
+        id: "facade.set_bands",
+        summary: "Give facades horizontal rendered bands standing proud of the wall (slab edges, spandrels, cornices): each band \
+                  runs on `levels` from `bottom` to `top` mm relative to each storey's floor (negative reaches below it), \
+                  `projection` mm proud (default 40). Openings are cut through. Replaces the facades' bands; `bands: []` clears.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<SetBands>,
+        run: |s, v| {
+            let p: SetBands = parse("facade.set_bands", v)?;
+            if p.facades.is_empty() || p.bands.len() > 50 {
+                return Err(ModelError::Invalid("give one or more facades and at most 50 bands".into()).into());
+            }
+            let b = s.doc.building_mut(p.building.as_deref())?;
+            let storeys = b.storeys.len();
+            for band in &p.bands {
+                trigon_model::checked("band bottom", band.bottom, -10_000.0, 10_000.0)?;
+                trigon_model::checked("band top", band.top, band.bottom + 10.0, 10_000.0)?;
+                trigon_model::checked("band projection", band.projection, 1.0, 500.0)?;
+                if band.levels.is_empty() || band.levels.iter().any(|l| *l >= storeys) {
+                    return Err(ModelError::Invalid(format!("band levels must be storey indices below {storeys}")).into());
+                }
+            }
+            for id in &p.facades {
+                b.facade_mut(id)?.bands = p.bands.clone();
+            }
+            trigon_model::build(&s.doc)?;
+            Ok(json!({"facades": p.facades, "bands": p.bands.len()}))
         },
     },
     CommandSpec {
@@ -1617,6 +1703,30 @@ struct SetBasementLine {
     building: Option<String>,
     /// Deepest facade step the basement wall runs straight past, mm (0: follow the footprint).
     straighten_mm: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetFinish {
+    building: Option<String>,
+    facades: Option<Vec<String>>,
+    finish: Option<trigon_model::WallFinish>,
+    clear: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetBands {
+    building: Option<String>,
+    facades: Vec<String>,
+    bands: Vec<trigon_model::doc::Band>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetCellarStairs {
+    building: Option<String>,
+    stairs: Vec<trigon_model::CellarStair>,
 }
 
 #[derive(Deserialize, JsonSchema)]

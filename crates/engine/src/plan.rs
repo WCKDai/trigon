@@ -173,6 +173,24 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 };
                 match kind {
                     Some(ComponentKind::Window { .. } | ComponentKind::FixedWindow) => window(&mut prims, u0, u1),
+                    Some(ComponentKind::Loggia { depth, door_width, door_side, .. }) => {
+                        // Open to the cut: brick returns, the glazing set back, a rail across the parapet.
+                        let back = depth.max(d + 300.0);
+                        for (a0, a1) in [(u0 - 110.0, u0), (u1, u1 + 110.0)] {
+                            prims.push(Prim::Poly {
+                                pts: vec![pt(fr, a0, d), pt(fr, a1, d), pt(fr, a1, back + 110.0), pt(fr, a0, back + 110.0)],
+                                fill: WALL,
+                                surface: Surface::Exterior,
+                            });
+                        }
+                        let (du0, du1) = if door_side == trigon_model::component::Side::Left { (u0, u0 + door_width) } else { (u1 - door_width, u1) };
+                        prims.push(Prim::Line { a: pt(fr, du0, back - 35.0), b: pt(fr, du1, back - 35.0), color, width: 45.0, dashed: false });
+                        let (wu0, wu1) = if door_side == trigon_model::component::Side::Left { (u0 + door_width, u1) } else { (u0, u1 - door_width) };
+                        for depth in [back - 60.0, back - 15.0] {
+                            prims.push(Prim::Line { a: pt(fr, wu0, depth), b: pt(fr, wu1, depth), color, width: 25.0, dashed: false });
+                        }
+                        prims.push(Prim::Line { a: pt(fr, u0, d * 0.4), b: pt(fr, u1, d * 0.4), color, width: 14.0, dashed: false });
+                    }
                     Some(ComponentKind::DoorWindow { door_width, door_side, .. }) => {
                         if door_side == trigon_model::component::Side::Left {
                             door(&mut prims, u0, u0 + door_width);
@@ -270,6 +288,38 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                         away: Some([(out[0] - label_at[0]) / 1000.0, (out[1] - label_at[1]) / 1000.0]),
                     });
                 }
+            }
+        }
+    }
+    // Outdoor cellar stairs: cut in the basement, seen from above on the ground storey.
+    for b in &doc.buildings {
+        if level != 0 && level != b.ground_level {
+            continue;
+        }
+        for c in &b.cellar_stairs {
+            let Ok(f) = b.facade(&c.facade) else { continue };
+            let Some((a, e)) = b.edge(f.edge) else { continue };
+            let Some(fr) = trigon_model::FacadeFrame::new(a, e) else { continue };
+            let (out, r) = (c.width, 150.0);
+            let walls = [
+                [(c.from - r, out), (c.to + r, out), (c.to + r, out + r), (c.from - r, out + r)],
+                [(c.from - r, 0.0), (c.from, 0.0), (c.from, out), (c.from - r, out)],
+                [(c.to, 0.0), (c.to + r, 0.0), (c.to + r, out), (c.to, out)],
+            ];
+            for q in walls {
+                let pts: Vec<[f64; 2]> = q.iter().map(|&(u, w)| pt(&fr, u, -w)).collect();
+                if level == 0 {
+                    prims.push(Prim::Poly { pts, fill: WALL, surface: Surface::Exterior });
+                } else {
+                    for k in 0..4 {
+                        prims.push(Prim::Line { a: pts[k], b: pts[(k + 1) % 4], color: LINE, width: 14.0, dashed: false });
+                    }
+                }
+            }
+            let risers = ((-c.floor) / 175.0).round().clamp(3.0, 40.0) as usize;
+            for i in 0..=risers {
+                let u = c.bottom + (c.top - c.bottom) * i as f64 / risers as f64;
+                prims.push(Prim::Line { a: pt(&fr, u, 0.0), b: pt(&fr, u, -out), color: LINE, width: 9.0, dashed: false });
             }
         }
     }
