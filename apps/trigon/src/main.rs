@@ -21,7 +21,7 @@ USAGE
 
 CREDENTIALS (environment)
   TRIGON_DATAFORSYNINGEN_TOKEN[_FILE]     addresses, elevation model, Skråfoto
-  TRIGON_DATAFORDELER_KEY[_FILE]          GeoDanmark and BBR (not used yet)";
+  TRIGON_DATAFORDELER_KEY[_FILE]          GeoDanmark and BBR";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

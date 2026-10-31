@@ -1,0 +1,155 @@
+[
+ {
+  "command": "types.define",
+  "params": {
+   "id": "window.f28",
+   "name": "Frederikssundsvej 28: 2-sash window",
+   "width": 1100.0,
+   "height": 1300.0,
+   "sill": 900.0,
+   "kind": {
+    "family": "window",
+    "lights": 2
+   }
+  }
+ },
+ {
+  "command": "types.define",
+  "params": {
+   "id": "balcony.f28",
+   "name": "Frederikssundsvej 28: cantilever balcony, single door",
+   "width": 800.0,
+   "height": 2200.0,
+   "sill": 0.0,
+   "kind": {
+    "family": "balcony",
+    "leaves": 1,
+    "depth": 1000.0,
+    "slab_width": 2000.0,
+    "rail_height": 1000.0
+   }
+  }
+ },
+ {
+  "command": "facade.set_kind",
+  "params": {
+   "facade": "b1.f31",
+   "kind": "courtyard"
+  }
+ },
+ {
+  "command": "facade.set_bays",
+  "params": {
+   "facade": "b1.f31",
+   "centres": [
+    1500.0,
+    3200.0,
+    5050.0,
+    6900.0,
+    8000.0,
+    10300.0,
+    11500.0,
+    13400.0,
+    15300.0,
+    17100.0,
+    18300.0,
+    20500.0,
+    21700.0,
+    23500.0,
+    25500.0,
+    27350.0,
+    28500.0,
+    30800.0,
+    31950.0,
+    33850.0,
+    35700.0,
+    37600.0,
+    38800.0,
+    41000.0,
+    42200.0,
+    43950.0,
+    45950.0
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f31",
+   "type": "window.f28",
+   "bays": [
+    1,
+    2,
+    4,
+    5,
+    7,
+    8,
+    10,
+    11,
+    13,
+    14,
+    16,
+    17,
+    19,
+    20,
+    22,
+    23,
+    25,
+    26
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f31",
+   "type": "balcony.f28",
+   "levels": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "bays": [
+    0,
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21,
+    24
+   ]
+  }
+ },
+ {
+  "command": "facade.place",
+  "params": {
+   "facade": "b1.f31",
+   "type": "window.f28",
+   "levels": [
+    0
+   ],
+   "bays": [
+    3,
+    6,
+    9,
+    12,
+    15,
+    18,
+    21,
+    24
+   ],
+   "width": 800.0
+  }
+ },
+ {
+  "command": "evidence.facade_image",
+  "params": {
+   "facade": "b1.f31",
+   "path": "out/evidence/b1.f31-model.png",
+   "mm_per_px": 25
+  }
+ }
+]

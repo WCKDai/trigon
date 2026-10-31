@@ -19,6 +19,7 @@ open-source landscape in [`docs/research`](docs/research).
 ```sh
 cargo build --release
 export TRIGON_DATAFORSYNINGEN_TOKEN_FILE=~/path/to/token   # free at dataforsyningen.dk
+export TRIGON_DATAFORDELER_KEY_FILE=~/path/to/key           # free at datafordeler.dk (GeoDanmark, BBR)
 ./target/release/trigon run --doc out/f28.trigon site.load_address '{"address":"Frederikssundsvej 28, 2400 København"}'
 ./target/release/trigon run --doc out/f28.trigon facade.list
 ./target/release/trigon script examples/frederikssundsvej-28.facades.json --doc out/f28.trigon
@@ -43,9 +44,11 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 | | |
 |---|---|
 | Address | Dataforsyningen GSearch (DAR id, EPSG:25832); Nominatim without a token |
-| Outline | OpenStreetMap (GeoDanmark via Datafordeler is next) |
-| Storeys and terrain | Danmarks Højdemodel: DSM − DTM inside the outline |
+| Outline | GeoDanmark via Datafordeler (surveyed wall line, 0.15 m); OpenStreetMap without a key |
+| Register | BBR via Datafordeler: storeys, year built, use, wall and roof material, areas |
+| Storeys and terrain | Storey count from BBR; storey height from the eaves height in Danmarks Højdemodel (DSM − DTM) |
 | Photos | Skråfoto 2021–2025, matched to the facades whose camera looks at them |
+| Facade images | `evidence.facade_image` straightens a facade from the photo that shows it best (only the needed tiles are downloaded) and draws the model's storeys, bays and openings over it; over MCP the agent receives the image itself |
 | Facades | Bay grid per facade; slots take typed components; every change is checked (fits the wall and storey, no overlaps, no openings in party walls) |
 | Components | Casement windows (1–3 sashes), fixed window, entrance door, French door, French balcony, cantilever balcony; define your own with `types.define` |
 | Export | IFC4 (walls voided by openings, typed windows and doors, slabs, railings, georeferenced with `IfcMapConversion`) and glTF 2.0 |

@@ -259,6 +259,34 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| photos(s, parse("evidence.photos", v)?),
     },
     CommandSpec {
+        id: "evidence.facade_image",
+        summary: "Straighten a facade from the Skråfoto photo that shows it best: an orthographic, to-scale PNG of the wall from \
+                  the ground to the eaves (left = facade start), with the model's storey lines (cyan), bay lines (yellow) and \
+                  openings (magenta) drawn on it. Look at it before setting bays and placing windows, and again after.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<FacadeImageParams>,
+        run: |s, v| {
+            let p: FacadeImageParams = parse("evidence.facade_image", v)?;
+            let out = p.path.as_deref().map(|x| checked_path(x, "png")).transpose()?;
+            let img = crate::facade_image::render(s, &p.facade, p.photo.as_deref(), p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out)?;
+            Ok(json!({
+                "image_path": img.path,
+                "photo": img.photo.id,
+                "camera_looks": img.photo.direction,
+                "taken": img.photo.datetime,
+                "width_px": img.width,
+                "height_px": img.height,
+                "mm_per_px": img.mm_per_px,
+                "facade_length_mm": img.length_mm.round(),
+                "facade_height_mm": img.height_mm.round(),
+                "photo_coverage": (img.coverage * 1000.0).round() / 1000.0,
+                "how_to_read": "x = mm along the facade from its start / mm_per_px; y = (facade height − height above ground) / mm_per_px. \
+                                Trees, other buildings and the roof overhang can hide parts of the wall.",
+            }))
+        },
+    },
+    CommandSpec {
         id: "export.gltf",
         summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up.",
         mutates: false,
@@ -341,6 +369,20 @@ static COMMANDS: &[CommandSpec] = &[
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NoParams {}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FacadeImageParams {
+    facade: String,
+    /// A Skråfoto photo id from evidence.photos; omit to use the photo that shows the facade largest.
+    photo: Option<String>,
+    /// Image scale, mm per pixel (default 50).
+    mm_per_px: Option<f64>,
+    /// Draw storeys, bays and openings over the photo (default true).
+    overlay: Option<bool>,
+    /// Where to write the PNG; default `trigon-evidence/` next to the document.
+    path: Option<String>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -531,6 +573,7 @@ fn info(doc: &Document) -> Value {
             "storey_height_mm": b.storeys.first().map(|s| s.height),
             "height_mm": b.height(),
             "wall_thickness_mm": b.wall_thickness,
+            "attributes": b.attributes,
             "facades": facades(doc, b),
             "evidence": b.evidence,
         })).collect::<Vec<_>>(),
@@ -555,15 +598,44 @@ fn load_address(s: &mut Session, p: LoadAddress) -> Result<Value> {
             None
         }
     };
-    // Storeys from the median roof height; the agent or the user corrects it with building.set_storeys.
+    let register = match fp.bbr_id.as_deref().map(|id| provider.register(id)) {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => {
+            notes.push(format!("no BBR data: {e}"));
+            None
+        }
+        None => None,
+    };
+    // Storeys: given, else BBR, else the median surface height over a default storey height.
+    let bbr_storeys = register.as_ref().and_then(|r| r.storeys).filter(|n| (1..=60).contains(n)).map(|n| n as usize);
     let estimated = heights.as_ref().map(|h| ((h.median * 1000.0) / storey_height).round().max(1.0) as usize);
-    let storeys = p.storeys.or(estimated).unwrap_or(4);
+    let storeys = p.storeys.or(bbr_storeys).or(estimated).unwrap_or(4);
+    // Storey height: given, else the eaves height (elevation model) shared by the storeys.
+    let storey_height = match (p.storey_height, &heights) {
+        (None, Some(h)) if h.eaves > 2.0 => ((h.eaves * 1000.0) / storeys as f64).clamp(2400.0, 4500.0).round(),
+        _ => storey_height,
+    };
     let local: Vec<[f64; 2]> = fp.ring_utm.iter().map(|q| [(q[0] - addr.utm[0]) * 1000.0, (q[1] - addr.utm[1]) * 1000.0]).collect();
     let mut b = Building::new("b1", &addr.text, &local, storeys, storey_height)?;
     if let Some(t) = p.wall_thickness {
         b.wall_thickness = trigon_model::checked("wall thickness", t, trigon_model::doc::MIN_WALL, trigon_model::doc::MAX_WALL)?;
     }
     b.evidence.push(fp.evidence.clone());
+    if let Some(r) = &register {
+        b.evidence.push(r.evidence.clone());
+        let mut put = |k: &str, v: Option<String>| {
+            if let Some(v) = v {
+                b.attributes.insert(k.to_string(), v);
+            }
+        };
+        put("bbr_id", Some(r.bbr_id.clone()));
+        put("year_built", r.year_built.map(|y| y.to_string()));
+        put("use", r.use_text.clone());
+        put("wall_material", r.wall_material.clone());
+        put("roof_material", r.roof_material.clone());
+        put("built_area_m2", r.built_area_m2.map(|a| a.to_string()));
+        put("floor_area_m2", r.floor_area_m2.map(|a| a.to_string()));
+    }
     if let Some(h) = &heights {
         b.evidence.push(h.evidence.clone());
     }
@@ -581,9 +653,11 @@ fn load_address(s: &mut Session, p: LoadAddress) -> Result<Value> {
         "dar_id": addr.id,
         "footprint_source": fp.evidence.source,
         "footprint_tags": fp.tags,
-        "heights_m": heights.as_ref().map(|h| json!({"terrain": h.terrain, "median_above_terrain": h.median, "top_above_terrain": h.top, "samples": h.samples})),
+        "heights_m": heights.as_ref().map(|h| json!({"terrain": h.terrain, "eaves_above_terrain": h.eaves, "median_above_terrain": h.median, "top_above_terrain": h.top, "samples": h.samples})),
+        "register": register,
         "storeys": storeys,
-        "storeys_source": if p.storeys.is_some() { "given" } else if estimated.is_some() { "estimated from median height" } else { "default" },
+        "storey_height_mm": storey_height,
+        "storeys_source": if p.storeys.is_some() { "given" } else if bbr_storeys.is_some() { "BBR" } else if estimated.is_some() { "estimated from median height" } else { "default" },
         "facades": facades(&s.doc, b),
         "notes": notes,
     }))

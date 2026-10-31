@@ -17,7 +17,11 @@ use std::time::Duration;
 use serde_json::Value;
 use trigon_model::{Evidence, GeoPoint};
 
+pub mod bbr;
 pub mod coords;
+pub mod skraafoto;
+
+pub use skraafoto::{Camera, Region};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DataError {
@@ -47,6 +51,23 @@ pub struct Footprint {
     /// Outline in ETRS89 / UTM 32N, metres.
     pub ring_utm: Vec<[f64; 2]>,
     pub tags: BTreeMap<String, String>,
+    /// The building's BBR id when the outline came from GeoDanmark.
+    pub bbr_id: Option<String>,
+    pub evidence: Evidence,
+}
+
+/// What BBR, the Danish building register, says about a building.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Register {
+    pub bbr_id: String,
+    pub year_built: Option<i64>,
+    pub storeys: Option<i64>,
+    pub use_code: Option<String>,
+    pub use_text: Option<String>,
+    pub wall_material: Option<String>,
+    pub roof_material: Option<String>,
+    pub built_area_m2: Option<f64>,
+    pub floor_area_m2: Option<f64>,
     pub evidence: Evidence,
 }
 
@@ -59,6 +80,8 @@ pub struct Heights {
     pub median: f64,
     /// 95th percentile of surface minus terrain: roughly the ridge.
     pub top: f64,
+    /// 10th percentile of surface minus terrain: roughly the eaves on a pitched roof.
+    pub eaves: f64,
     pub samples: usize,
     pub evidence: Evidence,
 }
@@ -72,6 +95,10 @@ pub struct Photo {
     /// `north`, `south`, `east`, `west` (the direction the camera looks) or `nadir`.
     pub direction: String,
     pub datetime: String,
+    pub camera: Option<Camera>,
+    /// Image URL. Never serialised: it carries the token.
+    #[serde(skip)]
+    pub href: String,
 }
 
 pub trait Provider: Send {
@@ -79,6 +106,10 @@ pub trait Provider: Send {
     fn footprint(&self, at: &Address) -> Result<Footprint>;
     fn heights(&self, ring_utm: &[[f64; 2]]) -> Result<Heights>;
     fn photos(&self, at_utm: [f64; 2]) -> Result<Vec<Photo>>;
+    /// BBR data for a building id; `Ok(None)` when no register is configured.
+    fn register(&self, bbr_id: &str) -> Result<Option<Register>>;
+    /// Full-resolution pixels `[x0, x1) × [y0, y1)` of a photo.
+    fn photo_region(&self, photo: &Photo, window: [u32; 4]) -> Result<Region>;
 }
 
 #[derive(Clone, Default)]
@@ -112,6 +143,7 @@ const USER_AGENT: &str = "Trigon/0.1 (+https://github.com/WCKDai/trigon)";
 const MAX_BODY: u64 = 64 * 1024 * 1024;
 const SKRAAFOTO_COLLECTIONS: [&str; 3] = ["skraafotos2025", "skraafotos2023", "skraafotos2021"];
 const SDFI: &str = "Indeholder data fra Styrelsen for Dataforsyning og Infrastruktur";
+const BBR_FIELDS: &str = "id_lokalId byg021BygningensAnvendelse byg026Opfoerelsesaar byg054AntalEtager byg038SamletBygningsareal byg041BebyggetAreal byg032YdervaeggensMateriale byg033Tagdaekningsmateriale";
 const OSM: &str = "© OpenStreetMap contributors, ODbL 1.0";
 
 /// The live providers over HTTP.
@@ -226,17 +258,8 @@ impl Live {
             _ => Err(bad()),
         }
     }
-}
-
-impl Provider for Live {
-    fn geocode(&self, query: &str) -> Result<Address> {
-        match self.creds.dataforsyningen.as_deref() {
-            Some(token) => self.gsearch(query, token),
-            None => self.nominatim(query),
-        }
-    }
-
-    fn footprint(&self, at: &Address) -> Result<Footprint> {
+    /// Building outline from OpenStreetMap: the way containing the address, else the nearest.
+    fn osm_footprint(&self, at: &Address) -> Result<Footprint> {
         let q = format!("[out:json][timeout:25];way(around:30,{},{})[\"building\"];out tags geom;", at.wgs.lat, at.wgs.lon);
         let v = self.get_json("OpenStreetMap (Overpass)", "https://overpass-api.de/api/interpreter", &[("data", q.as_str())])?;
         let ways = v.get("elements").and_then(Value::as_array).ok_or_else(|| DataError::BadResponse("Overpass".into()))?;
@@ -263,9 +286,138 @@ impl Provider for Live {
                 .unwrap_or_default();
             let id = w.get("id").and_then(Value::as_u64).unwrap_or(0);
             let evidence = Evidence { source: format!("osm:way/{id}"), supplies: "footprint".into(), attribution: OSM.into() };
-            best = Some((score, Footprint { ring_utm: ring, tags, evidence }));
+            best = Some((score, Footprint { ring_utm: ring, tags, bbr_id: None, evidence }));
         }
         best.map(|(_, f)| f).ok_or_else(|| DataError::NotFound(format!("no building outline within 30 m of {}", at.text)))
+    }
+
+    /// Building outline from GeoDanmark (surveyed wall line), with its BBR id.
+    fn geodanmark(&self, at: &Address) -> Result<Footprint> {
+        let key = self.creds.datafordeler.as_deref().ok_or_else(|| DataError::Unavailable("no Datafordeler key".into()))?;
+        let bbox = format!("{},{},{},{},urn:ogc:def:crs:EPSG::25832", at.utm[0] - 15.0, at.utm[1] - 15.0, at.utm[0] + 15.0, at.utm[1] + 15.0);
+        let q = [
+            ("service", "WFS"),
+            ("version", "2.0.0"),
+            ("request", "GetFeature"),
+            ("typeNames", "geodkv_v001:bygning_current"),
+            ("bbox", bbox.as_str()),
+            ("outputFormat", "application/json"),
+            ("count", "50"),
+            ("apikey", key),
+        ];
+        let v = self.get_json("GeoDanmark (Datafordeler)", "https://wfs.datafordeler.dk/GEODKV/GEODKV_WFS/1.0.0/WFS", &q)?;
+        let mut best: Option<(f64, Footprint)> = None;
+        for f in v.get("features").and_then(Value::as_array).into_iter().flatten() {
+            if f.pointer("/geometry/type").and_then(Value::as_str) != Some("Polygon") {
+                continue;
+            }
+            let Some(outer) = f.pointer("/geometry/coordinates/0").and_then(Value::as_array) else { continue };
+            let ring: Vec<[f64; 2]> = outer
+                .iter()
+                .filter_map(|c| {
+                    let c = c.as_array()?;
+                    Some([c.first()?.as_f64()?, c.get(1)?.as_f64()?])
+                })
+                .collect();
+            if ring.len() < 4 {
+                continue;
+            }
+            let score = if coords::contains(&ring, at.utm) { 0.0 } else { 1.0 + coords::distance_to_ring(&ring, at.utm) };
+            if best.as_ref().is_some_and(|(s, _)| *s <= score) {
+                continue;
+            }
+            let prop = |k: &str| f.pointer(&format!("/properties/{k}")).and_then(Value::as_str).map(str::to_string);
+            let mut tags = BTreeMap::new();
+            for k in ["bygningstype", "maalestedBygning", "metode3D", "planNoejagtighed", "planStedfaestelsesmetode"] {
+                if let Some(v) = prop(k) {
+                    tags.insert(k.to_string(), v);
+                }
+            }
+            let id = prop("id_lokalId").unwrap_or_default();
+            let evidence =
+                Evidence { source: format!("geodanmark:bygning/{id}"), supplies: "footprint".into(), attribution: format!("{SDFI} (GeoDanmark)") };
+            best = Some((score, Footprint { ring_utm: ring, tags, bbr_id: prop("BBRUUID").map(|s| s.to_lowercase()), evidence }));
+        }
+        best.map(|(_, f)| f).ok_or_else(|| DataError::NotFound(format!("no GeoDanmark building within 15 m of {}", at.text)))
+    }
+
+    /// The BBR record of a building, through Datafordeler's GraphQL service.
+    fn bbr(&self, bbr_id: &str) -> Result<Register> {
+        let key = self.creds.datafordeler.as_deref().ok_or_else(|| DataError::Unavailable("no Datafordeler key".into()))?;
+        if !bbr_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') || bbr_id.len() > 64 {
+            return Err(DataError::BadResponse("BBR id".into()));
+        }
+        let query = format!(
+            "{{ BBR_Bygning(first: 1, virkningstid: \"{}\", where: {{ id_lokalId: {{ eq: \"{bbr_id}\" }} }}) {{ nodes {{ {BBR_FIELDS} }} }} }}",
+            "2100-01-01T00:00:00Z"
+        );
+        let body = serde_json::json!({ "query": query }).to_string();
+        let url = "https://graphql.datafordeler.dk/BBR/v2";
+        let resp = self
+            .agent
+            .post(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", "application/json")
+            .query("apiKey", key)
+            .send(body.as_bytes());
+        let mut resp = resp.map_err(|e| match e {
+            ureq::Error::StatusCode(c) => DataError::Unavailable(format!("BBR (Datafordeler) answered HTTP {c}")),
+            _ => DataError::Unavailable("BBR (Datafordeler) could not be reached".into()),
+        })?;
+        let v: Value =
+            serde_json::from_slice(&resp.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|_| DataError::BadResponse("BBR".into()))?)
+                .map_err(|_| DataError::BadResponse("BBR".into()))?;
+        let n = v.pointer("/data/BBR_Bygning/nodes/0").ok_or_else(|| DataError::NotFound(format!("BBR building {bbr_id}")))?;
+        let s = |k: &str| n.get(k).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_i64().map(|i| i.to_string())));
+        let i = |k: &str| n.get(k).and_then(|x| x.as_i64().or_else(|| x.as_str()?.parse().ok()));
+        let use_code = s("byg021BygningensAnvendelse");
+        Ok(Register {
+            bbr_id: bbr_id.to_string(),
+            year_built: i("byg026Opfoerelsesaar"),
+            storeys: i("byg054AntalEtager"),
+            use_text: use_code.as_deref().map(bbr::use_text).map(str::to_string),
+            use_code,
+            wall_material: s("byg032YdervaeggensMateriale").as_deref().map(bbr::wall_material).map(str::to_string),
+            roof_material: s("byg033Tagdaekningsmateriale").as_deref().map(bbr::roof_material).map(str::to_string),
+            built_area_m2: i("byg041BebyggetAreal").map(|x| x as f64),
+            floor_area_m2: i("byg038SamletBygningsareal").map(|x| x as f64),
+            evidence: Evidence { source: format!("bbr:bygning/{bbr_id}"), supplies: "register".into(), attribution: format!("{SDFI} (BBR)") },
+        })
+    }
+}
+
+impl Provider for Live {
+    fn geocode(&self, query: &str) -> Result<Address> {
+        match self.creds.dataforsyningen.as_deref() {
+            Some(token) => self.gsearch(query, token),
+            None => self.nominatim(query),
+        }
+    }
+
+    fn footprint(&self, at: &Address) -> Result<Footprint> {
+        if self.creds.datafordeler.is_some() {
+            match self.geodanmark(at) {
+                Ok(f) => return Ok(f),
+                Err(DataError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.osm_footprint(at)
+    }
+
+    fn register(&self, bbr_id: &str) -> Result<Option<Register>> {
+        if self.creds.datafordeler.is_none() {
+            return Ok(None);
+        }
+        self.bbr(bbr_id).map(Some)
+    }
+
+    fn photo_region(&self, photo: &Photo, w: [u32; 4]) -> Result<Region> {
+        if photo.href.is_empty() {
+            return Err(DataError::NotFound(format!("no image for photo {}", photo.id)));
+        }
+        let reader = skraafoto::RangeReader::open(&self.agent, photo.href.clone())?;
+        skraafoto::read_region(reader, w[0], w[1], w[2], w[3])
     }
 
     fn heights(&self, ring: &[[f64; 2]]) -> Result<Heights> {
@@ -305,6 +457,7 @@ impl Provider for Live {
             terrain: q(&ground, 0.5),
             median: q(&rel, 0.5),
             top: q(&rel, 0.95),
+            eaves: q(&rel, 0.10),
             samples: rel.len(),
             evidence: Evidence {
                 source: "dhm:dhm_overflade,dhm_terraen".into(),
@@ -329,6 +482,8 @@ impl Provider for Live {
                     collection: c.to_string(),
                     direction: s("/properties/direction"),
                     datetime: s("/properties/datetime"),
+                    camera: f.get("properties").and_then(skraafoto::camera_from_item),
+                    href: s("/assets/data/href"),
                 });
             }
         }

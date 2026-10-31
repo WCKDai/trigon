@@ -56,14 +56,46 @@ pub fn handle(session: &mut Session, msg: &Value) -> Option<Value> {
                 return err(-32602, &format!("unknown tool {name}"));
             };
             let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
-            let (text, is_error) = match session.execute(spec.id, args) {
-                Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false),
-                Err(e) => (e.to_string(), true),
+            let (text, is_error, image) = match session.execute(spec.id, args) {
+                Ok(v) => (serde_json::to_string_pretty(&v).unwrap_or_default(), false, image_of(&v)),
+                Err(e) => (e.to_string(), true, None),
             };
-            ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+            let mut content = vec![json!({"type": "text", "text": text})];
+            if let Some(data) = image {
+                content.push(json!({"type": "image", "data": data, "mimeType": "image/png"}));
+            }
+            ok(json!({"content": content, "isError": is_error}))
         }
         _ => err(-32601, &format!("method not found: {method}")),
     }
+}
+
+/// Largest image sent inline to the agent.
+const MAX_IMAGE: u64 = 8 * 1024 * 1024;
+
+/// A command result that names a PNG (`image_path`) is sent to the agent as an image too.
+fn image_of(v: &Value) -> Option<String> {
+    let path = v.get("image_path")?.as_str()?;
+    if !path.ends_with(".png") || std::fs::metadata(path).ok()?.len() > MAX_IMAGE {
+        return None;
+    }
+    std::fs::read(path).ok().map(|b| base64(&b))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if i <= c.len() {
+                out.push(char::from(T[((n >> shift) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Serves until the input closes.
@@ -87,4 +119,16 @@ pub fn serve(session: &mut Session, input: impl BufRead, mut output: impl Write)
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64_matches_rfc_4648() {
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foo"), "Zm9v");
+        assert_eq!(super::base64(b"foobar"), "Zm9vYmFy");
+    }
 }

@@ -1,7 +1,7 @@
 //! Engine tests against a canned provider: no network.
 
 use serde_json::{Value, json};
-use trigon_data::{Address, DataError, Footprint, Heights, Photo, Provider};
+use trigon_data::{Address, Camera, DataError, Footprint, Heights, Photo, Provider, Region, Register};
 use trigon_model::{Evidence, GeoPoint};
 
 use crate::{EngineError, Session, commands};
@@ -30,13 +30,59 @@ impl Provider for Canned {
         let [e, n] = at.utm;
         // Clockwise on purpose: the model must turn it around.
         let ring = vec![[e - 12.0, n - 6.0], [e - 12.0, n + 6.0], [e + 12.0, n + 6.0], [e + 12.0, n - 6.0], [e - 12.0, n - 6.0]];
-        Ok(Footprint { ring_utm: ring, tags: Default::default(), evidence: ev("osm:way/1") })
+        Ok(Footprint { ring_utm: ring, tags: Default::default(), bbr_id: Some("b55fb3b8".into()), evidence: ev("geodanmark:bygning/1") })
     }
     fn heights(&self, _: &[[f64; 2]]) -> trigon_data::Result<Heights> {
-        Ok(Heights { terrain: 12.0, median: 15.2, top: 17.9, samples: 1800, evidence: ev("dhm:test") })
+        Ok(Heights { terrain: 12.0, median: 15.2, top: 17.9, eaves: 15.0, samples: 1800, evidence: ev("dhm:test") })
     }
     fn photos(&self, _: [f64; 2]) -> trigon_data::Result<Vec<Photo>> {
-        Ok(vec![Photo { id: "p-north".into(), collection: "c".into(), direction: "north".into(), datetime: "2025".into() }])
+        Ok(vec![Photo {
+            id: "p-north".into(),
+            collection: "c".into(),
+            direction: "north".into(),
+            datetime: "2025".into(),
+            camera: Some(south_camera()),
+            href: "memory".into(),
+        }])
+    }
+    fn register(&self, id: &str) -> trigon_data::Result<Option<Register>> {
+        Ok(Some(Register {
+            bbr_id: id.into(),
+            year_built: Some(1940),
+            storeys: Some(5),
+            use_code: Some("140".into()),
+            use_text: Some("Etagebolig, flerfamiliehus".into()),
+            wall_material: Some("brick (mursten)".into()),
+            roof_material: Some("clay tiles (tegl)".into()),
+            built_area_m2: Some(288.0),
+            floor_area_m2: Some(1440.0),
+            evidence: ev("bbr:test"),
+        }))
+    }
+    fn photo_region(&self, _: &Photo, w: [u32; 4]) -> trigon_data::Result<Region> {
+        // A checkerboard of 40 px squares, so the straightened facade shows a pattern.
+        let (width, height) = (w[2] - w[0], w[3] - w[1]);
+        let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+        for y in w[1]..w[3] {
+            for x in w[0]..w[2] {
+                let v = if (x / 40 + y / 40) % 2 == 0 { 220 } else { 30 };
+                rgb.extend([v, v, v]);
+            }
+        }
+        Ok(Region { x0: w[0], y0: w[1], width, height, rgb })
+    }
+}
+
+/// A level camera 200 m south of the block, 8 m above the terrain, looking north.
+fn south_camera() -> Camera {
+    Camera {
+        center: [721989.65, 6178379.47, 20.0],
+        rotation: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0],
+        focal_mm: 100.0,
+        pixel_mm: 0.01,
+        width: 4000.0,
+        height: 3000.0,
+        principal_offset_mm: [0.0, 0.0],
     }
 }
 
@@ -229,5 +275,39 @@ fn a_linked_georeferenced_export_lands_on_the_model() {
     assert!(s.execute("reference.link", json!({"path": ifc, "name": "self"})).is_err(), "duplicate names are refused");
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.doc.references.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bbr_sets_storeys_and_attributes() {
+    let mut s = session();
+    let info = s.execute("document.info", json!({})).unwrap();
+    let b = &info["buildings"][0];
+    assert_eq!(b["storeys"], 5);
+    assert_eq!(b["storey_height_mm"], 3000.0, "15 m eaves over 5 BBR storeys");
+    assert_eq!(b["attributes"]["year_built"], "1940");
+    assert_eq!(b["attributes"]["roof_material"], "clay tiles (tegl)");
+}
+
+#[test]
+fn facade_image_is_straightened_from_the_photo_that_shows_it() {
+    let mut s = session();
+    let south = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": south, "count": 6})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "window.casement.2"})).unwrap();
+    let dir = std::env::temp_dir().join(format!("trigon-img-{}", std::process::id()));
+    let path = dir.join("south.png");
+    let v = s.execute("evidence.facade_image", json!({"facade": south, "path": path, "mm_per_px": 100.0})).unwrap();
+    assert_eq!(v["photo"], "p-north");
+    assert_eq!(v["width_px"], 240, "24 m at 100 mm/px");
+    assert_eq!(v["height_px"], 150, "15 m at 100 mm/px");
+    assert_eq!(v["photo_coverage"], 1.0, "{v}");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[1..4], b"PNG");
+    // The north facade faces away from the only camera: no photo shows it.
+    let north = first_facade_facing(&mut s, "N");
+    let err = s.execute("evidence.facade_image", json!({"facade": north, "path": dir.join("n.png")})).unwrap_err();
+    assert!(err.to_string().contains("no photo shows"), "{err}");
+    assert!(s.execute("evidence.facade_image", json!({"facade": south, "path": dir.join("x.txt")})).is_err(), "only .png paths");
     let _ = std::fs::remove_dir_all(dir);
 }

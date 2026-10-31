@@ -12,6 +12,7 @@ use trigon_model::doc::JournalEntry;
 use trigon_model::{Document, ModelError};
 
 mod commands;
+mod facade_image;
 mod time;
 
 pub use commands::{CommandSpec, commands};
