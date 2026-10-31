@@ -21,7 +21,47 @@ pub enum Roof {
         pitch_deg: f64,
         #[serde(default)]
         gables: Vec<String>,
+        /// Steps in the facades up to this deep (mm) don't get their own roof faces: the eave runs
+        /// straight along the outer corners (a stepped street facade under one roof plane).
+        #[serde(default = "default_steps")]
+        straighten_mm: f64,
     },
+}
+
+fn default_steps() -> f64 {
+    1200.0
+}
+
+/// The roof's outline: the footprint with inward steps up to `tolerance` deep removed, so the eave
+/// follows the outer corners. Only inner (reflex) corners are dropped, which can only enlarge the
+/// outline, plus corners that are straight within 50 mm. Returns the kept corner indices.
+pub fn eave_outline(ring: &[[f64; 2]], tolerance: f64) -> Vec<usize> {
+    let mut keep: Vec<usize> = (0..ring.len()).collect();
+    loop {
+        let n = keep.len();
+        if n <= 4 {
+            break;
+        }
+        let mut best: Option<(usize, f64)> = None;
+        for k in 0..n {
+            let (p, c, q) = (ring[keep[(k + n - 1) % n]], ring[keep[k]], ring[keep[(k + 1) % n]]);
+            let cross = (c[0] - p[0]) * (q[1] - p[1]) - (c[1] - p[1]) * (q[0] - p[0]);
+            let len = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2)).sqrt().max(1e-9);
+            // Distance of c from the chord p–q; positive when c lies inside (a reflex corner of a CCW ring).
+            let dev = -cross / len;
+            let removable = (dev > 0.0 && dev <= tolerance) || dev.abs() <= 50.0;
+            if removable && best.is_none_or(|(_, d)| dev.abs() < d) {
+                best = Some((k, dev.abs()));
+            }
+        }
+        match best {
+            Some((k, _)) => {
+                keep.remove(k);
+            }
+            None => break,
+        }
+    }
+    keep
 }
 
 /// A pitched roof's geometry, in site mm.
@@ -148,5 +188,31 @@ mod tests {
     fn refuses_silly_pitches() {
         assert!(pitched(&WING, 0.0, 89.0, &[]).is_err());
         assert!(pitched(&WING, 0.0, f64::NAN, &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod straighten_tests {
+    use super::*;
+
+    #[test]
+    fn sawtooth_street_facade_gets_a_straight_eave() {
+        // A 30 × 12 m wing whose street side (y = 12000) steps in and out by 800 mm every 6 m.
+        let mut ring = vec![[0.0, 0.0], [30000.0, 0.0]];
+        for k in 0..5 {
+            let (x1, x0) = (30000.0 - k as f64 * 6000.0, 24000.0 - k as f64 * 6000.0);
+            let y = if k % 2 == 0 { 12000.0 } else { 11200.0 };
+            ring.push([x1, y]);
+            ring.push([x0, y]);
+        }
+        let ring = crate::footprint::clean(&ring).unwrap();
+        let kept = eave_outline(&ring, 1200.0);
+        assert_eq!(kept.len(), 4, "a plain rectangle under the roof: {:?}", kept.iter().map(|&i| ring[i]).collect::<Vec<_>>());
+        let outline: Vec<[f64; 2]> = kept.iter().map(|&i| ring[i]).collect();
+        // Never inside the walls: every footprint corner is inside or on the eave outline.
+        let r = pitched(&outline, 16000.0, 40.0, &[]).unwrap();
+        assert!((r.max_depth - 6000.0).abs() < 1.0);
+        // With straightening off, every step keeps its corners.
+        assert_eq!(eave_outline(&ring, 0.0).len(), ring.len());
     }
 }

@@ -467,15 +467,19 @@ fn floor_plans_from_a_registered_sheet() {
     assert!((v["px_per_m"].as_f64().unwrap() - 100.0).abs() < 0.01, "{v}");
     assert_eq!(v["residuals_mm"], json!([0.0, 0.0]));
     let dir = std::env::temp_dir().join(format!("trigon-plan-{}", std::process::id()));
-    let png = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.png"), "mm_per_px": 50.0})).unwrap();
+    let png = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.png"), "mm_per_px": 50.0, "show_scan": true})).unwrap();
     assert_eq!(png["underlay"], "sheet");
+    let clean = s.execute("plan.image", json!({"level": 1, "path": dir.join("clean.png"), "mm_per_px": 50.0})).unwrap();
+    assert!(clean["underlay"].is_null(), "output material shows no scan by default");
     assert_eq!(png["labelled_balconies"], 2);
-    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg"), "mm_per_px": 50.0})).unwrap();
+    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg"), "mm_per_px": 50.0, "show_scan": true})).unwrap();
     let text = std::fs::read_to_string(svg["written"].as_str().unwrap()).unwrap();
     assert!(text.contains("Ca. 1300 x 2700") && text.contains("<polygon") && text.contains("data:image/png;base64,"));
     // No plan registered for the ground floor: a plain plan, or a clear error when a drawing is asked for.
     assert!(s.execute("plan.image", json!({"level": 0, "path": dir.join("g.png")})).unwrap()["underlay"].is_null());
-    assert!(s.execute("plan.image", json!({"level": 0, "drawing": sheet, "path": dir.join("g.png")})).is_err());
+    assert!(s.execute("plan.image", json!({"level": 0, "drawing": sheet, "show_scan": true, "path": dir.join("g.png")})).is_err());
+    let plain = s.execute("plan.image", json!({"level": 1, "path": dir.join("plain.svg")})).unwrap();
+    assert!(!std::fs::read_to_string(plain["written"].as_str().unwrap()).unwrap().contains("base64"), "no scan in the SVG");
     assert!(s.execute("plan.image", json!({"level": 9, "path": dir.join("x.png")})).is_err());
     assert!(s.execute("plan.image", json!({"level": 1, "path": dir.join("x.pdf")})).is_err());
     assert!(s.execute("drawing.register_plan", json!({"name": sheet, "levels": [1], "points": [{"px": 1, "py": 1, "x": 0.0, "y": 0.0}]})).is_err());

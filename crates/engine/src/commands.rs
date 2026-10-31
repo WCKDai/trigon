@@ -477,8 +477,8 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "plan.image",
         summary: "Draw a floor plan of a storey, cut 1 m above its floor: walls, windows, door swings and balconies with their \
-                  size (\"Ca. depth x width\"), coloured by phase (green new, red dashed demolished), over the registered archive \
-                  plan. `path` ending in .png gives an image (returned to agents), .svg a vector drawing.",
+                  size (\"Ca. depth x width\"), coloured by phase (green new, red dashed demolished), the model only (set \
+                  show_scan to put the registered archive scan underneath for checking). `path` ending in .png gives an image (returned to agents), .svg a vector drawing.",
         mutates: false,
         journaled: false,
         schema: schema::<PlanImage>,
@@ -486,7 +486,16 @@ static COMMANDS: &[CommandSpec] = &[
             let p: PlanImage = parse("plan.image", v)?;
             let path = PathBuf::from(&p.path);
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
-            crate::plan::render(s, p.level, p.drawing.as_deref(), view, p.mm_per_px.unwrap_or(20.0), p.rotate_deg.unwrap_or(0.0), path)
+            crate::plan::render(
+                s,
+                p.level,
+                p.drawing.as_deref(),
+                p.show_scan.unwrap_or(false),
+                view,
+                p.mm_per_px.unwrap_or(20.0),
+                p.rotate_deg.unwrap_or(0.0),
+                path,
+            )
         },
     },
     CommandSpec {
@@ -701,6 +710,9 @@ struct PlanImage {
     path: String,
     /// A drawing with a plan registered for this level (default: the first one found).
     drawing: Option<String>,
+    /// Draw the registered archive scan under the plan, for checking and tracing (default false: output material
+    /// shows only the model).
+    show_scan: Option<bool>,
     phase: Option<String>,
     filter: Option<String>,
     /// Scale, mm per pixel (default 20).
@@ -794,6 +806,8 @@ struct SetRoof {
     ridge: Option<f64>,
     /// Facades that end in a gable.
     gables: Option<Vec<String>>,
+    /// Facade steps up to this deep (mm) get no roof faces of their own; the eave runs straight (default 1200, 0 = follow every step).
+    straighten_mm: Option<f64>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -1079,7 +1093,9 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 (Some(d), None) => d,
                 (None, Some(ridge)) => {
                     let eaves = b.height();
-                    let depth = trigon_model::roof::max_depth(&b.footprint)?;
+                    let kept = trigon_model::roof::eave_outline(&b.footprint, p.straighten_mm.unwrap_or(1200.0));
+                    let outline: Vec<[f64; 2]> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+                    let depth = trigon_model::roof::max_depth(&outline)?;
                     let rise = trigon_model::checked("ridge", ridge, eaves + 500.0, eaves + 30_000.0)? - eaves;
                     (rise / depth).atan().to_degrees()
                 }
@@ -1087,7 +1103,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
                 }
             };
-            trigon_model::Roof::Pitched { pitch_deg: pitch, gables }
+            trigon_model::Roof::Pitched { pitch_deg: pitch, gables, straighten_mm: p.straighten_mm.unwrap_or(1200.0) }
         }
         other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
     };

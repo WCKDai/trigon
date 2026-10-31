@@ -66,20 +66,9 @@ fn scene(doc: &Document, level: usize, view: View) -> Result<(Vec<Prim>, String)
                     }
                     prims.push(Prim::Line { a: pt(fr, wu0, 0.0), b: pt(fr, wu1, 0.0), color, width: 15.0, dashed: false });
                 };
+                // Doors as a leaf line in the closed position: no swing, no opening direction.
                 let door = |prims: &mut Vec<Prim>, hinge: f64, other: f64| {
-                    // Opens inward: leaf at right angles to the wall from the hinge, quarter arc back.
-                    let r = (other - hinge).abs();
-                    let leaf = pt(fr, hinge, d + r);
-                    prims.push(Prim::Line { a: pt(fr, hinge, d), b: leaf, color, width: 25.0, dashed: false });
-                    let n = 12;
-                    for k in 0..n {
-                        let (t0, t1) = (f64::from(k) / f64::from(n), f64::from(k + 1) / f64::from(n));
-                        let at = |t: f64| {
-                            let ang = t * std::f64::consts::FRAC_PI_2;
-                            pt(fr, hinge + (other - hinge) * ang.sin(), d + r * ang.cos())
-                        };
-                        prims.push(Prim::Line { a: at(t0), b: at(t1), color, width: 12.0, dashed: false });
-                    }
+                    prims.push(Prim::Line { a: pt(fr, hinge, d * 0.5), b: pt(fr, other, d * 0.5), color, width: 45.0, dashed: false });
                 };
                 match kind {
                     Some(ComponentKind::Window { .. } | ComponentKind::FixedWindow) => window(&mut prims, u0, u1),
@@ -358,12 +347,21 @@ fn svg(prims: &[Prim], f: &Frame, background: Option<&[u8]>, title: &str) -> Res
     Ok(out)
 }
 
-pub(crate) fn render(s: &mut Session, level: usize, drawing: Option<&str>, view: View, mm: f64, rot_deg: f64, path: PathBuf) -> Result<Value> {
+pub(crate) fn render(
+    s: &mut Session,
+    level: usize,
+    drawing: Option<&str>,
+    show_scan: bool,
+    view: View,
+    mm: f64,
+    rot_deg: f64,
+    path: PathBuf,
+) -> Result<Value> {
     let mm = trigon_model::checked("mm_per_px", mm, 5.0, 200.0)?;
     let rot_deg = trigon_model::checked("rotate_deg", rot_deg, -360.0, 360.0)?;
     let (prims, title) = scene(&s.doc, level, view)?;
     let f = frame_for(&s.doc, mm, rot_deg)?;
-    let (mut rgb, used) = underlay(s, &f, level, drawing)?;
+    let (mut rgb, used) = if show_scan { underlay(s, &f, level, drawing)? } else { (vec![255u8; (f.w * f.h * 3) as usize], None) };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_string();
     match ext.as_str() {
         "png" => {
@@ -387,7 +385,7 @@ pub(crate) fn render(s: &mut Session, level: usize, drawing: Option<&str>, view:
         "height_px": f.h,
         "mm_per_px": mm,
         "labelled_balconies": balconies,
-        "legend": "dark grey = cut walls; lines = windows; leaf + arc = doors; rectangles = balconies (green new, red dashed demolished)",
+        "legend": "black = load-bearing walls, grey = partitions; double lines = windows; single thick line = doors; rectangles = balconies (green new, red dashed demolished)",
     });
     if ext == "png" {
         out["image_path"] = json!(path);

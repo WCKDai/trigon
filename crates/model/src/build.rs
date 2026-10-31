@@ -485,7 +485,7 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
             });
             None
         }
-        crate::roof::Roof::Pitched { pitch_deg, gables } => {
+        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm } => {
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
                 id: format!("{}.attic", b.id),
@@ -496,8 +496,18 @@ fn build_building(doc: &Document, b: &Building, view: View) -> Result<Built> {
                 thickness: FLOOR_SLAB,
                 mesh: prism(&inner, h - FLOOR_SLAB, FLOOR_SLAB),
             });
-            let edges: Vec<usize> = gables.iter().map(|g| b.facade(g).map(|f| f.edge)).collect::<Result<_>>()?;
-            let r = crate::roof::pitched(&b.footprint, h, *pitch_deg, &edges)?;
+            let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
+            let outline: Vec<[f64; 2]> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+            // A gable facade is an edge of the eave outline when both its corners were kept next to each other.
+            let mut edges = Vec::with_capacity(gables.len());
+            for g in gables {
+                let f = b.facade(g)?;
+                let n = b.footprint.len();
+                let (i, j) = (f.edge, (f.edge + 1) % n);
+                let pos = kept.iter().position(|&k| k == i).filter(|&p| kept.get((p + 1) % kept.len()) == Some(&j));
+                edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
+            }
+            let r = crate::roof::pitched(&outline, h, *pitch_deg, &edges)?;
             Some(BuiltRoof { id: format!("{}.roof", b.id), cover: r.cover, gables: r.gables, eaves: h, ridge: r.ridge, pitch_deg: *pitch_deg })
         }
     };
