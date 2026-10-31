@@ -293,6 +293,11 @@ impl StudioApp {
                     keep.push(shot);
                 }
                 ShotTarget::Window => {
+                    if self.mode == Mode::Plan && self.plan.error.is_none() && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
+                    {
+                        keep.push(shot);
+                        continue;
+                    }
                     if !shot.requested {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                         shot.requested = true;
