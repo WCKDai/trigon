@@ -15,6 +15,7 @@ trigon-model = { path = "crates/model" }
 trigon-data = { path = "crates/data" }
 trigon-io = { path = "crates/io" }
 trigon-ifcread = { path = "crates/ifcread" }
+trigon-drawing = { path = "crates/drawing" }
 trigon-engine = { path = "crates/engine" }
 trigon-mcp = { path = "crates/mcp" }
 

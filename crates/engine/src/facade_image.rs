@@ -57,7 +57,7 @@ fn projected_area(cam: &Camera, corners: &[[f64; 3]; 4]) -> Option<f64> {
     Some((0..n).map(|i| px[i][0] * px[(i + 1) % n][1] - px[(i + 1) % n][0] * px[i][1]).sum::<f64>().abs() / 2.0)
 }
 
-fn facade_frame(b: &Building, facade: &str) -> Result<FacadeFrame> {
+pub(crate) fn facade_frame(b: &Building, facade: &str) -> Result<FacadeFrame> {
     let f = b.facade(facade)?;
     let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::NotFound(format!("facade {facade}")))?;
     Ok(FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid(format!("facade {facade} has zero length")))?)
@@ -136,23 +136,7 @@ pub fn render(s: &Session, facade: &str, photo_id: Option<&str>, mm_per_px: f64,
     }
 
     if overlay {
-        let f = b.facade(facade)?;
-        let mut pen = Pen { rgb: &mut rgb, width, height, du, dv, h };
-        for st in &b.storeys {
-            pen.hline(st.elevation, 0.0, fr.length, [0, 220, 255]);
-        }
-        for c in &f.bays {
-            pen.vline(*c, 0.0, h, [255, 210, 0]);
-        }
-        if let Ok(openings) = resolve_facade(doc, b, f) {
-            for o in openings {
-                let r = o.rect;
-                pen.hline(r.v0, r.u0, r.u1, [255, 0, 200]);
-                pen.hline(r.v1, r.u0, r.u1, [255, 0, 200]);
-                pen.vline(r.u0, r.v0, r.v1, [255, 0, 200]);
-                pen.vline(r.u1, r.v0, r.v1, [255, 0, 200]);
-            }
-        }
+        draw_model(doc, b, facade, &fr, &mut Pen { rgb: &mut rgb, width, height, du, dv, h })?;
     }
 
     let path = out.unwrap_or_else(|| default_path(s.path.as_deref(), facade, &photo.id));
@@ -169,24 +153,46 @@ pub fn render(s: &Session, facade: &str, photo_id: Option<&str>, mm_per_px: f64,
     })
 }
 
-fn default_path(doc: Option<&Path>, facade: &str, photo: &str) -> PathBuf {
+/// The model's storey lines (cyan), bay lines (yellow) and openings (magenta).
+pub(crate) fn draw_model(doc: &Document, b: &Building, facade: &str, fr: &FacadeFrame, pen: &mut Pen<'_>) -> Result<()> {
+    let f = b.facade(facade)?;
+    let h = b.height();
+    for st in &b.storeys {
+        pen.hline(st.elevation, 0.0, fr.length, [0, 220, 255]);
+    }
+    for c in &f.bays {
+        pen.vline(*c, 0.0, h, [255, 210, 0]);
+    }
+    if let Ok(openings) = resolve_facade(doc, b, f) {
+        for o in openings {
+            let r = o.rect;
+            pen.hline(r.v0, r.u0, r.u1, [255, 0, 200]);
+            pen.hline(r.v1, r.u0, r.u1, [255, 0, 200]);
+            pen.vline(r.u0, r.v0, r.v1, [255, 0, 200]);
+            pen.vline(r.u1, r.v0, r.v1, [255, 0, 200]);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn default_path(doc: Option<&Path>, facade: &str, photo: &str) -> PathBuf {
     let dir = doc.and_then(Path::parent).map_or_else(|| PathBuf::from("trigon-evidence"), |d| d.join("trigon-evidence"));
     let safe: String =
         format!("{facade}-{photo}").chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect();
     dir.join(format!("{safe}.png"))
 }
 
-struct Pen<'a> {
-    rgb: &'a mut [u8],
-    width: u32,
-    height: u32,
-    du: f64,
-    dv: f64,
-    h: f64,
+pub(crate) struct Pen<'a> {
+    pub(crate) rgb: &'a mut [u8],
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) du: f64,
+    pub(crate) dv: f64,
+    pub(crate) h: f64,
 }
 
 impl Pen<'_> {
-    fn dot(&mut self, i: i64, j: i64, c: [u8; 3]) {
+    pub(crate) fn dot(&mut self, i: i64, j: i64, c: [u8; 3]) {
         if i < 0 || j < 0 || i >= i64::from(self.width) || j >= i64::from(self.height) {
             return;
         }
@@ -215,7 +221,7 @@ impl Pen<'_> {
     }
 }
 
-fn write_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<()> {
+pub(crate) fn write_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::Io(format!("{}: {e}", dir.display())))?;
     }

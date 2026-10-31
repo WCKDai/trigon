@@ -12,6 +12,7 @@ use trigon_model::doc::JournalEntry;
 use trigon_model::{Document, ModelError};
 
 mod commands;
+mod drawings;
 mod facade_image;
 mod time;
 
@@ -45,11 +46,13 @@ pub struct Session {
     undo: Vec<Document>,
     redo: Vec<Document>,
     provider: Box<dyn Provider>,
+    /// The last decoded drawing page (path, page, rotation), since scans take a moment to decode.
+    pub(crate) drawing_cache: Option<((String, u32, u32), std::sync::Arc<trigon_drawing::Gray>)>,
 }
 
 impl Session {
     pub fn new(provider: Box<dyn Provider>) -> Self {
-        Self { doc: Document::default(), path: None, dirty: false, undo: Vec::new(), redo: Vec::new(), provider }
+        Self { doc: Document::default(), path: None, dirty: false, undo: Vec::new(), redo: Vec::new(), provider, drawing_cache: None }
     }
 
     pub fn provider(&self) -> &dyn Provider {

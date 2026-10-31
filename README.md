@@ -52,6 +52,7 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 | Facades | Bay grid per facade; slots take typed components; every change is checked (fits the wall and storey, no overlaps, no openings in party walls). Raised ground floors (`building.set_storeys ground_floor`), stairwell windows that cross floors (`spans_storeys`) and openings below floor level down to the terrain |
 | Components | Casement windows (1–3 sashes), fixed window, entrance door, French door, French balcony, cantilever balcony; define your own with `types.define` |
 | Export | IFC4 (walls voided by openings, typed windows and doors, slabs, railings, georeferenced with `IfcMapConversion`) and glTF 2.0 |
+| Drawings | `drawing.add` links a page of a scanned archive PDF (JPEG scans, read with lopdf + zune-jpeg); `drawing.view` shows it with a labelled pixel grid; `drawing.register_facade` ties a drawn elevation to a facade; `evidence.facade_image {drawing}` straightens it with the model drawn over it, like the photos. Only links are stored, never the scans |
 | IFC import | `ifc.check` reads a file with two independent readers (ifc-lite, bimifc) and compares them with each other and with the model; `reference.link` shows another IFC model with this one, placed through its georeference |
 | History | Undo/redo, and a journal of every change saved in the `.trigon` file |
 

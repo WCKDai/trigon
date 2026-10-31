@@ -290,6 +290,12 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| {
             let p: FacadeImageParams = parse("evidence.facade_image", v)?;
             let out = p.path.as_deref().map(|x| checked_path(x, "png")).transpose()?;
+            if let Some(d) = p.drawing.as_deref() {
+                if p.photo.is_some() {
+                    return Err(EngineError::Params { command: "evidence.facade_image".into(), message: "give photo or drawing, not both".into() });
+                }
+                return crate::drawings::facade_image(s, &p.facade, d, p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out);
+            }
             let img = crate::facade_image::render(s, &p.facade, p.photo.as_deref(), p.mm_per_px.unwrap_or(50.0), p.overlay.unwrap_or(true), out)?;
             Ok(json!({
                 "image_path": img.path,
@@ -305,6 +311,57 @@ static COMMANDS: &[CommandSpec] = &[
                 "how_to_read": "x = mm along the facade from its start / mm_per_px; y = (facade height − height above ground) / mm_per_px. \
                                 Trees, other buildings and the roof overhang can hide parts of the wall.",
             }))
+        },
+    },
+    CommandSpec {
+        id: "drawing.add",
+        summary: "Link a page of a scanned drawing PDF (plans, sections, elevations from an archive) as an underlay. Only the link \
+                  is stored. Then read coordinates with drawing.view and tie elevations to facades with drawing.register_facade.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<DrawingAdd>,
+        run: |s, v| {
+            let p: DrawingAdd = parse("drawing.add", v)?;
+            let path = checked_path(&p.path, "pdf")?;
+            crate::drawings::add(s, &path, p.page.unwrap_or(1), p.name, p.rotate.unwrap_or(0), p.note)
+        },
+    },
+    CommandSpec {
+        id: "drawing.list",
+        summary: "List the linked drawings and the facades registered on them.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("drawing.list", v)?;
+            Ok(serde_json::to_value(&s.doc.drawings).unwrap_or(Value::Null))
+        },
+    },
+    CommandSpec {
+        id: "drawing.view",
+        summary: "Look at a linked drawing or a region of it, with grid lines labelled in drawing pixels, to read positions \
+                  (facade ends, floor lines, window edges) for drawing.register_facade and for measuring.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<DrawingView>,
+        run: |s, v| {
+            let p: DrawingView = parse("drawing.view", v)?;
+            let out = p.path.as_deref().map(|x| checked_path(x, "png")).transpose()?;
+            crate::drawings::view(s, &p.name, p.region, p.max_px.unwrap_or(1600), p.grid, out)
+        },
+    },
+    CommandSpec {
+        id: "drawing.register_facade",
+        summary: "Tie an elevation on a linked drawing to a facade: the drawing x of the facade's start and end, and two drawing y \
+                  positions with their heights above the terrain (mm). Then evidence.facade_image with `drawing` shows the \
+                  drawing straightened to the facade with the model over it.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<DrawingRegister>,
+        run: |s, v| {
+            let p: DrawingRegister = parse("drawing.register_facade", v)?;
+            let reg = trigon_model::FacadeRegistration { facade: p.facade, x_start: p.x_start, x_end: p.x_end, y_levels: p.y_levels };
+            crate::drawings::register(s, &p.name, reg)
         },
     },
     CommandSpec {
@@ -403,6 +460,49 @@ struct FacadeImageParams {
     overlay: Option<bool>,
     /// Where to write the PNG; default `trigon-evidence/` next to the document.
     path: Option<String>,
+    /// Use a linked drawing (registered to this facade with drawing.register_facade) instead of a photo.
+    drawing: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DrawingAdd {
+    /// A PDF of scanned drawings.
+    path: String,
+    /// 1-based page (default 1).
+    page: Option<u32>,
+    /// Name to refer to it by; defaults to "<file> p<page>".
+    name: Option<String>,
+    /// Clockwise rotation that makes the scan upright: 0, 90, 180 or 270 (default 0).
+    rotate: Option<u32>,
+    /// Title, archive number, scale.
+    note: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DrawingView {
+    name: String,
+    /// [x0, y0, x1, y1] in drawing pixels; omit for the whole sheet.
+    region: Option<[f64; 4]>,
+    /// Longest side of the image, pixels (default 1600).
+    max_px: Option<u32>,
+    /// Grid spacing in drawing pixels (default: about ten lines).
+    grid: Option<f64>,
+    path: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DrawingRegister {
+    name: String,
+    facade: String,
+    /// Drawing x (pixels) where the facade starts (its first footprint corner).
+    x_start: f64,
+    /// Drawing x where the facade ends.
+    x_end: f64,
+    /// Two [drawing y in pixels, height above the terrain in mm] pairs, for example the eaves and a floor line.
+    y_levels: [[f64; 2]; 2],
 }
 
 #[derive(Deserialize, JsonSchema)]

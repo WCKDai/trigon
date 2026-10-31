@@ -311,3 +311,71 @@ fn facade_image_is_straightened_from_the_photo_that_shows_it() {
     assert!(s.execute("evidence.facade_image", json!({"facade": south, "path": dir.join("x.txt")})).is_err(), "only .png paths");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A synthetic 1:100 elevation sheet held in the session's drawing cache (no PDF needed): white,
+/// with a black vertical line every metre at 100 px/m starting at x = 200.
+fn with_sheet(s: &mut Session) -> String {
+    let (w, h) = (3000u32, 2000u32);
+    let mut data = vec![255u8; (w * h) as usize];
+    for y in 0..h {
+        for x in (200..w).step_by(100) {
+            data[(y * w + x) as usize] = 0;
+        }
+    }
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "sheet".into(),
+        path: "/virtual/sheet.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: w,
+        height: h,
+        note: String::new(),
+        facades: Vec::new(),
+    });
+    s.drawing_cache = Some((("/virtual/sheet.pdf".into(), 1, 0), std::sync::Arc::new(trigon_drawing::Gray { width: w, height: h, data })));
+    "sheet".into()
+}
+
+#[test]
+fn drawings_register_straighten_and_view() {
+    let mut s = session();
+    let sheet = with_sheet(&mut s);
+    let south = first_facade_facing(&mut s, "S");
+    // Not registered yet: a clear refusal.
+    let err = s.execute("evidence.facade_image", json!({"facade": south, "drawing": sheet, "path": "/tmp/x.png"})).unwrap_err();
+    assert!(err.to_string().contains("register_facade"), "{err}");
+    // 24 m facade from x = 200 to x = 2600 (100 px/m); terrain at y = 1800, 15 m at y = 300.
+    let v = s
+        .execute(
+            "drawing.register_facade",
+            json!({"name": sheet, "facade": south, "x_start": 200, "x_end": 2600, "y_levels": [[1800, 0], [300, 15000]]}),
+        )
+        .unwrap();
+    assert_eq!(v["px_per_m_along"], 100.0);
+    assert_eq!(v["px_per_m_up"], 100.0);
+    let dir = std::env::temp_dir().join(format!("trigon-sheet-{}", std::process::id()));
+    let out = dir.join("south.png");
+    let v =
+        s.execute("evidence.facade_image", json!({"facade": south, "drawing": sheet, "mm_per_px": 100.0, "overlay": false, "path": out})).unwrap();
+    assert_eq!(v["drawing_coverage"], 1.0);
+    // Every metre of facade lands on a drawn line: column 10 (u = 1000…1100 mm) holds the x = 300 line.
+    let png = std::fs::read(&out).unwrap();
+    assert_eq!(&png[1..4], b"PNG");
+    let view = s
+        .execute("drawing.view", json!({"name": sheet, "region": [0, 0, 1000, 1000], "max_px": 500, "grid": 250, "path": dir.join("v.png")}))
+        .unwrap();
+    assert_eq!(view["drawing_px_per_image_px"], 2);
+    assert_eq!(view["grid_px"], 250.0);
+    // Registration sanity checks.
+    for bad in [
+        json!({"name": sheet, "facade": south, "x_start": 200, "x_end": 205, "y_levels": [[1800, 0], [300, 15000]]}),
+        json!({"name": sheet, "facade": south, "x_start": 200, "x_end": 2600, "y_levels": [[1800, 0], [1800, 15000]]}),
+        json!({"name": "nope", "facade": south, "x_start": 200, "x_end": 2600, "y_levels": [[1800, 0], [300, 15000]]}),
+        json!({"name": sheet, "facade": "b9.f9", "x_start": 200, "x_end": 2600, "y_levels": [[1800, 0], [300, 15000]]}),
+    ] {
+        assert!(s.execute("drawing.register_facade", bad.clone()).is_err(), "{bad}");
+    }
+    assert!(s.execute("drawing.view", json!({"name": sheet, "region": [10, 10, 10, 10]})).is_err(), "empty region");
+    assert!(s.execute("drawing.add", json!({"path": "/etc/hosts"})).is_err(), "only .pdf files");
+    let _ = std::fs::remove_dir_all(dir);
+}

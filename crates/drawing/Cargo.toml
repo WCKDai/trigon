@@ -1,0 +1,17 @@
+[package]
+name = "trigon-drawing"
+description = "Scanned drawings as underlays: page images from PDFs, rotation, cropping and sampling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+# PDF object parsing (MIT): only to find a page's image stream; nothing is rendered.
+lopdf = { version = "0.46", default-features = false }
+# JPEG decoding of scanned pages (MIT OR Apache-2.0 OR Zlib).
+zune-jpeg = "0.5"
+zune-core = "0.5"

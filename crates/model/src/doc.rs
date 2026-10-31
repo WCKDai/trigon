@@ -23,6 +23,63 @@ pub struct Document {
     /// Linked IFC models shown with this one (neighbours, an architect's model, a survey).
     #[serde(default)]
     pub references: Vec<Reference>,
+    /// Linked drawings (scanned plans, sections, elevations). Only the link is stored.
+    #[serde(default)]
+    pub drawings: Vec<Drawing>,
+}
+
+/// A page of a drawing PDF used as an underlay, in its upright orientation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Drawing {
+    pub name: String,
+    pub path: String,
+    /// 1-based page.
+    pub page: u32,
+    /// Clockwise rotation applied to the scan to make it upright: 0, 90, 180 or 270.
+    pub rotate: u32,
+    /// Size after rotation, pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Free text: title, archive number, scale.
+    #[serde(default)]
+    pub note: String,
+    /// Elevations on this sheet tied to facades.
+    #[serde(default)]
+    pub facades: Vec<FacadeRegistration>,
+}
+
+/// Ties a drawn elevation to a facade: two x positions (the facade's ends) and two heights.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FacadeRegistration {
+    pub facade: String,
+    /// Drawing x (pixels) of the facade's start and end.
+    pub x_start: f64,
+    pub x_end: f64,
+    /// Two `[drawing y in pixels, height above the terrain in mm]` pairs.
+    pub y_levels: [[f64; 2]; 2],
+}
+
+impl FacadeRegistration {
+    /// Drawing pixel of the facade point `u` mm along it, `v` mm above the terrain; `length` is the facade's length.
+    pub fn to_drawing(&self, u: f64, v: f64, length: f64) -> [f64; 2] {
+        let x = self.x_start + (self.x_end - self.x_start) * u / length;
+        let [[ya, va], [yb, vb]] = self.y_levels;
+        [x, ya + (v - va) * (yb - ya) / (vb - va)]
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let all = [self.x_start, self.x_end, self.y_levels[0][0], self.y_levels[0][1], self.y_levels[1][0], self.y_levels[1][1]];
+        if all.iter().any(|v| !v.is_finite() || v.abs() > 1e7) {
+            return Err(ModelError::Invalid("registration values must be finite numbers".into()));
+        }
+        if (self.x_end - self.x_start).abs() < 10.0 {
+            return Err(ModelError::Invalid("x_start and x_end must be at least 10 px apart".into()));
+        }
+        if (self.y_levels[0][0] - self.y_levels[1][0]).abs() < 10.0 || (self.y_levels[0][1] - self.y_levels[1][1]).abs() < 100.0 {
+            return Err(ModelError::Invalid("the two y_levels must be at least 10 px and 100 mm apart".into()));
+        }
+        Ok(())
+    }
 }
 
 /// A linked IFC file. Only the link is stored; the file is read again when needed.
@@ -43,7 +100,15 @@ pub struct JournalEntry {
 
 impl Default for Document {
     fn default() -> Self {
-        Self { format: FORMAT.to_string(), site: None, buildings: Vec::new(), types: default_types(), journal: Vec::new(), references: Vec::new() }
+        Self {
+            format: FORMAT.to_string(),
+            site: None,
+            buildings: Vec::new(),
+            types: default_types(),
+            journal: Vec::new(),
+            references: Vec::new(),
+            drawings: Vec::new(),
+        }
     }
 }
 
