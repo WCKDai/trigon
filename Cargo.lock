@@ -1825,6 +1825,7 @@ name = "trigon"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "trigon-control",
  "trigon-data",
  "trigon-engine",
  "trigon-mcp",
@@ -1909,6 +1910,8 @@ name = "trigon-mcp"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "trigon-control",
+ "trigon-data",
  "trigon-engine",
 ]
 
