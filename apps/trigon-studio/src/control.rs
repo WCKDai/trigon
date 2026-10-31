@@ -67,6 +67,50 @@ pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result
     Ok(ViewRequest { mode, level, phase, filter, fit, focus })
 }
 
+/// Longest queue of synthetic input.
+const MAX_SYNTHETIC: usize = 64;
+
+fn modifiers(p: &Value) -> egui::Modifiers {
+    let on = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
+    egui::Modifiers {
+        alt: on("alt"),
+        ctrl: on("ctrl"),
+        shift: on("shift"),
+        mac_cmd: cfg!(target_os = "macos") && on("command"),
+        command: on("command"),
+    }
+}
+
+/// `ui.click {x, y, button?, double?, shift?…}` (window points) or `ui.key {key, command?, shift?…}`:
+/// the egui events a real click or key press makes.
+pub fn parse_input(method: &str, p: &Value) -> Result<Vec<egui::Event>, String> {
+    let m = modifiers(p);
+    if method == "ui.key" {
+        let name = p.get("key").and_then(Value::as_str).ok_or("ui.key needs `key`, an egui key name such as \"K\" or \"Escape\"")?;
+        let key = egui::Key::from_name(name).ok_or_else(|| format!("ui.key: unknown key {}", name.chars().take(32).collect::<String>()))?;
+        let ev = |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: m };
+        return Ok(vec![ev(true), ev(false)]);
+    }
+    let coord = |k: &str| p.get(k).and_then(Value::as_f64).filter(|v| v.is_finite() && (0.0..=20_000.0).contains(v)).map(|v| v as f32);
+    let (Some(x), Some(y)) = (coord("x"), coord("y")) else {
+        return Err("ui.click needs `x` and `y`: window points from the top left".into());
+    };
+    let button = match p.get("button").and_then(Value::as_str).unwrap_or("left") {
+        "left" => egui::PointerButton::Primary,
+        "right" => egui::PointerButton::Secondary,
+        "middle" => egui::PointerButton::Middle,
+        other => return Err(format!("ui.click: button {}: use left, right or middle", other.chars().take(16).collect::<String>())),
+    };
+    let pos = egui::pos2(x, y);
+    let press = |pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: m };
+    let mut events = vec![egui::Event::PointerMoved(pos), press(true), press(false)];
+    if p.get("double").and_then(Value::as_bool) == Some(true) {
+        events.extend([press(true), press(false)]);
+    }
+    events.truncate(MAX_SYNTHETIC);
+    Ok(events)
+}
+
 /// Widest window screenshot sent back; wider ones are halved (Retina windows), so replies stay
 /// well inside the channel's line limit.
 const MAX_SHOT_WIDTH: usize = 2400;
@@ -126,6 +170,15 @@ impl StudioApp {
                 self.run(who, &id, p)
             }),
             "ui.view" => self.ui_view(&params),
+            "ui.click" | "ui.key" => parse_input(&method, &params).and_then(|events| {
+                if self.synthetic.len() + events.len() > 4 * MAX_SYNTHETIC {
+                    return Err("busy: earlier input is still being delivered; send it again shortly".into());
+                }
+                let n = events.len();
+                self.synthetic.extend(events);
+                ctx.request_repaint();
+                Ok(json!({"queued": n, "window_hidden": self.window_hidden}))
+            }),
             "ui.screenshot" => {
                 let target = match params.get("target").and_then(Value::as_str).unwrap_or("viewport") {
                     "viewport" => ShotTarget::Viewport,
@@ -350,6 +403,28 @@ mod tests {
             assert!(parse_view(&bad, 6, &phases).is_err(), "{bad}");
         }
         assert!(parse_view(&json!({"level": 0}), 0, &phases).is_err(), "an empty model has no levels");
+    }
+
+    #[test]
+    fn synthetic_input_is_checked() {
+        let click = parse_input("ui.click", &json!({"x": 10, "y": 20.5})).unwrap();
+        assert_eq!(click.len(), 3);
+        assert!(matches!(click[1], egui::Event::PointerButton { pressed: true, button: egui::PointerButton::Primary, .. }));
+        assert_eq!(parse_input("ui.click", &json!({"x": 1, "y": 1, "double": true})).unwrap().len(), 5);
+        let key = parse_input("ui.key", &json!({"key": "K", "command": true})).unwrap();
+        assert!(matches!(key[0], egui::Event::Key { key: egui::Key::K, pressed: true, modifiers, .. } if modifiers.command));
+        for (m, bad) in [
+            ("ui.click", json!({})),
+            ("ui.click", json!({"x": -1, "y": 0})),
+            ("ui.click", json!({"x": f64::MAX, "y": 0})),
+            ("ui.click", json!({"x": "1", "y": 0})),
+            ("ui.click", json!({"x": 1, "y": 1, "button": "fourth"})),
+            ("ui.key", json!({})),
+            ("ui.key", json!({"key": "NotAKey"})),
+            ("ui.key", json!({"key": 5})),
+        ] {
+            assert!(parse_input(m, &bad).is_err(), "{m} {bad}");
+        }
     }
 
     #[test]

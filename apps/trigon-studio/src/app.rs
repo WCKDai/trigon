@@ -141,6 +141,8 @@ pub struct StudioApp {
     pub(crate) ppp: f32,
     /// Minimised or covered: eframe draws no frames, so the window can't be captured.
     pub(crate) window_hidden: bool,
+    /// Input sent with `ui.click` and `ui.key`, fed to egui one event per frame.
+    pub(crate) synthetic: std::collections::VecDeque<egui::Event>,
     pub(crate) viewport_rect: Option<egui::Rect>,
     redraw: bool,
     highlight: Option<Highlight>,
@@ -198,6 +200,7 @@ impl StudioApp {
             texture_size: [0, 0],
             ppp: cc.egui_ctx.pixels_per_point(),
             window_hidden: false,
+            synthetic: std::collections::VecDeque::new(),
             viewport_rect: None,
             redraw: true,
             highlight: None,
@@ -937,6 +940,15 @@ impl StudioApp {
 }
 
 impl eframe::App for StudioApp {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(event) = self.synthetic.pop_front() {
+            raw_input.events.push(event);
+        }
+        if !self.synthetic.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.window_hidden = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().occluded == Some(true));
         self.poll_worker();
