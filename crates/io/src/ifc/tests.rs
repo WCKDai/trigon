@@ -4,6 +4,8 @@ use super::*;
 use trigon_model::build::{PhaseFilter, View, build_view};
 use trigon_model::{Room, Stair};
 
+mod quantities;
+
 fn sample() -> (Document, Vec<Built>, String) {
     let doc = sample::document().unwrap();
     let built = trigon_model::build(&doc).unwrap();

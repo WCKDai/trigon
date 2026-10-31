@@ -75,6 +75,42 @@ Why these choices:
   through the wall. Wherever Trigon's own wall piece is a closed solid this is its volume (the tests
   check it); see the limits below for where it isn't.
 
+### Window and door base quantities
+
+Rectangular window and door occurrences carry `Qto_WindowBaseQuantities` or
+`Qto_DoorBaseQuantities` through `IfcRelDefinesByProperties`, including interior and cellar
+doors. The existing types, common property sets, opening/fill relationships, placements and
+geometry are unchanged. Quantities follow the exported phase view, not all placements in the
+document. Quantity-set and relationship GlobalIds are derived from the fill id and type and remain
+stable when its dimensions change. Existing fill ids can be reused by phased replacements; a
+deterministic occurrence ordinal prevents additional quantity-GUID collisions if both share an id
+and type. For such indistinguishable replacements, identity across phase filters is not guaranteed;
+the pre-existing product GlobalIds are unchanged by this increment.
+
+- `Height` and `Width` are `IfcQuantityLength` values in millimetres, using the occurrence's
+  `BuiltElement.height` and `BuiltElement.width`, including placement overrides. In these
+  rectangular families the model builds the outer lining to those limits, also exported as
+  `OverallHeight` and `OverallWidth`. IFC4 ADD2 TC1 defines these quantities as the total outer
+  height and width of the lining, only for rectangular windows or doors; they are not clear
+  passage dimensions or separately measured construction-opening dimensions.
+- `Area` is an `IfcQuantityArea` in m²: `width × height / 1_000_000`. It is the rectangular area
+  enclosed by the outer lining, not glazing area, exposed frame-material area, mesh surface area,
+  or the area of an individual storey's opening void when a window spans floors. A compound
+  door/window is measured as the modeled unit, not just its door leaf.
+- Loggias are omitted: their existing dimensions describe the facade hole, while the recessed
+  door/window lining extends down to the floor. Treating that hole as lining quantities would
+  misstate the IFC definitions. No lining depth is inferred from wall thickness, reveal or balcony
+  depth. Optional `Perimeter` and manufacturer/performance data are outside this increment.
+
+Sources are the public buildingSMART IFC4 ADD2 TC1 definitions for
+[windows](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcsharedbldgelements/qset/qto_windowbasequantities.htm)
+and [doors](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcsharedbldgelements/qset/qto_doorbasequantities.htm).
+The exact release XMLs are also archived by buildingSMART:
+[window quantities](https://github.com/buildingSMART/IFC4.x-development/blob/5d08761e63557bd3ded140139eede665ec31511c/reference_schemas/psd_IFC4_ADD2_TC1/Qto_WindowBaseQuantities.xml),
+[door quantities](https://github.com/buildingSMART/IFC4.x-development/blob/5d08761e63557bd3ded140139eede665ec31511c/reference_schemas/psd_IFC4_ADD2_TC1/Qto_DoorBaseQuantities.xml).
+These schedule inputs are not a claim of Revit/Vectorworks import certification or a vendor-tested
+quantity takeoff; no vendor files are used in the regression fixtures.
+
 ## Materials and layers
 
 Every material is an `IfcMaterial` with a colour (`IfcMaterialDefinitionRepresentation` with an
