@@ -13,6 +13,7 @@ records the owner's decisions and works out what they imply.
 | D4 | **Desktop app** for macOS and Windows. |
 | D5 | **AI controls the tool; it does not generate the model.** An agent drives Trigon through an **MCP server**, using the same commands a person uses. Geometry always comes from deterministic, parametric code. |
 | D6 | **Built on Polykrom's stack:** the PolyCore kernel (Rust, vendored truck) and Polykrom's app shell. |
+| D8 | **MPL-2.0 dependencies are accepted** when used unmodified (2026-10-31): ifc-lite for IFC import, bimifc as a second reader for comparison. GPL/LGPL/AGPL stay out, including through transitive dependencies. |
 | D7 | **Own the platform** rather than build on FreeCAD BIM or Bonsai. It must stay free and open source. Bonsai/IfcOpenShell may run as *external programs* (IFC oracle, interim drawings) but are never linked. |
 
 ## 2. What D6 actually means (observed in the local checkouts, 2026-10-31)

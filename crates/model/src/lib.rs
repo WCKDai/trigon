@@ -13,7 +13,7 @@ pub mod mesh;
 
 pub use build::{Built, BuiltElement, BuiltOpening, BuiltSlab, BuiltWall, ElementClass, FacadeFrame, Rect, SlabKind, build};
 pub use component::{ComponentKind, ComponentType, default_types};
-pub use doc::{Building, Document, Evidence, FORMAT, Facade, FacadeKind, GeoPoint, Placement, Site, Storey};
+pub use doc::{Building, Document, Evidence, FORMAT, Facade, FacadeKind, GeoPoint, Placement, Reference, Site, Storey};
 pub use mesh::{Material, Mesh};
 
 /// Model errors. Every message names the thing that is wrong and what is allowed.

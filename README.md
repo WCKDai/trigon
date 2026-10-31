@@ -49,6 +49,7 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 | Facades | Bay grid per facade; slots take typed components; every change is checked (fits the wall and storey, no overlaps, no openings in party walls) |
 | Components | Casement windows (1–3 sashes), fixed window, entrance door, French door, French balcony, cantilever balcony; define your own with `types.define` |
 | Export | IFC4 (walls voided by openings, typed windows and doors, slabs, railings, georeferenced with `IfcMapConversion`) and glTF 2.0 |
+| IFC import | `ifc.check` reads a file with two independent readers (ifc-lite, bimifc) and compares them with each other and with the model; `reference.link` shows another IFC model with this one, placed through its georeference |
 | History | Undo/redo, and a journal of every change saved in the `.trigon` file |
 
 ## Layout
@@ -58,11 +59,13 @@ Every command is a tool (`site_load_address`, `facade_list`, `evidence_photos`, 
 | `crates/model` | Document, component families, footprint clean-up, facade layout, geometry (2.5D: openings are 2D holes in wall faces) |
 | `crates/data` | Danish data providers, OSM fallback, coordinates |
 | `crates/io` | GLB and IFC4 writers, written from the public specifications |
+| `crates/ifcread` | IFC import and cross-checking through ifc-lite and bimifc |
 | `crates/engine` | Commands, session, undo, journal |
 | `crates/mcp` | MCP over stdio |
 | `apps/trigon` | CLI |
 
 ## Licence
 
-MIT OR Apache-2.0. Data you fetch keeps its own terms: Danish public data ("Indeholder data fra
+MIT OR Apache-2.0. Trigon links two IFC readers used unmodified under MPL-2.0, whose source is at
+[LTplus-AG/ifc-lite](https://github.com/LTplus-AG/ifc-lite) and [holg/bimifc](https://github.com/holg/bimifc) (0.1.0). Data you fetch keeps its own terms: Danish public data ("Indeholder data fra
 Styrelsen for Dataforsyning og Infrastruktur") and OpenStreetMap (ODbL).

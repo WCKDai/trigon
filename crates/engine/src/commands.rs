@@ -267,7 +267,8 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| {
             let p: PathParams = parse("export.gltf", v)?;
             let path = checked_path(&p.path, "glb")?;
-            let bytes = trigon_io::glb::write(&trigon_model::build(&s.doc)?);
+            let refs = reference_meshes(&s.doc)?;
+            let bytes = trigon_io::glb::write(&trigon_model::build(&s.doc)?, &refs);
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
@@ -287,11 +288,74 @@ static COMMANDS: &[CommandSpec] = &[
             Ok(json!({"written": path, "bytes": text.len()}))
         },
     },
+    CommandSpec {
+        id: "ifc.check",
+        summary: "Read an IFC file with two independent readers (ifc-lite and bimifc), compare them element by element, and compare \
+                  both with this document's model where GlobalIds match. Reports counts, failures and bounding-box deviations (mm).",
+        mutates: false,
+        journaled: false,
+        schema: schema::<PathParams>,
+        run: |s, v| {
+            let p: PathParams = parse("ifc.check", v)?;
+            ifc_check(&s.doc, &checked_path(&p.path, "ifc")?)
+        },
+    },
+    CommandSpec {
+        id: "reference.link",
+        summary: "Link an IFC model (neighbours, an architect's model, a survey) to show with this one. It is placed through its \
+                  georeference when it has one in EPSG:25832, otherwise at the site origin. Only the link is stored.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<LinkParams>,
+        run: |s, v| link_reference(s, parse("reference.link", v)?),
+    },
+    CommandSpec {
+        id: "reference.list",
+        summary: "List the linked IFC models.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("reference.list", v)?;
+            Ok(serde_json::to_value(&s.doc.references).unwrap_or(Value::Null))
+        },
+    },
+    CommandSpec {
+        id: "reference.remove",
+        summary: "Unlink an IFC model by name.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<NameParams>,
+        run: |s, v| {
+            let p: NameParams = parse("reference.remove", v)?;
+            let before = s.doc.references.len();
+            s.doc.references.retain(|r| r.name != p.name);
+            if s.doc.references.len() == before {
+                return Err(ModelError::NotFound(format!("reference {}", p.name)).into());
+            }
+            Ok(json!({"removed": p.name}))
+        },
+    },
 ];
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NoParams {}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NameParams {
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LinkParams {
+    /// Path to an .ifc file.
+    path: String,
+    /// Name to show; defaults to the file name.
+    name: Option<String>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -623,4 +687,172 @@ fn photos(s: &mut Session, p: BuildingParam) -> Result<Value> {
         })
         .collect();
     Ok(json!({"photos": list, "by_facade": per_facade}))
+}
+
+fn read_ifc_text(path: &Path) -> Result<String> {
+    let meta = std::fs::metadata(path).map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))?;
+    if meta.len() as usize > trigon_ifcread::MAX_FILE_BYTES {
+        return Err(EngineError::Io(format!("{}: larger than {} MB", path.display(), trigon_ifcread::MAX_FILE_BYTES >> 20)));
+    }
+    std::fs::read_to_string(path).map_err(|e| EngineError::Io(format!("{}: {e}", path.display())))
+}
+
+fn ifc_err(e: trigon_ifcread::ReadError) -> EngineError {
+    EngineError::Io(e.to_string())
+}
+
+fn read_summary(r: &trigon_ifcread::ReadResult) -> Value {
+    json!({
+        "reader": r.reader.name(),
+        "schema": r.schema,
+        "unit_m": r.unit_m,
+        "openings_cut": r.voids_applied,
+        "elements": r.elements.len(),
+        "triangles": r.triangles(),
+        "by_class": r.counts(),
+        "failures": r.failures.len(),
+        "first_failures": r.failures.iter().take(5).map(|f| json!({"id": f.id, "class": f.class, "message": f.message})).collect::<Vec<_>>(),
+        "georef": r.georef.as_ref().map(|g| json!({"crs": g.crs_name, "eastings": g.eastings, "northings": g.northings, "height": g.orthogonal_height})),
+    })
+}
+
+fn comparison(c: &trigon_ifcread::Comparison) -> Value {
+    json!({
+        "matched": c.matched,
+        "only_in_first": c.only_first.len(),
+        "only_in_second": c.only_second.len(),
+        "same_triangle_count": c.same_triangles,
+        "max_bounds_deviation_mm": (c.max_bounds_mm * 1000.0).round() / 1000.0,
+        "worst": c.worst.iter().map(|d| json!({"global_id": d.global_id, "class": d.class, "mm": (d.mm * 1000.0).round() / 1000.0})).collect::<Vec<_>>(),
+    })
+}
+
+/// Bounding boxes of this document's elements, keyed by the GlobalId the IFC export gives them.
+fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f64; 3], [f64; 3])>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut add = |id: &str, meshes: Vec<&trigon_model::Mesh>| {
+        let mut all = trigon_model::Mesh::default();
+        for m in meshes {
+            all.append(m);
+        }
+        if let Some(b) = all.bounds() {
+            out.insert(trigon_io::ifc::guid(&format!("trigon:{id}")), b);
+        }
+    };
+    for b in trigon_model::build(doc)? {
+        for w in &b.walls {
+            add(&w.id, vec![&w.mesh]);
+            for o in &w.openings {
+                for e in std::iter::once(&o.fill).chain(&o.attached) {
+                    add(&e.id, e.parts.iter().map(|(_, m)| m).collect());
+                }
+            }
+        }
+        for s in &b.slabs {
+            add(&s.id, vec![&s.mesh]);
+        }
+    }
+    Ok(out)
+}
+
+fn versus_model(doc: &Document, r: &trigon_ifcread::ReadResult) -> Result<Value> {
+    let ours = model_bounds(doc)?;
+    let mut devs: Vec<(f64, &str, &str)> = r
+        .elements
+        .iter()
+        .filter_map(|e| Some((trigon_ifcread::bounds_deviation(*ours.get(&e.global_id)?, e.mesh.bounds()?), e.global_id.as_str(), e.class.as_str())))
+        .collect();
+    devs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Ok(json!({
+        "reader": r.reader.name(),
+        "matched": devs.len(),
+        "model_elements": ours.len(),
+        "max_bounds_deviation_mm": devs.first().map_or(0.0, |d| (d.0 * 1000.0).round() / 1000.0),
+        "worst": devs.iter().take(3).map(|d| json!({"global_id": d.1, "class": d.2, "mm": (d.0 * 1000.0).round() / 1000.0})).collect::<Vec<_>>(),
+    }))
+}
+
+fn ifc_check(doc: &Document, path: &Path) -> Result<Value> {
+    let text = read_ifc_text(path)?;
+    let lite = trigon_ifcread::read_ifc_lite(&text).map_err(ifc_err)?;
+    let bim = trigon_ifcread::read_bimifc(&text).map_err(ifc_err)?;
+    let mut out = json!({
+        "file": path,
+        "readers": [read_summary(&lite), read_summary(&bim)],
+        "ifc_lite_vs_bimifc": comparison(&trigon_ifcread::compare(&lite, &bim)),
+        "note": "bimifc 0.1.0 does not cut openings, so wall triangle counts differ by design; extents should still agree.",
+    });
+    if !doc.buildings.is_empty() {
+        out["versus_this_model"] = json!([versus_model(doc, &lite)?, versus_model(doc, &bim)?]);
+    }
+    Ok(out)
+}
+
+/// How a linked file maps into this document's site frame.
+enum Alignment {
+    Local,
+    Map { origin: [f64; 2], elevation: f64 },
+}
+
+fn alignment_for(doc: &Document, r: &trigon_ifcread::ReadResult) -> (Alignment, String) {
+    let crs_ok = r.georef.as_ref().and_then(|g| g.crs_name.as_deref()).is_some_and(|c| c.contains("25832"));
+    match (&doc.site, crs_ok) {
+        (Some(site), true) => (Alignment::Map { origin: site.origin_utm, elevation: site.elevation }, "map".into()),
+        (None, true) => (Alignment::Local, "local (no site yet to place it against)".into()),
+        (_, false) => (Alignment::Local, "local (no EPSG:25832 georeference in the file)".into()),
+    }
+}
+
+fn to_site(r: &trigon_ifcread::ReadResult, how: &Alignment, p: [f64; 3]) -> [f64; 3] {
+    match how {
+        Alignment::Map { origin, elevation } => match r.to_map(p) {
+            Some([e, n, h]) => [(e - origin[0]) * 1000.0, (n - origin[1]) * 1000.0, (h - elevation) * 1000.0],
+            None => p,
+        },
+        Alignment::Local => p,
+    }
+}
+
+fn link_reference(s: &mut Session, p: LinkParams) -> Result<Value> {
+    let path = checked_path(&p.path, "ifc")?;
+    let r = trigon_ifcread::read_ifc_lite(&read_ifc_text(&path)?).map_err(ifc_err)?;
+    let name = p.name.unwrap_or_else(|| path.file_stem().and_then(|n| n.to_str()).unwrap_or("reference").to_string());
+    if s.doc.references.iter().any(|x| x.name == name) {
+        return Err(ModelError::Invalid(format!("a reference named {name} is already linked")).into());
+    }
+    let (how, alignment) = alignment_for(&s.doc, &r);
+    let mut extent = trigon_model::Mesh::default();
+    for e in &r.elements {
+        extent.positions.extend(e.mesh.positions.iter().map(|q| to_site(&r, &how, *q)));
+    }
+    s.doc.references.push(trigon_model::Reference {
+        name: name.clone(),
+        path: path.to_string_lossy().into_owned(),
+        alignment: if matches!(how, Alignment::Map { .. }) { "map".into() } else { "local".into() },
+    });
+    Ok(json!({
+        "linked": name,
+        "alignment": alignment,
+        "elements": r.elements.len(),
+        "failures": r.failures.len(),
+        "extent_mm": extent.bounds(),
+    }))
+}
+
+/// The linked models as one mesh per reference and IFC class, in this document's frame.
+fn reference_meshes(doc: &Document) -> Result<Vec<(String, trigon_model::Mesh)>> {
+    let mut out = Vec::new();
+    for rf in &doc.references {
+        let r = trigon_ifcread::read_ifc_lite(&read_ifc_text(Path::new(&rf.path))?).map_err(ifc_err)?;
+        let how = if rf.alignment == "map" { alignment_for(doc, &r).0 } else { Alignment::Local };
+        let mut by_class: std::collections::BTreeMap<String, trigon_model::Mesh> = Default::default();
+        for e in &r.elements {
+            let m = by_class.entry(e.class.clone()).or_default();
+            let base = m.positions.len() as u32;
+            m.positions.extend(e.mesh.positions.iter().map(|q| to_site(&r, &how, *q)));
+            m.triangles.extend(e.mesh.triangles.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+        }
+        out.extend(by_class.into_iter().map(|(class, m)| (format!("{}/{class}", rf.name), m)));
+    }
+    Ok(out)
 }

@@ -12,6 +12,7 @@ workspace = true
 trigon-model = { workspace = true }
 trigon-data = { workspace = true }
 trigon-io = { workspace = true }
+trigon-ifcread = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

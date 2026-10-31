@@ -20,6 +20,19 @@ pub struct Document {
     /// empty document gives the same model (given the same source data).
     #[serde(default)]
     pub journal: Vec<JournalEntry>,
+    /// Linked IFC models shown with this one (neighbours, an architect's model, a survey).
+    #[serde(default)]
+    pub references: Vec<Reference>,
+}
+
+/// A linked IFC file. Only the link is stored; the file is read again when needed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Reference {
+    pub name: String,
+    pub path: String,
+    /// `map`: placed through the file's IfcMapConversion relative to the site;
+    /// `local`: the file's local origin is put on the site origin.
+    pub alignment: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,7 +43,7 @@ pub struct JournalEntry {
 
 impl Default for Document {
     fn default() -> Self {
-        Self { format: FORMAT.to_string(), site: None, buildings: Vec::new(), types: default_types(), journal: Vec::new() }
+        Self { format: FORMAT.to_string(), site: None, buildings: Vec::new(), types: default_types(), journal: Vec::new(), references: Vec::new() }
     }
 }
 

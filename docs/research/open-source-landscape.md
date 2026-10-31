@@ -244,3 +244,15 @@ shows a repository: **Aetheris**, **Spare Kit** and **ConstructCAD `cc_geom`**.
 | bimifc (geometry) | crates.io 0.3.0 | MPL-2.0 | 2026-03 / 2026-05 | 588 | Second IFC reader to compare; slower-moving |
 | OpenSCAD | GitHub | GPL-2.0 | | | Code-first CSG. Can't be linked; its CSG speed comes from Manifold (Apache-2.0), already on PolyCore's list |
 | O3DE | o3de.org | Apache-2.0 OR MIT | | | C++ game engine. Not a kernel; at most a glTF/USD visualisation target |
+| NVIDIA USD BRep / SMLib | GitHub | Apache-2.0 | active (2026-10-22) | | C++ NURBS B-rep. PolyCore's RFC: read and port with attribution, never link (memory-safety findings); solidcore is its Rust port |
+| PicoGK (LEAP 71) | GitHub | Apache-2.0 | 2026-08 | | C#/C++ voxel and implicit kernel for computational engineering. Voxels don't keep exact planar faces: no fit for building geometry |
+| **OpenGeometry** | GitHub (npm, not crates.io) | MPL-2.0 | active (2026-10-30) | | Rust compiled to WASM, "CAD kernel for humans and AI agents": B-rep, booleans, extrude/sweep/revolve, shell, STEP. Browser-first; the Floorkit AEC toolkit builds on it. Bench it in PolyCore |
+
+### IFC readers in Trigon (decision D8)
+
+- **ifc-lite 27.1** (MPL-2.0) is Trigon's IFC import reader (`crates/ifcread`): openings cut, metres converted to mm, georeference read.
+- **bimifc** is the independent second reader, **pinned to 0.1.0**: from 0.2.0 on, `bimifc-parser` depends unconditionally on
+  `eulumdat` (AGPL-3.0-or-later, same author), which Trigon can't link. 0.1.0 doesn't cut openings, so host elements are compared by extent.
+- `trigon ifc.check` on Trigon's own Frederikssundsvej export: both readers 692/692 elements, max bounding-box deviation 0.006 mm
+  against the model. On four buildingSMART Sample-Test-Files (IFC2x3, IFC4, IFC4.3): both readers agree on every element, 0 failures,
+  at most 0.003 mm apart. (The samples carry no licence statement, so they are not committed.)

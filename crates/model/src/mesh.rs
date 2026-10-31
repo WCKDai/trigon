@@ -13,11 +13,22 @@ pub enum Material {
     Door,
     Sill,
     Railing,
+    /// Linked reference models.
+    Reference,
 }
 
 impl Material {
-    pub const ALL: [Material; 8] =
-        [Material::Wall, Material::Slab, Material::Roof, Material::Frame, Material::Glass, Material::Door, Material::Sill, Material::Railing];
+    pub const ALL: [Material; 9] = [
+        Material::Wall,
+        Material::Slab,
+        Material::Roof,
+        Material::Frame,
+        Material::Glass,
+        Material::Door,
+        Material::Sill,
+        Material::Railing,
+        Material::Reference,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -29,6 +40,7 @@ impl Material {
             Material::Door => "door",
             Material::Sill => "sill",
             Material::Railing => "railing",
+            Material::Reference => "reference",
         }
     }
 
@@ -43,6 +55,7 @@ impl Material {
             Material::Door => [0.30, 0.18, 0.10, 1.0],
             Material::Sill => [0.80, 0.78, 0.74, 1.0],
             Material::Railing => [0.12, 0.12, 0.12, 1.0],
+            Material::Reference => [0.78, 0.80, 0.84, 1.0],
         }
     }
 }

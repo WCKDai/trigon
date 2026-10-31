@@ -1,0 +1,20 @@
+[package]
+name = "trigon-ifcread"
+description = "IFC import and cross-checking through two independent readers: ifc-lite and bimifc (both MPL-2.0, used unmodified)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ifc-lite-core = "27.1"
+ifc-lite-geometry = "27.1"
+# bimifc is pinned to 0.1.0: from 0.2.0 on, bimifc-parser depends unconditionally on eulumdat
+# (AGPL-3.0-or-later), which Trigon can't link. Move up only when that dependency is optional.
+bimifc-model = "=0.1.0"
+bimifc-parser = "=0.1.0"
+bimifc-geometry = "=0.1.0"
+rustc-hash = "2"
+thiserror = { workspace = true }

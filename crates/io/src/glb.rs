@@ -51,8 +51,8 @@ impl Writer {
     }
 }
 
-/// Writes every built building as one GLB scene.
-pub fn write(built: &[Built]) -> Vec<u8> {
+/// Writes every built building, plus named reference meshes (linked models), as one GLB scene.
+pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
     let mut w = Writer { bin: Vec::new(), views: Vec::new(), accessors: Vec::new() };
     let materials: Vec<Value> = Material::ALL
         .iter()
@@ -109,6 +109,9 @@ pub fn write(built: &[Built]) -> Vec<u8> {
             add(&mut w, &s.id, &[(m, &s.mesh)]);
         }
     }
+    for (name, mesh) in references {
+        add(&mut w, name, &[(Material::Reference, mesh)]);
+    }
     w.align();
     let node_ids: Vec<usize> = (0..nodes.len()).collect();
     let doc = json!({
@@ -149,7 +152,7 @@ mod tests {
     fn glb_header_and_json_are_consistent() {
         let mut doc = Document::default();
         doc.buildings.push(Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
-        let glb = write(&build(&doc).unwrap());
+        let glb = write(&build(&doc).unwrap(), &[]);
         assert_eq!(&glb[0..4], b"glTF");
         let total = u32::from_le_bytes(glb[8..12].try_into().unwrap()) as usize;
         assert_eq!(total, glb.len());

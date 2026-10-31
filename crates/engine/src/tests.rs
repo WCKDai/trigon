@@ -160,3 +160,74 @@ fn every_command_has_an_object_schema() {
         assert!(!c.summary.is_empty());
     }
 }
+
+fn exported(s: &mut Session, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let south = first_facade_facing(s, "S");
+    s.execute("facade.set_bays", json!({"facade": south, "count": 7})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "window.casement.2"})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "balcony.cantilever", "levels": [1, 2], "bays": [3]})).unwrap();
+    let dir = std::env::temp_dir().join(format!("trigon-{tag}-{}", std::process::id()));
+    let ifc = dir.join("m.ifc");
+    s.execute("export.ifc", json!({"path": ifc})).unwrap();
+    (dir, ifc)
+}
+
+#[test]
+fn both_ifc_readers_agree_with_the_model() {
+    let mut s = session();
+    let (dir, ifc) = exported(&mut s, "check");
+    let v = s.execute("ifc.check", json!({"path": ifc})).unwrap();
+    for r in v["readers"].as_array().unwrap() {
+        assert_eq!(r["failures"], 0, "{r}");
+    }
+    let cmp = &v["ifc_lite_vs_bimifc"];
+    assert_eq!(cmp["only_in_first"], 0);
+    assert_eq!(cmp["only_in_second"], 0);
+    assert!(cmp["max_bounds_deviation_mm"].as_f64().unwrap() < 0.01, "{cmp}");
+    for m in v["versus_this_model"].as_array().unwrap() {
+        assert_eq!(m["matched"], m["model_elements"], "{m}");
+        assert!(m["max_bounds_deviation_mm"].as_f64().unwrap() < 0.01, "{m}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_linked_georeferenced_export_lands_on_the_model() {
+    let mut s = session();
+    let (dir, ifc) = exported(&mut s, "link");
+    let v = s.execute("reference.link", json!({"path": ifc, "name": "self"})).unwrap();
+    assert_eq!(v["alignment"], "map");
+    let built = trigon_model::build(&s.doc).unwrap();
+    let mut all = trigon_model::Mesh::default();
+    for b in &built {
+        for w in &b.walls {
+            all.append(&w.mesh);
+            for o in &w.openings {
+                for e in std::iter::once(&o.fill).chain(&o.attached) {
+                    for (_, m) in &e.parts {
+                        all.append(m);
+                    }
+                }
+            }
+        }
+        for sl in &b.slabs {
+            all.append(&sl.mesh);
+        }
+    }
+    let (lo, hi) = all.bounds().unwrap();
+    let ext = &v["extent_mm"];
+    for k in 0..3 {
+        assert!((ext[0][k].as_f64().unwrap() - lo[k]).abs() < 0.01, "min {k}: {ext} vs {lo:?}");
+        assert!((ext[1][k].as_f64().unwrap() - hi[k]).abs() < 0.01, "max {k}: {ext} vs {hi:?}");
+    }
+    // The link is a stored, undoable change, and it shows up in the glTF.
+    assert_eq!(s.execute("reference.list", json!({})).unwrap()[0]["name"], "self");
+    let glb = dir.join("m.glb");
+    s.execute("export.gltf", json!({"path": glb})).unwrap();
+    let bytes = std::fs::read(&glb).unwrap();
+    assert!(bytes.windows(14).any(|w| w == b"self/IFCWINDOW"));
+    assert!(s.execute("reference.link", json!({"path": ifc, "name": "self"})).is_err(), "duplicate names are refused");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc.references.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
