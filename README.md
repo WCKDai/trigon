@@ -55,6 +55,11 @@ saved plans, elevations and sections with precise annotation picking and snappin
 [saved drawings](docs/annotations.md). See [precise editing](docs/editing.md) for
 the shared commands, coordinate conventions and current boundaries.
 
+Studio's **Schedules** workspace and `schedule.openings` list the built windows and doors with their model IDs, storeys, types,
+dimensions, phase status and lining areas. It includes interior/cellar doors and explicitly
+excludes loggia facade-hole areas from the totals. `schedule.export` saves the inventory as
+CSV or JSON. See [opening schedules](docs/schedules.md).
+
 ```sh
 cargo build --release -p trigon-studio -p trigon
 ./target/release/trigon-studio path/to/model.trigon
@@ -112,6 +117,7 @@ you can read. See [`docs/control-protocol.md`](docs/control-protocol.md).
 | Cellar stairs | `building.set_cellar_stairs`: outdoor stairs down to the basement (kældernedgange) read off the basement plan: a pit along a facade between retaining walls with a kerb and railing, a straight flight along the wall, and a door into the basement |
 | Components | Loggias (`loggia`: the facade opened from the sill, glazed door and window set back between brick returns under a soffit, with a rail across), windows with top lights (`top_light`), glazed white stair, shop and balcony doors, door + window units (`door_window`: door width and side, window over a panel), casement windows (1–3 sashes), fixed window, entrance door, French door, French balcony, cantilever balcony; define your own with `types.define` |
 | Export | IFC4 as building elements for Revit and Vectorworks: layered walls with axes, wall types and joins, openings with typed windows and doors, floor slabs with stair openings, the roof, stairs of flights and landings, rooms as spaces, balconies as assemblies, colours and presentation layers, georeferenced with `IfcMapConversion` ([docs/ifc-export.md](docs/ifc-export.md), sample: [examples/sample-building.ifc](examples/sample-building.ifc)); and glTF 2.0. `export.gltf cut_level` makes a 3D plan cut (cut views): everything above `cut_mm` over that storey's floor is left out and the walls are closed at the cut |
+| Opening schedules | `schedule.openings` returns a deterministic, read-only inventory of actual built windows and doors, including occurrence dimensions and IFC-compatible outer-lining areas, with building/storey/phase filters; loggia areas are explicitly excluded ([contract](docs/schedules.md)) |
 | Drawings | `drawing.add` links a page of a scanned archive PDF (JPEG scans, read with lopdf + zune-jpeg); `drawing.view` shows it with a labelled pixel grid; `drawing.register_facade` ties a drawn elevation to a facade; `evidence.facade_image {drawing}` straightens it with the model drawn over it, like the photos. Only links are stored, never the scans |
 | Phases | Revit-style: `phase.set` (e.g. 1938 → 2026 → forslag), `phase.activate`; every placement is created in a phase and may be demolished in a later one. `facade.place` in a later phase demolishes what stood in the slot instead of deleting it; `facade.demolish` (openings close the wall). Views take `phase` + `filter` (complete, demolition, new, all): overlays colour existing magenta, new green, demolished red; glTF draws demolished translucent red; IFC carries Pset_*Common.Status (EXISTING, NEW, DEMOLISH) |
 | Balconies | Balconies are attachments (no opening): `balcony_slab` for existing ones and `steel_balcony` for the MinAltan stålaltan (UPE 160 frame, sunken Cumaru/fibre-concrete/composite/bamboo deck, Frederiksberg/Nørrebro/Vesterbro/Østerbro railing, galvanised/white/anthracite, optional hardwood handrail, matt-glass screens, tie rods) |

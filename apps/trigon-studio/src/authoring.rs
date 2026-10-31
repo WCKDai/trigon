@@ -14,6 +14,7 @@ pub enum Tab {
     Project,
     Families,
     Drawings,
+    Schedules,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -121,7 +122,7 @@ impl Authoring {
         ui.weak("Select a type to edit its parameters or create a variant.");
     }
 
-    fn selected(&self, current: Option<&Element>) -> Vec<String> {
+    pub(crate) fn selected(&self, current: Option<&Element>) -> Vec<String> {
         if self.targets.trim().is_empty() {
             current.map(|e| vec![e.id.clone()]).unwrap_or_default()
         } else {
@@ -273,7 +274,11 @@ impl Authoring {
             }
             Tool::Levels => {
                 ui.label("Destination storeys");
-                if let Some(b) = doc.buildings.first() {
+                let building = current
+                    .and_then(|e| e.props.iter().find(|(k, _)| *k == "building"))
+                    .and_then(|(_, id)| doc.buildings.iter().find(|b| b.id == *id))
+                    .or_else(|| doc.buildings.first());
+                if let Some(b) = building {
                     for (i, storey) in b.storeys.iter().enumerate() {
                         let mut selected = self.levels.contains(&i);
                         if ui.checkbox(&mut selected, &storey.name).changed() {

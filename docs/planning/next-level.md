@@ -14,7 +14,8 @@ and see it work; CI and compiling on the alpha runner.
 | IFC for Revit and Vectorworks (wall standard cases with layer sets and axes, typed doors/windows, slabs, roof, stairs, spaces, balconies, layers, colours) | `crates/io`, [export contract](../ifc-export.md) | implemented; commercial application import checks remain open |
 | Drawings: shared plan/section/elevation scene, DXF, saved views, persistent annotations and snapping | `crates/engine`, `crates/model/src/annotation.rs`, [drawing workflow](../annotations.md) | implemented; associative annotations remain open |
 | Trigon Studio: branded native workspace, families, groups, templates, precise edits and drawing authoring | `apps/trigon-studio`, [editing contract](../editing.md) | semantic 2D picking integrated and covered by worker/edit/undo tests; native OS click verification remains open |
-| CI on the trusted runner (alpha) | `.github/workflows/ci.yml` | done |
+| Window/door schedules | `crates/engine`, Studio, [schedule contract](../schedules.md), [#19](https://github.com/WCKDai/trigon/issues/19) | occurrence query, CSV/JSON export and live Studio table locally verified, including selection, filters, copy/Undo and 3D focus; physical OS input and large-model performance remain open |
+| CI on the trusted runner (alpha) | `.github/workflows/ci.yml` | workflow configured; Linux execution is blocked by the runner group's workflow allowlist pending owner approval |
 
 ## Product acceptance workflows
 
@@ -39,9 +40,10 @@ service; agent assistance uses the same undoable tools as manual editing.
 
 These are acceptance targets, not a claim that the full workflow is implemented. The saved
 drawing milestone covers annotation authoring and snapping. Direct 2D model selection and IFC
-window/door quantities are separate follow-up increments, with their own implementation and
-verification evidence. Each should close a workflow with a reproducible fixture before broadening
-the tool list.
+window/door quantities are implemented in separate follow-up increments ([#17](https://github.com/WCKDai/trigon/pull/17),
+[#18](https://github.com/WCKDai/trigon/pull/18)), with local verification and an offline workflow
+fixture. Those branches remain under review; native interaction and representative commercial
+import checks remain open. The next increment connects those quantities to local schedules.
 
 Open-source libraries, ML weights, datasets and component assets each need a source, an exact
 version and a checked redistribution licence. Reuse follows the clean-room rules in `AGENTS.md`;
@@ -88,17 +90,17 @@ is undoable.
 
 ## What more compute and agents would buy
 
-- **More CI capacity.** `alpha` is one trusted runner shared by PolyCore, Polykrom and Trigon;
-  Trigon's runs queue behind theirs (observed 2026-10-31: three Trigon runs superseded while
-  waiting). A second trusted Linux runner, or two more runner instances on alpha with their own
-  labels, removes that wait. A macOS and a Windows runner are needed to build and test Studio on
-  the platforms it ships on.
+- **CI access and capacity.** `alpha` is online in a trusted runner group shared by PolyCore,
+  Polykrom and Trigon. Its restricted workflow allowlist currently omits Trigon, so adding
+  runner capacity alone will not unblock these runs. A proposal to allow the exact reviewed
+  workflow revisions is prepared, pending owner approval. After access is resolved, a second
+  runner can reduce contention. macOS and Windows runners are needed for platform verification.
 - **Shell access to alpha** (an SSH host for the agent) would let heavy release builds and
   Blender renders run there instead of on the laptop.
 - **A GPU render node** (Blender, Eevee/Cycles) for presentation renders; renders take minutes per
   view on the laptop.
-- **Parallel agents per independent workstream** in isolated worktrees, with distinct build
-  artifacts and explicit ownership. Follow-up units are semantic drawing picking and IFC quantities;
-  their integration and Studio verification remain sequential. Add reviewers when a concrete diff is ready.
+- **Parallel agents per independent workstream** in isolated worktrees, with explicit file ownership
+  and exclusive build-cache leases. Semantic picking and IFC quantities have been integrated
+  sequentially; schedules are the current follow-up. Add reviewers when a concrete diff is ready.
 - **Representative import checks** of `examples/sample-building.ifc` in Revit, Archicad and
   Vectorworks, with the application version, element categories, quantities and geometry recorded.

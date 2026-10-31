@@ -13,6 +13,7 @@ mod palette;
 mod plan_view;
 mod render;
 mod scene;
+mod schedules;
 mod theme;
 mod worker;
 
