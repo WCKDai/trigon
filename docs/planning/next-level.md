@@ -37,9 +37,11 @@ service; agent assistance uses the same undoable tools as manual editing.
    geometry and properties with independent readers and representative commercial application
    imports, preserving explicit failures and unsupported cases.
 
-These are acceptance targets, not a claim that the full workflow is implemented. The current
-increment is direct 2D model selection plus IFC window/door quantities. Subsequent increments
-should close one of these workflows with a reproducible fixture before broadening the tool list.
+These are acceptance targets, not a claim that the full workflow is implemented. The saved
+drawing milestone covers annotation authoring and snapping. Direct 2D model selection and IFC
+window/door quantities are separate follow-up increments, with their own implementation and
+verification evidence. Each should close a workflow with a reproducible fixture before broadening
+the tool list.
 
 Open-source libraries, ML weights, datasets and component assets each need a source, an exact
 version and a checked redistribution licence. Reuse follows the clean-room rules in `AGENTS.md`;
@@ -96,7 +98,7 @@ is undoable.
 - **A GPU render node** (Blender, Eevee/Cycles) for presentation renders; renders take minutes per
   view on the laptop.
 - **Parallel agents per independent workstream** in isolated worktrees, with distinct build
-  artifacts and explicit ownership. Current units are semantic drawing picking and IFC quantities;
-  integration and Studio verification remain sequential. Add reviewers when a concrete diff is ready.
+  artifacts and explicit ownership. Follow-up units are semantic drawing picking and IFC quantities;
+  their integration and Studio verification remain sequential. Add reviewers when a concrete diff is ready.
 - **Representative import checks** of `examples/sample-building.ifc` in Revit, Archicad and
   Vectorworks, with the application version, element categories, quantities and geometry recorded.
