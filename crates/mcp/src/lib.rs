@@ -132,21 +132,25 @@ fn studio_tools() -> Value {
             "name": "studio_view",
             "description": "Change what the owner sees in Trigon Studio and return the view: mode (3d or plan), level (the plan's \
                             level; in 3D the top level shown, cut 1.2 m above its floor; null shows everything), phase (a phase id), \
-                            filter (complete, demolition, new, all), fit (true frames the whole model).",
+                            filter (complete, demolition, new, all), fit (true frames the whole model), focus (an element id such as a \
+                            facade's wall \"b1.f3\" or a placement: frames it, seen from outside its facade).",
             "inputSchema": {"type": "object", "properties": {
                 "mode": {"type": "string", "enum": ["3d", "plan"]},
                 "level": {"type": ["integer", "null"], "minimum": 0},
                 "phase": {"type": "string"},
                 "filter": {"type": "string", "enum": ["complete", "demolition", "new", "all"]},
-                "fit": {"type": "boolean"}
+                "fit": {"type": "boolean"},
+                "focus": {"type": "string"}
             }, "additionalProperties": false}
         },
         {
             "name": "studio_screenshot",
             "description": "See what the owner sees in Trigon Studio: a PNG of the 3D or plan viewport (default) or of the whole \
-                            window with the activity feed (target: window).",
+                            window with the activity feed (target: window). A covered window can't be captured; raise: true brings it \
+                            to the front first, taking focus from the owner, so only when they asked for it.",
             "inputSchema": {"type": "object", "properties": {
-                "target": {"type": "string", "enum": ["viewport", "window"]}
+                "target": {"type": "string", "enum": ["viewport", "window"]},
+                "raise": {"type": "boolean"}
             }, "additionalProperties": false}
         }
     ])
@@ -164,7 +168,10 @@ fn text_content(v: &Value) -> Value {
 fn call_studio_tool(backend: &mut dyn Backend, name: &str, args: Value) -> Value {
     let (method, args) = match name {
         "studio_view" => ("ui.view", args),
-        _ => ("ui.screenshot", json!({"target": args.get("target").cloned().unwrap_or(json!("viewport"))})),
+        _ => (
+            "ui.screenshot",
+            json!({"target": args.get("target").cloned().unwrap_or(json!("viewport")), "raise": args.get("raise").cloned().unwrap_or(json!(false))}),
+        ),
     };
     match backend.studio(method, args) {
         Ok(mut v) => {
