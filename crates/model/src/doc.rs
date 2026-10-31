@@ -27,6 +27,12 @@ pub struct Document {
     pub types: Vec<ComponentType>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ModelGroup>,
+    /// Saved plan, facade and section drawing frames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<crate::annotation::DrawingView>,
+    /// Drafting notes owned by one saved drawing view.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<crate::annotation::Annotation>,
     /// Every model-changing command that produced this document, in order. Replaying it from an
     /// empty document gives the same model (given the same source data).
     #[serde(default)]
@@ -194,6 +200,8 @@ impl Default for Document {
             buildings: Vec::new(),
             types: default_types(),
             groups: Vec::new(),
+            views: Vec::new(),
+            annotations: Vec::new(),
             journal: Vec::new(),
             references: Vec::new(),
             drawings: Vec::new(),

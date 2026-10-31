@@ -9,6 +9,54 @@ pub(crate) mod project;
 pub(crate) mod style;
 pub(crate) mod svg;
 
+/// The shared presentation scene, used both by file exports and live drafting workspaces.
+pub(crate) struct Sheet {
+    pub(crate) scene: Scene,
+    pub(crate) vp: Viewport,
+    pub(crate) clip: [f64; 4],
+    pub(crate) title: String,
+    pub(crate) project: String,
+    pub(crate) caption: String,
+    pub(crate) note: Option<String>,
+    pub(crate) metrics: serde_json::Value,
+}
+
+impl Sheet {
+    pub(crate) fn svg(&self) -> String {
+        svg::sheet(
+            &svg::Frame { title: &self.title, project: &self.project, caption: &self.caption, footer: &self.title, note: self.note.clone() },
+            &self.scene,
+            &self.vp,
+            self.clip,
+        )
+    }
+
+    pub(crate) fn write(&self, path: std::path::PathBuf) -> crate::Result<serde_json::Value> {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
+        let mut result = self.metrics.clone();
+        result["written"] = serde_json::json!(path);
+        let bytes = match ext {
+            "dxf" => {
+                let text = dxf::write(
+                    &self.scene,
+                    &dxf::TitleBlock { title: &self.title, project: &self.project, caption: &self.caption, note: self.note.clone() },
+                );
+                result["dxf"] = dxf::summary(&text);
+                dxf::bytes(&text)
+            }
+            "svg" => self.svg().into_bytes(),
+            "png" => crate::plan_output::png(&self.svg())?,
+            "pdf" => crate::plan_output::pdf(&[self.svg()], PAGE_MM)?,
+            _ => return Err(trigon_model::ModelError::Invalid("use .pdf, .png, .svg or .dxf for a drawing view".into()).into()),
+        };
+        crate::plan::write_output(&path, &bytes)?;
+        if ext == "png" {
+            result["image_path"] = serde_json::json!(path);
+        }
+        Ok(result)
+    }
+}
+
 /// The 1600 × 900 px sheet prints as 338.67 × 190.5 mm (96 dpi).
 pub(crate) const PAGE_MM: [f64; 2] = [338.666_666_7, 190.5];
 pub(crate) const MM_PER_PX: f64 = PAGE_MM[0] / 1600.0;

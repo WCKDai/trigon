@@ -842,6 +842,12 @@ pub(crate) fn sheet(
     Ok(result)
 }
 
+pub(crate) fn drawing_sheet(doc: &Document, level: usize, view: View) -> Result<crate::sheet::Sheet> {
+    let s = sheet_scene(doc, level, view, 0.0, None, "")?;
+    let metrics = json!({"pages":1, "width_px":1600, "height_px":900, "underlay":null, "style":"presentation", "scale":scale_text(s.scene.scale)});
+    Ok(crate::sheet::Sheet { scene: s.scene, vp: s.vp, clip: s.clip, title: s.floor, project: s.project, caption: s.caption, note: s.note, metrics })
+}
+
 /// One level's presentation sheet as SVG text, for live views (Trigon Studio's plan view).
 pub fn sheet_svg_text(doc: &Document, level: usize, view: View) -> Result<String> {
     let s = sheet_scene(doc, level, view, 0.0, None, "")?;
