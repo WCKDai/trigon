@@ -132,6 +132,7 @@ fn door_operation(kind: &ComponentKind) -> &'static str {
         ComponentKind::FrenchDoor { leaves: 2 } | ComponentKind::FrenchBalcony { leaves: 2, .. } | ComponentKind::Balcony { leaves: 2, .. } => {
             ".DOUBLE_DOOR_SINGLE_SWING."
         }
+        ComponentKind::DoorWindow { door_side: trigon_model::component::Side::Right, .. } => ".SINGLE_SWING_RIGHT.",
         _ => ".SINGLE_SWING_LEFT.",
     }
 }

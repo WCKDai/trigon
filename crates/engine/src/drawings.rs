@@ -54,6 +54,7 @@ pub(crate) fn add(s: &mut Session, path: &Path, page: u32, name: Option<String>,
         height: img.height,
         note: note.unwrap_or_default(),
         facades: Vec::new(),
+        plans: Vec::new(),
     });
     Ok(
         json!({"linked": name, "width_px": img.width, "height_px": img.height, "next": "drawing.view to read coordinates, then drawing.register_facade"}),
@@ -61,7 +62,7 @@ pub(crate) fn add(s: &mut Session, path: &Path, page: u32, name: Option<String>,
 }
 
 /// A 3 × 5 digit font (and a minus sign), one row per entry, three bits per row.
-const DIGITS: [[u8; 5]; 11] = [
+pub(crate) const DIGITS: [[u8; 5]; 11] = [
     [7, 5, 5, 5, 7],
     [2, 6, 2, 2, 7],
     [7, 1, 7, 4, 7],
@@ -275,4 +276,20 @@ pub(crate) fn facade_image(
         "facade_height_mm": h.round(),
         "drawing_coverage": (covered as f64 / f64::from(width * height) * 1000.0).round() / 1000.0,
     }))
+}
+
+pub(crate) fn digit(d: u32) -> [u8; 5] {
+    DIGITS.get(d as usize).copied().unwrap_or([0; 5])
+}
+
+pub(crate) fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= c.len() { char::from(T[((n >> shift) & 63) as usize]) } else { '=' });
+        }
+    }
+    out
 }

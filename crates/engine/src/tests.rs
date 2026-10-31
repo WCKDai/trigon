@@ -331,6 +331,7 @@ fn with_sheet(s: &mut Session) -> String {
         height: h,
         note: String::new(),
         facades: Vec::new(),
+        plans: Vec::new(),
     });
     s.drawing_cache = Some((("/virtual/sheet.pdf".into(), 1, 0), std::sync::Arc::new(trigon_drawing::Gray { width: w, height: h, data })));
     "sheet".into()
@@ -430,5 +431,53 @@ fn phases_past_present_future() {
     let list = s.execute("phase.list", json!({})).unwrap();
     assert_eq!(list["phases"][2]["builds"], 1);
     assert_eq!(list["phases"][2]["demolishes"], 2, "old balcony and door");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn floor_plans_from_a_registered_sheet() {
+    let mut s = session();
+    let sheet = with_sheet(&mut s);
+    let south = first_facade_facing(&mut s, "S");
+    s.execute("facade.set_bays", json!({"facade": south, "count": 6})).unwrap();
+    s.execute(
+        "types.define",
+        json!({"id": "dw", "name": "Door + window", "width": 1840.0, "height": 2150.0, "sill": 0.0,
+               "kind": {"family": "door_window", "door_width": 880.0, "door_side": "left", "window_sill": 750.0, "lights": 2}}),
+    )
+    .unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "dw", "levels": [1], "bays": [1, 4]})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "window.casement.2", "levels": [1], "bays": [0, 2, 3, 5]})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "balcony.minaltan", "levels": [1], "bays": [1, 4]})).unwrap();
+    // The outline lists the corners in site mm.
+    let outline = s.execute("building.outline", json!({})).unwrap();
+    assert_eq!(outline.as_array().unwrap().len(), 4);
+    // Register: the sheet is 100 px/m, rotated so the south facade runs along +x; two facade points and one site point.
+    let fr_len =
+        s.execute("facade.list", json!({})).unwrap().as_array().unwrap().iter().find(|f| f["id"] == south).unwrap()["length_mm"].as_f64().unwrap();
+    let v = s
+        .execute(
+            "drawing.register_plan",
+            json!({"name": sheet, "levels": [1], "points": [
+                {"px": 200, "py": 1500, "facade": south, "u": 0.0},
+                {"px": 200.0 + fr_len / 10.0, "py": 1500, "facade": south, "u": fr_len}
+            ]}),
+        )
+        .unwrap();
+    assert!((v["px_per_m"].as_f64().unwrap() - 100.0).abs() < 0.01, "{v}");
+    assert_eq!(v["residuals_mm"], json!([0.0, 0.0]));
+    let dir = std::env::temp_dir().join(format!("trigon-plan-{}", std::process::id()));
+    let png = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.png"), "mm_per_px": 50.0})).unwrap();
+    assert_eq!(png["underlay"], "sheet");
+    assert_eq!(png["labelled_balconies"], 2);
+    let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg"), "mm_per_px": 50.0})).unwrap();
+    let text = std::fs::read_to_string(svg["written"].as_str().unwrap()).unwrap();
+    assert!(text.contains("Ca. 1300 x 2700") && text.contains("<polygon") && text.contains("data:image/png;base64,"));
+    // No plan registered for the ground floor: a plain plan, or a clear error when a drawing is asked for.
+    assert!(s.execute("plan.image", json!({"level": 0, "path": dir.join("g.png")})).unwrap()["underlay"].is_null());
+    assert!(s.execute("plan.image", json!({"level": 0, "drawing": sheet, "path": dir.join("g.png")})).is_err());
+    assert!(s.execute("plan.image", json!({"level": 9, "path": dir.join("x.png")})).is_err());
+    assert!(s.execute("plan.image", json!({"level": 1, "path": dir.join("x.pdf")})).is_err());
+    assert!(s.execute("drawing.register_plan", json!({"name": sheet, "levels": [1], "points": [{"px": 1, "py": 1, "x": 0.0, "y": 0.0}]})).is_err());
     let _ = std::fs::remove_dir_all(dir);
 }

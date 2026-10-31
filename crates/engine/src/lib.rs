@@ -14,6 +14,7 @@ use trigon_model::{Document, ModelError};
 mod commands;
 mod drawings;
 mod facade_image;
+mod plan;
 mod time;
 
 pub use commands::{CommandSpec, commands};

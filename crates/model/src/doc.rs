@@ -64,6 +64,65 @@ pub struct Drawing {
     /// Elevations on this sheet tied to facades.
     #[serde(default)]
     pub facades: Vec<FacadeRegistration>,
+    /// Plans on this sheet tied to the site.
+    #[serde(default)]
+    pub plans: Vec<PlanRegistration>,
+}
+
+/// Ties a drawn plan to the site with a similarity transform (scale, rotation, shift; the
+/// drawing's y axis points down): `site = [a −b; b a] · (x, −y) + (tx, ty)`, mm.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanRegistration {
+    /// Storeys this plan shows (an "Etageplan" usually covers several).
+    pub levels: Vec<usize>,
+    pub a: f64,
+    pub b: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+impl PlanRegistration {
+    /// Least-squares fit from (drawing px, site mm) pairs; at least two.
+    pub fn fit(levels: Vec<usize>, pairs: &[([f64; 2], [f64; 2])]) -> Result<Self> {
+        if pairs.len() < 2 {
+            return Err(ModelError::Invalid("give at least two points".into()));
+        }
+        if pairs.iter().flat_map(|(p, q)| [p[0], p[1], q[0], q[1]]).any(|v| !v.is_finite() || v.abs() > 1e9) {
+            return Err(ModelError::Invalid("points must be finite".into()));
+        }
+        let n = pairs.len() as f64;
+        let pc = pairs.iter().fold([0.0, 0.0], |c, (p, _)| [c[0] + p[0] / n, c[1] - p[1] / n]);
+        let qc = pairs.iter().fold([0.0, 0.0], |c, (_, q)| [c[0] + q[0] / n, c[1] + q[1] / n]);
+        let (mut s, mut sa, mut sb) = (0.0, 0.0, 0.0);
+        for (p, q) in pairs {
+            let (px, py) = (p[0] - pc[0], -p[1] - pc[1]);
+            let (qx, qy) = (q[0] - qc[0], q[1] - qc[1]);
+            s += px * px + py * py;
+            sa += px * qx + py * qy;
+            sb += px * qy - py * qx;
+        }
+        if !(s > 1.0) {
+            return Err(ModelError::Invalid("the drawing points must be apart".into()));
+        }
+        let (a, b) = (sa / s, sb / s);
+        Ok(Self { levels, a, b, tx: qc[0] - (a * pc[0] - b * pc[1]), ty: qc[1] - (b * pc[0] + a * pc[1]) })
+    }
+
+    pub fn to_site(&self, p: [f64; 2]) -> [f64; 2] {
+        let (x, y) = (p[0], -p[1]);
+        [self.a * x - self.b * y + self.tx, self.b * x + self.a * y + self.ty]
+    }
+
+    pub fn to_drawing(&self, q: [f64; 2]) -> [f64; 2] {
+        let k = self.a * self.a + self.b * self.b;
+        let (x, y) = (q[0] - self.tx, q[1] - self.ty);
+        [(self.a * x + self.b * y) / k, -((-self.b * x + self.a * y) / k)]
+    }
+
+    /// Drawing pixels per metre.
+    pub fn px_per_m(&self) -> f64 {
+        1000.0 / (self.a * self.a + self.b * self.b).sqrt()
+    }
 }
 
 /// Ties a drawn elevation to a facade: two x positions (the facade's ends) and two heights.
@@ -399,5 +458,31 @@ impl Document {
             let known: Vec<&str> = self.types.iter().map(|t| t.id.as_str()).collect();
             ModelError::NotFound(format!("component type {id} (known: {})", known.join(", ")))
         })
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::PlanRegistration;
+
+    #[test]
+    fn similarity_round_trips_and_fits_exactly() {
+        // A sheet at 100 px/m, rotated 30°, shifted.
+        let (s, t) = (10.0, 30f64.to_radians());
+        let truth = |p: [f64; 2]| {
+            let (x, y) = (p[0], -p[1]);
+            [s * (t.cos() * x - t.sin() * y) + 5000.0, s * (t.sin() * x + t.cos() * y) - 2000.0]
+        };
+        let pts = [[100.0, 200.0], [900.0, 250.0], [400.0, 800.0]];
+        let pairs: Vec<_> = pts.iter().map(|p| (*p, truth(*p))).collect();
+        let r = PlanRegistration::fit(vec![1], &pairs).unwrap();
+        assert!((r.px_per_m() - 100.0).abs() < 1e-9);
+        for p in pts {
+            let q = r.to_site(p);
+            assert!((q[0] - truth(p)[0]).abs() < 1e-6 && (q[1] - truth(p)[1]).abs() < 1e-6);
+            let back = r.to_drawing(q);
+            assert!((back[0] - p[0]).abs() < 1e-9 && (back[1] - p[1]).abs() < 1e-9);
+        }
+        assert!(PlanRegistration::fit(vec![1], &pairs[..1]).is_err());
     }
 }

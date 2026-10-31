@@ -439,6 +439,57 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "building.outline",
+        summary: "The building's outline corners in site mm (x east, y north of the site origin) with the facades meeting at each, \
+                  for tying drawings to the site.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<BuildingParam>,
+        run: |s, v| {
+            let p: BuildingParam = parse("building.outline", v)?;
+            let b = s.doc.building(p.building.as_deref())?;
+            let n = b.footprint.len();
+            Ok(json!(
+                b.footprint
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| json!({
+                        "corner": i,
+                        "x": c[0].round(),
+                        "y": c[1].round(),
+                        "ends": b.facades.iter().find(|f| (f.edge + 1) % n == i).map(|f| f.id.clone()),
+                        "starts": b.facades.iter().find(|f| f.edge == i).map(|f| f.id.clone()),
+                    }))
+                    .collect::<Vec<_>>()
+            ))
+        },
+    },
+    CommandSpec {
+        id: "drawing.register_plan",
+        summary: "Tie a plan on a linked drawing to the site for the storeys it shows: two or more points, each a drawing pixel \
+                  (px, py) and either a site point (x, y in mm) or a facade point (facade, u = mm along it from its start, on the \
+                  outer face). Fits scale, rotation and shift and reports the residual at each point.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<RegisterPlan>,
+        run: |s, v| register_plan(s, parse("drawing.register_plan", v)?),
+    },
+    CommandSpec {
+        id: "plan.image",
+        summary: "Draw a floor plan of a storey, cut 1 m above its floor: walls, windows, door swings and balconies with their \
+                  size (\"Ca. depth x width\"), coloured by phase (green new, red dashed demolished), over the registered archive \
+                  plan. `path` ending in .png gives an image (returned to agents), .svg a vector drawing.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<PlanImage>,
+        run: |s, v| {
+            let p: PlanImage = parse("plan.image", v)?;
+            let path = PathBuf::from(&p.path);
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::plan::render(s, p.level, p.drawing.as_deref(), view, p.mm_per_px.unwrap_or(20.0), p.rotate_deg.unwrap_or(0.0), path)
+        },
+    },
+    CommandSpec {
         id: "export.gltf",
         summary: "Export the model as glTF 2.0 binary (.glb), metres, Y up. `phase` and `filter` choose the view (default: the \
                   active phase, complete); demolished elements are translucent red.",
@@ -620,6 +671,42 @@ struct DrawingRegister {
     x_end: f64,
     /// Two [drawing y in pixels, height above the terrain in mm] pairs, for example the eaves and a floor line.
     y_levels: [[f64; 2]; 2],
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanPoint {
+    px: f64,
+    py: f64,
+    x: Option<f64>,
+    y: Option<f64>,
+    facade: Option<String>,
+    u: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RegisterPlan {
+    name: String,
+    /// Storey indices the plan shows.
+    levels: Vec<usize>,
+    points: Vec<PlanPoint>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanImage {
+    level: usize,
+    /// .png or .svg
+    path: String,
+    /// A drawing with a plan registered for this level (default: the first one found).
+    drawing: Option<String>,
+    phase: Option<String>,
+    filter: Option<String>,
+    /// Scale, mm per pixel (default 20).
+    mm_per_px: Option<f64>,
+    /// Rotate the drawing counter-clockwise by this many degrees (0 = north up).
+    rotate_deg: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1016,6 +1103,61 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
         "eaves_mm": r.map(|r| r.eaves.round()),
         "ridge_mm": r.map(|r| r.ridge.round()),
         "pitch_deg": r.map(|r| (r.pitch_deg * 10.0).round() / 10.0),
+    }))
+}
+
+fn register_plan(s: &mut Session, p: RegisterPlan) -> Result<Value> {
+    let storeys = s.doc.building(None)?.storeys.len();
+    if p.levels.is_empty() || p.levels.iter().any(|l| *l >= storeys) {
+        return Err(ModelError::Invalid(format!("levels must be storey indices below {storeys}")).into());
+    }
+    if p.points.len() > 50 {
+        return Err(ModelError::Invalid("at most 50 points".into()).into());
+    }
+    let mut pairs = Vec::with_capacity(p.points.len());
+    for (i, q) in p.points.iter().enumerate() {
+        let site = match (q.x, q.y, q.facade.as_deref(), q.u) {
+            (Some(x), Some(y), None, None) => [x, y],
+            (None, None, Some(fid), Some(u)) => {
+                let b = s
+                    .doc
+                    .buildings
+                    .iter()
+                    .find(|b| b.facades.iter().any(|f| f.id == fid))
+                    .ok_or_else(|| ModelError::NotFound(format!("facade {fid}")))?;
+                let f = b.facade(fid)?;
+                let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::NotFound(format!("facade {fid}")))?;
+                let fr = FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid(format!("facade {fid} has zero length")))?;
+                let u = trigon_model::checked("u", u, -5000.0, fr.length + 5000.0)?;
+                let pt = fr.point(u, 0.0, 0.0);
+                [pt[0], pt[1]]
+            }
+            _ => {
+                return Err(EngineError::Params {
+                    command: "drawing.register_plan".into(),
+                    message: format!("point {i}: give x and y, or facade and u"),
+                });
+            }
+        };
+        pairs.push(([q.px, q.py], site));
+    }
+    let reg = trigon_model::PlanRegistration::fit(p.levels.clone(), &pairs)?;
+    let residuals: Vec<f64> = pairs
+        .iter()
+        .map(|(px, q)| {
+            let r = reg.to_site(*px);
+            ((r[0] - q[0]).powi(2) + (r[1] - q[1]).powi(2)).sqrt().round()
+        })
+        .collect();
+    let d = s.doc.drawings.iter_mut().find(|d| d.name == p.name).ok_or_else(|| ModelError::NotFound(format!("drawing {}", p.name)))?;
+    d.plans.retain(|r| !r.levels.iter().any(|l| p.levels.contains(l)));
+    d.plans.push(reg.clone());
+    Ok(json!({
+        "drawing": p.name,
+        "levels": p.levels,
+        "px_per_m": (reg.px_per_m() * 100.0).round() / 100.0,
+        "rotation_deg": (reg.b.atan2(reg.a).to_degrees() * 100.0).round() / 100.0,
+        "residuals_mm": residuals,
     }))
 }
 

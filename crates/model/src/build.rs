@@ -3,7 +3,7 @@
 //! Walls are 2.5D: one prism per facade between the outer wall line and its mitred inward
 //! offset, with openings cut as 2D holes in the wall faces. No 3D booleans are needed.
 
-use crate::component::{ComponentKind, ComponentType, Deck, Finish, Railing, Screens};
+use crate::component::{ComponentKind, ComponentType, Deck, Finish, Railing, Screens, Side};
 use crate::doc::{Building, Document, Facade, FacadeKind, Placement, Storey};
 use crate::mesh::{Material, Mesh};
 use crate::{ModelError, Result};
@@ -573,6 +573,24 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind) -> Vec<(Materi
                 frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (v0 + panel, v1 - FRAME)));
             }
             glass.append(&fbox(fr, (iu0, iu1), glass_w, (v0 + panel, v1 - FRAME)));
+        }
+        ComponentKind::DoorWindow { door_width, door_side, window_sill, lights } => {
+            // Split the opening: door leaf on one side, window over a brick panel on the other.
+            let (du0, du1, wu0, wu1) = match door_side {
+                Side::Left => (u0, u0 + door_width, u0 + door_width, u1),
+                Side::Right => (u1 - door_width, u1, u0, u1 - door_width),
+            };
+            let mullion = if door_side == &Side::Left { wu0 } else { wu1 };
+            frame.append(&fbox(fr, (mullion - FRAME / 2.0, mullion + FRAME / 2.0), w, (v0, v1 - FRAME)));
+            parts.push((Material::Door, fbox(fr, (du0 + FRAME / 2.0, du1 - FRAME / 2.0), (REVEAL + 15.0, REVEAL + 60.0), (v0, v1 - FRAME))));
+            let ws = v0 + window_sill;
+            parts.push((Material::Wall, fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
+            frame.append(&fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), w, (ws, ws + FRAME)));
+            for c in dividers(wu0 + FRAME / 2.0, wu1 - FRAME / 2.0, *lights) {
+                frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (ws + FRAME, v1 - FRAME)));
+            }
+            glass.append(&fbox(fr, (wu0 + FRAME / 2.0, wu1 - FRAME / 2.0), glass_w, (ws + FRAME, v1 - FRAME)));
+            parts.push((Material::Sill, fbox(fr, (wu0, wu1), (-40.0, REVEAL), (ws - 40.0, ws))));
         }
         ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
     }
