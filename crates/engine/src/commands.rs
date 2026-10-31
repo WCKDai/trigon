@@ -1047,8 +1047,11 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "export.ifc",
-        summary: "Export the model as IFC4 (.ifc), georeferenced to EPSG:25832. `phase` and `filter` choose the view; with \
-                  phases, every window, door, railing and balcony carries Pset_*Common.Status (EXISTING, NEW, DEMOLISH).",
+        summary: "Export the model as IFC4 (.ifc) building elements for Revit, Vectorworks and other BIM tools, georeferenced to \
+                  EPSG:25832: layered walls with axes and wall types, openings with typed windows and doors, floor slabs with stair \
+                  openings, the roof, stairs of flights and landings, rooms as spaces, balconies as assemblies, with materials, \
+                  colours, quantities and presentation layers. `phase` and `filter` choose the view; with phases, elements carry \
+                  Pset_*Common.Status (EXISTING, NEW, DEMOLISH).",
         mutates: false,
         journaled: false,
         schema: schema::<ExportParams>,
@@ -2095,40 +2098,11 @@ fn comparison(c: &trigon_ifcread::Comparison) -> Value {
 
 /// Bounding boxes of this document's elements, keyed by the GlobalId the IFC export gives them.
 fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f64; 3], [f64; 3])>> {
-    let mut out = std::collections::BTreeMap::new();
-    let mut add = |id: &str, meshes: Vec<&trigon_model::Mesh>| {
-        let mut all = trigon_model::Mesh::default();
-        for m in meshes {
-            all.append(m);
-        }
-        if let Some(b) = all.bounds() {
-            out.insert(trigon_io::ifc::guid(&format!("trigon:{id}")), b);
-        }
-    };
-    for b in trigon_model::build(doc)? {
-        for w in &b.walls {
-            for seg in &w.segments {
-                add(&seg.id, vec![&seg.mesh]);
-            }
-            for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
-                add(&e.id, e.parts.iter().map(|(_, m)| m).collect());
-            }
-        }
-        for s in &b.slabs {
-            add(&s.id, vec![&s.mesh]);
-        }
-        if let Some(r) = &b.roof {
-            add(&r.id, vec![&r.cover]);
-            add(&format!("{}.gables", r.id), vec![&r.gables]);
-        }
-        for iw in &b.interior {
-            add(&iw.id, vec![&iw.mesh]);
-        }
-        for stair in &b.stairs {
-            add(&stair.id, vec![&stair.mesh]);
-        }
-    }
-    Ok(out)
+    let built = trigon_model::build(doc)?;
+    Ok(trigon_io::ifc::model_shapes(doc, &built)
+        .into_iter()
+        .filter_map(|(id, mesh)| Some((trigon_io::ifc::guid(&format!("trigon:{id}")), mesh.bounds()?)))
+        .collect())
 }
 
 fn versus_model(doc: &Document, r: &trigon_ifcread::ReadResult) -> Result<Value> {

@@ -762,7 +762,9 @@ fn interior_walls_traced_from_a_plan_sheet() {
     let dir = std::env::temp_dir().join(format!("trigon-interior-{}", std::process::id()));
     s.execute("export.ifc", json!({"path": dir.join("m.ifc")})).unwrap();
     let ifc = std::fs::read_to_string(dir.join("m.ifc")).unwrap();
-    assert!(ifc.contains(".PARTITIONING.") && ifc.contains("Interior wall (load-bearing)"));
+    // Partitions and load-bearing walls are typed by their build-up; the room is a space with its name.
+    assert!(ifc.contains(".PARTITIONING.") && ifc.contains("IFCWALLTYPE(") && ifc.contains("B\\X2\\00E6\\X0\\rende inderv\\X2\\00E6\\X0\\g"));
+    assert!(ifc.contains("IFCSPACE(") && ifc.contains("'Stue'") && ifc.contains("IFCSTAIRFLIGHT("));
     let svg = s.execute("plan.image", json!({"level": 1, "path": dir.join("p.svg")})).unwrap();
     let text = std::fs::read_to_string(svg["written"].as_str().unwrap()).unwrap();
     assert!(text.contains(">Stue<") && text.contains("60.0 m²"));
@@ -826,7 +828,8 @@ fn masonry_walls_step_inside_at_every_floor_and_interior_walls_join_them() {
     assert!((0..storeys).all(|l| b.edge_thickness(edge, l) == 360.0));
     let built = trigon_model::build(&s.doc).unwrap();
     let text = trigon_io::ifc::write(&s.doc, &built, "t.ifc", "2000-01-01T00:00:00Z");
-    assert_eq!(text.matches("IFCWALL(").count(), built[0].walls.len() * storeys + built[0].interior.len());
+    let walls = text.matches("IFCWALL(").count() + text.matches("IFCWALLSTANDARDCASE(").count();
+    assert_eq!(walls, built[0].walls.len() * storeys + built[0].interior.len());
 
     // Refused: wrong count, hostile values, preset with facades. The document is unchanged.
     let before = s.doc.clone();
@@ -841,4 +844,79 @@ fn masonry_walls_step_inside_at_every_floor_and_interior_walls_join_them() {
         assert!(s.execute("building.set_wall_schedule", bad.clone()).is_err(), "{bad}");
     }
     assert_eq!(s.doc, before);
+}
+
+#[test]
+fn a_bim_export_reads_back_the_same_in_both_readers() {
+    // Stepped masonry, a pitched roof with a gable, a steel balcony with tie rods, a cantilever
+    // balcony, a staircase, interior walls and rooms, in two phases.
+    let mut s = session();
+    let (south, north, east) = (first_facade_facing(&mut s, "S"), first_facade_facing(&mut s, "N"), first_facade_facing(&mut s, "E"));
+    s.execute("phase.set", json!({"phases": [{"id": "1940", "name": "Opført"}, {"id": "forslag", "name": "Forslag"}]})).unwrap();
+    s.execute("building.set_wall_schedule", json!({"preset": "copenhagen_masonry"})).unwrap();
+    s.execute("building.set_roof", json!({"kind": "pitched", "pitch_deg": 40.0, "gables": [east]})).unwrap();
+    s.execute(
+        "types.define",
+        json!({"id": "balcony.steel", "name": "Stålaltan", "width": 2400.0, "height": 1000.0, "sill": 0.0,
+               "kind": {"family": "steel_balcony", "depth": 1300.0, "railing": "frederiksberg", "finish": "anthracite", "deck": "cumaru",
+                        "handrail": true, "screens": "both", "tie_rods": true}}),
+    )
+    .unwrap();
+    for f in [&south, &north] {
+        s.execute("facade.set_bays", json!({"facade": f, "count": 6})).unwrap();
+        s.execute("facade.place", json!({"facade": f, "type": "window.casement.2", "phase": "1940"})).unwrap();
+    }
+    s.execute("facade.place", json!({"facade": south, "type": "door.french", "levels": [1, 2], "bays": [2]})).unwrap();
+    s.execute("facade.place", json!({"facade": south, "type": "balcony.steel", "levels": [1, 2], "bays": [2]})).unwrap();
+    s.execute("facade.place", json!({"facade": north, "type": "balcony.cantilever", "levels": [1], "bays": [3], "phase": "1940"})).unwrap();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls": [{"id": "spine", "levels": [0, 1, 2, 3, 4], "a": [-11000.0, 0.0], "b": [11000.0, 0.0], "thickness": 240.0, "load_bearing": true},
+                         {"id": "p", "levels": [1, 2], "a": [3000.0, 200.0], "b": [3000.0, 5000.0], "thickness": 100.0}]}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs": [{"id": "core", "levels": [0, 1], "outline": [[-6000.0, -4800.0], [-3200.0, -4800.0], [-3200.0, -2600.0], [-6000.0, -2600.0]],
+                           "kind": "u_turn", "rounded": false}]}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_rooms",
+        json!({"rooms": [{"levels": [1, 2], "name": "Stue", "polygon": [[-2000.0, -5000.0], [2800.0, -5000.0], [2800.0, -200.0], [-2000.0, -200.0]]}]}),
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("trigon-bim-{}", std::process::id()));
+    let ifc = dir.join("m.ifc");
+    s.execute("export.ifc", json!({"path": ifc})).unwrap();
+    let text = std::fs::read_to_string(&ifc).unwrap();
+    for class in [
+        "IFCWALLSTANDARDCASE(",
+        "IFCMATERIALLAYERSETUSAGE(",
+        "IFCRELCONNECTSPATHELEMENTS(",
+        "IFCROOF(",
+        "IFCSTAIRFLIGHT(",
+        "IFCSPACE(",
+        "IFCELEMENTASSEMBLY(",
+        "IFCBEAM(",
+        "IFCMEMBER(",
+        "IFCPRESENTATIONLAYERASSIGNMENT(",
+        "IFCSTYLEDITEM(",
+        "Qto_WallBaseQuantities",
+    ] {
+        assert!(text.contains(class), "{class}");
+    }
+    assert!(text.contains("IFCLABEL('NEW')") && text.contains("IFCLABEL('EXISTING')"), "phase status");
+    let v = s.execute("ifc.check", json!({"path": ifc})).unwrap();
+    for r in v["readers"].as_array().unwrap() {
+        assert_eq!(r["failures"], 0, "{r}");
+    }
+    let cmp = &v["ifc_lite_vs_bimifc"];
+    assert_eq!((cmp["only_in_first"].as_u64(), cmp["only_in_second"].as_u64()), (Some(0), Some(0)), "{cmp}");
+    assert!(cmp["max_bounds_deviation_mm"].as_f64().unwrap() < 0.01, "{cmp}");
+    for m in v["versus_this_model"].as_array().unwrap() {
+        assert_eq!(m["matched"], m["model_elements"], "{m}");
+        assert!(m["max_bounds_deviation_mm"].as_f64().unwrap() < 0.01, "{m}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
