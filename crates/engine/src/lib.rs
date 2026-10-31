@@ -19,6 +19,7 @@ mod facade_image;
 mod plan;
 mod plan_output;
 mod rooms;
+mod schedule_export;
 mod schedules;
 mod section;
 mod sheet;

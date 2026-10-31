@@ -1,4 +1,4 @@
-//! Reproduce a local, offline model → drawings → pick → edit/undo → IFC workflow.
+//! Reproduce a local, offline model → drawings → pick → edit/undo → schedules → IFC workflow.
 //! Run: cargo run -p trigon-engine --example drawing-workflow --locked -- out/drawing-workflow
 
 use std::error::Error;
@@ -57,6 +57,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     require(session.doc.buildings != before.buildings, "move did not change the building")?;
     require(session.execute("edit.undo", json!({}))?["undone"] == true, "move was not undoable")?;
     require(session.doc == before, "undo did not restore the document exactly")?;
+    let schedule = session.execute("schedule.openings", json!({}))?;
+    require(schedule["totals"]["instances"] == 55, "sample opening inventory changed")?;
+    session.execute("edit.copy", json!({"targets":[target],"delta":[1600,0,0],"count":1}))?;
+    let copied = session.execute("schedule.openings", json!({}))?;
+    require(copied["totals"]["instances"] == 56, "schedule did not update after copying an opening")?;
+    require(session.execute("edit.undo", json!({}))?["undone"] == true, "opening copy was not undoable")?;
+    require(session.doc == before, "copy undo did not restore the document exactly")?;
+    require(session.execute("schedule.openings", json!({}))? == schedule, "schedule did not restore after undo")?;
+    session.execute("schedule.export", json!({"path":directory.join("opening-schedule.json")}))?;
+    session.execute("schedule.export", json!({"path":directory.join("opening-schedule.csv")}))?;
     session.execute("document.save", json!({"path":directory.join("sample.trigon")}))?;
     session.execute("export.gltf", json!({"path":directory.join("sample.glb")}))?;
     session.execute("export.ifc", json!({"path":directory.join("sample.ifc")}))?;
@@ -72,8 +82,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }),
         "IFC reader geometry did not match the model within 0.01 mm",
     )?;
-    let report = json!({"picks":picks,"move_undo_exact":true,"ifc":exchange,"native_mouse_input_verified":false});
+    require(
+        readers.iter().all(|reader| {
+            reader["by_class"]["IFCWINDOW"] == schedule["totals"]["windows"] && reader["by_class"]["IFCDOOR"] == schedule["totals"]["doors"]
+        }),
+        "schedule occurrence counts differ from independent IFC readers",
+    )?;
+    let report = json!({"picks":picks,"move_undo_exact":true,"copy_undo_schedule_exact":true,"opening_schedule_totals":schedule["totals"],"ifc":exchange,"native_mouse_input_verified":false});
     std::fs::write(directory.join("verification.json"), serde_json::to_vec_pretty(&report)?)?;
-    println!("Verified local model, three drawing views, picking, exact Move/Undo and two IFC readers in {}", directory.display());
+    println!("Verified local model, three drawing views, picking, opening schedule, exact edit/undo and two IFC readers in {}", directory.display());
     Ok(())
 }

@@ -159,7 +159,7 @@ pub(crate) struct OpeningScheduleRequest {
     pub filter: Option<String>,
 }
 
-pub(crate) fn openings(session: &Session, request: OpeningScheduleRequest) -> Result<Value> {
+pub(crate) fn query(session: &Session, request: &OpeningScheduleRequest) -> Result<(OpeningSchedule, View)> {
     if let Some(id) = &request.building {
         session.doc.building(Some(id))?;
     }
@@ -177,6 +177,11 @@ pub(crate) fn openings(session: &Session, request: OpeningScheduleRequest) -> Re
     let view = crate::commands::view_of(&session.doc, request.phase.as_deref(), request.filter.as_deref())?;
     let mut schedule = opening_schedule(&session.doc, view)?;
     schedule.retain(request.building.as_deref(), request.levels.as_deref());
+    Ok((schedule, view))
+}
+
+pub(crate) fn openings(session: &Session, request: OpeningScheduleRequest) -> Result<Value> {
+    let (schedule, view) = query(session, &request)?;
     Ok(json!({
         "phase":session.doc.phases.get(view.phase).map(|phase|phase.id.as_str()),
         "filter":request.filter.as_deref().unwrap_or("complete"),

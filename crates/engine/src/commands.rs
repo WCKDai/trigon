@@ -44,6 +44,14 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "schedule.export",
+        summary: "Write an opening schedule to .csv or .json with the same building/storey/phase filters as schedule.openings. CSV uses UTF-8, model millimetres, m2 areas and an apostrophe prefix for formula-like text. Atomic file output; document and history are unchanged.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::schedule_export::Export>,
+        run: |s, v| crate::schedule_export::export(s, parse("schedule.export", v)?),
+    },
+    CommandSpec {
         id: "schedule.openings",
         summary: "List actual built windows and doors with semantic IDs, building/host/storey/type, phase status and dimensions. Areas are rectangular outer-lining m2; loggia facade-hole areas are excluded. Optional building, levels and phase/filter. Read-only and deterministic; does not change history.",
         mutates: false,
