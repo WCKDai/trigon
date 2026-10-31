@@ -1170,10 +1170,9 @@ impl StudioApp {
             return;
         }
         let (schedules::Action::Select(index) | schedules::Action::Show(index)) = action;
-        let Some(row) = self.schedules.data().and_then(|s| s.rows.iter().find(|r| schedules::resolve_row(&self.scene, r) == Ok(index))) else {
+        let Some(_) = self.schedules.data().and_then(|s| s.rows.iter().find(|r| schedules::resolve_row(&self.scene, r) == Ok(index))) else {
             return;
         };
-        self.plan_level = row.level;
         self.selection = Some(index);
         self.pending_selection = None;
         self.selection_dirty = true;
@@ -1529,6 +1528,7 @@ impl eframe::App for StudioApp {
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.authoring.tab == Tab::Schedules {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::PANEL);
                 if let Some(action) = self.schedules.ui(ui, &self.scene, self.selection) {
                     self.schedule_action(action);
                 }
@@ -1639,6 +1639,39 @@ mod tests {
         app.request_plan();
         assert_eq!(app.schedules.data(), Some(&changed), "a drawing-only request does not invalidate quantities");
         assert!(app.generation > generation);
+    }
+
+    #[test]
+    fn selecting_an_upper_storey_schedule_row_preserves_the_ready_or_pending_plan() {
+        for pending in [false, true] {
+            let mut app = app(false);
+            app.mode = Mode::Plan;
+            app.plan_level = 0;
+            app.request_plan();
+            let mut done = Some(crate::worker::run(&Job {
+                generation: app.generation,
+                doc: Arc::new(app.session.doc.clone()),
+                view: app.view(),
+                want_scene: false,
+                drawing: app.drawing_request(),
+            }));
+            if !pending {
+                app.apply_done(done.take().unwrap());
+            }
+            let row = app.schedules.data().unwrap().rows.iter().find(|row| row.level == 1).unwrap();
+            let index = schedules::resolve_row(&app.scene, row).unwrap();
+            app.schedule_action(schedules::Action::Select(index));
+            app.authoring.tab = Tab::Project; // Return to Model without changing the view controls.
+            assert_eq!(app.selection, Some(index));
+            assert_eq!(app.plan_level, 0, "selection must not relabel a cached plan or abandon a pending plan");
+            assert_eq!(app.drawing_request(), Some(DrawingRequest::Plan(0)));
+            if let Some(done) = done {
+                app.apply_done(done);
+            }
+            assert!(!app.drawing_plan());
+            assert_eq!(app.plan_generation, app.plan_wanted);
+            assert!(app.plan.screen_mapping(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))).is_some());
+        }
     }
 
     #[test]

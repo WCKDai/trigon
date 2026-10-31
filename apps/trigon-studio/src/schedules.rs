@@ -183,6 +183,7 @@ impl Schedules {
         let filtered = self.filters.apply(schedule);
         let totals = &filtered.totals;
         egui::Frame::new().fill(theme::PANEL).inner_margin(12).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.heading("Windows & doors");
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("{} openings", totals.instances));
@@ -208,6 +209,7 @@ impl Schedules {
             egui::Grid::new("openings").striped(true).spacing([16.0, 6.0]).max_col_width(240.0).show(ui, |ui| {
                 for label in [
                     "Element ID",
+                    "Model",
                     "Building",
                     "Storey",
                     "Kind",
@@ -218,7 +220,6 @@ impl Schedules {
                     "Area / m²",
                     "Basis",
                     "Location",
-                    "Model",
                 ] {
                     ui.strong(label);
                 }
@@ -235,6 +236,15 @@ impl Schedules {
                     {
                         action = Some(Action::Select(index));
                     }
+                    let show = ui.add_enabled(target.is_ok(), egui::Button::new("Show in 3D"));
+                    if let Err(reason) = target {
+                        show.clone().on_disabled_hover_text(reason);
+                    }
+                    if show.clicked()
+                        && let Ok(index) = target
+                    {
+                        action = Some(Action::Show(index));
+                    }
                     ui.label(&row.building_name).on_hover_text(&row.building_id);
                     ui.label(&row.level_name);
                     ui.label(kind_name(row.kind));
@@ -248,15 +258,6 @@ impl Schedules {
                     ui.label(row.area_m2.map_or_else(|| "Excluded".into(), |a| format!("{a:.2}")));
                     ui.label(basis_name(row.quantity_basis));
                     ui.label(if row.external { "Exterior" } else { "Interior" }).on_hover_text(&row.host_id);
-                    let show = ui.add_enabled(target.is_ok(), egui::Button::new("Show in 3D"));
-                    if let Err(reason) = target {
-                        show.clone().on_disabled_hover_text(reason);
-                    }
-                    if show.clicked()
-                        && let Ok(index) = target
-                    {
-                        action = Some(Action::Show(index));
-                    }
                     ui.end_row();
                 }
             });
