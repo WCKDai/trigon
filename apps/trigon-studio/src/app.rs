@@ -136,6 +136,7 @@ pub struct StudioApp {
     pub(crate) render_state: Option<eframe::egui_wgpu::RenderState>,
     viewport: Option<Viewport3d>,
     texture: Option<egui::TextureId>,
+    texture_size: [u32; 2],
     /// Screen pixels per point, as of the last frame.
     pub(crate) ppp: f32,
     /// Minimised or covered: eframe draws no frames, so the window can't be captured.
@@ -194,6 +195,7 @@ impl StudioApp {
             render_state: cc.wgpu_render_state.clone(),
             viewport: cc.wgpu_render_state.as_ref().map(|rs| Viewport3d::new(&rs.device)),
             texture: None,
+            texture_size: [0, 0],
             ppp: cc.egui_ctx.pixels_per_point(),
             window_hidden: false,
             viewport_rect: None,
@@ -826,6 +828,10 @@ impl StudioApp {
         }
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round().max(1.0) as u32, (rect.height() * ppp).round().max(1.0) as u32];
+        if self.texture_size != size {
+            self.texture_size = size;
+            self.redraw = true;
+        }
         let painter = ui.painter_at(rect);
         let animating = self.highlight.is_some();
         if let Some(rs) = self.render_state.clone() {

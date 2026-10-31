@@ -157,41 +157,46 @@ impl Feed {
                 } else {
                     egui::Color32::TRANSPARENT
                 });
-                let resp = frame
+                let summary = frame
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            dot(ui, colour);
-                            ui.strong(&e.command);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.weak(age(e.at.elapsed()));
-                                ui.weak(if e.ms < 10.0 { format!("{:.1} ms", e.ms) } else { format!("{:.0} ms", e.ms) });
-                                let who = egui::RichText::new(e.who.label()).small();
-                                match e.who {
-                                    Who::Agent(_) => ui.label(who.color(egui::Color32::from_rgb(70, 140, 230))),
-                                    Who::Owner => ui.label(who.weak()),
-                                };
-                            });
-                        });
-                        let line = gist(&e.result);
-                        if e.result.is_err() {
-                            ui.colored_label(egui::Color32::from_rgb(200, 70, 60), line);
-                        } else if !line.is_empty() {
-                            ui.weak(line);
-                        }
-                        if let Some(c) = &e.changes {
-                            let mut parts = Vec::new();
-                            if !c.changed.is_empty() {
-                                parts.push(format!("changed {}", list(&c.changed)));
-                            }
-                            if !c.removed.is_empty() {
-                                parts.push(format!("removed {}", list(&c.removed)));
-                            }
-                            if parts.is_empty() {
-                                parts.push("no visible change".into());
-                            }
-                            ui.label(egui::RichText::new(parts.join("; ")).small().color(egui::Color32::from_rgb(200, 130, 20)));
-                        }
+                        // The summary toggles the details; the details stay selectable.
+                        let summary = ui
+                            .scope(|ui| {
+                                ui.horizontal(|ui| {
+                                    dot(ui, colour);
+                                    ui.strong(&e.command);
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.weak(age(e.at.elapsed()));
+                                        ui.weak(if e.ms < 10.0 { format!("{:.1} ms", e.ms) } else { format!("{:.0} ms", e.ms) });
+                                        let who = egui::RichText::new(e.who.label()).small();
+                                        match e.who {
+                                            Who::Agent(_) => ui.label(who.color(egui::Color32::from_rgb(70, 140, 230))),
+                                            Who::Owner => ui.label(who.weak()),
+                                        };
+                                    });
+                                });
+                                let line = gist(&e.result);
+                                if e.result.is_err() {
+                                    ui.colored_label(egui::Color32::from_rgb(200, 70, 60), line);
+                                } else if !line.is_empty() {
+                                    ui.weak(line);
+                                }
+                                if let Some(c) = &e.changes {
+                                    let mut parts = Vec::new();
+                                    if !c.changed.is_empty() {
+                                        parts.push(format!("changed {}", list(&c.changed)));
+                                    }
+                                    if !c.removed.is_empty() {
+                                        parts.push(format!("removed {}", list(&c.removed)));
+                                    }
+                                    if parts.is_empty() {
+                                        parts.push("no visible change".into());
+                                    }
+                                    ui.label(egui::RichText::new(parts.join("; ")).small().color(egui::Color32::from_rgb(200, 130, 20)));
+                                }
+                            })
+                            .response;
                         if open {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("Parameters").small().strong());
@@ -202,9 +207,10 @@ impl Feed {
                                 Err(err) => json_block(ui, err),
                             }
                         }
+                        summary
                     })
-                    .response;
-                if resp.interact(egui::Sense::click()).clicked() {
+                    .inner;
+                if summary.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     self.open = if open { None } else { Some(e.seq) };
                 }
             }
