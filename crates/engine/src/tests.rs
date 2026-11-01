@@ -467,6 +467,40 @@ fn wall_alignment_rejects_mixed_targets_self_reference_and_nonparallel_walls_ato
 }
 
 #[test]
+fn wall_cleanup_preserves_hosted_door_centres_and_definitions_with_atomic_exact_undo() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"door-a","levels":[0],"a":[-4000,0],"b":[-2000,0],"thickness":100,"doors":[{"at":800,"width":700}]},
+            {"id":"door-b","levels":[0],"a":[-1950,0],"b":[0,0],"thickness":100,"doors":[{"at":800,"width":700}]},
+            {"id":"cross","levels":[0],"a":[-4080,-1000],"b":[-4080,1000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    let after = s.doc.clone();
+    assert_eq!(after.buildings[0].interior_walls.iter().map(|w| w.doors.len()).sum::<usize>(), 2);
+    for old in before.buildings[0].interior_walls.iter().filter(|w| !w.doors.is_empty()) {
+        let new = after.buildings[0].interior_walls.iter().find(|w| w.id == old.id).unwrap();
+        assert_eq!(old.doors.len(), new.doors.len());
+        for (a, b) in old.doors.iter().zip(&new.doors) {
+            assert!((old.a[0] + a.at - new.a[0] - b.at).abs() < 1e-7);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+        }
+    }
+    s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    assert_eq!(s.doc.buildings, after.buildings);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert!(s.execute("interior.regularize", json!({"axes_deg":[0.],"tolerance_mm":-1})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
 fn editing_copies_arrays_aligns_to_a_line_and_copies_over_storeys() {
     let mut s = session();
     editing_wall(&mut s, &[0]);

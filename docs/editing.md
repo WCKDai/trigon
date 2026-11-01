@@ -43,6 +43,13 @@ Successful edits return `targets`: the handles of the moved or created definitio
 Use those handles for subsequent edits because splitting a definition creates a new id.
 `edit.undo` restores a whole batch; `edit.redo` reapplies it.
 
+`interior.regularize` cleans traced walls against explicit building-grid angles. Walls with
+explicit doors retain their source identities and are never merged into another host. When
+a wall axis snaps or its start extends to a junction, each door centre is projected onto that
+axis and its distance from the new start is updated; clear widths and heights stay unchanged.
+This preserves the opening's position instead of shifting it with a changed start point.
+Derived room boundaries still need an explicit refresh after cleanup.
+
 A batch is limited to 256 targets. Arrays have at most 100 copies and 5,000 new definitions;
 facades have at most 200 bay axes. An offset component is limited to 100,000 mm. Plan elements
 stay on their storeys; vertical offsets apply to facade instances only. Storey copying is
