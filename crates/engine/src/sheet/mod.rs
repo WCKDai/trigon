@@ -29,6 +29,20 @@ impl Element {
 }
 
 pub(crate) fn overlap<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; DIM]; 2], epsilon: f64) -> Option<[[f64; DIM]; 2]> {
+    // Most ownership candidates are on unrelated parts of the drawing. Reject disjoint bounds
+    // before doing the exact collinearity/interval arithmetic. Include its perpendicular
+    // tolerance and a few ULPs at the existing 1e8 mm coordinate limit.
+    let pad = epsilon.abs() + 1e-7;
+    if (0..DIM).any(|axis| {
+        drawn[0][axis].min(drawn[1][axis]) > source[0][axis].max(source[1][axis]) + pad
+            || source[0][axis].min(source[1][axis]) > drawn[0][axis].max(drawn[1][axis]) + pad
+    }) {
+        return None;
+    }
+    overlap_exact(drawn, source, epsilon)
+}
+
+fn overlap_exact<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; DIM]; 2], epsilon: f64) -> Option<[[f64; DIM]; 2]> {
     if drawn.iter().chain(source.iter()).flatten().any(|value| !value.is_finite() || value.abs() > 1e8) {
         return None;
     }
@@ -551,6 +565,32 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_broad_phase_preserves_exact_clipping_at_tolerance_and_coordinate_limits() {
+        for origin in [[0.0; 3], [-25000.0, 40000.0, 1200.0], [99_999_000.0; 3]] {
+            for direction in [[0.0, 10.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 10.0], [10.0, -10.0, 10.0]] {
+                let at = |t: f64, offset: [f64; 3]| std::array::from_fn(|axis| origin[axis] + direction[axis] * t + offset[axis]);
+                for reverse in [false, true] {
+                    let drawn = if reverse { [at(1.0, [0.0; 3]), origin] } else { [origin, at(1.0, [0.0; 3])] };
+                    for (start, end) in [(-1.0, 2.0), (-0.2, 0.3), (0.0, 1.0), (0.2, 0.8), (0.9, 1.2), (1.1, 2.0)] {
+                        for offset in [[0.0; 3], [0.099, 0.0, 0.0], [0.0, -0.099, 0.0], [0.0, 0.0, 0.099], [0.2; 3]] {
+                            let source = [at(start, offset), at(end, offset)];
+                            assert_eq!(overlap(drawn, source, 0.1), overlap_exact(drawn, source, 0.1));
+                            assert_eq!(
+                                overlap(drawn.map(|p| [p[0], p[1]]), source.map(|p| [p[0], p[1]]), 0.5),
+                                overlap_exact(drawn.map(|p| [p[0], p[1]]), source.map(|p| [p[0], p[1]]), 0.5)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for bad in [f64::NAN, f64::INFINITY, 1e300] {
+            let a = [[bad, 0.0], [0.0, 1.0]];
+            assert_eq!(overlap(a, [[0.0, 0.0], [1.0, 1.0]], 0.1), None);
+        }
+    }
 
     #[test]
     fn scales_round_up_to_a_standard_one() {
