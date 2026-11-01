@@ -507,6 +507,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn opening_mounts_fit_the_host_wall_without_moving_the_nominal_rectangle() {
+        use crate::component::{Muntins, WindowShape};
+        let r = Rect { u0: 100.0, u1: 2000.0, v0: 0.0, v1: 2300.0 };
+        for wall in [100.0, 150.0, 190.0, 360.0, 1500.0] {
+            for kind in [
+                ComponentKind::Window { lights: 2, top_light: 350.0 },
+                ComponentKind::FixedWindow,
+                ComponentKind::EntranceDoor,
+                ComponentKind::FrenchDoor { leaves: 2 },
+                ComponentKind::PanelDoor { leaves: 2, panel_columns: 2, panel_rows: 3, glazed_rows: 1 },
+                ComponentKind::HistoricWindow {
+                    shape: WindowShape::Segmental { rise_mm: 250.0 },
+                    lights: 2,
+                    top_light: 350.0,
+                    panes_across: 2,
+                    panes_down: 2,
+                    muntins: Muntins::TrueDivided,
+                    muntin_width_mm: 24.0,
+                    operable: true,
+                },
+                ComponentKind::DoorWindow { door_width: 850.0, door_side: Side::Left, window_sill: 800.0, lights: 2 },
+                ComponentKind::DoorWindow { door_width: 850.0, door_side: Side::Right, window_sill: 800.0, lights: 2 },
+            ] {
+                let parts = fill_parts(&facade(), r, &kind, Fill { wall, finish: Material::Wall, floor: 0.0, ceiling: 3000.0 });
+                let frame = &parts.iter().find(|(m, _)| *m == Material::Frame).unwrap().1;
+                let (lo, hi) = frame.bounds().unwrap();
+                let reveal = REVEAL.min(wall - FRAME_DEPTH);
+                assert_eq!((lo[1], hi[1]), (reveal, reveal + FRAME_DEPTH), "{wall} mm host, {kind:?}");
+                assert_eq!((lo[0], hi[0], lo[2], hi[2]), (r.u0, r.u1, r.v0, r.v1), "nominal opening must remain unchanged");
+                for (material, mesh) in parts {
+                    sound(&mesh);
+                    let (lo, hi) = mesh.bounds().unwrap();
+                    match material {
+                        Material::Sill => assert!(hi[1] <= wall, "sill/threshold must seat in its host"),
+                        Material::Steel => assert!(lo[1] >= reveal - 30.0 && hi[1] <= reveal + FRAME_DEPTH + 30.0, "hardware stays attached"),
+                        _ => assert!(lo[1] >= 0.0 && hi[1] <= wall, "{kind:?} {material:?} is outside {wall} mm host: {lo:?}, {hi:?}"),
+                    }
+                }
+            }
+        }
+    }
+
     fn sound(mesh: &Mesh) {
         use std::collections::BTreeMap;
         assert!(mesh.positions.iter().flatten().all(|v| v.is_finite()));

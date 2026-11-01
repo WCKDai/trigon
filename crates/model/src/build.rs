@@ -1240,7 +1240,11 @@ fn opening_joint(mut door: Rect, mut window: Rect, side: Side) -> (Rect, Rect) {
 /// Frame, sashes or leaves and glazing for a window or door in `rect`.
 fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> Vec<(Material, Mesh)> {
     let Rect { u0, u1, v0, v1 } = rect;
-    let w = (REVEAL, REVEAL + FRAME_DEPTH);
+    // The family reveal is measured from the exterior wall face. A thin host cannot
+    // accommodate the usual 120 mm reveal plus the 70 mm frame: seat its rear at
+    // the inner wall face instead of leaving the assembly floating behind the wall.
+    let reveal = REVEAL.min((at.wall - FRAME_DEPTH).max(0.0));
+    let w = (reveal, reveal + FRAME_DEPTH);
     let mut detail = opening::Parts::default();
     let mut parts = Vec::new();
     match kind {
@@ -1248,7 +1252,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             detail =
                 opening::historic_window(fr, rect, w, shape, *lights, *top_light, *panes_across, *panes_down, *muntin_width_mm, *muntins, *operable);
             if !matches!(shape, crate::component::WindowShape::Round) {
-                detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
+                detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
             }
         }
         ComponentKind::PanelDoor { leaves, panel_columns, panel_rows, glazed_rows } => {
@@ -1256,11 +1260,11 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
         }
         ComponentKind::Window { lights, top_light } => {
             detail = opening::window(fr, rect, w, *lights, *top_light, true, false);
-            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
+            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
         }
         ComponentKind::FixedWindow => {
             detail = opening::window(fr, rect, w, 1, 0.0, false, false);
-            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
+            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
         }
         ComponentKind::EntranceDoor => {
             let gate = u1 - u0 > 2000.0;
@@ -1276,10 +1280,10 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             detail = opening::door(fr, dr, w, 1, true, 0.0, *door_side == Side::Right);
             let ws = v0 + window_sill;
             if ws > v0 {
-                parts.push((at.finish, fbox(fr, (wr.u0, wr.u1), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
+                parts.push((at.finish, fbox(fr, (wr.u0, wr.u1), (0.0, w.1), (v0, ws))));
             }
             detail.append(opening::window(fr, Rect { v0: ws, ..wr }, w, *lights, 0.0, true, *door_side == Side::Left));
-            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, REVEAL));
+            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, reveal));
         }
         ComponentKind::Loggia { depth, rail_height, door_width, door_side } => {
             // Set back behind the facade: brick returns, a soffit, and the back wall with its

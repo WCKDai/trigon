@@ -15,7 +15,7 @@ The masonry void, stepped lining, sash, glazing and IFC opening use the same out
 use 24 circular-segment chords; circles use 48. Width and height remain the nominal bounding
 rectangle, as do placement IDs and source edits. Opening schedules and IFC quantities use the
 actual faceted outer-lining area for these new families. Legacy rectangular quantities remain
-width × height. The reveal stays at the existing family placement depth.
+width × height. The reveal retains the existing family placement depth where the host can contain it.
 
 These are family defaults, **not measured client joinery**: 46 mm lining sightline, 32 mm sash,
 22 mm muntins, 2 mm sash gap, 6 mm illustrative glazing, seated gaskets, and the existing
@@ -46,3 +46,18 @@ illustrates available curved and round configurations. No product geometry or as
 
 Private drawings and photos guide project-specific choices outside Git. A photographed window
 is not evidence of its concealed section, hardware dimensions, glazing performance or approval.
+
+### Host wall seating
+
+The 70 mm frame uses the existing 120 mm exterior reveal when the host wall is at
+least 190 mm thick. For thinner supported walls, the reveal is constrained to
+`wall thickness − 70 mm`, so the frame's rear seats at the inner wall face. Sills
+and door/window composite infills follow that same mounting station. This fixes
+a reproducible floating assembly on 100 mm hosts without changing the opening
+rectangle, source identity or scheduled sizes. Operating handles may project
+beyond a frame face; their attachment remains on the leaf or sash.
+
+`opening-mounting` is an offline export and exact wall edit/Undo fixture. Its
+horizontal cut at 1500 mm makes the host/frame intersection inspectable in GLB.
+This geometry constraint does not establish the cause of all native viewport
+transparency or edge artifacts; those require the parent's renderer review.
