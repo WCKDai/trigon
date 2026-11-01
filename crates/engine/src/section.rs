@@ -15,10 +15,10 @@ use trigon_model::mesh::Material;
 use trigon_model::{Document, ModelError};
 
 use crate::Result;
-use crate::plan::write_output;
+use crate::sheet::Sheet;
 use crate::sheet::cut::{self, Shape};
 use crate::sheet::project::{Class, Look, Near, project};
-use crate::sheet::{Anchor, Fill, Layer, PAGE_MM, Rgb, Scene, Stroke, Text, Viewport, dxf, level_text, scale_text, style, svg};
+use crate::sheet::{Anchor, Fill, Layer, Rgb, Scene, Stroke, Text, Viewport, level_text, scale_text, style};
 
 /// Drawing area on the 1600 × 900 sheet, px: room at the sides for the level marks.
 const AREA: [f64; 4] = [230.0, 150.0, 1140.0, 640.0];
@@ -125,12 +125,16 @@ pub(crate) fn sheet(
     caption: &str,
     path: PathBuf,
 ) -> Result<Value> {
-    if title.len() > 200 || caption.len() > 500 {
-        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
-    }
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
     if !matches!(ext, "png" | "svg" | "pdf" | "dxf") {
         return Err(ModelError::Invalid("use .pdf, .png, .svg or .dxf for a section".into()).into());
+    }
+    scene(doc, line, flip, depth, view, title, caption)?.write(path)
+}
+
+pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64, view: View, title: &str, caption: &str) -> Result<Sheet> {
+    if title.len() > 200 || caption.len() > 500 {
+        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
     }
     if line.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
         return Err(ModelError::Invalid("the cut line needs two finite site points".into()).into());
@@ -265,8 +269,7 @@ pub(crate) fn sheet(
 
     let project_name = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
     let cut_area: f64 = all_poche.iter().flatten().map(|r| cut::area2(r)).sum::<f64>() / 2.0;
-    let mut result = json!({
-        "written": path,
+    let metrics = json!({
         "scale": scale_text(scale),
         "mm_per_px": vp.mm,
         "looking": if flip { "right of from → to" } else { "left of from → to" },
@@ -276,29 +279,14 @@ pub(crate) fn sheet(
         "lines": projection.edges.len(),
         "levels": levels.len(),
     });
-    let bytes = match ext {
-        "dxf" => {
-            let text = dxf::write(&scene, &dxf::TitleBlock { title, project: project_name, caption, note: None });
-            result["dxf"] = dxf::summary(&text);
-            dxf::bytes(&text)
-        }
-        _ => {
-            let page = svg::sheet(
-                &svg::Frame { title, project: project_name, caption, footer: title, note: None },
-                &scene,
-                &vp,
-                [0.0, 120.0, 1600.0, 700.0],
-            );
-            match ext {
-                "pdf" => crate::plan_output::pdf(std::slice::from_ref(&page), PAGE_MM)?,
-                "png" => crate::plan_output::png(&page)?,
-                _ => page.into_bytes(),
-            }
-        }
-    };
-    write_output(&path, &bytes)?;
-    if ext == "png" {
-        result["image_path"] = json!(path);
-    }
-    Ok(result)
+    Ok(Sheet {
+        scene,
+        vp,
+        clip: [0.0, 120.0, 1600.0, 700.0],
+        title: title.into(),
+        project: project_name.into(),
+        caption: caption.into(),
+        note: None,
+        metrics,
+    })
 }

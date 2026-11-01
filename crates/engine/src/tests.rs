@@ -1492,3 +1492,165 @@ fn street_fronts_loggias_bands_finishes_and_cellar_stairs() {
     }
     assert_eq!(s.doc, before);
 }
+
+#[test]
+fn drawing_annotations_are_atomic_journaled_and_persisted() {
+    let mut s = session();
+    let start = s.doc.clone();
+    s.execute("view.define", json!({"id":"ground", "name":"Ground floor", "kind":{"view":"plan", "level":0}})).unwrap();
+    let note = json!({"id":"note", "view":"ground", "size_mm":2.5,
+        "kind":{"annotation":"text", "at":[1000.0,2000.0], "text":"Brick & <stone>", "rotation_deg":0.0}});
+    s.execute("annotation.define", note.clone()).unwrap();
+    let annotated = s.doc.clone();
+    assert!(s.dirty);
+    assert_eq!(s.doc.journal.last().unwrap().command, "annotation.define");
+    let listed = s.execute("annotation.list", json!({"view":"ground"})).unwrap();
+    assert_eq!(listed["annotations"][0], note);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.execute("annotation.list", json!({})).unwrap()["annotations"], json!([]));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, annotated);
+    for bad in [
+        json!({"id":"note", "view":"missing", "kind":{"annotation":"text", "at":[0,0], "text":"x"}}),
+        json!({"id":"note", "view":"ground", "kind":{"annotation":"dimension", "from":[0,0], "to":[0,0], "offset_mm":100}}),
+        json!({"id":"note", "view":"ground", "kind":{"annotation":"text", "at":[1e300,0], "text":"x"}}),
+    ] {
+        assert!(s.execute("annotation.define", bad).is_err());
+        assert_eq!(s.doc, annotated);
+    }
+    assert!(s.execute("view.remove", json!({"id":"ground"})).is_err());
+    assert_eq!(s.doc, annotated);
+    let path = std::env::temp_dir().join(format!("trigon-annotation-roundtrip-{}.trigon", std::process::id()));
+    s.execute("document.save", json!({"path":path})).unwrap();
+    let loaded = crate::commands::read_document(&path).unwrap();
+    assert_eq!(loaded, annotated);
+    std::fs::remove_file(path).unwrap();
+    s.execute("annotation.remove", json!({"id":"note"})).unwrap();
+    s.execute("view.remove", json!({"id":"ground"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, annotated);
+    assert_eq!(s.doc.buildings, start.buildings);
+}
+
+#[test]
+fn saved_drawing_views_isolate_notes_and_share_every_export_format() {
+    use trigon_model::build::View;
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    let kinds =
+        [json!({"view":"plan","level":0}), json!({"view":"facade","facade":facade}), json!({"view":"section","from":[-15000,0],"to":[15000,0]})];
+    let root = std::env::temp_dir().join(format!("trigon-annotation-export-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    for (i, kind) in kinds.into_iter().enumerate() {
+        let id = format!("view-{i}");
+        s.execute("view.define", json!({"id":id,"name":format!("Drawing {i}"),"kind":kind})).unwrap();
+        for (tag, kind) in [
+            ("note", json!({"annotation":"text","at":[1000,2000],"text":format!("Only view {i} & <stone>"),"rotation_deg":15})),
+            ("dim", json!({"annotation":"dimension","from":[1000,1000],"to":[4000,5000],"offset_mm":-500})),
+            ("tag", json!({"annotation":"leader","tip":[1000,2000],"elbow":[2000,3000],"at":[4000,3000],"text":"Wall type A"})),
+        ] {
+            s.execute("annotation.define", json!({"id":format!("{id}-{tag}"),"view":id,"kind":kind})).unwrap();
+        }
+        if i > 0 {
+            s.execute(
+                "annotation.define",
+                json!({"id":format!("{id}-level"),"view":id,
+                "kind":{"annotation":"level","at":[2000,3200],"datum_mm":200,"label":"FFL"}}),
+            )
+            .unwrap();
+        }
+        let preview = crate::drawing_view(&s.doc, &id, View::latest(&s.doc)).unwrap();
+        assert!(preview.svg.contains(&format!("Only view {i} &amp; &lt;stone&gt;")));
+        assert!(preview.svg.contains(">5000</text>"));
+        assert!(preview.svg.contains("Wall type A"));
+        if i > 0 {
+            assert!(preview.svg.contains("+3,00 FFL"));
+        }
+        for p in [[0.0, 0.0], [1234.5678, -9876.5432]] {
+            let q = preview.transform.to_model(preview.transform.to_sheet(p));
+            assert!((p[0] - q[0]).abs() < 1e-8 && (p[1] - q[1]).abs() < 1e-8);
+        }
+        for ext in ["svg", "png", "pdf", "dxf"] {
+            let path = root.join(format!("{id}.{ext}"));
+            let result = s.execute("view.export", json!({"id":id,"path":path})).unwrap();
+            assert_eq!(result["view"], id);
+            let bytes = std::fs::read(&path).unwrap();
+            match ext {
+                "svg" => assert_eq!(String::from_utf8(bytes).unwrap(), preview.svg),
+                "png" => assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n")),
+                "pdf" => {
+                    let pdf = lopdf::Document::load(&path).unwrap();
+                    assert_eq!(pdf.get_pages().len(), 1);
+                    // These remain vector sheets, not a whole-page raster image.
+                    assert!(!pdf.objects.values().any(|o| {
+                        let dict = match o {
+                            lopdf::Object::Dictionary(dict) => Some(dict),
+                            lopdf::Object::Stream(stream) => Some(&stream.dict),
+                            _ => None,
+                        };
+                        dict.and_then(|d| d.get(b"Subtype").ok()).is_some_and(|v| v.as_name().ok() == Some(b"Image"))
+                    }));
+                }
+                _ => {
+                    assert_eq!(ext, "dxf");
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(text.contains("A-ANNO"));
+                    assert!(text.contains("Wall type A"));
+                    assert!(text.contains("5000"));
+                }
+            }
+        }
+    }
+    let notes = s.doc.annotations.clone();
+    // Projection depth does not change the section coordinate frame.
+    s.execute(
+        "view.define",
+        json!({"id":"view-2","name":"Deeper section","kind":{"view":"section","from":[-15000,0],"to":[15000,0],"depth_mm":45000}}),
+    )
+    .unwrap();
+    assert_eq!(s.doc.annotations, notes);
+    let before_snap = s.doc.clone();
+    let snapped=s.execute("view.snap",json!({"id":"view-0","point":[11001,5001],"tolerance_mm":10,"options":{"endpoints":false,"midpoints":false,"intersections":false,"grid_mm":100}})).unwrap();
+    assert_eq!(snapped["point"], json!([11000.0, 5000.0]));
+    assert_eq!(snapped["snap"]["kind"], "grid");
+    assert_eq!(s.doc, before_snap);
+    let plan = crate::drawing_view(&s.doc, "view-0", View::latest(&s.doc)).unwrap().svg;
+    assert!(!plan.contains("Only view 1") && !plan.contains("Only view 2"));
+    let before = s.doc.clone();
+    assert!(s.execute("view.define", json!({"id":"view-0","name":"Reframe","kind":{"view":"plan","level":1}})).is_err());
+    assert_eq!(s.doc, before);
+    assert!(s.execute("annotation.define", json!({"id":"bad-level","view":"view-0","kind":{"annotation":"level","at":[0,1000]}})).is_err());
+    assert_eq!(s.doc, before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn drawing_commands_refuse_hostile_values_without_changing_history() {
+    let mut s = session();
+    s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+    let before = s.doc.clone();
+    let bad = [
+        ("view.snap", json!({"id":"p","point":[1e300,0],"tolerance_mm":10})),
+        ("view.snap", json!({"id":"p","point":[0,0],"tolerance_mm":10,"options":{"grid_mm":0}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"plan","level":usize::MAX}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[1e300,0]}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[0,0]}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[1000,0],"depth_mm":1e300}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"facade","facade":"missing"}})),
+        ("annotation.define", json!({"id":"a","view":"p","size_mm":1e300,"kind":{"annotation":"text","at":[0,0],"text":"x"}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"dimension","from":[0,0],"to":[1000,0],"offset_mm":1e300}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"leader","tip":[0,0],"elbow":[0,0],"at":[1000,0],"text":"x"}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"text","at":[0,0],"text":"0\nSECTION\n"}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"text","at":[0,0],"text":"x","rotation_deg":1e300}})),
+        ("view.export", json!({"id":"p","path":"/tmp/trigon-annotations-must-not-write.invalid"})),
+    ];
+    for (command, params) in bad {
+        let result = s.execute(command, params);
+        assert!(result.is_err() && !matches!(result, Err(EngineError::Internal(_))), "{command}: {result:?}");
+        assert_eq!(s.doc, before);
+    }
+    // Rejected edits did not consume a step in the undo history.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc.views.is_empty());
+}

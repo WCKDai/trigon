@@ -13,9 +13,9 @@ use trigon_model::build::{FacadeFrame, Status, View, build_view, resolve_facade}
 use trigon_model::{ComponentKind, Document, ModelError};
 
 use crate::Result;
-use crate::plan::{Label, write_output};
+use crate::plan::Label;
 use crate::sheet::project::{Look, Near, project};
-use crate::sheet::{Halo, Layer, MM_PER_PX, PAGE_MM, Scene, Stroke, Text, Viewport, dxf, scale_text, sheet_scale, style, svg};
+use crate::sheet::{Halo, Layer, MM_PER_PX, Scene, Sheet, Stroke, Text, Viewport, scale_text, sheet_scale, style};
 
 /// Drawing area on the 1600 × 900 sheet, px.
 const LEFT: f64 = 80.0;
@@ -47,12 +47,16 @@ pub(crate) fn sheet(
     caption: &str,
     path: PathBuf,
 ) -> Result<Value> {
-    if title.len() > 200 || caption.len() > 500 {
-        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
-    }
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
     if !matches!(ext, "png" | "svg" | "pdf" | "dxf") {
         return Err(ModelError::Invalid("use .pdf, .png, .svg or .dxf for an elevation".into()).into());
+    }
+    scene(doc, side, view, range, title, caption)?.write(path)
+}
+
+pub(crate) fn scene(doc: &Document, side: Side<'_>, view: View, range: (Option<f64>, Option<f64>), title: &str, caption: &str) -> Result<Sheet> {
+    if title.len() > 200 || caption.len() > 500 {
+        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
     }
     let built = build_view(doc, view)?;
     let (b, fr) = match side {
@@ -189,26 +193,15 @@ pub(crate) fn sheet(
         scene.text(t);
     }
     let floor = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
-    let mut result = json!({"written": path, "triangles": projection.triangles, "lines": projection.edges.len(), "mm_per_px": mm, "scale": scale_text(scene.scale), "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
-    let bytes = match ext {
-        "dxf" => {
-            let text = dxf::write(&scene, &dxf::TitleBlock { title, project: floor, caption, note: None });
-            result["dxf"] = dxf::summary(&text);
-            dxf::bytes(&text)
-        }
-        _ => {
-            let page =
-                svg::sheet(&svg::Frame { title, project: floor, caption, footer: title, note: None }, &scene, &vp, [0.0, 120.0, 1600.0, 700.0]);
-            match ext {
-                "pdf" => crate::plan_output::pdf(std::slice::from_ref(&page), PAGE_MM)?,
-                "png" => crate::plan_output::png(&page)?,
-                _ => page.into_bytes(),
-            }
-        }
-    };
-    write_output(&path, &bytes)?;
-    if ext == "png" {
-        result["image_path"] = json!(path);
-    }
-    Ok(result)
+    let metrics = json!({"triangles": projection.triangles, "lines": projection.edges.len(), "mm_per_px": mm, "scale": scale_text(scene.scale), "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
+    Ok(Sheet {
+        scene,
+        vp,
+        clip: [0.0, 120.0, 1600.0, 700.0],
+        title: title.into(),
+        project: floor.into(),
+        caption: caption.into(),
+        note: None,
+        metrics,
+    })
 }

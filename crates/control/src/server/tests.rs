@@ -231,6 +231,8 @@ fn connections_beyond_the_limit_are_turned_away() {
     let mut c = Conn::open(app.port);
     let r = c.read().expect("a refusal");
     assert!(is_error(&r, "too many connections"), "{r}");
+    assert!(c.read().is_none(), "the excess connection is closed after its refusal");
+    drop(c);
     drop(_a);
     // A slot frees once a connection closes.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -243,6 +245,22 @@ fn connections_beyond_the_limit_are_turned_away() {
         assert!(std::time::Instant::now() < deadline, "{r}");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn an_excess_client_receives_its_refusal_even_if_it_already_sent_a_request() {
+    let app = start(Options { max_connections: 0, ..Options::default() });
+    for _ in 0..64 {
+        let mut c = Conn::open(app.port);
+        c.send(format!("{}\n", json!({"id": 1, "method": "commands.list", "token": TOKEN})).as_bytes());
+        let mut line = String::new();
+        let read = c.lines.read_line(&mut line);
+        assert!(matches!(read, Ok(n) if n > 0), "the refusal must arrive before EOF/reset: {read:?}");
+        let reply = serde_json::from_str(&line).unwrap();
+        assert!(is_error(&reply, "too many connections"), "{reply}");
+        assert!(c.read().is_none(), "the excess connection is closed after its refusal");
+    }
+    assert!(app.seen.lock().unwrap().is_empty(), "an excess client's request never reaches the app");
 }
 
 /// A request that outlasts its wait says it is still running; the connection keeps its reply for

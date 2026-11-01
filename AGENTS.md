@@ -21,3 +21,12 @@ follows Polykrom's engineering rules (`~/wckdboy/polykrom/AGENTS.md`), summarise
   offsets in `Site::origin_utm`). Never put map coordinates in the model.
 - **Gates before a commit:** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace`.
+
+- **Free BIM workflows:** keep the complete modelling, family, drawing and exchange workflows free
+  and open source, with local project files and no mandatory paid account or AI service. Judge
+  features through reproducible building workflows and the same commands used by Studio and MCP.
+- **PolyCore upstream:** report reproducible kernel defects and shared kernel requirements to
+  `WCKDai/polycore` on GitHub. Search existing issues first; include the revision, minimal input,
+  command, expected/actual result, platform and regression check, and link the Trigon issue or PR.
+  Label proposals as requirements rather than observed defects. Keep the upstream issue linked
+  when adding a local workaround and verify the upstream fix in its consumers.

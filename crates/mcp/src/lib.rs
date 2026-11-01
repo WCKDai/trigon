@@ -130,12 +130,13 @@ fn studio_tools() -> Value {
     json!([
         {
             "name": "studio_view",
-            "description": "Change what the owner sees in Trigon Studio and return the view: mode (3d or plan), level (the plan's \
+            "description": "Change what the owner sees in Trigon Studio and return the view: mode (3d, plan or drawing), drawing (a saved drawing view id), level (the plan's \
                             level; in 3D the top level shown, cut 1.2 m above its floor; null shows everything), phase (a phase id), \
                             filter (complete, demolition, new, all), fit (true frames the whole model), focus (an element id such as a \
                             facade's wall \"b1.f3\" or a placement: frames it, seen from outside its facade).",
             "inputSchema": {"type": "object", "properties": {
-                "mode": {"type": "string", "enum": ["3d", "plan"]},
+                "mode": {"type": "string", "enum": ["3d", "plan", "drawing"]},
+                "drawing": {"type":"string", "maxLength":80},
                 "level": {"type": ["integer", "null"], "minimum": 0},
                 "phase": {"type": "string"},
                 "filter": {"type": "string", "enum": ["complete", "demolition", "new", "all"]},

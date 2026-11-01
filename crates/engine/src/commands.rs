@@ -44,6 +44,87 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "view.define",
+        summary: "Create or replace a named plan, facade or section drawing view. Coordinates are drawing-plane mm. A view with annotations may be renamed, but its coordinate frame cannot change. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<trigon_model::annotation::DrawingView>,
+        run: |s, v| crate::views::define_view(s, parse("view.define", v)?),
+    },
+    CommandSpec {
+        id: "view.list",
+        summary: "List saved drawing views with validity and annotation counts. Stale model references remain repairable.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| parse::<NoParams>("view.list", v).map(|_| crate::views::list_views(s)),
+    },
+    CommandSpec {
+        id: "view.remove",
+        summary: "Remove an empty saved drawing view. Remove its annotations first. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::views::Id>,
+        run: |s, v| {
+            let p: crate::views::Id = parse("view.remove", v)?;
+            crate::views::remove_view(s, &p.id)
+        },
+    },
+    CommandSpec {
+        id: "view.snap",
+        summary: "Find the closest endpoint, midpoint, intersection or grid point within a tolerance in drawing mm in a saved view. Read-only; returns the original point when no candidate is near.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::SnapRequest>,
+        run: |s, v| {
+            let p: crate::views::SnapRequest = parse("view.snap", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::snap(&s.doc, p, view)
+        },
+    },
+    CommandSpec {
+        id: "view.export",
+        summary: "Export one saved drawing view and its annotations to SVG, PNG, vector PDF or DXF at 1:1 in drawing-plane mm. Phase/filter defaults match other sheet exports.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::Export>,
+        run: |s, v| {
+            let p: crate::views::Export = parse("view.export", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::sheet(&s.doc, &p.id, view)?.write(PathBuf::from(p.path))
+        },
+    },
+    CommandSpec {
+        id: "annotation.define",
+        summary: "Create or replace text, an aligned measured dimension, a leader/tag or a vertical level mark in a saved view. Positions/offsets are drawing mm; size_mm is paper mm. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<trigon_model::annotation::Annotation>,
+        run: |s, v| crate::views::define_annotation(s, parse("annotation.define", v)?),
+    },
+    CommandSpec {
+        id: "annotation.list",
+        summary: "List drafting annotations, optionally filtered to one saved drawing view.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::ListAnnotations>,
+        run: |s, v| {
+            let p: crate::views::ListAnnotations = parse("annotation.list", v)?;
+            crate::views::list_annotations(s, p.view.as_deref())
+        },
+    },
+    CommandSpec {
+        id: "annotation.remove",
+        summary: "Remove one drafting annotation. Undoable; model geometry is unchanged.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::views::Id>,
+        run: |s, v| {
+            let p: crate::views::Id = parse("annotation.remove", v)?;
+            crate::views::remove_annotation(s, &p.id)
+        },
+    },
+    CommandSpec {
         id: "group.define",
         summary: "Save a named group of up to 256 editable source definitions/instances. Groups may be targets of edit commands (group:<id>); references to existing groups are flattened. Atomic and undoable.",
         mutates: true,
@@ -1995,6 +2076,7 @@ pub fn read_document(path: &Path) -> Result<Document> {
     }
     // A document that doesn't build is reported now, not at export.
     trigon_model::build(&doc)?;
+    trigon_model::annotation::validate_document(&doc)?;
     Ok(doc)
 }
 

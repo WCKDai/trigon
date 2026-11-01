@@ -3,11 +3,16 @@
 Status: proposal, 2026-10-31. This is input to PolyCore's own RFC process. PolyCore is a separate
 repository with its own owner process, so nothing here changes it directly.
 
+Upstream tracking: [PolyCore #45](https://github.com/WCKDai/polycore/issues/45) requests
+bounded sections and drawing projection with source-topology provenance for both consumers.
+It records the public API observed at revision `478c176b8d4be23265010ffe0f552e6ad68b212f`;
+this is a consumer requirement, not a reproduced kernel defect.
+
 Read alongside: `~/wckdboy/polycore/docs/rfcs/0001-polycore.md` (phases, gates),
 `0002-ai-native-engineering-platform.md` (kernel contract, backends),
 `docs/research/reuse-survey.md`, and `bench/scorecard.md` (2026-10-27).
 
-## 1. Where PolyCore stands (observed)
+## 1. PolyCore scorecard snapshot (2026-10-27)
 
 - Score on its own 509-case corpus: truck **67.7** against **50.7** for "OCCT behind Polykrom's bridge" (133.6 %).
   The scorecard itself warns that this does **not** mean it beats OCCT: the bridge loses operations, and mass

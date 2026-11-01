@@ -13,6 +13,7 @@ pub enum Tab {
     #[default]
     Project,
     Families,
+    Drawings,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -125,6 +126,14 @@ impl Authoring {
             current.map(|e| vec![e.id.clone()]).unwrap_or_default()
         } else {
             self.targets.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).map(str::to_string).collect()
+        }
+    }
+
+    pub fn ribbon(&mut self, ui: &mut egui::Ui) {
+        for (tool, label) in
+            [(Tool::Move, "Move"), (Tool::Copy, "Copy"), (Tool::Align, "Align"), (Tool::Levels, "To levels"), (Tool::Delete, "Delete")]
+        {
+            ui.selectable_value(&mut self.tool, tool, label);
         }
     }
 

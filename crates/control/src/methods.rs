@@ -11,7 +11,10 @@ pub const METHODS: &[(&str, &str)] = &[
     ("command.run", "run any engine command: `command` (dotted id), `params` (object)"),
     ("commands.list", "every engine command: id, summary, whether it changes the model; `schemas: true` adds parameter schemas"),
     ("document.summary", "the open document (document.info) with its file and unsaved state"),
-    ("ui.view", "what the owner sees: `mode` (3d, plan), `level`, `phase`, `filter`, `fit`, `focus` (an element id); returns the view"),
+    (
+        "ui.view",
+        "what the owner sees: `mode` (3d, plan, drawing), `drawing` (saved view id), `level`, `phase`, `filter`, `fit`, `focus` (an element id); returns the view",
+    ),
     (
         "ui.screenshot",
         "a PNG of the viewport (`target: viewport`, default) or the whole window (`window`; `raise: true` brings it to the front first); `path` writes it, else base64",

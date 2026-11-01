@@ -2,7 +2,7 @@
 //! ASCII). Model space holds the drawing at 1:1 in millimetres ($INSUNITS 4, $MEASUREMENT 1); every
 //! scene layer is a DXF layer with its colour, lineweight and linetype. Line work is LINE and
 //! LWPOLYLINE, poche and fills are HATCH (written first, so lines draw over them), labels are TEXT
-//! and the title block under the drawing is MTEXT. The file is in its declared code page,
+//! (MTEXT for long labels) and the title block under the drawing is MTEXT. The file is in its declared code page,
 //! Windows-1252 (æ, ø, å, ×, – as single bytes); anything outside it is written `\U+XXXX`.
 
 use std::fmt::Write as _;
@@ -312,8 +312,12 @@ fn text(w: &mut W, t: &Text, scale: f64) {
     if !finite(&t.at) || !t.deg.is_finite() {
         return;
     }
-    let value = encode(&t.text, false, 250);
+    let value = encode(&t.text, false, 4000);
     if value.trim().is_empty() {
+        return;
+    }
+    if value.chars().count() > 250 {
+        long_text(w, t, scale);
         return;
     }
     w.entity("TEXT", t.layer, aci(t.colour), None);
@@ -341,6 +345,42 @@ fn text(w: &mut W, t: &Text, scale: f64) {
     if v != 0 {
         w.pair(73, v);
     }
+}
+
+/// Long single-line labels use MTEXT to avoid TEXT's string limit. Its top/middle
+/// attachment and local direction preserve the label's alignment and rotation.
+fn long_text(w: &mut W, t: &Text, scale: f64) {
+    // A literal pair of percent signs must not become an AutoCAD symbol control code.
+    let value = encode(&t.text, true, 4000).replace('%', "\\U+0025");
+    let height = t.size * scale * CAP;
+    let (sin, cos) = t.deg.rem_euclid(360.0).to_radians().sin_cos();
+    let rise = if t.middle { 0.0 } else { height };
+    w.entity("MTEXT", t.layer, aci(t.colour), None);
+    w.pair(100, "AcDbMText");
+    w.num(10, t.at[0] - sin * rise);
+    w.num(20, t.at[1] + cos * rise);
+    w.num(30, 0.0);
+    w.num(40, height);
+    w.num(41, 0.0);
+    let column = match t.anchor {
+        Anchor::Start => 1,
+        Anchor::Middle => 2,
+        Anchor::End => 3,
+    };
+    w.pair(71, column + if t.middle { 3 } else { 0 });
+    w.pair(72, 1);
+    // Autodesk's MTEXT DXF reference: continuation groups 3 hold 250 characters;
+    // the final group 1 holds fewer, including an empty remainder at exact multiples.
+    let chars: Vec<char> = value.chars().collect();
+    let (chunks, remainder) = chars.as_chunks::<250>();
+    for chunk in chunks {
+        w.pair(3, chunk.iter().collect::<String>());
+    }
+    w.pair(1, remainder.iter().collect::<String>());
+    w.pair(7, "Standard");
+    w.num(11, cos);
+    w.num(21, sin);
+    w.num(31, 0.0);
 }
 
 /// One line of the title block: MTEXT, top left at `at`.
@@ -777,6 +817,56 @@ mod tests {
         handles.dedup();
         assert_eq!(handles.len(), n);
         assert!(handles.iter().all(|h| *h < seed));
+    }
+
+    #[test]
+    fn long_labels_preserve_content_alignment_and_rotation() {
+        for (source, expected) in [
+            ("a".repeat(500), "a".repeat(500)),
+            ("%%d".repeat(100), "\\U+0025\\U+0025d".repeat(100)),
+            ("→".repeat(80), "\\U+2192".repeat(80)),
+            (r"\{frame}".repeat(50), r"\\\{frame\}".repeat(50)),
+        ] {
+            assert!(source.len() <= 512, "a valid annotation must export in full");
+            for (anchor, column) in [(Anchor::Start, 1), (Anchor::Middle, 2), (Anchor::End, 3)] {
+                for middle in [false, true] {
+                    for deg in [0.0_f64, 90.0, -30.0] {
+                        let mut t = Text::new(Layer::Annotation, [1250.0, -750.0], &source, 2.5);
+                        t.anchor = anchor;
+                        t.middle = middle;
+                        t.deg = deg;
+                        let mut w = W { out: String::new(), next: FIRST };
+                        text(&mut w, &t, 100.0);
+                        let p = pairs(&w.out);
+                        let chunks: Vec<_> = p.iter().filter(|(c, _)| *c == 1 || *c == 3).collect();
+                        let content: String = chunks.iter().map(|(_, s)| s.as_str()).collect();
+                        assert_eq!(content, expected, "long notes must not be truncated");
+                        assert_eq!(p[0], (0, "MTEXT".into()));
+                        for chunk in &chunks[..chunks.len() - 1] {
+                            assert_eq!(chunk.0, 3);
+                            assert_eq!(chunk.1.chars().count(), 250);
+                        }
+                        let last = chunks.last().unwrap();
+                        assert_eq!(last.0, 1);
+                        assert!(last.1.chars().count() < 250);
+                        let value = |code| p.iter().find(|(c, _)| *c == code).unwrap().1.parse::<f64>().unwrap();
+                        let (sin, cos) = deg.to_radians().sin_cos();
+                        let height = 2.5 * 100.0 * CAP;
+                        // MTEXT has top/middle/bottom anchors; raise its top by the cap height
+                        // for a baseline-anchored label, in its rotated local coordinates.
+                        let rise = if middle { 0.0 } else { height };
+                        assert!((value(10) - (1250.0 - sin * rise)).abs() < 1e-4);
+                        assert!((value(20) - (-750.0 + cos * rise)).abs() < 1e-4);
+                        assert_eq!(value(40), height);
+                        assert_eq!(value(41), 0.0, "single-line notes must not wrap");
+                        assert_eq!(value(71), f64::from(column + if middle { 3 } else { 0 }));
+                        assert!((value(11) - cos).abs() < 1e-4);
+                        assert!((value(21) - sin).abs() < 1e-4);
+                        assert_eq!(value(31), 0.0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

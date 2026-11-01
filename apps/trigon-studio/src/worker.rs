@@ -8,24 +8,37 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
 use trigon_engine::resvg::usvg;
+use trigon_engine::{DrawingPreview, DrawingTransform};
 use trigon_model::Document;
 use trigon_model::build::View;
 
 use crate::scene::Scene;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrawingRequest {
+    Plan(usize),
+    Saved(String),
+}
+
+pub struct PreparedDrawing {
+    pub tree: Arc<usvg::Tree>,
+    pub transform: DrawingTransform,
+    pub segments: Vec<[[f64; 2]; 2]>,
+}
 
 pub struct Job {
     pub generation: u64,
     pub doc: Arc<Document>,
     pub view: View,
     pub want_scene: bool,
-    /// The plan sheet of this level, too.
-    pub plan_level: Option<usize>,
+    /// One drawing workspace, prepared with its exact picking geometry.
+    pub drawing: Option<DrawingRequest>,
 }
 
 pub struct Done {
     pub generation: u64,
     pub scene: Option<Result<Scene, String>>,
-    pub plan: Option<(usize, Result<Arc<usvg::Tree>, String>)>,
+    pub drawing: Option<(DrawingRequest, Result<PreparedDrawing, String>)>,
     /// Milliseconds in `build_view`, in making the scene, in drawing and parsing the plan.
     pub build_ms: f64,
     pub scene_ms: f64,
@@ -58,16 +71,21 @@ pub fn run(job: &Job) -> Done {
         scene_ms = ms(t);
         scene
     });
-    let plan = job.plan_level.map(|level| {
+    let drawing = job.drawing.as_ref().map(|request| {
         let t = Instant::now();
-        let tree = guarded("drawing the plan", || {
-            let svg = trigon_engine::plan_sheet_svg(&job.doc, level, job.view).map_err(|e| e.to_string())?;
-            trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())
+        let tree = guarded("drawing the workspace", || {
+            let DrawingPreview { svg, transform, segments } = match request {
+                DrawingRequest::Plan(level) => trigon_engine::plan_drawing(&job.doc, *level, job.view),
+                DrawingRequest::Saved(id) => trigon_engine::drawing_view(&job.doc, id, job.view),
+            }
+            .map_err(|e| e.to_string())?;
+            let tree = trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())?;
+            Ok(PreparedDrawing { tree, transform, segments })
         });
         plan_ms = ms(t);
-        (level, tree)
+        (request.clone(), tree)
     });
-    Done { generation: job.generation, scene, plan, build_ms, scene_ms, plan_ms }
+    Done { generation: job.generation, scene, drawing, build_ms, scene_ms, plan_ms }
 }
 
 impl Worker {
@@ -77,7 +95,7 @@ impl Worker {
         let _ = std::thread::Builder::new().name("trigon-build".into()).spawn(move || {
             while let Ok(mut job) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
-                    job = Job { want_scene: job.want_scene || newer.want_scene, plan_level: newer.plan_level.or(job.plan_level), ..newer };
+                    job = Job { want_scene: job.want_scene || newer.want_scene, drawing: newer.drawing.or(job.drawing), ..newer };
                 }
                 if tx.send(run(&job)).is_err() {
                     break;
@@ -103,23 +121,29 @@ mod tests {
     use trigon_model::build::PhaseFilter;
 
     fn job(doc: Document, plan_level: Option<usize>) -> Job {
-        Job { generation: 1, doc: Arc::new(doc), view: View { phase: 0, filter: PhaseFilter::Complete }, want_scene: true, plan_level }
+        Job {
+            generation: 1,
+            doc: Arc::new(doc),
+            view: View { phase: 0, filter: PhaseFilter::Complete },
+            want_scene: true,
+            drawing: plan_level.map(DrawingRequest::Plan),
+        }
     }
 
     #[test]
     fn empty_and_hostile_requests_give_errors_not_panics() {
         let done = run(&job(Document::default(), Some(0)));
         assert!(matches!(done.scene, Some(Ok(ref s)) if s.elements.is_empty()));
-        assert!(done.plan.is_some());
+        assert!(done.drawing.is_some());
         let mut doc = Document::default();
         doc.buildings.push(trigon_model::Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
         let done = run(&job(doc.clone(), Some(usize::MAX)));
-        assert!(matches!(done.plan, Some((_, Err(_)))));
+        assert!(matches!(done.drawing, Some((_, Err(_)))));
         let mut bad_view = job(doc.clone(), Some(0));
         bad_view.view.phase = usize::MAX;
         assert!(matches!(run(&bad_view).scene, Some(Err(_))));
         let done = run(&job(doc, Some(1)));
-        assert!(matches!(done.plan, Some((1, Ok(_)))), "a real plan sheet parses");
+        assert!(matches!(done.drawing, Some((DrawingRequest::Plan(1), Ok(_)))), "a real plan sheet parses");
         assert!(matches!(done.scene, Some(Ok(ref s)) if !s.elements.is_empty()));
     }
 }

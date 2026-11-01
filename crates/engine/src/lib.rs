@@ -22,6 +22,7 @@ mod rooms;
 mod section;
 mod sheet;
 mod time;
+mod views;
 
 pub use commands::{CommandSpec, commands};
 /// For live views (Trigon Studio): one level's presentation plan as SVG text, the drawings' SVG
@@ -29,6 +30,7 @@ pub use commands::{CommandSpec, commands};
 pub use plan::sheet_svg_text as plan_sheet_svg;
 pub use plan_output::parse_svg;
 pub use resvg;
+pub use views::{DrawingPreview, DrawingSnap, DrawingTransform, SnapKind, SnapOptions, drawing_view, plan_drawing, snap_drawing};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {

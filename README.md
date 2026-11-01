@@ -49,10 +49,13 @@ watch the agent work: every command it runs lands in your window, in the activit
 agent's name, with parameters, result and duration) and in the model, where what it changed glows
 for a few seconds.
 
-The Project browser opens floor plans, 3D cuts and facades. Properties provides precise move,
+Studio uses the Trigon orange identity, graphite controls and warm drawing paper. The **Model**
+workspace's Project browser opens floor plans, 3D cuts and facades. Properties provides precise move,
 copy, align, storey-copy and delete tools; saved selection groups run as one undoable batch.
-Families browses and edits component types and creates parameter variants. The Templates menu
-saves reusable projects and starts detached copies. See [precise editing](docs/editing.md) for
+**Families** browses and edits component types and creates parameter variants. The project menu
+beside the Trigon mark saves reusable templates and starts detached copies. **Document** opens
+saved plans, elevations and sections with precise annotation picking and snapping; see
+[saved drawings](docs/annotations.md). See [precise editing](docs/editing.md) for
 the shared commands, coordinate conventions and current boundaries.
 
 ```sh
