@@ -49,12 +49,14 @@ fn default_results() -> usize {
 
 struct Findings {
     items: Vec<Value>,
+    counts: std::collections::BTreeMap<String, usize>,
     total: usize,
     limit: usize,
 }
 impl Findings {
     fn push(&mut self, value: Value) {
         self.total += 1;
+        *self.counts.entry(value["kind"].as_str().unwrap_or("unknown").to_string()).or_default() += 1;
         if self.items.len() < self.limit {
             self.items.push(value);
         }
@@ -82,7 +84,7 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
     if selected.is_empty() {
         return Err(ModelError::Invalid("precision audit needs a building".into()).into());
     }
-    let mut findings = Findings { items: Vec::new(), total: 0, limit: p.max_results };
+    let mut findings = Findings { items: Vec::new(), counts: Default::default(), total: 0, limit: p.max_results };
     let mut work = 0usize;
     let mut inspected = 0usize;
     let mut ambiguous = std::collections::BTreeMap::<String, usize>::new();
@@ -188,8 +190,10 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
                             }
                         }
                     }
-                    let mut solids: Vec<(String, Vec<[f64; 2]>)> =
-                        walls.iter().flat_map(|w| w.cut.iter().cloned().map(move |poly| (w.id.clone(), poly))).collect();
+                    // Keep built segment IDs for compatibility, alongside their queryable
+                    // element source IDs (a facade segment's .L suffix is not an element ID).
+                    let mut solids: Vec<(String, String, Vec<[f64; 2]>)> =
+                        walls.iter().flat_map(|w| w.cut.iter().cloned().map(move |poly| (w.id.clone(), w.id.clone(), poly))).collect();
                     for wall in &model.walls {
                         let Some(segment) = wall.segment(level) else { continue };
                         let cut = model.storeys[level].elevation + 1000.0;
@@ -211,30 +215,32 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
                             [p[0], p[1]]
                         };
                         for (u0, u1) in holes {
-                            solids.push((segment.id.clone(), vec![start.0, pt(u0, 0.), pt(u0, segment.thickness), start.1]));
+                            solids.push((segment.id.clone(), wall.id.clone(), vec![start.0, pt(u0, 0.), pt(u0, segment.thickness), start.1]));
                             start = (pt(u1, 0.), pt(u1, segment.thickness));
                         }
-                        solids.push((segment.id.clone(), vec![start.0, b, inner_b, start.1]));
+                        solids.push((segment.id.clone(), wall.id.clone(), vec![start.0, b, inner_b, start.1]));
                     }
                     for wall in &walls {
                         for (end, cap) in [("a", [wall.outline[0], wall.outline[3]]), ("b", [wall.outline[1], wall.outline[2]])] {
-                            let mut nearest: Option<(f64, &str, [f64; 2], [f64; 2])> = None;
-                            for (id, poly) in &solids {
+                            let mut nearest: Option<(f64, &str, &str, [f64; 2], [f64; 2])> = None;
+                            for (id, source_id, poly) in &solids {
                                 if id == &wall.id || poly.len() < 3 || trigon_model::doc::polygon_area(poly) < 1e-6 {
                                     continue;
                                 }
                                 let (distance, from, to) = segment_polygon(cap, poly);
                                 if nearest.as_ref().is_none_or(|n| distance < n.0 || (distance == n.0 && id.as_str() < n.1)) {
-                                    nearest = Some((distance, id, from, to));
+                                    nearest = Some((distance, id, source_id, from, to));
                                 }
                             }
-                            if let Some((gap, id, from, to)) = nearest
+                            if let Some((gap, id, source_id, from, to)) = nearest
                                 && gap > 0.001
                                 && gap <= p.gap_tolerance_mm
                             {
                                 findings.push(json!({"kind":"wall_gap","building":source.id,"level":level,"id":wall.id,
                                 "end":end,"nearest_id":id,"gap_mm":gap,"from":from,"to":to,
-                                "delta_mm":[to[0]-from[0],to[1]-from[1]],"review_required":true}));
+                                "delta_mm":[to[0]-from[0],to[1]-from[1]],"review_required":true,
+                                "inspect_commands":[{"command":"element.get","params":{"id":wall.id}},
+                                    {"command":"element.get","params":{"id":source_id}}]}));
                             }
                         }
                     }
@@ -243,10 +249,13 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         }
     }
     let total = findings.total;
+    let counts = findings.counts;
     let findings = findings.items;
     Ok(json!({"status":if total==0&&geometry_valid {"no_findings_in_scope"} else {"needs_review"},"geometry_valid":geometry_valid,
         "wall_instances_inspected":inspected,"gap_tolerance_mm":p.gap_tolerance_mm,"angle_tolerance_deg":p.angle_tolerance_deg,"expected_joint_angles_deg":p.expected_joint_angles_deg,"alignment_tolerance_mm":p.alignment_tolerance_mm,"joint_radius_mm":p.joint_radius_mm,"findings":findings,
-        "total_findings":total,"truncated":total>p.max_results,"scope":"latest phase; 1000 mm plan cut; nearest material at each interior wall end; near-parallel wall overlaps and end-to-end run deviations; overlapping visible/departing stair openings",
+        "total_findings":total,"finding_counts":counts,"truncated":total>p.max_results,
+        "mutation_workflow":["precision.preview","precision.apply"],
+        "scope":"latest phase; 1000 mm plan cut; nearest material at each interior wall end; near-parallel wall overlaps and end-to-end run deviations; overlapping visible/departing stair openings",
         "limitations":["Intentional gaps and adjacent-storey stair overlaps need source review; findings are not automatic repairs.","No structural, accessibility, survey or complete clash certification."]}))
 }
 
@@ -358,4 +367,42 @@ fn segment_polygon(cap: [[f64; 2]; 2], poly: &[[f64; 2]]) -> (f64, [f64; 2], [f6
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_feedback_keeps_complete_counts_and_inspects_actual_facade_sources() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        let mut b =
+            trigon_model::Building::new("b", "Gap feedback fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.).unwrap();
+        b.interior_walls = serde_json::from_value(json!([{"id":"near-face","levels":[0],"a":[1000,455],"b":[5000,455],"thickness":100}])).unwrap();
+        s.doc.buildings.push(b);
+        let before = s.doc.clone();
+        let limited = s.execute("precision.audit", json!({"levels":[0],"max_results":1})).unwrap();
+        assert_eq!(limited["total_findings"], 2);
+        assert_eq!(limited["truncated"], true);
+        assert_eq!(limited["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["findings"][0]["gap_mm"], 5.0);
+        assert_eq!(limited["findings"][0]["nearest_id"], "b.f1.L0", "keep the existing built-segment identity");
+        assert_eq!(limited["finding_counts"], json!({"wall_gap":2}));
+        let full = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+        assert_eq!(limited["finding_counts"], full["finding_counts"]);
+        assert_eq!(limited["mutation_workflow"], json!(["precision.preview", "precision.apply"]));
+        let commands = limited["findings"][0]["inspect_commands"].as_array().unwrap();
+        assert_eq!(
+            commands,
+            &vec![json!({"command":"element.get","params":{"id":"near-face.L0"}}), json!({"command":"element.get","params":{"id":"b.f1"}}),]
+        );
+        for command in commands {
+            let id = command["command"].as_str().unwrap();
+            assert!(!crate::commands().iter().find(|c| c.id == id).unwrap().mutates);
+            assert_eq!(s.execute(id, command["params"].clone()).unwrap()["id"], command["params"]["id"]);
+        }
+        assert_eq!(s.doc, before);
+        assert!(!s.dirty);
+        assert!(s.undo.is_empty() && s.redo.is_empty());
+    }
 }
