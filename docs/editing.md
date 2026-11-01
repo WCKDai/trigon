@@ -1,6 +1,6 @@
 # Precise editing
 
-Studio, the CLI and MCP run the same five undoable commands. Every distance is in millimetres,
+Studio, the CLI and MCP run the same undoable editing commands. Every distance is in millimetres,
 in the site's local frame. A failing command restores the complete document and its journal.
 
 Targets are the ids shown in Studio. `partition.L1` selects that wall only on storey 1;
@@ -25,6 +25,16 @@ source definition once in a batch.
   `anchor` (`start`, `center`, `end`) and either `coordinate` or `reference` (an element id).
   Alternatively give `line:[[x0,y0],[x1,y1]]` to align an edge or centre to any plan line.
   Wall edges include their thickness. U references must be on the same facade.
+- `edit.align_walls`: give interior-wall `targets` and one `reference` wall. It makes the
+  selected walls' directions and centrelines collinear, rather than just translating their
+  bounding boxes. Optional `reference_face` and `target_face` are `center` (default), `left`
+  or `right`; left/right follow each source wall's A-to-B direction, including reversed runs.
+  Walls must be within 15° of parallel. Run lengths, thicknesses and door distances from the
+  start stay unchanged. Displayed occurrence IDs affect one storey; `wall:<id>` affects the
+  shared source. The reference cannot also be a target on an overlapping storey. Existing
+  model joins still resolve generated junctions; neighbouring wall and room sources stay
+  independent. Studio's **Align → Wall line / face** captures a picked reference without
+  typing coordinates, then aligns the next picked wall through this same command.
 - `edit.delete`: `{"targets":["partition.L1"]}` removes that storey instance and preserves the
   definition on its other storeys. Deletion removes source data in every phase; use
   `facade.demolish` for demolition in a particular phase.

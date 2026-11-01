@@ -46,6 +46,8 @@ pub struct Authoring {
     align_mode: usize,
     coordinate: f64,
     reference: String,
+    wall_reference_face: usize,
+    wall_target_face: usize,
     line: [[f64; 2]; 2],
     group_id: String,
     group_name: String,
@@ -76,6 +78,8 @@ impl Default for Authoring {
             align_mode: 0,
             coordinate: 0.0,
             reference: String::new(),
+            wall_reference_face: 0,
+            wall_target_face: 0,
             line: [[0.0, 0.0], [1000.0, 0.0]],
             group_id: "selection".into(),
             group_name: "Selection group".into(),
@@ -219,6 +223,19 @@ impl Authoring {
         }
     }
 
+    fn align_walls(&self, targets: &[String]) -> Option<Run> {
+        let reference = self.reference.trim();
+        if reference.is_empty() || targets.is_empty() || targets.iter().any(|id| id == reference) {
+            return None;
+        }
+        let faces = ["center", "left", "right"];
+        Some(Run {
+            command: "edit.align_walls",
+            params: json!({"targets":targets,"reference":reference,
+            "reference_face":faces[self.wall_reference_face],"target_face":faces[self.wall_target_face]}),
+        })
+    }
+
     pub fn ribbon(&mut self, ui: &mut egui::Ui) {
         for (tool, label) in
             [(Tool::Move, "Move"), (Tool::Copy, "Copy"), (Tool::Align, "Align"), (Tool::Levels, "To levels"), (Tool::Delete, "Delete")]
@@ -303,13 +320,13 @@ impl Authoring {
             Tool::Align => {
                 let axes = ["x", "y", "u", "z"];
                 let anchors = ["start", "center", "end"];
-                let modes = ["Coordinate", "Reference element", "Plan line"];
+                let modes = ["Coordinate", "Reference element", "Plan line", "Wall line / face"];
                 egui::ComboBox::from_id_salt("align-mode").selected_text(modes[self.align_mode]).show_ui(ui, |ui| {
                     for (i, label) in modes.iter().enumerate() {
                         ui.selectable_value(&mut self.align_mode, i, *label);
                     }
                 });
-                if self.align_mode != 2 {
+                if self.align_mode < 2 {
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("align-axis").width(60.0).selected_text(axes[self.axis].to_uppercase()).show_ui(ui, |ui| {
                             for (i, a) in axes.iter().enumerate() {
@@ -337,7 +354,7 @@ impl Authoring {
                     1 => {
                         ui.add(egui::TextEdit::singleline(&mut self.reference).hint_text("Reference element id"));
                     }
-                    _ => {
+                    2 => {
                         egui::Grid::new("align-line").show(ui, |ui| {
                             field(ui, "Start X", &mut self.line[0][0]);
                             field(ui, "Start Y", &mut self.line[0][1]);
@@ -345,8 +362,30 @@ impl Authoring {
                             field(ui, "End Y", &mut self.line[1][1]);
                         });
                     }
+                    _ => {
+                        ui.label("Pick the reference wall, capture it, then pick the wall to align.");
+                        if ui.add_enabled(current.is_some_and(|e|e.kind == "interior wall"),egui::Button::new("Use picked wall as reference")).clicked()
+                            && let Some(wall)=current {
+                            self.reference=wall.id.clone();
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut self.reference).hint_text("Reference wall id").char_limit(512));
+                        let labels=["Centreline","Left face","Right face"];
+                        for (name,id,selected) in [("Reference", "wall-reference-face", &mut self.wall_reference_face),
+                            ("Target", "wall-target-face", &mut self.wall_target_face)] {
+                            ui.horizontal(|ui| {
+                                ui.label(name);
+                                egui::ComboBox::from_id_salt(id).selected_text(labels[*selected]).show_ui(ui,|ui| {
+                                    for (index,label) in labels.iter().enumerate() { ui.selectable_value(selected,index,*label); }
+                                });
+                            });
+                        }
+                        ui.weak("Left/right follow each wall's start-to-end direction. Aligns walls within 15°, keeping lengths and door positions along the wall.");
+                    }
                 }
-                if ui.button("Align selection").clicked() {
+                if self.align_mode == 3 {
+                    let alignment=self.align_walls(&targets);
+                    if ui.add_enabled(alignment.is_some(),egui::Button::new("Align wall selection")).clicked() { run=alignment; }
+                } else if ui.button("Align selection").clicked() {
                     let mut params = json!({"targets":targets,"anchor":anchors[self.anchor]});
                     if self.align_mode == 2 {
                         params["line"] = json!(self.line);
@@ -560,6 +599,20 @@ impl Authoring {
 #[cfg(test)]
 mod library_tests {
     use super::*;
+    #[test]
+    fn wall_alignment_form_keeps_the_captured_reference_separate_from_the_picked_target() {
+        let mut form = Authoring::default();
+        assert!(form.align_walls(&["target.L1".into()]).is_none());
+        form.reference = "reference.L1".into();
+        assert!(form.align_walls(&["reference.L1".into()]).is_none());
+        form.wall_reference_face = 1;
+        form.wall_target_face = 2;
+        let run = form.align_walls(&["target.L1".into()]).unwrap();
+        assert_eq!(run.command, "edit.align_walls");
+        assert_eq!(run.params, json!({"reference":"reference.L1","targets":["target.L1"],"reference_face":"left","target_face":"right"}));
+        assert!(run.params.get("axis").is_none(), "wall face alignment must not fall back to bounding-box translation");
+    }
+
     #[test]
     fn shared_type_scope_stays_readable_in_a_narrow_properties_column() {
         let doc = Document::default();
