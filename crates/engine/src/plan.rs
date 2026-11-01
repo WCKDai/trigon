@@ -579,10 +579,13 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         // Entrances: house number on the staircase's floor landing, the apartments' doors either side
         // ("TV" to the left and "TH" to the right as you arrive up the stairs).
         for e in &b.entrances {
-            let Some(st) = e.stair.as_ref().and_then(|id| b.stairs.iter().find(|s| &s.id == id)) else { continue };
-            if !visible.iter().any(|shown| shown.id == st.id) {
+            // Prefer the departing flight; on its receiving floor use the preceding departure.
+            let Some(st) = [Some(level), level.checked_sub(1)].into_iter().flatten().find_map(|departure| {
+                let id = e.stair_at(departure)?;
+                visible.iter().copied().find(|s| s.id == id && s.levels.contains(&departure))
+            }) else {
                 continue;
-            }
+            };
             let Ok(f) = trigon_model::stair::frame(st) else { continue };
             let landing = f.at(-700.0, f.width / 2.0);
             // Arriving on the floor you walk back along the second flight: facing −run.

@@ -161,7 +161,15 @@ pub(crate) fn scene(
     // Entrances above the roof, named as seen from this side: "TV 7 TH" from the street the stair
     // is entered from, "TH 7 TV" from behind.
     for e in &doc.buildings.iter().find(|x| x.id == b.building_id).map(|x| x.entrances.clone()).unwrap_or_default() {
-        let Some(st) = e.stair.as_ref().and_then(|id| doc.buildings.iter().flat_map(|x| &x.stairs).find(|s| &s.id == id)) else { continue };
+        let Some(source) = doc.buildings.iter().find(|x| x.id == b.building_id) else { continue };
+        let Some(st) = e
+            .stair_at(source.ground_level)
+            .and_then(|id| source.stairs.iter().find(|s| s.id == id))
+            .or_else(|| e.stair.as_ref().and_then(|id| source.stairs.iter().find(|s| &s.id == id)))
+            .or_else(|| e.stair_by_level.iter().find_map(|(level, id)| source.stairs.iter().find(|s| &s.id == id && s.levels.contains(level))))
+        else {
+            continue;
+        };
         let Ok(sf) = trigon_model::stair::frame(st) else { continue };
         let core = sf.at(sf.length / 2.0, sf.width / 2.0);
         let u = (core[0] - fr.origin[0]) * fr.t[0] + (core[1] - fr.origin[1]) * fr.t[1];

@@ -1342,6 +1342,10 @@ static COMMANDS: &[CommandSpec] = &[
             }
             if matches!(what, "all" | "stairs") {
                 b.stairs.clear();
+                for entrance in &mut b.entrances {
+                    entrance.stair = None;
+                    entrance.stair_by_level.clear();
+                }
             }
             if matches!(what, "all" | "rooms") {
                 b.rooms.clear();
@@ -1400,6 +1404,7 @@ static COMMANDS: &[CommandSpec] = &[
                     number: e.number,
                     point: [(e.point_utm[0] - origin[0]) * 1000.0, (e.point_utm[1] - origin[1]) * 1000.0],
                     stair: None,
+                    stair_by_level: Default::default(),
                     units: e
                         .units
                         .into_iter()

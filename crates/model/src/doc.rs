@@ -1,5 +1,7 @@
 //! The document: site, buildings, storeys, facades and placements.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::component::{ComponentType, default_types};
@@ -480,7 +482,18 @@ pub struct Entrance {
     /// The staircase serving it.
     #[serde(default)]
     pub stair: Option<String>,
+    /// Per-departure-storey association after editing an individual stair occurrence.
+    /// Absent keys use `stair`; physical entrances and their units are never duplicated.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stair_by_level: BTreeMap<usize, String>,
     pub units: Vec<Unit>,
+}
+
+impl Entrance {
+    /// Source stair for a departing flight on this storey, before checking its existence.
+    pub fn stair_at(&self, level: usize) -> Option<&str> {
+        self.stair_by_level.get(&level).map(String::as_str).or(self.stair.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -873,6 +886,23 @@ impl Building {
         if self.storeys.len() >= 60 {
             return Err(ModelError::Invalid("at most 60 storeys".into()));
         }
+        // Check before changing anything, including hostile keys in externally loaded documents.
+        let entrance_stairs: Vec<BTreeMap<usize, String>> = self
+            .entrances
+            .iter()
+            .map(|entrance| {
+                entrance
+                    .stair_by_level
+                    .iter()
+                    .map(|(level, id)| {
+                        level
+                            .checked_add(1)
+                            .map(|next| (next, id.clone()))
+                            .ok_or_else(|| ModelError::Invalid("entrance stair storey overflows".into()))
+                    })
+                    .collect::<Result<_>>()
+            })
+            .collect::<Result<_>>()?;
         self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor });
         if !self.floor_thicknesses.is_empty() {
             self.floor_thicknesses.insert(0, 200.0);
@@ -899,6 +929,9 @@ impl Building {
         }
         for r in &mut self.rooms {
             r.levels.iter_mut().for_each(|l| *l += 1);
+        }
+        for (entrance, stairs) in self.entrances.iter_mut().zip(entrance_stairs) {
+            entrance.stair_by_level = stairs;
         }
         Ok(())
     }

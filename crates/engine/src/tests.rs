@@ -1976,3 +1976,154 @@ fn dtm_terrain_converts_map_samples_to_the_local_datum_and_undo_is_exact() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(s.doc, before);
 }
+
+// Proposed public synthetic regression for crates/engine/src/tests.rs.
+// Read-only audit output: not inserted into source or run by this agent.
+// Uses the existing Canned test provider; no private model, source plan, account or network.
+#[test]
+fn moving_one_stair_storey_keeps_entrance_labels_units_other_floors_and_exact_undo() {
+    for selected in [1, 2] {
+        let mut s = Session::new(Box::new(Canned));
+        s.doc.buildings.push(
+            trigon_model::Building::new("b", "Synthetic entrance", &[[0., 0.], [20000., 0.], [20000., 16000.], [0., 16000.]], 4, 3000.).unwrap(),
+        );
+        s.execute(
+            "interior.add_stairs",
+            json!({"stairs":[{
+                "id":"core", "levels":[0,1,2],
+                "outline":[[4000,4000],[6000,4000],[6000,6000],[4000,6000]],
+                "kind":"u_turn", "rounded":false, "landing":1000, "well":150
+            }]}),
+        )
+        .unwrap();
+        let units: Vec<Value> =
+            ["st", "1", "2", "3"].into_iter().flat_map(|floor| ["tv", "th"].map(|door| json!({"floor":floor,"door":door}))).collect();
+        s.doc.buildings[0].entrances = serde_json::from_value(json!([{
+            "street":"Synthetic street", "number":"SYNTHETIC-731", "point":[0,5000],
+            "stair":"core", "units":units
+        }]))
+        .unwrap();
+        let render = |s: &Session, level| crate::plan::sheet_svg_text(&s.doc, level, trigon_model::build::View::latest(&s.doc)).unwrap();
+        let marker = ">TV  SYNTHETIC-731  TH<";
+        let before = s.doc.clone();
+        let plans: Vec<_> = (0..4).map(|level| render(&s, level)).collect();
+        assert!(plans.iter().all(|svg| svg.matches(marker).count() == 1));
+        let original = before.buildings[0].stairs[0].clone();
+        let out = s
+            .execute(
+                "edit.move",
+                json!({
+                    "targets":[format!("core.L{selected}")], "delta":[125.5,-75.25,0]
+                }),
+            )
+            .unwrap();
+        assert_eq!(out["targets"].as_array().unwrap().len(), 1);
+        let b = &s.doc.buildings[0];
+        assert_eq!(b.entrances.len(), 1);
+        assert_eq!(b.entrances[0].units, before.buildings[0].entrances[0].units);
+        assert_eq!(b.stairs.len(), 2);
+        let unchanged = b.stairs.iter().find(|stair| stair.id == "core").unwrap();
+        assert_eq!(unchanged.outline, original.outline);
+        assert_eq!(unchanged.levels, original.levels.iter().copied().filter(|l| *l != selected).collect::<Vec<_>>());
+        let moved = b.stairs.iter().find(|stair| stair.levels == [selected]).unwrap();
+        for (old, new) in original.outline.iter().zip(&moved.outline) {
+            assert_eq!(*new, [old[0] + 125.5, old[1] - 75.25]);
+        }
+        assert_eq!(out["targets"][0], json!(format!("{}.L{selected}", moved.id)));
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        // Confirmed current-source failure: the bound original is suppressed by the moved
+        // outgoing stair, while the entrance still references only that original source.
+        assert_eq!(render(&s, selected).matches(marker).count(), 1, "the physical entrance and its units must follow the selected stair occurrence");
+        if selected == 2 {
+            assert_eq!(render(&s, 3).matches(marker).count(), 1, "the receiving floor must resolve the moved previous departure");
+        }
+        for (level, plan) in plans.iter().enumerate().take(3) {
+            if level != selected {
+                assert_eq!(&render(&s, level), plan, "unselected floor {level}");
+            }
+        }
+        let changed = s.doc.clone();
+        let round_trip: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(round_trip, changed);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, changed);
+    }
+}
+
+#[test]
+fn stair_associations_survive_align_parameter_copy_replace_basement_and_cleanup() {
+    let setup = || {
+        let mut s = session();
+        s.execute(
+            "interior.add_stairs",
+            json!({"stairs":[{
+                "id":"core", "levels":[0,1,2], "kind":"u_turn", "rounded":false,
+                "outline":[[-6000,-2000],[-4000,-2000],[-4000,0],[-6000,0]], "landing":1000
+            }]}),
+        )
+        .unwrap();
+        s.doc.buildings[0].entrances = serde_json::from_value(json!([{
+            "street":"Synthetic street","number":"731","point":[-5000,-6000],"stair":"core",
+            "units":[{"floor":"st","door":"tv"},{"floor":"1","door":"th"}]
+        }]))
+        .unwrap();
+        // Legacy data round trips without a new empty key.
+        let entrance = &s.doc.buildings[0].entrances[0];
+        assert!(entrance.stair_by_level.is_empty());
+        assert!(serde_json::to_value(entrance).unwrap().get("stair_by_level").is_none());
+        s
+    };
+    for (command, params) in [
+        ("edit.align", json!({"targets":["core.L1"],"axis":"x","coordinate":-4900.125})),
+        ("element.set", json!({"id":"core.L1","properties":{"width_mm":2100.125}})),
+        ("edit.copy_to_levels", json!({"targets":["core.L0"],"levels":[1],"replace":true})),
+    ] {
+        let mut s = setup();
+        let before = s.doc.clone();
+        let result = s.execute(command, params).unwrap();
+        let building = &s.doc.buildings[0];
+        let entrance = &building.entrances[0];
+        let id = entrance.stair_at(1).unwrap().to_string();
+        assert_ne!(id, "core", "{command}: {result}");
+        assert!(building.stairs.iter().any(|stair| stair.id == id && stair.levels == [1]));
+        assert_eq!(entrance.stair_at(0), Some("core"));
+        assert_eq!(entrance.stair_at(2), Some("core"));
+        assert_eq!(entrance.units, before.buildings[0].entrances[0].units);
+        assert_eq!(building.entrances.len(), 1);
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        let edited = s.doc.clone();
+        s.execute("edit.copy", json!({"targets":["core.L0"],"delta":[12000,0,0]})).unwrap();
+        assert_eq!(s.doc.buildings[0].entrances, edited.buildings[0].entrances);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        s.execute("building.add_basement", json!({"floor":-2500})).unwrap();
+        assert_eq!(s.doc.buildings[0].entrances[0].stair_at(2), Some(id.as_str()));
+        assert_eq!(s.doc.buildings[0].entrances[0].stair_by_level.len(), 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        s.execute("edit.delete", json!({"targets":[format!("{id}.L1")]})).unwrap();
+        assert!(s.doc.buildings[0].entrances[0].stair_by_level.is_empty());
+        assert_eq!(s.doc.buildings[0].entrances[0].stair.as_deref(), Some("core"));
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("edit.delete", json!({"targets":["stair:core"]})).unwrap();
+        assert_eq!(s.doc.buildings[0].entrances[0].stair, None);
+        assert_eq!(s.doc.buildings[0].entrances[0].stair_at(1), Some(id.as_str()));
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("interior.clear", json!({"what":"stairs"})).unwrap();
+        let entrance = &s.doc.buildings[0].entrances[0];
+        assert_eq!(entrance.stair, None);
+        assert!(entrance.stair_by_level.is_empty());
+        assert_eq!(entrance.units, before.buildings[0].entrances[0].units);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+    let mut s = setup();
+    s.doc.buildings[0].entrances[0].stair_by_level.insert(usize::MAX, "core".into());
+    let before = s.doc.clone();
+    assert!(s.doc.buildings[0].add_basement(-2500., "Basement").is_err());
+    assert_eq!(s.doc, before);
+}

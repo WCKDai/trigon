@@ -446,7 +446,23 @@ pub(crate) fn remove_group(s: &mut Session, p: GroupId) -> Result<Value> {
     Ok(json!({"removed":p.id}))
 }
 
-fn remap_groups(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
+fn remap_references(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
+    let base = next.split_once(':').map(|(_, s)| s).or_else(|| next.rsplit_once(".L").map(|(s, _)| s)).unwrap_or(next);
+    if let Item::Stair(stair) = &entry.item
+        && let Some(building) = doc.buildings.get_mut(entry.building)
+    {
+        for entrance in &mut building.entrances {
+            for &level in &stair.levels {
+                if entrance.stair_at(level) == Some(entry.original.id()) {
+                    if entrance.stair.as_deref() == Some(base) {
+                        entrance.stair_by_level.remove(&level);
+                    } else {
+                        entrance.stair_by_level.insert(level, base.to_string());
+                    }
+                }
+            }
+        }
+    }
     if matches!(entry.item, Item::Placement(_)) {
         return;
     }
@@ -457,7 +473,6 @@ fn remap_groups(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
         Item::Placement(_) => "placement",
     };
     let all = format!("{kind}:{}", entry.original.id());
-    let base = next.split_once(':').map(|(_, s)| s).or_else(|| next.rsplit_once(".L").map(|(s, _)| s)).unwrap_or(next);
     let levels = entry.item.levels();
     for group in &mut doc.groups {
         let mut add = false;
@@ -594,7 +609,7 @@ pub(crate) fn move_elements(s: &mut Session, p: Move) -> Result<Value> {
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
         let next = put(&mut s.doc, entry, item, shared, false, false)?;
-        remap_groups(&mut s.doc, entry, &next, shared);
+        remap_references(&mut s.doc, entry, &next, shared);
         ids.push(next);
     }
     finish(s, ids)
@@ -627,12 +642,12 @@ pub(crate) fn update_parameters(doc: &mut Document, target: &str, update: impl F
         }
         let level = levels.first().copied().ok_or_else(|| invalid("missing source storey"))?;
         let next = format!("{id}.L{level}");
-        remap_groups(doc, &entry, &next, false);
+        remap_references(doc, &entry, &next, false);
         return Ok(next);
     }
     let shared = remove(doc, &entry)?;
     let next = put(doc, &entry, item, shared, false, false)?;
-    remap_groups(doc, &entry, &next, shared);
+    remap_references(doc, &entry, &next, shared);
     Ok(next)
 }
 
@@ -745,12 +760,25 @@ pub(crate) fn copy_to_levels(s: &mut Session, mut p: CopyToLevels) -> Result<Val
             }
             let next = put(&mut s.doc, &entry, item, true, false, true)?;
             for (replaced, shared) in replacements {
-                remap_groups(&mut s.doc, &replaced, &next, shared);
+                remap_references(&mut s.doc, &replaced, &next, shared);
             }
             ids.push(next);
         }
     }
+    for building in &mut s.doc.buildings {
+        prune_entrance_stairs(building);
+    }
     finish(s, ids)
+}
+
+/// Drop dangling associations without removing physical entrances or their unit registers.
+fn prune_entrance_stairs(b: &mut trigon_model::Building) {
+    for entrance in &mut b.entrances {
+        entrance.stair_by_level.retain(|level, id| b.stairs.iter().any(|s| &s.id == id && s.levels.contains(level)));
+        if entrance.stair.as_ref().is_some_and(|id| !b.stairs.iter().any(|s| &s.id == id)) {
+            entrance.stair = None;
+        }
+    }
 }
 
 pub(crate) fn delete(s: &mut Session, p: Selection) -> Result<Value> {
@@ -766,11 +794,7 @@ pub(crate) fn delete(s: &mut Session, p: Selection) -> Result<Value> {
     }
     s.doc.groups.retain(|g| !g.targets.is_empty());
     for b in &mut s.doc.buildings {
-        for entrance in &mut b.entrances {
-            if entrance.stair.as_ref().is_some_and(|id| !b.stairs.iter().any(|s| &s.id == id)) {
-                entrance.stair = None;
-            }
-        }
+        prune_entrance_stairs(b);
     }
     trigon_model::build(&s.doc)?;
     Ok(json!({"deleted":deleted}))
@@ -836,7 +860,7 @@ pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
         let next = put(&mut s.doc, entry, item, shared, false, false)?;
-        remap_groups(&mut s.doc, entry, &next, shared);
+        remap_references(&mut s.doc, entry, &next, shared);
         ids.push(next);
     }
     finish(s, ids)
@@ -898,7 +922,7 @@ pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
         let next = put(&mut s.doc, entry, item, shared, false, false)?;
-        remap_groups(&mut s.doc, entry, &next, shared);
+        remap_references(&mut s.doc, entry, &next, shared);
         ids.push(next);
     }
     finish(s, ids)
