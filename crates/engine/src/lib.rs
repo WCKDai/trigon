@@ -18,6 +18,7 @@ mod edit;
 mod elements;
 mod elevation;
 mod facade_image;
+mod libraries;
 mod plan;
 mod plan_output;
 mod rooms;

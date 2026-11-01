@@ -763,6 +763,22 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "types.export",
+        summary: "Export selected component types (or all) to a portable, parametric .trigonlib library.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::libraries::Export>,
+        run: |s, v| crate::libraries::export(s, parse("types.export", v)?),
+    },
+    CommandSpec {
+        id: "types.import",
+        summary: "Import a parametric .trigonlib library; replace explicitly updates all linked instances as one undoable change.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::libraries::Import>,
+        run: |s, v| crate::libraries::import(s, parse("types.import", v)?),
+    },
+    CommandSpec {
         id: "evidence.photos",
         summary: "List the Skråfoto oblique photos covering the building, and for each facade the photos whose camera looks at it.",
         mutates: false,
@@ -2097,7 +2113,7 @@ fn selected(list: &Option<Vec<usize>>, i: usize) -> bool {
 }
 
 /// Paths must carry the expected extension, so a command can't overwrite an unrelated file.
-fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
+pub(crate) fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
     let path = PathBuf::from(p);
     if path.extension().and_then(|e| e.to_str()) != Some(ext) {
         return Err(EngineError::Io(format!("{p}: the file name must end in .{ext}")));
@@ -2105,7 +2121,7 @@ fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::Io(format!("{}: {e}", dir.display())))?;
     }
