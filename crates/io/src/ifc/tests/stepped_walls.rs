@@ -159,3 +159,58 @@ fn stepped_wall_ifc_preserves_material_volumes_quantities_and_hosted_doors() {
         }
     }
 }
+
+#[test]
+fn nearby_stepped_stations_have_single_material_coverage_in_both_readers() {
+    let sources = [
+        ([1000., 5000.], [3000., 5000.], 240.),
+        ([3000., 5000.], [3120., 5000.], 120.),
+        ([3120., 5000.], [9000., 5000.], 400.),
+        ([3000., 2000.], [3000., 5000.], 300.),
+        ([3120., 8000.], [3120., 5000.], 120.),
+    ];
+    for reversed in [false, true] {
+        let mut doc = fixture(false, false, None);
+        doc.buildings[0].interior_walls = sources
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, b, thickness))| InteriorWall {
+                id: format!("wall{i}"),
+                levels: vec![0],
+                a: if reversed { b } else { a },
+                b: if reversed { a } else { b },
+                thickness,
+                load_bearing: false,
+                doors: Vec::new(),
+            })
+            .collect();
+        let built = trigon_model::build(&doc).unwrap();
+        let text = write(&doc, &built, "nearby.ifc", "2026-01-01T00:00:00");
+        for reader in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+            assert!(reader.failures.is_empty());
+            let products: Vec<_> = built[0]
+                .interior
+                .iter()
+                .map(|wall| {
+                    let product = reader.elements.iter().find(|e| e.global_id == crate::ifc::guid(&format!("trigon:{}", wall.id))).unwrap();
+                    let expected = volume(&wall.mesh);
+                    assert!((reader_volume(&product.mesh) - expected).abs() < expected * 0.00001 + 1.);
+                    product
+                })
+                .collect();
+            assert_eq!(products.iter().filter(|p| cap_contains(&p.mesh, [3130., 4900.], 2800.)).count(), 1, "formerly duplicated material");
+            for x in 0..41 {
+                for y in 0..41 {
+                    let point = [2800. + (f64::from(x) + 0.137) * 10., 4760. + (f64::from(y) + 0.271) * 10.];
+                    let expected = built[0].interior.iter().any(|wall| wall.cut.iter().any(|ring| inside(ring, point)));
+                    assert_eq!(
+                        products.iter().filter(|p| cap_contains(&p.mesh, point, 2800.)).count(),
+                        usize::from(expected),
+                        "{} material coverage at {point:?}, reversed={reversed}",
+                        reader.reader.name()
+                    );
+                }
+            }
+        }
+    }
+}

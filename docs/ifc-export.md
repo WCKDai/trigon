@@ -86,6 +86,11 @@ single `IfcWall` body. Ordinary quad walls keep their existing export path and s
 classification. Doors keep their opening/void/filling relationships; their cuts act on the
 actual material, including a doorway through a stepped end.
 
+At nearby steps, a branch is clipped against intersecting members of the complete exact
+collinear continuation, including equal-width seams. Internal run seams keep their source
+caps; distant members do not enter the local overlay grid. This keeps a wider band at the
+next station from duplicating branch material, and the same partition reaches both IFC readers.
+
 For these walls, gross footprint/volume come from the actual gross profiles, net footprint
 from the cut material, and net volume from the built mesh in a local frame. Side areas use the
 union of the material's projection along the wall axis, viewed perpendicular to that axis;

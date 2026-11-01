@@ -63,7 +63,7 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
     let mut reset = vec![[false; 2]; walls.len()];
     let mut clips = vec![BTreeSet::new(); walls.len()];
     let mut locals = vec![None; walls.len()];
-    let mut contacts = vec![[None; 2]; walls.len()];
+    let mut contacts = vec![[None, None]; walls.len()];
     let direction = |i: usize, end: usize| frames[i].map(|(t, _, _)| if end == 0 { t } else { [-t[0], -t[1]] });
     for incident in stations.values() {
         let mut pairs = Vec::new();
@@ -91,22 +91,41 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
                 axis_order(&walls[first(a)], &walls[first(b)])
             })
         });
-        let Some(&[(i, e), (j, f)]) = pairs.first() else { continue };
+        let Some(&[(i, e), (j, _)]) = pairs.first() else { continue };
         let Some(main) = direction(i, e) else { continue };
         let mut branches: Vec<_> =
             incident.iter().copied().filter(|&(k, g)| direction(k, g).is_some_and(|d| cross(main, d).abs() >= MIN_SIN)).collect();
         if branches.is_empty() {
             continue;
         }
+        // A short leg can put the next step inside a branch's width. Follow exact,
+        // opposite collinear endpoints through every leg, including equal-width seams.
+        let mut run = BTreeSet::from([i, j]);
+        let mut pending = vec![i, j];
+        while let Some(k) = pending.pop() {
+            for (end, point) in [walls[k].a, walls[k].b].into_iter().enumerate() {
+                let Some(inward) = direction(k, end) else { continue };
+                for &(other, other_end) in stations.get(&endpoint_key(point)).into_iter().flatten() {
+                    let Some(d) = direction(other, other_end) else { continue };
+                    if cross(main, d).abs() <= 1e-9 && dot(inward, d) < 0.0 {
+                        // Internal seams belong to the continuous band, even if the legacy
+                        // near-face solver mistook a nearby wide branch for an end target.
+                        reset[k][end] = true;
+                        reset[other][other_end] = true;
+                        joined[k].ends[end] = None;
+                        joined[other].ends[other_end] = None;
+                        if run.insert(other) {
+                            pending.push(other);
+                        }
+                    }
+                }
+            }
+        }
         branches.sort_by(|&(a, _), &(b, _)| walls[b].thickness.total_cmp(&walls[a].thickness).then_with(|| axis_order(&walls[a], &walls[b])));
-        reset[i][e] = true;
-        reset[j][f] = true;
-        joined[i].ends[e] = None;
-        joined[j].ends[f] = None;
         for (k, &(b, g)) in branches.iter().enumerate() {
             reset[b][g] = true;
-            clips[b].extend([i, j]);
-            contacts[b][g] = Some([i, j]);
+            clips[b].extend(run.iter().copied());
+            contacts[b][g] = Some(run.clone());
             locals[b] = Some(Local { origin: if e == 0 { walls[i].a } else { walls[i].b }, t: main, n: [-main[1], main[0]] });
             // Transverse branches on the same side can share material outside the run too.
             // Assign that intersection once, without admitting near-parallel joins.
@@ -140,7 +159,11 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
         .zip(contacts)
         .map(|(((mut joined, clips), local), contacts)| {
             let material = local.map(|local| {
-                let clips: Vec<_> = clips.into_iter().map(|i| outlines[i].iter().map(|&p| local.project(p)).collect()).collect();
+                let clips: Vec<_> = clips
+                    .into_iter()
+                    .filter(|&i| intersects(&joined.outline, &outlines[i]))
+                    .map(|i| outlines[i].iter().map(|&p| local.project(p)).collect())
+                    .collect();
                 let subject = vec![vec![joined.outline.iter().map(|&p| local.project(p)).collect()]];
                 let mut material = overlay(&subject, &clips, OverlayRule::Difference);
                 for p in material.iter_mut().flatten().flatten() {
@@ -166,6 +189,24 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
             Profiled { joined, material }
         })
         .collect()
+}
+
+/// Convex join references share material only when no edge separates them. Excluding
+/// remote run members keeps their coordinates out of the local overlay's integer grid.
+fn intersects(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
+    for ring in [a, b] {
+        for (&p, &q) in ring.iter().zip(ring.iter().cycle().skip(1)).take(ring.len()) {
+            let Some((_, n, _)) = frame(p, q) else { continue };
+            let interval = |r: &[[f64; 2]]| {
+                r.iter().map(|&v| dot(super::sub(v, p), n)).fold([f64::INFINITY, f64::NEG_INFINITY], |[lo, hi], v| [lo.min(v), hi.max(v)])
+            };
+            let ([al, ah], [bl, bh]) = (interval(a), interval(b));
+            if ah < bl || bh < al {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn shared_length(material: &Shapes, outline: &[[f64; 2]]) -> f64 {

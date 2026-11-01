@@ -432,6 +432,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn nearby_stepped_stations_preserve_one_material_owner() {
+        let base = [
+            Axis { a: [1000.0, 5000.0], b: [3000.0, 5000.0], thickness: 240.0 },
+            Axis { a: [3000.0, 5000.0], b: [3120.0, 5000.0], thickness: 120.0 },
+            Axis { a: [3120.0, 5000.0], b: [9000.0, 5000.0], thickness: 400.0 },
+            Axis { a: [3000.0, 2000.0], b: [3000.0, 5000.0], thickness: 300.0 },
+            Axis { a: [3120.0, 8000.0], b: [3120.0, 5000.0], thickness: 120.0 },
+        ];
+        for angle in [0.0_f64, 37.0, 90.0] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |[x, y]: [f64; 2]| [30000.0 + x * cos - y * sin, -27000.0 + x * sin + y * cos];
+            let sources = base.map(|w| Axis { a: at(w.a), b: at(w.b), ..w });
+            for order in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [2, 4, 1, 3, 0]] {
+                for reversed in [false, true] {
+                    let raw: Vec<_> =
+                        order.iter().map(|&i| if reversed { Axis { a: sources[i].b, b: sources[i].a, ..sources[i] } } else { sources[i] }).collect();
+                    let walls = built_sources(&raw);
+                    assert_complete_partition(&raw, &walls);
+                    for wall in &walls {
+                        closed_outward_volume(&wall.mesh);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stepped_run_follows_equal_width_seams_and_ignores_remote_material() {
+        let sources = [
+            Axis { a: [1000., 5000.], b: [3000., 5000.], thickness: 240. },
+            Axis { a: [3000., 5000.], b: [3100., 5000.], thickness: 120. },
+            Axis { a: [3100., 5000.], b: [3200., 5000.], thickness: 120. },
+            Axis { a: [3200., 5000.], b: [9000., 5000.], thickness: 400. },
+            Axis { a: [3000., 2000.], b: [3000., 5000.], thickness: 1000. },
+        ];
+        assert_complete_partition(&sources, &built_sources(&sources));
+        let base = stepped_sources();
+        let before = join_material(&base, &[], 0.0);
+        let mut extended = base.to_vec();
+        extended.push(Axis { a: base[0].b, b: [5000., 200000.], thickness: 400. });
+        let after = join_material(&extended, &[], 0.0);
+        assert_eq!(before[2], after[2], "remote continuation must not change the local overlay grid or contact");
+    }
+
     fn stepped_sources() -> [Axis; 3] {
         [
             Axis { a: [5000.0, 5000.0], b: [5000.0, 6500.0], thickness: 120.0 },
@@ -501,7 +546,11 @@ mod tests {
         let actual: Vec<_> = walls.iter().flat_map(|w| w.cut.clone()).collect();
         let missing = overlay_area(&expected, &actual, OverlayRule::Difference);
         let extra = overlay_area(&actual, &expected, OverlayRule::Difference);
-        assert!(missing < 0.05 && extra < 0.05, "source union coverage: missing={missing}, extra={extra} mm²");
+        assert!(
+            missing < 0.05 && extra < 0.05,
+            "source union coverage: missing={missing}, extra={extra} mm²; references={:?}; cuts={actual:?}",
+            walls.iter().map(|w| (&w.id, w.axis, w.outline)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
