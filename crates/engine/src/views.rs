@@ -110,9 +110,15 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
             Some(range) => crate::plan_range::sheet(doc, *level, phase, range)?,
             None => crate::plan::drawing_sheet(doc, *level, phase)?,
         },
-        DrawingViewKind::Facade { facade } => {
-            crate::elevation::scene(doc, crate::elevation::Side::Facade(facade), phase, (None, None), &view.name, "")?
-        }
+        DrawingViewKind::Facade { facade } => crate::elevation::scene(
+            doc,
+            crate::elevation::Side::Facade(facade),
+            phase,
+            (None, None),
+            &view.name,
+            "",
+            view.template.as_ref().is_some_and(|template| template.hide_balcony_dimensions),
+        )?,
         DrawingViewKind::Section { from, to, flip, depth_mm } => crate::section::scene(doc, [*from, *to], *flip, *depth_mm, phase, &view.name, "")?,
     };
     sheet.title = view.name.clone();
@@ -663,6 +669,76 @@ mod picking_tests {
             session.execute("edit.undo", json!({})).unwrap();
             assert_eq!(session.doc, before);
         }
+    }
+
+    #[test]
+    fn presentation_facades_can_hide_generated_balcony_sizes_without_hiding_manual_notes_or_model_picking() {
+        let mut s = session();
+        s.execute("facade.place", json!({"facade":"b.f1","type":"balcony.minaltan","levels":[1],"bays":[1]})).unwrap();
+        s.execute(
+            "annotation.define",
+            json!({"id":"manual","view":"facade","kind":{"annotation":"text","at":[1000,8000],"text":"Ca. manual size note"}}),
+        )
+        .unwrap();
+        let fixed = json!({"name":"Presentation","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}});
+        s.execute("view.configure", json!({"id":"facade","template":fixed})).unwrap();
+        let before = s.doc.clone();
+        let shown = sheet(&s.doc, "facade", View::latest(&s.doc)).unwrap();
+        assert!(shown.metrics["balcony_labels"].as_u64().unwrap() > 0);
+        let shown_svg = shown.svg();
+        let shown_dxf = crate::sheet::dxf::write(
+            &shown.scene,
+            &crate::sheet::dxf::TitleBlock { title: &shown.title, project: &shown.project, caption: &shown.caption, note: shown.note.clone() },
+        );
+        let preview_before = drawing_view(&s.doc, "facade", View::latest(&s.doc)).unwrap();
+        assert!(
+            serde_json::to_value(&s.doc.views.iter().find(|v| v.id == "facade").unwrap().template).unwrap().get("hide_balcony_dimensions").is_none()
+        );
+        let mut hidden = fixed;
+        hidden["hide_balcony_dimensions"] = json!(true);
+        s.execute("view.configure", json!({"id":"facade","template":hidden})).unwrap();
+        let clean = sheet(&s.doc, "facade", View::latest(&s.doc)).unwrap();
+        assert_eq!(clean.metrics["balcony_labels"], 0);
+        assert!(clean.svg().contains("Ca. manual size note"));
+        assert!(!clean.svg().contains("Ca. 1300"));
+        assert_eq!(s.doc.buildings, before.buildings);
+        assert_eq!(s.doc.types, before.types);
+        assert_eq!(s.doc.annotations, before.annotations);
+        let preview_after = drawing_view(&s.doc, "facade", View::latest(&s.doc)).unwrap();
+        assert_eq!(preview_before.element_segments, preview_after.element_segments);
+        assert_eq!(preview_before.element_regions, preview_after.element_regions);
+        let loaded: Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(sheet(&loaded, "facade", View::latest(&loaded)).unwrap().svg(), clean.svg());
+        let png = crate::plan_output::png(&clean.svg()).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let pdf = crate::plan_output::pdf(&[clean.svg()], crate::sheet::PAGE_MM).unwrap();
+        assert_eq!(lopdf::Document::load_mem(&pdf).unwrap().get_pages().len(), 1);
+        let clean_dxf = crate::sheet::dxf::write(
+            &clean.scene,
+            &crate::sheet::dxf::TitleBlock { title: &clean.title, project: &clean.project, caption: &clean.caption, note: clean.note.clone() },
+        );
+        assert!(clean_dxf.contains("Ca. manual size note"));
+        assert!(!clean_dxf.contains("Ca. 1300"));
+        let valid = s.doc.clone();
+        hidden["hide_balcony_dimensions"] = json!("yes");
+        assert!(s.execute("view.configure", json!({"id":"facade","template":hidden})).is_err());
+        assert_eq!(s.doc, valid);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        let restored = sheet(&s.doc, "facade", View::latest(&s.doc)).unwrap();
+        assert_eq!(restored.svg(), shown_svg);
+        assert_eq!(
+            crate::sheet::dxf::write(
+                &restored.scene,
+                &crate::sheet::dxf::TitleBlock {
+                    title: &restored.title,
+                    project: &restored.project,
+                    caption: &restored.caption,
+                    note: restored.note.clone(),
+                }
+            ),
+            shown_dxf
+        );
     }
 
     #[test]

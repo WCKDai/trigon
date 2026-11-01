@@ -17,6 +17,9 @@ override keeps that value; creating a type variant creates a separate type.
 {"path":"libraries/balconies.trigonlib"}
 ```
 
+The filename extension is lowercase `.trigonlib`. Studio's Import/Export forms use the same
+case-sensitive extension rule as the engine; uppercase or mixed-case extensions must be renamed.
+
 Existing IDs are rejected by default. To refresh a shared library definition and all its linked
 uses, choose replacement explicitly:
 

@@ -23,6 +23,14 @@ consumers/struct literals need updating. Older strict readers need a separate sa
 the optional room-label setting removed before opening a feature-bearing project. Tags use
 explicit room polygons; they do not establish apartment boundaries or survey accuracy.
 
+Saved facade templates can set `hide_balcony_dimensions: true` through `view.configure` or
+Studio's **Hide balcony size labels** checkbox. This removes generated balcony sizes and their
+ticks for a clear presentation elevation. Balcony geometry, exact model picking, entrance labels
+and manually authored dimensions/notes remain. Plans and sections ignore this facade-only option.
+The default is false and omitted on save, so existing files and `elevation.sheet` keep their
+dimensioned output. The public Rust `DrawingTemplate` adds this boolean field; struct literals
+need updating. Older strict readers need a separate copy with the optional field removed.
+
 ```json
 {"command":"view.define","params":{"id":"ground","name":"Ground floor","kind":{"view":"plan","level":0}}}
 {"command":"annotation.define","params":{"id":"wall-note","view":"ground","size_mm":2.5,"kind":{"annotation":"text","at":[1000,2000],"text":"Existing brickwork"}}}

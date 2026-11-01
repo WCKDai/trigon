@@ -703,6 +703,10 @@ impl Drafting {
                     ui.weak("Dashed overhead; dotted below primary range. Uses actual mesh cuts and hidden lines, including adjacent storeys.");
                 }
             }
+            if matches!(view.kind, DrawingViewKind::Facade { .. }) {
+                ui.checkbox(&mut self.template.hide_balcony_dimensions, "Hide balcony size labels");
+                ui.weak("Presentation elevation · manual dimensions and notes stay visible.");
+            }
             let error = self.template.validate().err();
             if let Some(error) = &error {
                 ui.colored_label(theme::ACCENT, error.to_string());

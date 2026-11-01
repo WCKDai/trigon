@@ -51,10 +51,18 @@ pub(crate) fn sheet(
     if !matches!(ext, "png" | "svg" | "pdf" | "dxf") {
         return Err(ModelError::Invalid("use .pdf, .png, .svg or .dxf for an elevation".into()).into());
     }
-    scene(doc, side, view, range, title, caption)?.write(path)
+    scene(doc, side, view, range, title, caption, false)?.write(path)
 }
 
-pub(crate) fn scene(doc: &Document, side: Side<'_>, view: View, range: (Option<f64>, Option<f64>), title: &str, caption: &str) -> Result<Sheet> {
+pub(crate) fn scene(
+    doc: &Document,
+    side: Side<'_>,
+    view: View,
+    range: (Option<f64>, Option<f64>),
+    title: &str,
+    caption: &str,
+    hide_balcony_dimensions: bool,
+) -> Result<Sheet> {
     if title.len() > 200 || caption.len() > 500 {
         return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
     }
@@ -116,6 +124,9 @@ pub(crate) fn scene(doc: &Document, side: Side<'_>, view: View, range: (Option<f
         .map(|w| (w.id.as_str(), w.frame))
         .collect();
     for (mb, (id, wf)) in doc.buildings.iter().filter(|x| x.id == b.building_id).flat_map(|mb| facing.iter().map(move |f| (mb, f))) {
+        if hide_balcony_dimensions {
+            continue;
+        }
         let Ok(f) = mb.facade(id) else { continue };
         for r in resolve_facade(doc, mb, f)? {
             if matches!(r.ty.kind, ComponentKind::GuardRail { .. }) {

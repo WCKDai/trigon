@@ -89,6 +89,13 @@ pub struct DrawingTemplate {
     /// Live labels from the selected floor's room definitions; hidden preserves old drawings.
     #[serde(default, skip_serializing_if = "RoomLabels::is_hidden")]
     pub room_labels: RoomLabels,
+    /// Facade only. Hide generated balcony size labels and ticks; manual annotations remain.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_balcony_dimensions: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -147,6 +154,7 @@ impl Default for DrawingTemplate {
             crop: None,
             range: None,
             room_labels: Default::default(),
+            hide_balcony_dimensions: false,
         }
     }
 }

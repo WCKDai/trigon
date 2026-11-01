@@ -135,7 +135,7 @@ impl Authoring {
         ui.weak("Select a shared type to edit all referencing instances, or duplicate it as a new type.");
         ui.add_space(10.0);
         egui::CollapsingHeader::new("Portable component libraries").id_salt("portable-libraries").show(ui, |ui| {
-            ui.weak("Local .trigonlib snapshots · no account required. Imported definitions become shared project types.");
+            ui.weak("Local snapshots with a lowercase .trigonlib extension · no account required. Imported definitions become shared project types.");
             ui.label("Import library");
             ui.add(
                 egui::TextEdit::singleline(&mut self.library_import_path)
@@ -201,7 +201,7 @@ impl Authoring {
             && path.len() <= 4096
             && !path.chars().any(char::is_control)
             && !path.contains("://")
-            && std::path::Path::new(path).extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("trigonlib")))
+            && std::path::Path::new(path).extension().and_then(|s| s.to_str()) == Some("trigonlib"))
         .then_some(path)
     }
     fn import_library(&self) -> Option<Run> {
@@ -671,9 +671,13 @@ mod library_tests {
         assert_eq!(export.params["ids"], json!([doc.types[0].id]));
         form.library_selected_only = false;
         assert!(form.export_library().unwrap().params.get("ids").is_none());
-        for invalid in ["", "library.json", "bad\nname.trigonlib", "https://example.invalid/library.trigonlib"] {
+        for invalid in
+            ["", "library.json", "library.TRIGONLIB", "library.TrigonLib", "bad\nname.trigonlib", "https://example.invalid/library.trigonlib"]
+        {
             form.library_import_path = invalid.into();
-            assert!(form.import_library().is_none());
+            form.library_export_path = invalid.into();
+            assert!(form.import_library().is_none(), "Import must not enable a path the engine rejects: {invalid:?}");
+            assert!(form.export_library().is_none(), "Export must not enable a path the engine rejects: {invalid:?}");
         }
         assert_eq!(doc, Document::default(), "form choices never mutate type definitions or instances");
     }
