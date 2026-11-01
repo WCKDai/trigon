@@ -23,6 +23,11 @@ pub struct Dormer {
     pub id: String,
     pub facade: String,
     pub u_mm: f64,
+    /// Right-handed +Z rotation from the source facade, about its `u_mm` wall-line anchor.
+    /// Explicit modelling intent, finite and within ±45 degrees; omitted means zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(range(min = -45.0, max = 45.0))]
+    pub yaw_deg: f64,
     pub window_type: String,
     pub width_mm: f64,
     pub height_mm: f64,
@@ -66,6 +71,7 @@ impl Dormer {
             }
         }
         crate::checked("dormer centre", self.u_mm, 0.0, 1e8)?;
+        crate::checked("dormer yaw (degrees about +Z from source facade)", self.yaw_deg, -45.0, 45.0)?;
         crate::checked("dormer window width", self.width_mm, 300.0, 3000.0)?;
         crate::checked("dormer window height", self.height_mm, 300.0, 2200.0)?;
         crate::checked("dormer setback", self.setback_mm, 100.0, 1500.0)?;
