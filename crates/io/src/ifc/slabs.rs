@@ -128,7 +128,8 @@ impl Ifc<'_> {
             placed.id,
             string(&r.id)
         ));
-        self.common("Pset_RoofCommon", roof, &up.name, None, vec![("IsExternal", Val::Bool(true))]);
+        let reference = if r.compound { "Original mansard shell - illustrative build-up; covering is separate" } else { &up.name };
+        self.common("Pset_RoofCommon", roof, reference, None, vec![("IsExternal", Val::Bool(true))]);
         fl.contain(top, roof);
         let mut planes = Vec::new();
         for piece in &pieces {
@@ -157,6 +158,24 @@ impl Ifc<'_> {
             let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
             let id = self.w.add(format!("IFCPIPESEGMENT({},$,'Tagrende',$,$,#{},#{shape},{},.GUTTER.)", gid(&key), lp.id, string(&key)));
             self.made_of(id, catalog::ZINC);
+            fl.contain(top, id);
+        }
+        for (material, mesh) in &r.covering {
+            let key = format!("{}.covering.{}", r.id, material.name());
+            let frame = fl.at(top).frame;
+            let lp = self.w.place(Some(fl.at(top)), frame);
+            let Some(item) = self.w.faceset(mesh, &frame) else { continue };
+            let mat = catalog::of(*material);
+            self.cat.paint(&mut self.w, item, mat);
+            let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
+            let id = self.w.add(format!(
+                "IFCCOVERING({},$,{},$,$,#{},#{shape},{},.ROOFING.)",
+                gid(&key),
+                string(&format!("{} - original family defaults", material.name())),
+                lp.id,
+                string(&key)
+            ));
+            self.made_of(id, mat);
             fl.contain(top, id);
         }
         for d in &r.dormers {

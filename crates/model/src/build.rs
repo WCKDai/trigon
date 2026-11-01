@@ -264,6 +264,7 @@ pub struct BuiltRoof {
     pub gables: Mesh,
     /// Opt-in compound roofs retain each gable's explicit host finish for display/export.
     pub gable_parts: Vec<(Material, Mesh)>,
+    pub covering: Vec<(Material, Mesh)>,
     /// Gutters along the eaves.
     pub gutters: Mesh,
     pub eaves: f64,
@@ -935,14 +936,24 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     mesh.triangles.push([base, base + 1, base + 2]);
                 }
             }
+            let covering = if let crate::Roof::Mansard { parameters } = &b.roof {
+                match &parameters.covering {
+                    Some(spec) => crate::roof::covering(&r.cover, parameters.lower_pitch_deg, parameters.upper_pitch_deg, spec)?,
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let ridge = covering.iter().flat_map(|(_, m)| m.positions.iter().map(|p| p[2])).fold(r.ridge, f64::max);
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
                 cover: r.cover,
                 gables: r.gables,
                 gable_parts: gable_parts.into_iter().collect(),
+                covering,
                 gutters: r.gutters,
                 eaves: h,
-                ridge: r.ridge,
+                ridge,
                 pitch_deg,
                 compound,
                 dormers,

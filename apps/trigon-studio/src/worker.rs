@@ -207,7 +207,7 @@ mod tests {
                 .unwrap(),
         );
         s.execute("types.install_copenhagen", json!({})).unwrap();
-        s.execute("building.set_roof",json!({"kind":"mansard","thickness_mm":220,"dormers":[{"id":"test","facade":"b.f1","u_mm":15000,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}]})).unwrap();
+        s.execute("building.set_roof",json!({"kind":"mansard","thickness_mm":220,"dormers":[{"id":"test","facade":"b.f1","u_mm":15000,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}],"covering":{"lower":{"material":"slate"},"upper":{"material":"felt"}}})).unwrap();
         let before = s.doc.clone();
         let prepared = run(&job(s.doc.clone(), None)).scene.unwrap().unwrap();
         assert_eq!(prepared.schedule.totals.windows, 1);

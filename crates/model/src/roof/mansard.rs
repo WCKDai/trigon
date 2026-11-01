@@ -29,6 +29,8 @@ pub struct Mansard {
     pub gutters: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dormers: Vec<super::Dormer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covering: Option<super::Covering>,
 }
 
 fn lower() -> f64 {
@@ -54,6 +56,7 @@ impl Default for Mansard {
             thickness_mm: 0.0,
             gutters: false,
             dormers: Vec::new(),
+            covering: None,
         }
     }
 }

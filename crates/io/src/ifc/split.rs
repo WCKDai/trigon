@@ -539,6 +539,9 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
             out.extend(gutters(r));
+            for (material, mesh) in &r.covering {
+                out.push((format!("{}.covering.{}", r.id, material.name()), mesh.clone()));
+            }
             for d in &r.dormers {
                 out.push((format!("{}.roof", d.id), d.roof.clone()));
                 out.push((format!("{}.cheeks", d.id), d.cheeks.clone()));

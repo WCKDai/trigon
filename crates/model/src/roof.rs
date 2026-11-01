@@ -11,6 +11,8 @@ use crate::{ModelError, Result};
 
 mod mansard;
 pub use mansard::{Mansard, build as mansard};
+mod covering;
+pub use covering::{Covering, Surface, build as covering};
 
 /// Original shed dormer source parameters, relative to a straight mansard facade.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

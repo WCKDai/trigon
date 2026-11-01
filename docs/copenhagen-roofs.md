@@ -79,3 +79,34 @@ Shed roofs and cheek cladding remain separate IFC products; their windows use th
 normal opening/fill relationships and actual dimensions. Dormers follow the
 existing unphased roof source and are associated with the highest modelled storey;
 this family does not infer an extra inhabited attic storey or attic room layout.
+
+## Slate courses and tagpap
+
+`covering` is optional and leaves the existing envelope when absent. Each slope
+can use `plain`, `slate` or `felt`:
+
+```json
+{"covering":{"lower":{"material":"slate"},"upper":{"material":"felt"}}}
+```
+
+Slate defaults are 300 × 400 × 6 mm, a 160 mm course exposure and 3 mm side joints.
+Courses stagger by half a slate. Their slope seats each course on the preceding
+course throughout the lap; validation retains a double lap with at least 20 mm
+headlap and at most three overlapping courses. Slate width, length, exposure,
+thickness and joint width are typed parameters. Tagpap defaults are 1000 mm wide
+sheets, 100 mm laps and 3 mm thickness, with a raised second layer at each lap.
+These dimensions are original presentation defaults, not a Danish statutory
+section, manufacturer's specification or surveyed roof.
+
+Coverings use the actual roof faces, including dormer voids. They remain real
+closed pieces in GLB/FBX and separate material-labelled `IfcCovering` products in
+IFC. Dormer sill clearance is measured above the declared finished roof envelope;
+changing lap thickness therefore recomputes its derived elevation and depth,
+retaining its source ID and nominal window width/height. The structural roof
+build-up remains the existing source envelope; covering geometry is additional.
+
+The builder limits a roof to 20,000 candidate slates/laps and rejects larger
+requests before generating them. Use a larger module or a plain surface for
+larger context buildings. Ridge/valley flashings, battens, fixings, insulation,
+ventilation and drainage design remain project-specific details; they are not
+inferred by the surface family.

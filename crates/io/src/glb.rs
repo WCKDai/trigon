@@ -209,6 +209,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             } else {
                 parts.extend(r.gable_parts.iter().map(|(m, mesh)| (*m, mesh)));
             }
+            parts.extend(r.covering.iter().map(|(m, mesh)| (*m, mesh)));
             add(&mut w, &r.id, &parts);
             for d in &r.dormers {
                 add(&mut w, &format!("{}.roof", d.id), &[(Material::Steel, &d.roof)]);

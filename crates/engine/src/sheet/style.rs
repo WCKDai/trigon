@@ -90,6 +90,9 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
                     out.push(part(mesh, Class::Wall, walls, *material, Role::Both, element.clone()));
                 }
             }
+            for (material, mesh) in &r.covering {
+                out.push(part(mesh, Class::Roof, next(), *material, Role::Both, element.clone()));
+            }
             out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both, element));
             for d in &r.dormers {
                 out.push(part(

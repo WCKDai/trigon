@@ -405,6 +405,7 @@ impl Scene {
                 } else {
                     parts.extend(r.gable_parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
                 }
+                parts.extend(r.covering.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
                 b.add(
                     &r.id,
                     "roof",

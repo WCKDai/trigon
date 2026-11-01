@@ -56,14 +56,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    s.execute("building.set_roof",json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gables":["b.f3"],"gutters":true,"dormers":dormers}))?;
+    s.execute("building.set_roof",json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gables":["b.f3"],"gutters":true,"dormers":dormers,"covering":{"lower":{"material":"slate"},"upper":{"material":"felt"}}}))?;
     s.execute(
         "site.set_terrain",
         json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[50000,32000],"heights_mm":[[0,0],[0,0]],"source":"illustrative:flat-ground"}}),
     )?;
     s.execute("export.gltf", json!({"path":dir.join("building.glb")}))?;
     s.execute("export.ifc", json!({"path":dir.join("building.ifc")}))?;
-    s.execute("document.save", json!({"path":dir.join("building.trigon")}))?;
     s.execute("schedule.export", json!({"path":dir.join("schedule.json")}))?;
     s.execute("view.define", json!({"id":"balcony-plan","name":"Original balcony plan","kind":{"view":"plan","level":1}}))?;
     for ext in ["svg", "png", "dxf"] {
@@ -81,6 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let report = s.execute("ifc.check", json!({"path":dir.join("building.ifc")}))?;
     std::fs::write(dir.join("ifc-check.json"), serde_json::to_vec_pretty(&report)?)?;
+    s.execute("document.save", json!({"path":dir.join("building.trigon")}))?;
     println!("Original apartment-block study and exact roof edit/Undo: {}", dir.display());
     Ok(())
 }

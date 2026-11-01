@@ -11,6 +11,28 @@ fn session() -> Session {
 }
 
 #[test]
+fn roof_covering_is_typed_parametric_and_exactly_undoable() {
+    let mut s = session();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","count":8})).unwrap();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[1],"bays":[2]})).unwrap();
+    s.execute("building.set_roof", json!({"kind":"mansard","thickness_mm":220})).unwrap();
+    let bare = trigon_io::glb::write(&build(&s.doc).unwrap(), &[]);
+    let schedule = s.execute("schedule.openings", json!({})).unwrap();
+    s.execute("element.set", json!({"id":"b.roof","properties":{"covering":{"lower":{"material":"slate"},"upper":{"material":"felt"}}}})).unwrap();
+    assert_eq!(s.execute("schedule.openings", json!({})).unwrap(), schedule);
+    let covered = s.doc.clone();
+    let mesh = build(&s.doc).unwrap();
+    let bytes = trigon_io::glb::write(&mesh, &[]);
+    assert!(bytes.len() > bare.len());
+    s.execute("element.set", json!({"id":"b.roof","properties":{"covering":null}})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, covered);
+    assert_eq!(build(&s.doc).unwrap(), mesh);
+    assert!(s.execute("element.set", json!({"id":"b.roof","properties":{"covering":{"lower":{"material":"slate","width_mm":1e300}}}})).is_err());
+    assert_eq!(s.doc, covered);
+}
+
+#[test]
 fn mansard_gable_render_material_follows_the_host_facade_finish() {
     let mut s = session();
     s.execute("facade.set_finish", json!({"finish":"yellow_brick"})).unwrap();

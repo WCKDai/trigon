@@ -612,6 +612,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("gutters", "Half-round gutters", p.gutters, true),
                 field("gables", "Gable facade IDs", json!(p.gables), true),
                 field("dormers", "Parametric roof dormers", json!(p.dormers), true),
+                field("covering", "Lower/upper roof covering", json!(p.covering), true),
             ]);
         }
     }
@@ -1103,6 +1104,10 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         }
                     }
                     trigon_model::Roof::Mansard { parameters: p } => match key.as_str() {
+                        "covering" => {
+                            p.covering =
+                                serde_json::from_value(value.clone()).map_err(|_| invalid("covering requires typed lower and upper roof surfaces"))?
+                        }
                         "lower_pitch_deg" => p.lower_pitch_deg = numeric(key, value)?,
                         "upper_pitch_deg" => p.upper_pitch_deg = numeric(key, value)?,
                         "break_run_mm" => p.break_run_mm = numeric(key, value)?,

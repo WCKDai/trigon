@@ -217,7 +217,18 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         if top.0[1] < slope + 0.1 {
             return Err(ModelError::Invalid("dormer host roof must be steeper than its shed roof".into()));
         }
-        let sill = top.z(spec.u_mm, front + FRONT) + spec.sill_clearance_mm;
+        let finished = if let crate::Roof::Mansard { parameters } = &b.roof {
+            match &parameters.covering {
+                Some(covering) => {
+                    covering.offset(top.0[1].atan().to_degrees(), parameters.lower_pitch_deg, parameters.upper_pitch_deg)?
+                        * (1.0 + top.0[1].powi(2)).sqrt()
+                }
+                None => 0.0,
+            }
+        } else {
+            0.0
+        };
+        let sill = top.z(spec.u_mm, front + FRONT) + finished + spec.sill_clearance_mm;
         let roof_bottom = sill + ty.height + spec.head_mm;
         let lift = spec.roof_thickness_mm / pitch.cos();
         let back = (roof_bottom + lift - slope * front - top.0[2]) / (top.0[1] - slope);
@@ -399,5 +410,53 @@ mod tests {
         closed(&roof.cover);
         assert!(roof.cover.triangles.len() < 6000);
         assert_eq!(model, crate::build(&doc).unwrap());
+    }
+
+    #[test]
+    fn hosted_window_clearance_follows_the_finished_roof_envelope() {
+        let mut doc = Document::default();
+        doc.types.extend(crate::component::copenhagen_types());
+        let mut b =
+            Building::new("b", "Original finished-roof fixture", &[[0., 0.], [30000., 0.], [30000., 10000.], [0., 10000.]], 3, 3400.).unwrap();
+        b.roof=serde_json::from_value(serde_json::json!({"kind":"mansard","thickness_mm":220,"overhang_mm":250,"dormers":[{"id":"test","facade":"b.f1","u_mm":15000,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}]})).unwrap();
+        doc.buildings.push(b);
+        let bare = crate::build(&doc).unwrap();
+        let before = &bare[0].roof.as_ref().unwrap().dormers[0].front.openings[0];
+        if let crate::Roof::Mansard { parameters } = &mut doc.buildings[0].roof {
+            parameters.covering = Some(
+                serde_json::from_value(
+                    serde_json::json!({"lower":{"material":"slate","width_mm":600,"length_mm":1200,"exposure_mm":400,"thickness_mm":20}}),
+                )
+                .unwrap(),
+            );
+        }
+        let model = crate::build(&doc).unwrap();
+        let roof = model[0].roof.as_ref().unwrap();
+        let after = &roof.dormers[0].front.openings[0];
+        assert_eq!((after.fill.width, after.fill.height), (before.fill.width, before.fill.height));
+        assert_eq!(after.fill.id, before.fill.id);
+        let expected = 80.0 / 68f64.to_radians().cos();
+        assert!((after.rect.v0 - before.rect.v0 - expected).abs() < 1e-6, "clearance follows the declared lap thickness");
+        closed(&roof.cover);
+        assert!(roof.covering.iter().any(|(m, _)| *m == Material::Slate));
+        let fr = FacadeFrame::new([0., 0.], [30000., 0.]).unwrap();
+        let glass = &after.fill.parts.iter().find(|(m, _)| *m == Material::Glass).unwrap().1;
+        for p in &glass.positions {
+            let q = local(&fr, *p);
+            for (_, cover) in &roof.covering {
+                for tri in &cover.triangles {
+                    let [a, b, c] = tri.map(|i| local(&fr, cover.positions[i as usize]));
+                    let det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                    if det <= EPS {
+                        continue;
+                    }
+                    let s = ((q[0] - a[0]) * (c[1] - a[1]) - (q[1] - a[1]) * (c[0] - a[0])) / det;
+                    let t = ((b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0])) / det;
+                    if s >= -EPS && t >= -EPS && s + t <= 1.0 + EPS {
+                        assert!(q[2] > a[2] + s * (b[2] - a[2]) + t * (c[2] - a[2]), "glazing is covered by a slate lap");
+                    }
+                }
+            }
+        }
     }
 }

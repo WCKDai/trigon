@@ -33,6 +33,7 @@ pub const CONCRETE: Mat = mat("Beton", "concrete", [0.72, 0.72, 0.70]);
 pub const TILES: Mat = mat("Tegltag på lægter", "clay", [0.62, 0.27, 0.18]);
 pub const RAFTERS: Mat = mat("Spær og undertag", "wood", [0.70, 0.55, 0.36]);
 pub const FELT: Mat = mat("Tagpap", "bitumen", [0.16, 0.16, 0.17]);
+pub const SLATE: Mat = mat("Slate roofing, illustrative family", "stone", [0.18, 0.20, 0.22]);
 pub const FRAME: Mat = mat("Træ, malet hvid", "wood", [0.95, 0.95, 0.93]);
 pub const GLASS: Mat = Mat { name: "Glas", category: "glass", rgb: [0.55, 0.70, 0.80], transparency: 0.6 };
 pub const DOOR: Mat = mat("Træ, dørblad", "wood", [0.42, 0.26, 0.16]);
@@ -69,6 +70,8 @@ pub fn of(m: Material) -> Mat {
         Material::BrickRed => BRICK_RED,
         Material::BrickYellow => BRICK_YELLOW,
         Material::Ground => GROUND,
+        Material::Slate => SLATE,
+        Material::Felt => FELT,
     }
 }
 

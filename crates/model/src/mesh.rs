@@ -33,10 +33,14 @@ pub enum Material {
     BrickYellow,
     /// Neutral outdoor ground; actual paving/soil composition is project information.
     Ground,
+    /// Original slate/shingle roof presentation material.
+    Slate,
+    /// Bituminous roofing felt (tagpap).
+    Felt,
 }
 
 impl Material {
-    pub const ALL: [Material; 18] = [
+    pub const ALL: [Material; 20] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -55,6 +59,8 @@ impl Material {
         Material::BrickRed,
         Material::BrickYellow,
         Material::Ground,
+        Material::Slate,
+        Material::Felt,
     ];
 
     pub fn name(self) -> &'static str {
@@ -77,6 +83,8 @@ impl Material {
             Material::BrickRed => "brick_red",
             Material::BrickYellow => "brick_yellow",
             Material::Ground => "ground",
+            Material::Slate => "slate",
+            Material::Felt => "felt",
         }
     }
 
@@ -101,6 +109,8 @@ impl Material {
             Material::BrickRed => [0.55, 0.22, 0.14, 1.0],
             Material::BrickYellow => [0.57, 0.43, 0.22, 1.0],
             Material::Ground => [0.38, 0.40, 0.35, 1.0],
+            Material::Slate => [0.12, 0.14, 0.16, 1.0],
+            Material::Felt => [0.065, 0.07, 0.075, 1.0],
         }
     }
 
