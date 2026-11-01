@@ -8,6 +8,8 @@ use crate::{Document, ModelError, Result, checked};
 pub const MAX_VIEWS: usize = 256;
 pub const MAX_ANNOTATIONS: usize = 5000;
 pub const MAX_REGION_POINTS: usize = 256;
+pub const MAX_FRAME_CAPTION_CHARS: usize = 40;
+pub const MAX_FRAME_NOTE_CHARS: usize = 80;
 
 /// A bundled, portable font family. Documents cannot request a local font path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
@@ -92,6 +94,14 @@ pub struct DrawingTemplate {
     /// Facade only. Hide generated balcony size labels and ticks; manual annotations remain.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_balcony_dimensions: bool,
+    /// Printed below the viewport. None retains generated text; an empty string hides it.
+    /// One line, at most MAX_FRAME_CAPTION_CHARS characters, fitting the existing paper frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Replaces the generated frame note, including automatic size/crop notes. Empty hides it.
+    /// One line, at most MAX_FRAME_NOTE_CHARS characters; manual annotations are independent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -155,6 +165,8 @@ impl Default for DrawingTemplate {
             range: None,
             room_labels: Default::default(),
             hide_balcony_dimensions: false,
+            caption: None,
+            note: None,
         }
     }
 }
@@ -187,6 +199,14 @@ impl DrawingTemplate {
         }
         if let Some(range) = self.range {
             range.validate()?;
+        }
+        for (value, limit, label) in [(&self.caption, MAX_FRAME_CAPTION_CHARS, "caption"), (&self.note, MAX_FRAME_NOTE_CHARS, "note")] {
+            if let Some(value) = value {
+                text(value, true)?;
+                if value.chars().count() > limit {
+                    return Err(ModelError::Invalid(format!("frame {label} is limited to {limit} characters")));
+                }
+            }
         }
         Ok(())
     }

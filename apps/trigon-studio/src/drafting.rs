@@ -707,6 +707,29 @@ impl Drafting {
                 ui.checkbox(&mut self.template.hide_balcony_dimensions, "Hide balcony size labels");
                 ui.weak("Presentation elevation · manual dimensions and notes stay visible.");
             }
+            let mut custom_caption = self.template.caption.is_some();
+            if ui.checkbox(&mut custom_caption, "Custom caption").changed() {
+                self.template.caption = custom_caption.then(String::new);
+            }
+            if let Some(caption) = &mut self.template.caption {
+                ui.add(
+                    egui::TextEdit::singleline(caption)
+                        .hint_text("Blank hides the caption")
+                        .char_limit(trigon_model::annotation::MAX_FRAME_CAPTION_CHARS),
+                );
+            }
+            let mut custom_note = self.template.note.is_some();
+            if ui.checkbox(&mut custom_note, "Custom note").changed() {
+                self.template.note = custom_note.then(String::new);
+            }
+            if let Some(note) = &mut self.template.note {
+                ui.add(
+                    egui::TextEdit::singleline(note)
+                        .hint_text("Blank hides the generated note")
+                        .char_limit(trigon_model::annotation::MAX_FRAME_NOTE_CHARS),
+                );
+            }
+            ui.weak("Printed frame text only; model names and manual annotations stay unchanged.");
             let error = self.template.validate().err();
             if let Some(error) = &error {
                 ui.colored_label(theme::ACCENT, error.to_string());

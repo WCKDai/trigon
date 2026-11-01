@@ -193,3 +193,10 @@ requires existing storeys, finite bounded heights and 1–500 mm projection; at 
 are accepted per facade. Files using the new finish need an updated reader. The additive
 Rust `Band.finish` and derived `BuiltWall.trim_parts` fields require source consumers that
 construct those structs directly to initialize them; legacy JSON is unchanged.
+
+Saved view templates optionally override printed `caption` (40 characters) and `note`
+(80 characters). Missing fields retain the generated frame text and legacy serialization;
+an empty string hides that part of the frame. Overrides are single-line text, do not rename
+the building or alter model geometry/manual annotations/picking, and save/reopen/Undo through
+`view.configure`. Studio exposes the same controls in the view template settings. This lets
+a multi-building review sheet carry its actual project caption and evidence note.

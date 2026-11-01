@@ -98,6 +98,12 @@ pub(crate) fn prepare(sheet: &mut Sheet, template: &DrawingTemplate, annotation_
             None => note.into(),
         });
     }
+    if let Some(caption) = &template.caption {
+        sheet.caption.clone_from(caption);
+    }
+    if let Some(note) = &template.note {
+        sheet.note = (!note.is_empty()).then(|| note.clone());
+    }
     sheet.metrics["template"] = json!(template.name);
     sheet.metrics["line_weights"] = json!(template.line_weights);
     sheet.metrics["sizing"] = json!(if matches!(template.sizing, ViewSizing::Fit) { "fit" } else { "fixed" });
@@ -290,6 +296,72 @@ mod room_label_tests {
         s.execute("edit.undo", json!({})).unwrap();
         assert_eq!(s.doc, before);
         assert_eq!(crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap().svg(), svg);
+    }
+
+    #[test]
+    fn empty_frame_overrides_hide_generated_text_and_invalid_text_is_atomic() {
+        let mut s = session();
+        let before = s.doc.clone();
+        for (field, value) in [
+            ("caption", "W".repeat(trigon_model::annotation::MAX_FRAME_CAPTION_CHARS + 1)),
+            ("note", "W".repeat(trigon_model::annotation::MAX_FRAME_NOTE_CHARS + 1)),
+            ("caption", "two\nlines".into()),
+            ("note", "hidden\0control".into()),
+        ] {
+            let mut template = json!({"name":"Review"});
+            template[field] = json!(value);
+            assert!(s.execute("view.configure", json!({"id":"plan","template":template})).is_err());
+            assert_eq!(s.doc, before);
+        }
+        s.execute("view.configure", json!({"id":"plan","template":{"name":"Review","caption":"","note":""}})).unwrap();
+        let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert!(sheet.caption.is_empty());
+        assert!(sheet.note.is_none());
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn frame_text_overrides_save_and_undo_without_changing_model_or_picking() {
+        let mut s = session();
+        s.execute(
+            "annotation.define",
+            json!({"id":"manual","view":"plan","kind":{
+                "annotation":"text","at":[6000,6500],"text":"Manual note stays"
+            }}),
+        )
+        .unwrap();
+        s.execute(
+            "view.configure",
+            json!({"id":"plan","template":{
+                "name":"Review","room_labels":"name_and_area",
+                "sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}
+            }}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let original = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        let picking = crate::views::drawing_view(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        let mut template = serde_json::to_value(&s.doc.views[0].template).unwrap();
+        assert!(template.get("caption").is_none() && template.get("note").is_none());
+        template["caption"] = json!("Door detail");
+        template["note"] = json!("Detail excerpt; areas are indicative.");
+        s.execute("view.configure", json!({"id":"plan","template":template})).unwrap();
+        let changed = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        let next_pick = crate::views::drawing_view(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert_eq!(changed.caption, "Door detail");
+        assert_eq!(changed.note.as_deref(), Some("Detail excerpt; areas are indicative."));
+        assert!(changed.svg().contains("Manual note stays") && changed.svg().contains("28.0 m²"));
+        assert_eq!(s.doc.buildings, before.buildings);
+        assert_eq!(s.doc.types, before.types);
+        assert_eq!(s.doc.annotations, before.annotations);
+        assert_eq!(next_pick.element_segments, picking.element_segments);
+        assert_eq!(next_pick.element_regions, picking.element_regions);
+        let loaded: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&s.doc).unwrap()).unwrap();
+        assert_eq!(crate::views::sheet(&loaded, "plan", View::latest(&loaded)).unwrap().svg(), changed.svg());
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap().svg(), original.svg());
     }
 
     fn configure(s: &mut Session, mode: &str, denominator: f64, crop: Option<[f64; 4]>) {
