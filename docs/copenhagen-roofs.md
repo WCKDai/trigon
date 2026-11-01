@@ -6,6 +6,9 @@ are source parameters. `element.get` and `element.set` expose those same values;
 commands remain atomic, journaled and exactly undoable. Existing flat and pitched
 roof geometry and defaults are unchanged.
 
+Mansard gables follow the explicitly assigned finish of their host facade in
+Studio, drawings and GLB/FBX, matching the existing IFC material assignment.
+
 For example:
 
 ```json

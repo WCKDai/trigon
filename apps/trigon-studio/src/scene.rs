@@ -396,17 +396,22 @@ impl Scene {
                 );
             }
             if let Some(r) = &building.roof {
+                let mut parts = vec![
+                    Part { mesh: &r.cover, rgba: Material::Roof.rgba(), material: Material::Roof },
+                    Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
+                ];
+                if r.gable_parts.is_empty() {
+                    parts.insert(1, Part { mesh: &r.gables, rgba: Material::Wall.rgba(), material: Material::Wall });
+                } else {
+                    parts.extend(r.gable_parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
+                }
                 b.add(
                     &r.id,
                     "roof",
                     None,
                     vec![("eaves", mm(r.eaves)), ("ridge", mm(r.ridge)), ("pitch", format!("{:.1}°", r.pitch_deg))],
                     true,
-                    &[
-                        Part { mesh: &r.cover, rgba: Material::Roof.rgba(), material: Material::Roof },
-                        Part { mesh: &r.gables, rgba: Material::Wall.rgba(), material: Material::Wall },
-                        Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
-                    ],
+                    &parts,
                 );
                 for d in &r.dormers {
                     for (suffix, kind, mesh) in [("roof", "dormer roof", &d.roof), ("cheeks", "dormer cheeks", &d.cheeks)] {

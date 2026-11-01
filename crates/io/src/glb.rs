@@ -203,7 +203,13 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             add(&mut w, &s.id, &[(m, &s.mesh)]);
         }
         if let Some(r) = &b.roof {
-            add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables), (Material::Steel, &r.gutters)]);
+            let mut parts = vec![(Material::Roof, &r.cover), (Material::Steel, &r.gutters)];
+            if r.gable_parts.is_empty() {
+                parts.insert(1, (Material::Wall, &r.gables));
+            } else {
+                parts.extend(r.gable_parts.iter().map(|(m, mesh)| (*m, mesh)));
+            }
+            add(&mut w, &r.id, &parts);
             for d in &r.dormers {
                 add(&mut w, &format!("{}.roof", d.id), &[(Material::Steel, &d.roof)]);
                 add(&mut w, &format!("{}.cheeks", d.id), &[(Material::Steel, &d.cheeks)]);

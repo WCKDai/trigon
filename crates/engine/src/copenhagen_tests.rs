@@ -11,6 +11,26 @@ fn session() -> Session {
 }
 
 #[test]
+fn mansard_gable_render_material_follows_the_host_facade_finish() {
+    let mut s = session();
+    s.execute("facade.set_finish", json!({"finish":"yellow_brick"})).unwrap();
+    s.execute("building.set_roof", json!({"kind":"mansard","thickness_mm":220,"gables":["b.f2","b.f4"]})).unwrap();
+    let bytes = trigon_io::glb::write(&build(&s.doc).unwrap(), &[]);
+    let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let glb: serde_json::Value = serde_json::from_slice(&bytes[20..20 + len]).unwrap();
+    let node = glb["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "b.roof").unwrap();
+    let mesh = node["mesh"].as_u64().unwrap() as usize;
+    let names = glb["meshes"][mesh]["primitives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| glb["materials"][p["material"].as_u64().unwrap() as usize]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"brick_yellow"), "the gable must render in the explicitly assigned yellow brick: {names:?}");
+    assert!(!names.contains(&"wall"), "an opt-in mansard gable must not silently use the old generic red wall material");
+}
+
+#[test]
 fn mansard_dormers_cut_real_roof_voids_and_keep_shared_edits_atomic() {
     let mut s = session();
     s.execute("types.install_copenhagen", json!({})).unwrap();

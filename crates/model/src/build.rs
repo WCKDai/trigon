@@ -262,6 +262,8 @@ pub struct BuiltRoof {
     pub cover: Mesh,
     /// Vertical gable triangles above gable walls.
     pub gables: Mesh,
+    /// Opt-in compound roofs retain each gable's explicit host finish for display/export.
+    pub gable_parts: Vec<(Material, Mesh)>,
     /// Gutters along the eaves.
     pub gutters: Mesh,
     pub eaves: f64,
@@ -913,10 +915,31 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             } else {
                 Vec::new()
             };
+            let mut gable_parts = std::collections::BTreeMap::<Material, Mesh>::new();
+            if compound {
+                for tri in &r.gables.triangles {
+                    let points = tri.map(|i| r.gables.positions.get(i as usize).copied().unwrap_or_default());
+                    let wall = walls
+                        .iter()
+                        .find(|w| {
+                            points.iter().all(|p| {
+                                let d = [p[0] - w.frame.origin[0], p[1] - w.frame.origin[1]];
+                                let along = d[0] * w.frame.t[0] + d[1] * w.frame.t[1];
+                                (d[0] * w.frame.n[0] + d[1] * w.frame.n[1]).abs() < 0.01 && along >= -0.01 && along <= w.frame.length + 0.01
+                            })
+                        })
+                        .ok_or_else(|| ModelError::Invalid("mansard gable has no matching host facade".into()))?;
+                    let mesh = gable_parts.entry(wall.finish).or_default();
+                    let base = mesh.positions.len() as u32;
+                    mesh.positions.extend(points);
+                    mesh.triangles.push([base, base + 1, base + 2]);
+                }
+            }
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
                 cover: r.cover,
                 gables: r.gables,
+                gable_parts: gable_parts.into_iter().collect(),
                 gutters: r.gutters,
                 eaves: h,
                 ridge: r.ridge,
