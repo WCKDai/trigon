@@ -414,34 +414,91 @@ pub(super) fn interior(fr: &FacadeFrame, r: Rect, depth: f64) -> Parts {
     parts
 }
 
-/// Sloped sill with a 5 mm underside drip groove. The back seats at the nominal opening
-/// bottom; no part rises into the opening. Composite sills stop at their door jamb.
-pub(super) fn sill(fr: &FacadeFrame, u: (f64, f64), z: f64, back: f64) -> Mesh {
-    let profile = [
-        [-40.0, z - 12.0],
-        [back, z],
-        [back, z - 32.0],
-        [-18.0, z - 44.0],
-        [-18.0, z - 39.0],
-        [-23.0, z - 39.0],
-        [-23.0, z - 44.0],
-        [-40.0, z - 44.0],
-    ];
-    let mut m = Mesh::default();
-    for k in 0..profile.len() {
-        let j = (k + 1) % profile.len();
-        let (a, b) = (profile[k], profile[j]);
-        m.quad(fr.point(u.0, a[0], a[1]), fr.point(u.1, a[0], a[1]), fr.point(u.1, b[0], b[1]), fr.point(u.0, b[0], b[1]));
-    }
-    for (u, reverse) in [(u.0, true), (u.1, false)] {
-        let mut cap = Mesh::default();
-        cap.polygon(&profile, &[], |q| fr.point(u, q[0], q[1]));
-        if reverse {
-            for t in &mut cap.triangles {
-                t.swap(1, 2);
+/// Cap a sill section, retaining the collinear vertices at the wall face. They are
+/// needed where its narrower bed joins the projecting nose; an unsplit cap edge
+/// would leave a T junction despite the section looking closed in projection.
+fn sill_cap(fr: &FacadeFrame, u: f64, section: &[[f64; 2]], reverse: bool) -> Mesh {
+    let mut cap = Mesh::default();
+    cap.polygon(section, &[], |q| fr.point(u, q[0], q[1]));
+    let mut out = Mesh::default();
+    for triangle in &cap.triangles {
+        let pts = triangle.map(|i| cap.positions[i as usize]);
+        let mut boundary = Vec::new();
+        for i in 0..3 {
+            let (a, b) = (pts[i], pts[(i + 1) % 3]);
+            let delta: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
+            let length = delta.iter().map(|v| v * v).sum::<f64>();
+            let mut along = vec![(0.0, a)];
+            for p in &cap.positions {
+                let t = (0..3).map(|k| (p[k] - a[k]) * delta[k]).sum::<f64>() / length;
+                if t > 1e-8 && t < 1.0 - 1e-8 && (0..3).all(|k| (p[k] - a[k] - t * delta[k]).abs() < 1e-7) {
+                    along.push((t, *p));
+                }
+            }
+            along.sort_by(|a, b| a.0.total_cmp(&b.0));
+            boundary.extend(along.into_iter().map(|(_, p)| p));
+        }
+        let start = out.positions.len() as u32;
+        if boundary.len() == 3 {
+            out.positions.extend(pts);
+            out.triangles.push([start, start + 1, start + 2]);
+        } else {
+            let centre = std::array::from_fn(|k| (pts[0][k] + pts[1][k] + pts[2][k]) / 3.0);
+            out.positions.push(centre);
+            out.positions.extend_from_slice(&boundary);
+            for i in 0..boundary.len() as u32 {
+                out.triangles.push([start, start + 1 + i, start + 1 + (i + 1) % boundary.len() as u32]);
             }
         }
-        m.append(&cap);
+    }
+    if reverse {
+        for t in &mut out.triangles {
+            t.swap(1, 2);
+        }
+    }
+    out
+}
+
+/// Sloped sill seated ON the nominal rough-opening bottom, against the frame's front.
+/// Its 32 mm upstand covers the brick reveal without entering the frame or glazing.
+/// The 40 mm projecting nose retains its 5 mm underside drip; only that exterior part
+/// has ears. `u` is the nominal jamb span; composites use zero ears at their door jamb.
+pub(super) fn sill(fr: &FacadeFrame, u: (f64, f64), z: f64, back: f64, ears: f64) -> Mesh {
+    let at_wall = z + 20.0 + 12.0 * 40.0 / (back + 40.0);
+    let nose = [
+        [-40.0, z + 20.0],
+        [0.0, at_wall],
+        [0.0, z],
+        [0.0, z - 12.0],
+        [-18.0, z - 12.0],
+        [-18.0, z - 7.0],
+        [-23.0, z - 7.0],
+        [-23.0, z - 12.0],
+        [-40.0, z - 12.0],
+    ];
+    let bed = [[0.0, at_wall], [back, z + 32.0], [back, z], [0.0, z]];
+    let section: Vec<_> = nose[..2].iter().chain(&bed[1..]).chain(&nose[3..]).copied().collect();
+    let mut m = Mesh::default();
+    let mut sweep = |span: (f64, f64), p: &[[f64; 2]]| {
+        for k in 0..p.len() {
+            let (a, b) = (p[k], p[(k + 1) % p.len()]);
+            m.quad(fr.point(span.0, a[0], a[1]), fr.point(span.1, a[0], a[1]), fr.point(span.1, b[0], b[1]), fr.point(span.0, b[0], b[1]));
+        }
+    };
+    sweep(u, &section);
+    if ears > 0.0 {
+        sweep((u.0 - ears, u.0), &nose);
+        sweep((u.1, u.1 + ears), &nose);
+        for (u, reverse) in [(u.0, true), (u.1, false)] {
+            m.append(&sill_cap(fr, u, &bed, reverse));
+        }
+        for (u, reverse) in [(u.0 - ears, true), (u.1 + ears, false)] {
+            m.append(&sill_cap(fr, u, &nose, reverse));
+        }
+    } else {
+        for (u, reverse) in [(u.0, true), (u.1, false)] {
+            m.append(&sill_cap(fr, u, &section, reverse));
+        }
     }
     m
 }
@@ -488,6 +545,131 @@ mod tests {
         // Check the whole middle of the cross rail, allowing family profile widths to change.
         assert!((1975..=2025).any(|v| !covers(glass, [300.0, f64::from(v)])), "top lights need separate panes either side of the transom");
         assert!(covers(glass, [300.0, 1400.0]) && covers(glass, [900.0, 2200.0]), "clear lights must remain glazed");
+    }
+
+    // Axis-aligned ray/triangle intersections, deduplicated at shared triangle edges.
+    // Sorted pairs bound solid intervals, so an occluded or intersecting part cannot pass
+    // merely because its facade silhouette looks plausible.
+    fn ray_cuts(mesh: &Mesh, axis: usize, q: [f64; 2]) -> Vec<f64> {
+        let axes = if axis == 2 { [0, 1] } else { [0, 2] };
+        let cross = |a: [f64; 2], b: [f64; 2]| a[0] * b[1] - a[1] * b[0];
+        let mut hits: Vec<_> = mesh
+            .triangles
+            .iter()
+            .filter_map(|tri| {
+                let [a, b, c] = tri.map(|i| mesh.positions[i as usize]);
+                let delta = |p: [f64; 3]| [p[axes[0]] - a[axes[0]], p[axes[1]] - a[axes[1]]];
+                let (ab, ac) = (delta(b), delta(c));
+                let aq = [q[0] - a[axes[0]], q[1] - a[axes[1]]];
+                let d = cross(ab, ac);
+                if d.abs() < 1e-9 {
+                    return None;
+                }
+                let (s, t) = (cross(aq, ac) / d, cross(ab, aq) / d);
+                (s >= -1e-9 && t >= -1e-9 && s + t <= 1.0 + 1e-9).then_some(a[axis] + s * (b[axis] - a[axis]) + t * (c[axis] - a[axis]))
+            })
+            .collect();
+        hits.sort_by(f64::total_cmp);
+        hits.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        hits
+    }
+
+    #[test]
+    fn window_sills_cover_the_reveal_bed_without_entering_masonry_or_joinery() {
+        use crate::component::{Muntins, WindowShape};
+        let r = Rect { u0: 100.0, u1: 1300.0, v0: 850.0, v1: 2350.0 };
+        for wall in [100.0, 190.0, 400.0, 1500.0] {
+            let reveal = REVEAL.min(wall - FRAME_DEPTH);
+            for kind in [
+                ComponentKind::Window { lights: 2, top_light: 350.0 },
+                ComponentKind::FixedWindow,
+                ComponentKind::HistoricWindow {
+                    shape: WindowShape::Segmental { rise_mm: 150.0 },
+                    lights: 2,
+                    top_light: 350.0,
+                    panes_across: 1,
+                    panes_down: 1,
+                    muntins: Muntins::TrueDivided,
+                    muntin_width_mm: 22.0,
+                    operable: true,
+                },
+            ] {
+                let parts = fill_parts(&facade(), r, &kind, Fill { wall, finish: Material::Wall, floor: 0.0, ceiling: 3000.0 });
+                let sill = &parts.iter().find(|(m, _)| *m == Material::Sill).unwrap().1;
+                let centre = (r.u0 + r.u1) / 2.0;
+                let bed = ray_cuts(sill, 2, [centre, reveal / 2.0]);
+                assert_eq!(bed.len(), 2, "sill bed must be one closed section");
+                assert!(bed[0] >= r.v0, "sill bed is buried in masonry: {bed:?}");
+                assert!(bed[1] > r.v0 + 1.0, "sill must cover the exposed horizontal brick reveal");
+                assert_eq!(bed[0], r.v0, "sill must seat on the rough opening without floating");
+                let front = ray_cuts(sill, 2, [centre, -30.0]);
+                let back = ray_cuts(sill, 2, [centre, reveal - 0.1]);
+                assert!(front[1] < bed[1] && bed[1] < back[1], "water must drain outwards");
+                let (lo, hi) = sill.bounds().unwrap();
+                assert_eq!((lo[0], hi[0], lo[1], hi[1]), (r.u0 - 30.0, r.u1 + 30.0, -40.0, reveal));
+                for p in &sill.positions {
+                    if p[1] > 1e-6 {
+                        assert!(p[0] >= r.u0 && p[0] <= r.u1 && p[2] >= r.v0, "sill or ear enters the masonry: {p:?}");
+                    }
+                }
+                for u in [r.u0 - 15.0, r.u1 + 15.0] {
+                    assert!(ray_cuts(sill, 2, [u, reveal / 2.0]).is_empty(), "ears must stop outside the jambs");
+                    assert_eq!(ray_cuts(sill, 2, [u, -30.0]).len(), 2, "exterior sill ears remain solid");
+                }
+                sound(sill);
+            }
+        }
+    }
+
+    #[test]
+    fn composite_sill_seats_above_its_infill_and_stops_at_the_door_jamb() {
+        let r = Rect { u0: 100.0, u1: 2000.0, v0: 0.0, v1: 2300.0 };
+        for side in [Side::Left, Side::Right] {
+            let kind = ComponentKind::DoorWindow { door_width: 850.0, door_side: side, window_sill: 800.0, lights: 2 };
+            let parts = fill(r, &kind);
+            let (dr, wr) = opening_split(r, 850.0, side);
+            let (_, wr) = opening_joint(dr, wr, side);
+            let sill = &parts.iter().find(|(m, _)| *m == Material::Sill).unwrap().1;
+            let bed = ray_cuts(sill, 2, [(wr.u0 + wr.u1) / 2.0, REVEAL / 2.0]);
+            assert_eq!(bed.len(), 2);
+            assert!(bed[0] >= 800.0, "composite sill is buried in its solid masonry infill: {bed:?}");
+            assert_eq!(bed[0], 800.0);
+            for p in &sill.positions {
+                if p[2] > 100.0 {
+                    assert!(p[0] >= wr.u0 && p[0] <= wr.u1, "window sill must not cross the door jamb");
+                    if p[1] > 1e-6 {
+                        assert!(p[2] >= 800.0, "window sill must not intersect the infill");
+                    }
+                }
+            }
+            sound(sill);
+        }
+    }
+
+    #[test]
+    fn window_panes_clear_the_stepped_sashes_stops_mullions_transoms_and_sills() {
+        let r = Rect { u0: 100.0, u1: 1300.0, v0: 850.0, v1: 2350.0 };
+        for kind in [ComponentKind::Window { lights: 2, top_light: 350.0 }, ComponentKind::FixedWindow] {
+            let parts = fill(r, &kind);
+            let glass = &parts.iter().find(|(m, _)| *m == Material::Glass).unwrap().1;
+            for (material, solid) in parts.iter().filter(|(m, _)| matches!(m, Material::Frame | Material::Sill)) {
+                for p in glass.positions.iter().copied().chain(glass.triangles.iter().map(|t| {
+                    let [a, b, c] = t.map(|i| glass.positions[i as usize]);
+                    std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0)
+                })) {
+                    let hits = ray_cuts(solid, 1, [p[0], p[2]]);
+                    assert_eq!(hits.len() % 2, 0, "closed joinery ray must enter and leave");
+                    assert!(
+                        !hits.as_chunks::<2>().0.iter().any(|h| p[1] > h[0] + 1e-6 && p[1] < h[1] - 1e-6),
+                        "glass intersects {material:?} at {p:?}"
+                    );
+                }
+            }
+            let frame = &parts.iter().find(|(m, _)| *m == Material::Frame).unwrap().1;
+            let sill = &parts.iter().find(|(m, _)| *m == Material::Sill).unwrap().1;
+            assert_eq!(sill.bounds().unwrap().1[1], frame.bounds().unwrap().0[1], "sill back must meet the frame front without entering it");
+            assert!(sill.positions.iter().any(|p| p[1] == REVEAL && p[2] == r.v0), "sill and frame must share their bottom seating line");
+        }
     }
 
     #[test]
@@ -586,7 +768,9 @@ mod tests {
         }
         sound(&super::panel(&fr, r, (40.0, 80.0)));
         sound(&super::barrel(&fr, 40.0, 120.0, 300.0, 6.0, 40.0));
-        sound(&super::sill(&fr, (0.0, 900.0), 850.0, 120.0));
+        for ears in [0.0, 30.0] {
+            sound(&super::sill(&fr, (0.0, 900.0), 850.0, 120.0, ears));
+        }
     }
 
     #[test]

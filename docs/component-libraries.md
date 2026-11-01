@@ -95,6 +95,15 @@ separate; material fractions are unset rather than invented. This follows the pu
 [constituent set](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcmaterialresource/lexical/ifcmaterialconstituentset.htm)
 and [shape aspect](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2/HTML/schema/ifcrepresentationresource/lexical/ifcshapeaspect.htm) contracts.
 
+Window sills seat on the nominal rough-opening bottom and meet the front of the frame. The
+illustrative family section rises 32 mm at the back, slopes down 12 mm to its 40 mm projecting
+nose, and keeps a 5 mm underside drip groove. The 30 mm ears extend only outside the wall face;
+the bed stays between the nominal jambs. Composite door/window units omit ears at their jambs.
+These are original presentation defaults, not surveyed construction dimensions. This seating
+correction changes generated sill geometry without changing stored family parameters, opening
+width/height/sill, IDs, phases, or scheduled opening quantities. Reverting the correction restores
+the earlier geometry without a document migration.
+
 Regression tests cover exact type round trips, read-only exports, shared dimension/finish changes,
 preserved instance overrides, batch/host failures, file limits and exact Undo. Revert the library
 feature commit to roll back the commands; imported ordinary type definitions remain compatible
