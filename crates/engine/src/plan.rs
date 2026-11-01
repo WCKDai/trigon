@@ -133,7 +133,7 @@ pub(crate) fn facade_crossing(ring: &[[f64; 2]], from: [f64; 2], dir: [f64; 2]) 
         .min_by(f64::total_cmp)
 }
 
-fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&trigon_model::Stair> {
+pub(crate) fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&trigon_model::Stair> {
     let outgoing: Vec<_> = b.stairs.iter().filter(|s| s.levels.contains(&level)).collect();
     b.stairs
         .iter()
@@ -799,7 +799,7 @@ pub(crate) struct Label {
     pub(crate) fs: f64,
     pub(crate) text: String,
     pub(crate) balcony: bool,
-    pub(crate) source: Option<String>,
+    pub(crate) source: Option<crate::sheet::TextSource>,
     pub(crate) clearance: Option<crate::sheet::TextClearance>,
 }
 
@@ -1062,7 +1062,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                     fs,
                     text: text.replace(" x ", " × "),
                     balcony: text.starts_with("Ca. "),
-                    source: elements.get(&index).map(|e| format!("element:{}:size", e.id)),
+                    source: elements.get(&index).map(|e| crate::sheet::TextSource { kind: "element", id: e.id.clone(), role: "balcony_size" }),
                     clearance,
                 });
             }

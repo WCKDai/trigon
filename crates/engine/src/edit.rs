@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use trigon_model::build::FacadeFrame;
 use trigon_model::doc::{InteriorWall, Room, Stair};
@@ -15,7 +15,7 @@ use crate::{Result, Session};
 const MAX_TARGETS: usize = 256;
 const MAX_COPIES: usize = 5000;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Selection {
     /// Studio element ids, or wall:<id>, stair:<id>, room:<id> for every storey of a definition.
@@ -23,7 +23,7 @@ pub(crate) struct Selection {
     pub targets: Vec<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Move {
     pub targets: Vec<String>,
@@ -32,7 +32,7 @@ pub(crate) struct Move {
     pub delta: [f64; 3],
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Copy {
     pub targets: Vec<String>,
@@ -46,7 +46,7 @@ fn one() -> usize {
     1
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CopyToLevels {
     pub targets: Vec<String>,
@@ -57,7 +57,7 @@ pub(crate) struct CopyToLevels {
     pub replace: bool,
 }
 
-#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Axis {
     X,
@@ -66,7 +66,7 @@ pub(crate) enum Axis {
     Z,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Anchor {
     Start,
@@ -75,7 +75,7 @@ pub(crate) enum Anchor {
     End,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Align {
     pub targets: Vec<String>,
@@ -90,7 +90,7 @@ pub(crate) struct Align {
     pub anchor: Anchor,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WallFace {
     #[default]
@@ -111,7 +111,7 @@ impl WallFace {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AlignWalls {
     pub targets: Vec<String>,
@@ -434,7 +434,7 @@ pub(crate) fn list_groups(s: &Session) -> Value {
     }).collect::<Vec<_>>()})
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupId {
     pub id: String,
@@ -917,6 +917,90 @@ pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {
         };
         checked_delta(delta)?;
         changes.push(entry.shifted(&s.doc, delta)?);
+    }
+    let mut ids = Vec::new();
+    for (entry, item) in entries.iter().zip(changes) {
+        let shared = remove(&mut s.doc, entry)?;
+        let next = put(&mut s.doc, entry, item, shared, false, false)?;
+        remap_references(&mut s.doc, entry, &next, shared);
+        ids.push(next);
+    }
+    finish(s, ids)
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WallEndpoint {
+    /// Exact wall source selector or storey occurrence, never a nearest-ID guess.
+    pub target: String,
+    pub end: WallEnd,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WallEnd {
+    A,
+    B,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectWalls {
+    pub endpoints: Vec<WallEndpoint>,
+    /// Explicit common centre-line junction, site-local mm.
+    pub junction: [f64; 2],
+    /// Maximum displacement of each selected source endpoint, mm (0.001..300).
+    pub max_move_mm: f64,
+}
+
+pub(crate) fn connect_walls(s: &mut Session, mut p: ConnectWalls) -> Result<Value> {
+    checked("junction tolerance", p.max_move_mm, 0.001, 300.0)?;
+    for value in p.junction {
+        checked("junction coordinate", value, -1e8, 1e8)?;
+    }
+    if !(2..=16).contains(&p.endpoints.len()) {
+        return Err(invalid("connect 2 to 16 distinct wall endpoints"));
+    }
+    p.endpoints.sort_by(|a, b| a.target.cmp(&b.target));
+    if p.endpoints.iter().any(|e| e.target.starts_with("group:")) || p.endpoints.windows(2).any(|w| w[0].target == w[1].target) {
+        return Err(invalid("select distinct wall sources directly, not groups"));
+    }
+    let targets: Vec<_> = p.endpoints.iter().map(|e| e.target.clone()).collect();
+    let entries = selected(&s.doc, &targets)?;
+    let mut levels = None;
+    let mut changes = Vec::new();
+    for (entry, endpoint) in entries.iter().zip(&p.endpoints) {
+        let Item::Wall(wall) = &entry.item else {
+            return Err(invalid("junction targets must be interior walls"));
+        };
+        let scope = (entry.building, wall.levels.iter().copied().collect::<BTreeSet<_>>());
+        if levels.as_ref().is_some_and(|old| old != &scope) {
+            return Err(invalid("junction endpoints must belong to the same building and storeys"));
+        }
+        levels = Some(scope);
+        let at = match endpoint.end {
+            WallEnd::A => wall.a,
+            WallEnd::B => wall.b,
+        };
+        checked("junction endpoint movement", (at[0] - p.junction[0]).hypot(at[1] - p.junction[1]), 0.0, p.max_move_mm)?;
+        let mut next = wall.clone();
+        match endpoint.end {
+            WallEnd::A => next.a = p.junction,
+            WallEnd::B => next.b = p.junction,
+        };
+        let old_len = (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]);
+        let new_len = checked("connected wall length", (next.b[0] - next.a[0]).hypot(next.b[1] - next.a[1]), 100.0, 200_000.0)?;
+        let t = [(next.b[0] - next.a[0]) / new_len, (next.b[1] - next.a[1]) / new_len];
+        for (old, door) in wall.doors.iter().zip(&mut next.doors) {
+            let world = [wall.a[0] + (wall.b[0] - wall.a[0]) * old.at / old_len, wall.a[1] + (wall.b[1] - wall.a[1]) * old.at / old_len];
+            let d = [world[0] - next.a[0], world[1] - next.a[1]];
+            if (d[0] * t[1] - d[1] * t[0]).abs() > 0.001 {
+                return Err(invalid("junction would move a hosted door off its current world position; align the wall first"));
+            }
+            door.at = d[0] * t[0] + d[1] * t[1];
+        }
+        next.validate(s.doc.buildings[entry.building].storeys.len())?;
+        changes.push(Item::Wall(next));
     }
     let mut ids = Vec::new();
     for (entry, item) in entries.iter().zip(changes) {

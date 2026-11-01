@@ -102,6 +102,14 @@ fn find<'a>(doc: &'a Document, id: &str) -> Result<&'a DrawingView> {
 }
 
 pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
+    sheet_with_clipping(doc, id, phase, true)
+}
+
+pub(crate) fn sheet_unclipped(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
+    sheet_with_clipping(doc, id, phase, false)
+}
+
+fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> Result<Sheet> {
     annotation::validate_document(doc)?;
     let view = find(doc, id)?;
     view.validate_source(doc)?;
@@ -152,7 +160,7 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
     for a in doc.annotations.iter().filter(|a| a.view == id && !matches!(a.kind, AnnotationKind::Region { .. })) {
         draw(&mut sheet.scene, a);
     }
-    if let Some(template) = &view.template {
+    if finish && let Some(template) = &view.template {
         crate::view_config::finish(&mut sheet, template);
     }
     sheet.metrics["view"] = json!(id);

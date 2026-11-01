@@ -103,6 +103,54 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| crate::terrain::sample(s, parse("site.sample_terrain", v)?),
     },
     CommandSpec {
+        id: "view.audit",
+        summary: "Read-only lettering validation at final physical view scale. Measures bundled SVG glyph ink/halos, rotated corners, crop clipping and potential text overlaps; returns exact annotation/element provenance and unrounded dimension values. No automatic movement or suppression.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::lettering_audit::Audit>,
+        run: |s, v| crate::lettering_audit::audit(s, parse("view.audit", v)?),
+    },
+    CommandSpec {
+        id: "precision.audit",
+        summary: "Read-only bounded sanity audit: wall gaps, near-parallel material overlaps, end-to-end axis/face misalignment, small abrupt angle changes, and overlapping visible/departing stairs. Wall solids use a 1000 mm floor cut. Exact IDs, storeys, distances, closest points and deltas; build errors and ambiguous IDs are explicit. Findings require review and never trigger repairs.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::precision_audit::Audit>,
+        run: |s, v| crate::precision_audit::audit(s, parse("precision.audit", v)?),
+    },
+    CommandSpec {
+        id: "precision.preview",
+        summary: "Preview a typed local placement/repair action on a separate document. Returns exact source changes, validation and an opaque same-build token bound to the complete document and action. Read-only: no journal, files, credentials or network.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::precision::Preview>,
+        run: |s, v| crate::precision::preview(s, parse("precision.preview", v)?),
+    },
+    CommandSpec {
+        id: "precision.apply",
+        summary: "Apply precisely the previewed action if the complete document and action still match its token. Rejects stale previews; validates model and annotations, one atomic journal entry and exact Undo. Tokens are conflict checks, not authorization.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::precision::Apply>,
+        run: |s, v| crate::precision::apply(s, parse("precision.apply", v)?),
+    },
+    CommandSpec {
+        id: "edit.connect_walls",
+        summary: "Connect 2 to 16 explicitly selected interior-wall endpoints to an exact centre-line junction, within a caller-specified 0.001..300 mm displacement limit. Keeps other storeys and hosted door world positions; rejects ambiguous/mixed scopes. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::ConnectWalls>,
+        run: |s, v| crate::edit::connect_walls(s, parse("edit.connect_walls", v)?),
+    },
+    CommandSpec {
+        id: "annotation.move_label",
+        summary: "Move a saved text/leader label by exact drawing-plane mm, preserving style/content and leader witnesses. Dimensions move only perpendicular to their measurement; level marks horizontally. Generated labels are excluded. Validated, atomic, undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::precision::MoveLabel>,
+        run: |s, v| crate::precision::move_label(s, parse("annotation.move_label", v)?),
+    },
+    CommandSpec {
         id: "element.get",
         summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
         mutates: false,
@@ -1038,8 +1086,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "drawing.to_site",
-        summary: "Convert drawing pixels on a registered plan to site mm (x east, y north), to place walls, stairs and rooms read \
-                  off the drawing.",
+        summary: "Convert registered plan pixels to site mm. exact:true preserves unrounded f64 coordinates; default whole-mm output is unchanged. Coordinates inherit the source registration's accuracy.",
         mutates: false,
         journaled: false,
         schema: schema::<ToSite>,
@@ -1054,16 +1101,27 @@ static COMMANDS: &[CommandSpec] = &[
             if p.points.len() > 10_000 || p.points.iter().flatten().any(|v| !v.is_finite()) {
                 return Err(ModelError::Invalid("give up to 10000 finite points".into()).into());
             }
+            if p.exact && p.points.iter().flat_map(|q| reg.to_site(*q)).any(|v| !v.is_finite() || v.abs() > 1e8) {
+                return Err(ModelError::Invalid("exact converted points must be finite site-local coordinates within 100 km".into()).into());
+            }
             Ok(json!(
                 p.points
                     .iter()
                     .map(|q| {
                         let r = reg.to_site(*q);
-                        [r[0].round(), r[1].round()]
+                        if p.exact { r } else { [r[0].round(), r[1].round()] }
                     })
                     .collect::<Vec<_>>()
             ))
         },
+    },
+    CommandSpec {
+        id: "drawing.measure_stair",
+        summary: "Measure a stair candidate on a registered scan without changing the document/history. Returns full-precision source parameters, fit measurements and mm/pixel resolution. Does not claim survey accuracy or add/replace stairs; preview an explicit element.set action to apply it.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::precision::MeasureStair>,
+        run: |s, v| crate::precision::measure_stair(s, parse("drawing.measure_stair", v)?),
     },
     CommandSpec {
         id: "drawing.fit_stair",
@@ -1793,6 +1851,9 @@ struct DrawingRegister {
 #[serde(deny_unknown_fields)]
 struct ToSite {
     name: String,
+    /// Return unrounded coordinates. False preserves the legacy whole-mm output.
+    #[serde(default)]
+    exact: bool,
     /// A storey the plan is registered for.
     level: usize,
     /// Drawing pixels [x, y].

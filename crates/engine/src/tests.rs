@@ -2127,3 +2127,289 @@ fn stair_associations_survive_align_parameter_copy_replace_basement_and_cleanup(
     assert!(s.doc.buildings[0].add_basement(-2500., "Basement").is_err());
     assert_eq!(s.doc, before);
 }
+
+#[test]
+fn precision_preview_connect_apply_audit_preserves_doors_other_storeys_and_history() {
+    let mut s = Session::new(Box::new(Canned));
+    s.doc
+        .buildings
+        .push(trigon_model::Building::new("b", "Precision fixture", &[[0., 0.], [20000., 0.], [20000., 12000.], [0., 12000.]], 2, 3000.).unwrap());
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"west","levels":[0,1],"a":[1000,4000],"b":[5000,4000],"thickness":100,"doors":[{"at":2000,"width":800}]},
+            {"id":"east","levels":[0,1],"a":[5005,4000],"b":[10000,4000],"thickness":100,"doors":[{"at":2000,"width":800}]},
+            {"id":"door-gap","levels":[0,1],"a":[10800,4000],"b":[14000,4000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let before_dirty = s.dirty;
+    let audit = s.execute("precision.audit", json!({"levels":[0],"gap_tolerance_mm":10,"max_results":1})).unwrap();
+    assert_eq!(audit["total_findings"], 2);
+    assert_eq!(audit["truncated"], true);
+    assert_eq!(audit["findings"][0]["gap_mm"], 5.);
+    let action = json!({"command":"edit.connect_walls","params":{"endpoints":[
+        {"target":"west.L0","end":"b"},{"target":"east.L0","end":"a"}],"junction":[5002.5,4000],"max_move_mm":3}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(s.dirty, before_dirty);
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["validation"]["model_build"], "passed");
+    assert!(!preview["changes"].as_array().unwrap().is_empty());
+    assert_eq!(preview, s.execute("precision.preview", json!({"action":action})).unwrap());
+    let mut wrong = action.clone();
+    wrong["params"]["junction"] = json!([5002.6, 4000]);
+    assert!(s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":wrong})).is_err());
+    assert_eq!(s.doc, before);
+    s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.doc.journal.last().unwrap().command, "precision.apply");
+    let walls = &s.doc.buildings[0].interior_walls;
+    let west = walls.iter().find(|w| w.levels == [0] && w.id.starts_with("west.")).unwrap();
+    let east = walls.iter().find(|w| w.levels == [0] && w.id.starts_with("east.")).unwrap();
+    assert_eq!(west.b, [5002.5, 4000.]);
+    assert_eq!(east.a, west.b);
+    assert_eq!(west.doors[0].at, 2000.);
+    assert_eq!(east.a[0] + east.doors[0].at, 7005.);
+    for original in &before.buildings[0].interior_walls {
+        let retained = walls.iter().find(|w| w.id == original.id).unwrap();
+        assert_eq!(retained.a, original.a);
+        assert_eq!(retained.b, original.b);
+        assert_eq!(retained.doors, original.doors);
+    }
+    let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    assert_eq!(audit["status"], "no_findings_in_scope", "{audit}");
+    assert!(s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).is_err());
+    let after = s.doc.clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    // Read-only previews and audits must also preserve a pending Redo.
+    s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+}
+
+#[test]
+fn precision_repairs_reject_wrong_scope_excess_motion_and_hosted_door_drift_atomically() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"one","levels":[0,1],"a":[-6000,0],"b":[-2000,0],"thickness":100,"doors":[{"at":2000,"width":800}]},
+            {"id":"two","levels":[0,1],"a":[-1995,0],"b":[2000,0],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    for params in [
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L0","end":"a"}],"junction":[-1998,1],"max_move_mm":10}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L1","end":"a"}],"junction":[-1998,0],"max_move_mm":10}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L0","end":"a"}],"junction":[-1998,0],"max_move_mm":1}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"one.L0","end":"a"}],"junction":[-1998,0],"max_move_mm":10}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L0","end":"a"}],"junction":[1e300,0],"max_move_mm":300}),
+    ] {
+        assert!(s.execute("edit.connect_walls", params.clone()).is_err());
+        assert_eq!(s.doc, before);
+        assert!(s.execute("precision.preview", json!({"action":{"command":"edit.connect_walls","params":params}})).is_err());
+        assert_eq!(s.doc, before);
+    }
+    assert!(s.execute("precision.preview", json!({"action":{"command":"document.open","params":{"path":"/etc/passwd"}}})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_label_moves_preserve_witnesses_styles_and_level_values() {
+    let mut s = session();
+    s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+    let facade = s.doc.buildings[0].facades[0].id.clone();
+    s.execute("view.define", json!({"id":"e","name":"Elevation","kind":{"view":"facade","facade":facade}})).unwrap();
+    for (id, kind, delta) in [
+        ("text", json!({"annotation":"text","at":[0,0],"text":"Kitchen","rotation_deg":30}), [0.125, -0.375]),
+        ("leader", json!({"annotation":"leader","tip":[0,0],"elbow":[1000,500],"at":[2000,500],"text":"Detail"}), [0.125, -0.375]),
+        ("dimension", json!({"annotation":"dimension","from":[0,0],"to":[4000,0],"offset_mm":300}), [0., 125.125]),
+        ("level", json!({"annotation":"level","at":[1000,3000],"datum_mm":1000,"label":"FFL"}), [125.125, 0.]),
+    ] {
+        s.execute(
+            "annotation.define",
+            json!({"id":id,"view":if id=="level" {"e"} else {"p"},"size_mm":2.5,"style":{"family":"serif","bold":true},"kind":kind}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let action = json!({"command":"annotation.move_label","params":{"id":id,"delta":delta}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+        let mut expected = before.annotations.last().unwrap().clone();
+        match &mut expected.kind {
+            trigon_model::annotation::AnnotationKind::Text { at, .. } | trigon_model::annotation::AnnotationKind::Leader { at, .. } => {
+                at[0] += delta[0];
+                at[1] += delta[1];
+            }
+            trigon_model::annotation::AnnotationKind::Dimension { offset_mm, .. } => *offset_mm += delta[1],
+            trigon_model::annotation::AnnotationKind::Level { at, .. } => at[0] += delta[0],
+            _ => assert_eq!(expected.id, "unsupported fixture"),
+        }
+        assert_eq!(s.doc.annotations.last().unwrap(), &expected);
+        let changed = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, changed);
+    }
+    let before = s.doc.clone();
+    for (id, delta) in [("dimension", [1., 0.]), ("level", [0., 1.]), ("text", [f64::MAX, 0.])] {
+        assert!(s.execute("annotation.move_label", json!({"id":id,"delta":delta})).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn precision_lettering_audit_measures_real_fonts_scale_rotation_crop_and_exact_values() {
+    let mut s = Session::new(Box::new(Canned));
+    s.doc
+        .buildings
+        .push(trigon_model::Building::new("b", "Lettering fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 2, 3000.).unwrap());
+    s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+    s.execute("view.configure", json!({"id":"p","template":{"name":"100","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}))
+        .unwrap();
+    for (id, at) in [("wide-a", [2000, 4000]), ("wide-b", [3500, 4000])] {
+        s.execute(
+            "annotation.define",
+            json!({"id":id,"view":"p","size_mm":2.5,"kind":{"annotation":"text","at":at,"text":"WWWWWWWW","rotation_deg":0}}),
+        )
+        .unwrap();
+    }
+    s.execute(
+        "annotation.define",
+        json!({"id":"measured","view":"p","kind":{"annotation":"dimension","from":[2000,1000],"to":[4000.125,1000],"offset_mm":300}}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let audit = s.execute("view.audit", json!({"id":"p"})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(audit, s.execute("view.audit", json!({"id":"p"})).unwrap());
+    let labels = audit["labels"].as_array().unwrap();
+    let a = labels.iter().find(|l| l["source"]["id"] == "wide-a").unwrap();
+    let b = labels.iter().find(|l| l["source"]["id"] == "wide-b").unwrap();
+    let points = a["ink_corners_mm"].as_array().unwrap();
+    let width = (points[1][0].as_f64().unwrap() - points[0][0].as_f64().unwrap()) / 100.;
+    assert!(width > 18. && width < 19.);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "potential_text_overlap"
+        && f["keys"].as_array().unwrap().contains(&a["key"])
+        && f["keys"].as_array().unwrap().contains(&b["key"])));
+    let measured = labels.iter().find(|l| l["source"]["id"] == "measured").unwrap();
+    assert_eq!(measured["measurement_mm"], 2000.125);
+    assert_eq!(measured["text"], "2000.1");
+    let action = json!({"command":"annotation.move_label","params":{"id":"wide-b","delta":[2000.125,0]}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    let fixed = s.execute("view.audit", json!({"id":"p"})).unwrap();
+    assert!(!fixed["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "potential_text_overlap"), "{fixed}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("annotation.define",json!({"id":"wide-a","view":"p","size_mm":2.5,"style":{"family":"serif","bold":true,"italic":true},"kind":{"annotation":"text","at":[2000,4000],"text":"WWWWWWWW","rotation_deg":90}})).unwrap();
+    s.execute(
+        "view.configure",
+        json!({"id":"p","template":{"name":"crop","sizing":{"mode":"fixed","denominator":50,"centre":[6000,4000]},"crop":[1000,3000,11000,4500]}}),
+    )
+    .unwrap();
+    let audit = s.execute("view.audit", json!({"id":"p"})).unwrap();
+    let rotated = audit["labels"].as_array().unwrap().iter().find(|l| l["source"]["id"] == "wide-a").unwrap();
+    assert_eq!(rotated["rotation_deg"], 90.);
+    assert_eq!(rotated["clipped"], true);
+    let corners = rotated["ink_corners_mm"].as_array().unwrap();
+    let vertical = (corners[1][1].as_f64().unwrap() - corners[0][1].as_f64().unwrap()) / 50.;
+    assert!((vertical - 17.756).abs() < 0.005);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "clipped_label" && f["source"]["id"] == "wide-a"));
+}
+
+#[test]
+fn precision_audit_reports_overlapping_stair_sources_without_mutating_invalid_model() {
+    let mut s = session();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs":[{"id":"core","levels":[0],"outline":[[-6000,-2000],[-4000,-2000],[-4000,0],[-6000,0]],"kind":"u_turn","rounded":false}]}),
+    )
+    .unwrap();
+    let mut duplicate = s.doc.buildings[0].stairs[0].clone();
+    duplicate.id = "other".into();
+    s.doc.buildings[0].stairs.push(duplicate);
+    let before = s.doc.clone();
+    let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    assert_eq!(audit["geometry_valid"], false);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "overlapping_stair_sources"));
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_registered_pixel_conversion_keeps_opt_in_decimals_and_legacy_array_output() {
+    let mut s = session();
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "synthetic".into(),
+        path: "/virtual/not-read.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: 1000,
+        height: 1000,
+        note: String::new(),
+        facades: Vec::new(),
+        plans: vec![trigon_model::PlanRegistration { levels: vec![0], a: 1.125, b: 0.25, tx: 1000.0625, ty: -500.125 }],
+    });
+    let before = s.doc.clone();
+    let exact = s.execute("drawing.to_site", json!({"name":"synthetic","level":0,"exact":true,"points":[[100.125,200.375]]})).unwrap();
+    assert_eq!(exact, json!([[1162.796875, -700.515625]]));
+    let old = s.execute("drawing.to_site", json!({"name":"synthetic","level":0,"points":[[100.125,200.375]]})).unwrap();
+    assert_eq!(old, json!([[1163., -701.]]));
+    assert!(s.execute("drawing.to_site", json!({"name":"synthetic","level":0,"exact":true,"points":[[1e300,0]]})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_sanity_checks_find_kinks_misalignment_and_overlaps_without_straightening() {
+    for (other, thickness, kind) in [
+        (json!({"a":[5000,4000],"b":[9000,4200]}), 100., "sudden_wall_angle_change"),
+        (json!({"a":[5000,4000],"b":[7000,6000]}), 100., "sudden_wall_angle_change"),
+        (json!({"a":[5005,4005],"b":[9000,4005]}), 100., "misaligned_wall_run"),
+        (json!({"a":[1500,4000],"b":[4500,4000]}), 100., "near_parallel_wall_overlap"),
+    ] {
+        let mut s = Session::new(Box::new(Canned));
+        s.doc
+            .buildings
+            .push(trigon_model::Building::new("b", "Sanity fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.).unwrap());
+        s.execute(
+            "interior.add_walls",
+            json!({"walls":[
+                {"id":"first","levels":[0],"a":[1000,4000],"b":[5000,4000],"thickness":100},
+                {"id":"second","levels":[0],"a":other["a"],"b":other["b"],"thickness":thickness}
+            ]}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+        assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == kind), "expected {kind}: {audit}");
+        assert_eq!(s.doc, before);
+        if other["b"] == json!([7000, 6000]) {
+            let reviewed = s.execute("precision.audit", json!({"levels":[0],"expected_joint_angles_deg":[0,45,90]})).unwrap();
+            assert!(!reviewed["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "sudden_wall_angle_change"));
+            assert_eq!(s.doc, before);
+        }
+    }
+    // Different-thickness walls can intentionally align one face while their axes differ.
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"thick","levels":[0],"a":[-6000,0],"b":[-2000,0],"thickness":200},
+            {"id":"thin","levels":[0],"a":[-1995,50],"b":[2000,50],"thickness":100},
+            {"id":"perpendicular","levels":[0],"a":[0,-2000],"b":[0,2000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    assert!(
+        !audit["findings"].as_array().unwrap().iter().any(|f| matches!(f["kind"].as_str(), Some("misaligned_wall_run" | "sudden_wall_angle_change"))),
+        "{audit}"
+    );
+}

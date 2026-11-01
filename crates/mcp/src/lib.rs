@@ -24,7 +24,11 @@ site_load_address (outline, storeys and heights from public data) → facade_lis
 facade_set_bays → facade_place with component types from types_list (windows, doors, French and \
 cantilever balconies) → export_ifc / export_gltf → document_save. Lengths are millimetres. \
 Every change is checked; a refused change leaves the model as it was and the error says why. \
-edit_undo reverts the last change.";
+edit_undo reverts the last change. For precise reconstruction, prioritise registered drawings and \
+measured controls: drawing_to_site with exact:true or drawing_measure_stair → element_get / \
+view_snap → precision_audit and view_audit → precision_preview → precision_apply with the returned \
+preview_token and unchanged action → audit/export → edit_undo if needed. Preview never changes \
+the project. Millimetre calculations do not establish the accuracy of incomplete source evidence.";
 
 const STUDIO_INSTRUCTIONS: &str = " You are connected to Trigon Studio: the owner watches every \
 command land in the model and in the activity feed. studio_view shows them a level, a phase or the \

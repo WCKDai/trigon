@@ -213,12 +213,16 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
             if !named && !fits(area.chars().count(), 1) {
                 continue;
             }
+            let id = crate::room_element_id(building, index, level);
             if named {
-                sheet.scene.items.push(Item::Text(Text::new(Layer::Annotation, [at[0], at[1] + 1.75 * scale], &room.name, size)));
+                let mut text = Text::new(Layer::Annotation, [at[0], at[1] + 1.75 * scale], &room.name, size);
+                text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_name" });
+                sheet.scene.items.push(Item::Text(text));
             }
             let area_at = if named { [at[0], at[1] - 1.75 * scale] } else { at };
-            sheet.scene.items.push(Item::Text(Text::new(Layer::Annotation, area_at, area, size)));
-            let id = crate::room_element_id(building, index, level);
+            let mut text = Text::new(Layer::Annotation, area_at, area, size);
+            text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_area" });
+            sheet.scene.items.push(Item::Text(text));
             if !sheet.scene.element_regions.iter().any(|region| region.id == id) {
                 sheet.scene.element_regions.push(crate::DrawingElementRegion {
                     id,

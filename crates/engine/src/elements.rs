@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use trigon_model::build::{Built, BuiltElement, ElementClass, Status, View, build_view};
 use trigon_model::doc::{Building, FacadeKind, WallFinish};
@@ -20,7 +20,7 @@ pub(crate) struct Get {
     pub filter: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Set {
     pub id: String,

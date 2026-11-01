@@ -295,6 +295,14 @@ pub(crate) enum Halo {
     Box,
 }
 
+/// Transient source ownership for lettering diagnostics. Never persisted or exported as SVG attributes.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct TextSource {
+    pub(crate) kind: &'static str,
+    pub(crate) id: String,
+    pub(crate) role: &'static str,
+}
+
 /// A generated label's known dimension line. Transient layout data, never serialized.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TextClearance {
@@ -318,7 +326,7 @@ pub(crate) struct Text {
     pub(crate) halo: Halo,
     pub(crate) style: trigon_model::annotation::TextStyle,
     /// Stable source/role for read-only diagnostics, not SVG attributes or document data.
-    pub(crate) source: Option<String>,
+    pub(crate) source: Option<TextSource>,
     pub(crate) clearance: Option<TextClearance>,
 }
 

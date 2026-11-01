@@ -15,6 +15,7 @@ fn lettering(scene: &mut Scene, at: [f64; 2], value: &str, size: f64, rotation: 
 }
 
 pub(crate) fn draw(scene: &mut Scene, a: &Annotation) {
+    let start = scene.items.len();
     let s = scene.scale;
     let pen = Stroke::new(0.18);
     match &a.kind {
@@ -80,6 +81,11 @@ pub(crate) fn draw(scene: &mut Scene, a: &Annotation) {
         }
         AnnotationKind::Region { points, fill, border } => {
             scene.polygon(Layer::Annotation, vec![points.clone()], Some(Fill::Solid(*fill)), border.then_some(pen));
+        }
+    }
+    for item in scene.items.iter_mut().skip(start) {
+        if let crate::sheet::Item::Text(text) = item {
+            text.source = Some(crate::sheet::TextSource { kind: "annotation", id: a.id.clone(), role: "label" });
         }
     }
 }
