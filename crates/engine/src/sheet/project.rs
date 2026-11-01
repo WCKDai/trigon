@@ -386,8 +386,13 @@ fn feature_edges(tris: &[([u32; 3], Option<P3>, Class)], points: &[P3]) -> Vec<(
     // Boundary candidates by the line they lie on: (along-line interval, normal, side into the face, class).
     let mut lines: HashMap<[i64; 6], (P3, P3, Vec<(f64, f64, P3, P3, Class)>)> = HashMap::new();
     let mut keys = Vec::new();
-    for ((a, b), f) in &faces {
-        let (Some(pa), Some(pb)) = (point(*a), point(*b)) else { continue };
+    // The first boundary piece selects the exact line frame. Stable welded-vertex order keeps
+    // equivalent floating-point frames independent of each HashMap's random iteration seed.
+    let mut face_keys: Vec<_> = faces.keys().copied().collect();
+    face_keys.sort_unstable();
+    for (a, b) in face_keys {
+        let Some(f) = faces.get(&(a, b)) else { continue };
+        let (Some(pa), Some(pb)) = (point(a), point(b)) else { continue };
         let mut normals: Vec<P3> = f.iter().filter_map(|(i, _)| tris.get(*i)?.1).collect();
         let class = f.first().and_then(|(i, _)| tris.get(*i)).map_or(Class::Wall, |t| t.2);
         if f.len() == 1 {
@@ -860,6 +865,32 @@ mod tests {
         let pr = project(&[Source { mesh: &m, class: Class::Wall, group: 0, element: None }], &north(), (-1e5, 1e5), Near::Caps(&[]));
         assert!((total(&pr.edges) - 6000.0).abs() < 1.0, "only the outline: {}", total(&pr.edges));
         assert!(!pr.edges.iter().any(|e| (e.a[0] - 1000.0).abs() < 1e-6 && (e.b[0] - 1000.0).abs() < 1e-6), "no joint at x = 1 m");
+    }
+
+    #[test]
+    fn repeated_projection_keeps_identical_collinear_boundary_coordinates() {
+        // Shared sloping edges have equivalent line frames with slightly different floating
+        // arithmetic. Random hash iteration must not choose a different representative frame.
+        let mut mesh = Mesh::default();
+        for k in 0..8 {
+            let a = 300.05 + f64::from(k) * 1000.0;
+            let b = a + 1000.0;
+            mesh.quad([a, 1000.0, a / 3.0], [b, 1000.0, b / 3.0], [b, 1000.0, b / 3.0 + 500.0], [a, 1000.0, a / 3.0 + 500.0]);
+        }
+        let sources = [Source { mesh: &mesh, class: Class::Wall, group: 0, element: None }];
+        let coordinates = || {
+            let projection = project(&sources, &north(), (-1e5, 1e5), Near::Caps(&[]));
+            let mut edges: Vec<_> = projection.edges.into_iter().map(|e| if e.a <= e.b { [e.a, e.b] } else { [e.b, e.a] }).collect();
+            edges.sort_by(|a, b| {
+                a.iter().flatten().zip(b.iter().flatten()).map(|(a, b)| a.total_cmp(b)).find(|c| !c.is_eq()).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            edges
+        };
+        let expected = coordinates();
+        assert!(!expected.is_empty());
+        for _ in 0..32 {
+            assert_eq!(coordinates(), expected, "exact exported coordinates must not depend on hash seeds");
+        }
     }
 
     #[test]
