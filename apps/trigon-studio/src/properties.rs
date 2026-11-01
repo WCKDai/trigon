@@ -388,11 +388,12 @@ impl Gizmo {
         enabled: bool,
     ) -> (bool, Option<Edit>) {
         let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape) || i.viewport().focused == Some(false));
+        let was_active = self.active();
         if !enabled || self.drag.as_ref().is_some_and(|d| d.id != id || d.generation != generation) || cancelled {
             self.cancel();
         }
         if cancelled {
-            return (true, None);
+            return (was_active, None);
         }
         if !enabled {
             return (false, None);
@@ -472,6 +473,31 @@ mod tests {
                 gain: 1.0,
             },
             mapping: Mapping::Drawing { at: egui::pos2(100.0, 100.0), per_mm: egui::vec2(0.2, 0.0) },
+        }
+    }
+
+    #[test]
+    fn unfocused_gizmo_only_blocks_selection_when_cancelling_an_active_drag() {
+        for active in [false, true] {
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600., 400.));
+            let mut gizmo = Gizmo::default();
+            if active {
+                gizmo.begin("window", 1, &handle(), egui::pos2(100., 100.));
+            }
+            for frame in 0..2 {
+                let mut input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+                input.viewports.entry(egui::ViewportId::ROOT).or_default().focused = Some(false);
+                let mut busy = false;
+                let mut output = ctx.run_ui(input, |ui| {
+                    let result = gizmo.ui(ui, rect, "window", 1, &[handle()], true);
+                    busy = result.0;
+                    assert!(result.1.is_none());
+                });
+                output.textures_delta.clear();
+                assert_eq!(busy, active && frame == 0, "unfocused frame {frame}, active before cancellation {active}");
+                assert!(!gizmo.active());
+            }
         }
     }
 
