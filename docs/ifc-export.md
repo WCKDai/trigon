@@ -75,6 +75,39 @@ Why these choices:
   through the wall. Wherever Trigon's own wall piece is a closed solid this is its volume (the tests
   check it); see the limits below for where it isn't.
 
+### Roof fragments and solid coverage
+
+Roof cuts can leave small positive triangular caps. The ordinary profile path still requires
+three corners after the 0.01 mm cleanup, area greater than 1 mm² and depth greater than 1 mm.
+When that path rejects a fragment, a bounded fallback writes its existing `plane_solid` as an
+`IfcTriangulatedFaceSet`, without cleaning, retriangulating or enlarging its cap. The fallback
+accepts only a single triangular source cap matching its three boundary vertices. Multiple
+triangles need a separate proof of cap coverage: summing absolute triangle areas can hide
+overlap or cancellation.
+
+The fallback checks finite coordinates, a stable plane within 0.000001 mm, outward orientation,
+positive volume and a closed shell after welding at the writer's 0.000001 mm coordinate
+precision. Rounding must not invert or collapse a triangle or change volume by more than 0.1%.
+Area and volume must also remain positive at the existing quantity precision (0.001 mm² and
+1 mm³). Invalid, degenerate, unstable or unsupported fragments stay rejected and must be
+reported as uncovered. This is not permission to discard them from the source-model count.
+The slab keeps its source GlobalId, roof aggregation, `IfcSlab` .ROOF. class/type, tile style,
+material layers, `A-Tag` layer, common properties and base quantities. Fallback quantities use
+the uncleaned cap. Ordinary extrusions and existing non-square/warped tessellations retain their
+previous path.
+
+Solid coverage needs three separate checks: a source product exists in STEP, each reader builds
+it with the expected bounds, and its actual triangles preserve a finite outward closed solid.
+Zero reader failures or a successful schema check alone cannot detect a product omitted before
+export. `ifc.check` reports matched-product bounds; it does not certify complete solid coverage.
+The public regressions in `crates/io/src/ifc/tests/roof_fragments.rs` exercise small caps and a
+long thin cap that loses a corner during profile cleanup, and check the retained semantics and
+quantities. They also characterize a reader limitation: ifc-lite 27.1 drops the thin cap faces
+below its approximately 0.015259 mm triangle-height cleanup grid. That fixture has a valid closed
+IFC solid and a product in both readers, but its ifc-lite solid coverage is **incomplete**, even
+though product counts and bounds agree. Bimifc retains its closed solid. Neither the source nor
+the reader thresholds are changed to conceal that limitation.
+
 ### Window and door base quantities
 
 Window and door occurrences carry `Qto_WindowBaseQuantities` or
@@ -149,6 +182,10 @@ Every shape is on an `IfcPresentationLayerAssignment` (Vectorworks turns these i
   the building whatever way its sashes open.
 - A bare roof surface's planes hang square below it, so neighbouring planes overlap or leave small
   wedges at hips and ridges; the roof surface itself is exact. Built-up roofs follow Trigon's slab.
+- Tiny fragments amplify reader coordinate precision: the Rust readers return f32 geometry, so
+  sub-millimetre bounds agreement does not imply accurate volume for every narrow solid. Check
+  volume independently at higher precision before using such fragments for takeoff. Quantity
+  rounding itself is 0.001 mm² / 1 mm³; tiny nonzero quantities have limited relative precision.
 - No space boundaries (`IfcRelSpaceBoundary`); rooms are volumes only.
 - Wall build-ups (plaster thickness, floor and roof layers) are typical Copenhagen constructions,
   not surveyed ones; the total thickness is always the modelled one.

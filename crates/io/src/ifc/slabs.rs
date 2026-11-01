@@ -4,15 +4,82 @@
 //! an `IfcRoof`: a flat roof of one slab, a pitched roof of one slab per plane; gables are walls.
 
 use trigon_model::build::BuiltSlab;
-use trigon_model::{Built, SlabKind};
+use trigon_model::{Built, Mesh, SlabKind};
 
 use super::catalog::{self, Qty, Val};
-use super::part21::{Frame, area, ccw, clean_ring, gid, refs, string};
+use super::part21::{Frame, area, ccw, clean_ring, cross, dot, gid, refs, string, sub};
 use super::split::{self, ROOF_PLANE};
 use super::{Floors, Ifc};
 
 /// A floor this close to the terrain or below it rests on the ground (a basement or slab on grade), mm.
 const ON_GROUND: f64 = 300.0;
+
+#[cfg(test)]
+#[path = "tests/roof_fragments.rs"]
+mod tests;
+
+/// The bounded fallback for a rejected profile: an unchanged triangular source cap and its
+/// rise. Do not retriangulate or clean it. In particular, multiple cap triangles can overlap
+/// or cancel; a positive sum of absolute triangle areas does not prove a valid cap.
+fn roof_fragment_solid(piece: &split::RoofPiece, frame: &Frame) -> Option<Mesh> {
+    let [cap] = piece.surface.triangles.as_slice() else { return None };
+    if piece.polygon.len() != 3 || piece.surface.positions.len() != 3 {
+        return None;
+    }
+    let cap = [
+        *piece.surface.positions.get(cap[0] as usize)?,
+        *piece.surface.positions.get(cap[1] as usize)?,
+        *piece.surface.positions.get(cap[2] as usize)?,
+    ];
+    if !piece.polygon.iter().all(|p| cap.contains(p)) || piece.polygon.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e9) {
+        return None;
+    }
+    let n = cross(sub(cap[1], cap[0]), sub(cap[2], cap[0]));
+    let cap_area = dot(n, n).sqrt() / 2.0;
+    if !cap_area.is_finite() || cap_area < 0.0005 || piece.warp() > 1e-6 {
+        return None;
+    }
+    let mesh = split::plane_solid(piece);
+    let local: Vec<_> = mesh.positions.iter().map(|p| frame.local(*p)).collect();
+    if local.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e9) {
+        return None;
+    }
+    // Match faceset's real() precision, also welding the duplicated side/cap vertices at
+    // that precision. A shell must remain closed and outward after writing, not just before.
+    let keys: Vec<_> = local.iter().map(|p| p.map(|v| (v * 1e6).round() as i64)).collect();
+    let written: Vec<_> = keys.iter().map(|p| p.map(|v| v as f64 / 1e6)).collect();
+    let mut edges = std::collections::BTreeMap::<_, (usize, i32)>::new();
+    let (mut source_volume, mut written_volume) = (0.0, 0.0);
+    for t in &mesh.triangles {
+        let [a, b, c] = [*local.get(t[0] as usize)?, *local.get(t[1] as usize)?, *local.get(t[2] as usize)?];
+        let [wa, wb, wc] = [*written.get(t[0] as usize)?, *written.get(t[1] as usize)?, *written.get(t[2] as usize)?];
+        let alignment = dot(cross(sub(b, a), sub(c, a)), cross(sub(wb, wa), sub(wc, wa)));
+        if !alignment.is_finite() || alignment <= 0.0 {
+            return None;
+        }
+        source_volume += dot(a, cross(b, c)) / 6.0;
+        written_volume += dot(wa, cross(wb, wc)) / 6.0;
+        for k in 0..3 {
+            let (a, b) = (*keys.get(t[k] as usize)?, *keys.get(t[(k + 1) % 3] as usize)?);
+            let e = edges.entry((a.min(b), a.max(b))).or_default();
+            e.0 += 1;
+            e.1 += if a < b { 1 } else { -1 };
+        }
+    }
+    // Require positive quantities at Qto's 0.001 mm² / 1 mm³ resolution, and at most 0.1% change
+    // from coordinate rounding. Geometry below those limits stays explicitly uncovered.
+    if edges.is_empty()
+        || edges.values().any(|e| *e != (2, 0))
+        || !source_volume.is_finite()
+        || !written_volume.is_finite()
+        || source_volume < 0.5
+        || written_volume <= 0.0
+        || (written_volume - source_volume).abs() > source_volume * 0.001
+    {
+        return None;
+    }
+    Some(mesh)
+}
 
 impl Ifc<'_> {
     pub(super) fn slabs(&mut self, b: &Built, fl: &mut Floors) {
@@ -225,24 +292,30 @@ impl Ifc<'_> {
     fn roof_plane(&mut self, piece: &split::RoofPiece, up: &catalog::BuildUp, parent: super::part21::Placed, pitch: f64) -> Option<usize> {
         let frame = split::plane_frame(&piece.polygon)?;
         let ring: Vec<[f64; 2]> = piece.polygon.iter().map(|p| frame.local(*p)).map(|q| [q[0], q[1]]).collect();
-        let ring = ccw(clean_ring(&ring));
+        let profile = ccw(clean_ring(&ring));
         let rise = frame.local_dir(piece.rise);
         let depth = (rise[0] * rise[0] + rise[1] * rise[1] + rise[2] * rise[2]).sqrt();
-        if ring.len() < 3 || !(area(&ring) > 1.0) || !(depth > 1.0 && rise[2] > 0.0) {
+        if !depth.is_finite() || !(rise[2] > 0.0) {
             return None;
         }
+        let profile_safe = profile.len() >= 3 && area(&profile) > 1.0 && depth > 1.0;
+        let fallback = if profile_safe { None } else { Some(roof_fragment_solid(piece, &frame)?) };
         let placed = self.w.place(Some(parent), frame);
         // An extrusion only where it runs square to the plane: a built-up roof's planes rise
         // straight up (vertical fascias), which some readers (bimifc 0.1.0) extrude wrongly, and a
         // plane next to a gable is warped where the ridge was slid onto the gable. Those are
         // closed triangulated solids, as built.
         let square = rise[0].abs() + rise[1].abs() < 1e-6 * depth;
-        let shape = if !square || piece.warp() > split::WARP {
-            let item = self.w.faceset(&split::plane_solid(piece), &frame)?;
+        let shape = if fallback.is_some() || !square || piece.warp() > split::WARP {
+            let solid = match fallback {
+                Some(solid) => solid,
+                None => split::plane_solid(piece),
+            };
+            let item = self.w.faceset(&solid, &frame)?;
             self.cat.paint(&mut self.w, item, catalog::TILES);
             self.shape("Tessellation", &[item], None, catalog::L_ROOF)?
         } else {
-            let profile = self.w.profile(&ring, &[]);
+            let profile = self.w.profile(&profile, &[]);
             let position = self.w.axis2([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
             let solid = self.w.extrusion(profile, position, depth);
             self.cat.paint(&mut self.w, solid, catalog::TILES);
@@ -260,7 +333,7 @@ impl Ifc<'_> {
             None,
             vec![("IsExternal", Val::Bool(true)), ("LoadBearing", Val::Bool(true)), ("PitchAngle", Val::Angle(pitch.to_radians()))],
         );
-        let (a, t) = (area(&ring), piece.thickness());
+        let (a, t) = (area(if profile_safe { &profile } else { &ring }), piece.thickness());
         let qs = [
             Qty::Length("Width", t),
             Qty::Area("GrossArea", a / 1e6),
