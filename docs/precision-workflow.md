@@ -200,3 +200,10 @@ an empty string hides that part of the frame. Overrides are single-line text, do
 the building or alter model geometry/manual annotations/picking, and save/reopen/Undo through
 `view.configure`. Studio exposes the same controls in the view template settings. This lets
 a multi-building review sheet carry its actual project caption and evidence note.
+
+At an exact shared endpoint, collinear wall pieces of matching thickness are treated as
+one continuous run when resolving a T or four-way junction. This prevents both pieces
+from extending through the same branch and duplicating material. Thickness, combined run
+length and source order resolve priority; the saved axes, source IDs and lifetimes remain
+unchanged. Intentional gaps and noncoincident source ends are not snapped by this correction.
+Mixed-thickness transitions and other audit candidates still need source and joint review.

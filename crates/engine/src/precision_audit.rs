@@ -374,6 +374,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_collinear_wall_ends_do_not_report_generated_material_overlap() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        let mut b =
+            trigon_model::Building::new("b", "Shared-end fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.).unwrap();
+        b.interior_walls = serde_json::from_value(json!([
+            {"id":"run-south","levels":[0],"a":[6000,2800],"b":[6000,4000],"thickness":100},
+            {"id":"run-north","levels":[0],"a":[6000,4000],"b":[6000,6400],"thickness":100},
+            {"id":"branch","levels":[0],"a":[5200,4000],"b":[6000,4000],"thickness":100}
+        ]))
+        .unwrap();
+        s.doc.buildings.push(b);
+        let before = s.doc.clone();
+        let report = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+        assert!(
+            report["findings"].as_array().unwrap().iter().all(|f| f["kind"] != "near_parallel_wall_overlap"),
+            "already coincident source ends must not become overlapping joined solids: {report}"
+        );
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
     fn audit_feedback_keeps_complete_counts_and_inspects_actual_facade_sources() {
         let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
         let mut b =

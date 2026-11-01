@@ -110,11 +110,61 @@ struct Candidate {
     join: Join,
 }
 
+#[derive(Clone, Copy)]
+struct Run {
+    continued: bool,
+    length: f64,
+    first: usize,
+}
+
+fn endpoint_key(point: [f64; 2]) -> [u64; 2] {
+    // Signed zero names the same physical station; other source coordinates stay exact.
+    point.map(|v| if v == 0.0 { 0 } else { v.to_bits() })
+}
+
 /// Joins the walls of one storey. `facade` is the facade's inner face for this storey
 /// (counter-clockwise, one vertex per footprint corner) and `band` the facade wall's thickness.
 /// Output order matches the input.
 pub fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Joined> {
     let frames: Vec<_> = walls.iter().map(|w| frame(w.a, w.b)).collect();
+    // A shared, exactly collinear endpoint is a seam inside a continuous run,
+    // rather than two independent L corners. Index the exact stations rather than
+    // repeating the all-wall scan when determining each end's run priority.
+    let mut endpoints = std::collections::BTreeMap::<[u64; 2], Vec<(usize, usize)>>::new();
+    for (i, w) in walls.iter().enumerate() {
+        if frames[i].is_some() {
+            for (end, point) in [w.a, w.b].into_iter().enumerate() {
+                endpoints.entry(endpoint_key(point)).or_default().push((i, end));
+            }
+        }
+    }
+    let runs: Vec<[Run; 2]> = walls
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            std::array::from_fn(|end| {
+                let mut run = Run { continued: false, length: frames[i].map_or(0.0, |f| f.2), first: i };
+                let Some((t, _, len)) = frames[i] else { return run };
+                let point = if end == 0 { w.a } else { w.b };
+                let inward = if end == 0 { t } else { [-t[0], -t[1]] };
+                let Some(neighbours) = endpoints.get(&endpoint_key(point)) else { return run };
+                for &(j, other_end) in neighbours {
+                    let other = &walls[j];
+                    if i == j || (w.thickness - other.thickness).abs() > 1e-6 {
+                        continue;
+                    }
+                    let Some((tj, _, other_len)) = frames[j] else { continue };
+                    let direction = if other_end == 0 { tj } else { [-tj[0], -tj[1]] };
+                    if cross(inward, direction).abs() <= 1e-9 && dot(inward, direction) < 0.0 {
+                        run.continued = true;
+                        run.length = run.length.max(len + other_len);
+                        run.first = run.first.min(j);
+                    }
+                }
+                run
+            })
+        })
+        .collect();
     walls
         .iter()
         .enumerate()
@@ -185,7 +235,17 @@ pub fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Joined> {
                     }
                     // Near the other wall's end too: a corner, where the thicker wall runs through.
                     let corner = r < margin || r > lj - margin;
-                    let through = corner && runs_through(w, len, o, (lj, i, j));
+                    let at_start = r.abs() <= 1e-6;
+                    let at_end = (r - lj).abs() <= 1e-6;
+                    let junction = (sc - s_end).abs() <= 1e-6 && (at_start || at_end);
+                    let own_run = if junction { runs[i][e] } else { Run { continued: false, length: len, first: i } };
+                    let other_run = if junction { runs[j][usize::from(at_end)] } else { Run { continued: false, length: lj, first: j } };
+                    let through = corner && runs_through(w, own_run.length, o, (other_run.length, own_run.first, other_run.first));
+                    if through && own_run.continued {
+                        // Its continuation already fills the far side. Extending both
+                        // definitions through this branch would duplicate material.
+                        continue;
+                    }
                     let (face, kind) = if through { (far, JoinKind::Through) } else { (near, JoinKind::Butt) };
                     let face_off = side_offset(w.a, t, (o.a, nj, hj), face);
                     let rank = (sc - s_end).abs();
@@ -299,6 +359,51 @@ mod tests {
         let right = Axis { a: [4900.0, 4000.0], b: [8000.0, 4000.0], thickness: 120.0 };
         let out = join(&[left, right], &facade(), 400.0);
         assert!(close(out[0].b, [4000.0, 4000.0]) && close(out[1].a, [4900.0, 4000.0]));
+    }
+
+    #[test]
+    fn shared_collinear_ends_form_disjoint_t_junctions_without_gaps() {
+        // A continuous wall may be stored as two definitions. Its shared endpoint
+        // must not make both pieces extend through the same perpendicular branch.
+        for angle in [0.0_f64, 37.0, 90.0] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |p: [f64; 2]| [2700.0 + p[0] * cos - p[1] * sin, -800.0 + p[0] * sin + p[1] * cos];
+            for (branch_length, branch_width) in [(800.0, 100.0), (1800.0, 100.0), (4800.0, 100.0), (800.0, 240.0)] {
+                let base = [
+                    Axis { a: at([0.0, -1200.0]), b: at([0.0, 0.0]), thickness: 100.0 },
+                    Axis { a: at([0.0, 0.0]), b: at([0.0, 2400.0]), thickness: 100.0 },
+                    Axis { a: at([-branch_length, 0.0]), b: at([0.0, 0.0]), thickness: branch_width },
+                ];
+                for crossing in [false, true] {
+                    let mut raw = base.to_vec();
+                    let orders = if crossing {
+                        raw.push(Axis { a: at([0.0, 0.0]), b: at([1800.0, 0.0]), thickness: branch_width });
+                        vec![vec![0, 1, 2, 3], vec![3, 2, 1, 0], vec![2, 0, 3, 1], vec![1, 3, 0, 2]]
+                    } else {
+                        vec![vec![0, 1, 2], vec![1, 0, 2], vec![2, 0, 1], vec![2, 1, 0], vec![0, 2, 1], vec![1, 2, 0]]
+                    };
+                    for order in orders {
+                        for reversed in [false, true] {
+                            let sources: Vec<_> =
+                                order.iter().map(|&i| if reversed { Axis { a: raw[i].b, b: raw[i].a, ..raw[i] } } else { raw[i] }).collect();
+                            let joined = join(&sources, &[], 0.0);
+                            for x in [-200.0, -125.0, -75.0, -25.0, 25.0, 75.0, 125.0, 200.0] {
+                                for y in [-200.0, -125.0, -75.0, -25.0, 25.0, 75.0, 125.0, 200.0] {
+                                    let point = at([x, y]);
+                                    let expected = raw.iter().any(|w| inside(&square(w, None).outline, point));
+                                    let coverage = joined.iter().filter(|w| inside(&w.outline, point)).count();
+                                    assert_eq!(
+                                        coverage,
+                                        usize::from(expected),
+                                        "junction material must occur exactly once: angle={angle}, branch={branch_length}/{branch_width}, order={order:?}, reversed={reversed}, sample={x}/{y}, joined={joined:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
