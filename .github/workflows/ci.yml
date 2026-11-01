@@ -56,6 +56,9 @@ jobs:
           shared-key: trigon-trusted-linux
           cache-on-failure: true
           cache-targets: false
+          # alpha's home persists: rust-cache must not clean the runner user's ~/.cargo/bin
+          # (rustup, cargo-nextest), as it may on a throwaway runner.
+          cache-bin: false
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
