@@ -147,3 +147,16 @@ zero edges, duplicate building IDs and hostile coordinates are refused. Setting
 `preserve_vertices: false` explicitly chooses the legacy 200 mm context simplification.
 Use `building.set_levels` for unequal measured floors and `building.add_basement` for levels
 below ground. A numeric source value is not a claim that its dimension was actually measured.
+
+
+## Archival scan encoding
+
+The scan importer reads original JPEG and 1-bit grayscale CCITT Group 4 PDF image streams,
+without rendering, resampling or recompressing the page. Group 4 polarity follows PDF
+`BlackIs1` and `Decode`; dimensions/rows are checked before allocating the grayscale image.
+The default end-of-block marker is required to reject truncated input. With
+`EndOfBlock: false`, every declared row must decode. Single-filter arrays and indirect decode
+parameter dictionaries are supported. Group 3, indexed palettes, image masks, byte-aligned
+CCITT rows and compound filter chains remain unsupported and return explicit errors.
+The existing 1 GiB file and 400-million-pixel limits still apply; Group 4 dimensions must also
+fit the codec's 16-bit width/height. No external converter or service is required.
