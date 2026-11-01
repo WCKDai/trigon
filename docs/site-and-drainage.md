@@ -7,7 +7,7 @@ GitHub tracking exception recorded in #15 while Plane and the engineering kit ar
 
 Existing `gutters: true` documents retain their original geometry and omitted fields. Set the
 roof's `drainage` property with `element.set`, or supply `drainage` to `building.set_roof`, to opt
-into half-round metal channels, rolled rims, capped run ends and sleeve joints. Roof cover,
+into half-round metal channels, rolled rims, mitred corners, terminal stop ends and sleeve joints. Roof cover,
 gables, building source and roof identity stay unchanged. `null` restores legacy gutters.
 
 ```json
@@ -22,8 +22,27 @@ gables, building source and roof identity stay unchanged. `null` restores legacy
 The distances are explicit design inputs in millimetres. A downpipe needs an eave facade that
 survives roof straightening. Its open channel aperture, outlet, offset knees, pipe and shoe are
 one geometric assembly; no pipe is inferred from a photograph or placed automatically. An empty
-`downpipes` list adds channels only. Adjacent gutter runs have capped ends; corner fittings,
-hydraulic sizing, roof falls, underground drainage and collision checking are not implemented.
+`downpipes` list adds channels only. Adjacent eaves meet at a common mitre computed from their
+actual directions, for convex and reentrant corners; no square-corner assumption is used. There
+are no endcaps between connected runs. Gable terminations have full metal stop plates of
+`wall_mm` thickness. Rolled rims are integrated into the channel section; separate closed sleeve
+fittings have 0.25 mm clearance. Aperture edges close the sheet thickness.
+
+Pipe knees and shoes use tangent circular elbows at the actual change in direction. Their
+centreline radius is normally 1.5 pipe diameters; short legs reduce the radius while leaving 10%
+straight clearance. Paths needing a radius no larger than the outside pipe radius plus wall
+thickness are refused. The 32-sided pipes and at most 7.5-degree elbow samples stay below Studio's
+20-degree feature-edge threshold. Two closed collars follow that same centreline at its thirds,
+with 1 mm radial clearance, including short shoes. No internal knee endcaps are generated.
+
+This intentionally corrects the opt-in detailed geometry. Serialized drainage parameters,
+per-eave `building.roof.gutterN` IDs and explicit `building.roof.downpipe.ID` IDs are unchanged.
+Individual eave meshes share open mitre boundaries; the assembled metal shell is closed and
+oriented, without coincident joint caps. Reversing corners, mitres that consume a short run and
+outlets crossing a mitre are refused rather than folded or silently resized. `drainage: null`
+and omitted drainage still produce the exact legacy gutter geometry.
+
+Hydraulic sizing, roof falls, underground drainage and general collision checking are not implemented.
 These presentation details are not measured evidence or construction documentation.
 
 Limits include 100–300 mm gutters, 1–5 mm walls, 1–10 m joint spacing, 256 eave corners,

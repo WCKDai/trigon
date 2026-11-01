@@ -74,7 +74,8 @@ fn invalid(s: &str) -> ModelError {
 
 /// Build independently identified gutter runs and downpipe assemblies. The parent roof keeps its
 /// identity and unchanged cover/gables. Each run has an open half-round channel, rolled rims,
-/// capped ends and sleeve joints; outlets cut a small aperture through the channel bottom.
+/// shared mitres at adjacent eaves, stop ends only at gables, and closed sleeve joints. Metal is
+/// closed across run boundaries as one assembly; per-eave semantic IDs remain stable.
 pub fn build(
     b: &Building,
     kept: &[usize],
@@ -97,8 +98,43 @@ pub fn build(
         return Err(invalid("detailed drainage needs 3 to 256 eave corners and at most 64 downpipes"));
     }
     checked("eaves", eaves, -5000.0, 500000.0)?;
+    if gables.iter().any(|k| *k >= outline.len()) {
+        return Err(invalid("invalid drainage gable edge"));
+    }
     let low = eaves - overhang * pitch.to_radians().tan();
     let r = d.gutter_width_mm / 2.0;
+    let profile = ChannelProfile::new(r, d.wall_mm);
+    let frames: Vec<_> = (0..outline.len())
+        .map(|k| FacadeFrame::new(outline[k], outline[(k + 1) % outline.len()]).ok_or_else(|| invalid("invalid eave")))
+        .collect::<Result<_>>()?;
+    let mut corners = Vec::with_capacity(outline.len());
+    for k in 0..outline.len() {
+        let prev = (k + outline.len() - 1) % outline.len();
+        let (a, c) = (frames[prev].n, frames[k].n);
+        let joined = !gables.contains(&prev) && !gables.contains(&k);
+        let denom = 1.0 + a[0] * c[0] + a[1] * c[1];
+        if joined && denom < 1e-8 {
+            return Err(invalid("gutter corner reverses direction; the nominal channel cannot fit"));
+        }
+        corners.push(joined.then(|| [(a[0] + c[0]) / denom, (a[1] + c[1]) / denom]));
+    }
+    let runs: Vec<_> = frames
+        .iter()
+        .enumerate()
+        .map(|(k, &fr)| GutterRun {
+            fr,
+            start: corners[k].unwrap_or(fr.n),
+            end: corners[(k + 1) % corners.len()].unwrap_or(fr.n),
+            end_origin: outline[(k + 1) % outline.len()],
+            stop_start: corners[k].is_none(),
+            stop_end: corners[(k + 1) % corners.len()].is_none(),
+            low,
+        })
+        .collect();
+    for (k, run) in runs.iter().enumerate().filter(|(k, _)| !gables.contains(k)) {
+        run.validate(&profile, d.wall_mm)
+            .map_err(|_| invalid(&format!("gutter {k} is too short or its mitres cross; reduce width or revise the eave outline")))?;
+    }
     let mut ids = BTreeSet::new();
     let mut outlets = Vec::new();
     for p in &d.downpipes {
@@ -130,6 +166,8 @@ pub fn build(
         let anchor = wall.point(p.along_mm, 0.0, 0.0);
         let u = (anchor[0] - fr.origin[0]) * fr.t[0] + (anchor[1] - fr.origin[1]) * fr.t[1];
         checked("downpipe eave position", u, p.diameter_mm, fr.length - p.diameter_mm)?;
+        let (start, end) = runs[k].straight_limits(&profile);
+        checked("downpipe clear of gutter mitres", u, start + p.diameter_mm / 2.0 + d.wall_mm, end - p.diameter_mm / 2.0 - d.wall_mm)?;
         if outlets.iter().any(|(edge, at, _, other): &(usize, f64, FacadeFrame, &Downpipe)| {
             *edge == k && (u - at).abs() < (p.diameter_mm + other.diameter_mm) / 2.0 + 50.0
         }) {
@@ -140,13 +178,16 @@ pub fn build(
     let mut parts = Vec::new();
     let mut joints = 0usize;
     for k in (0..outline.len()).filter(|k| !gables.contains(k)) {
-        let fr = FacadeFrame::new(outline[k], outline[(k + 1) % outline.len()]).ok_or_else(|| invalid("invalid eave"))?;
+        let run = &runs[k];
+        let fr = run.fr;
         checked("detailed gutter run length", fr.length, 100.0, 200000.0)?;
         joints += (fr.length / d.joint_spacing_mm) as usize;
         if joints > 1024 {
             return Err(invalid("at most 1024 gutter joints"));
         }
-        let mut breaks = vec![0.0, fr.length];
+        let start = if run.stop_start { d.wall_mm } else { 0.0 };
+        let end = fr.length - if run.stop_end { d.wall_mm } else { 0.0 };
+        let mut breaks = vec![start, end];
         let mine: Vec<_> = outlets.iter().filter(|(edge, _, _, _)| *edge == k).collect();
         for (_, u, _, p) in &mine {
             breaks.extend([u - p.diameter_mm / 2.0, u + p.diameter_mm / 2.0]);
@@ -157,28 +198,22 @@ pub fn build(
         for range in breaks.windows(2) {
             let mid = (range[0] + range[1]) / 2.0;
             let aperture = mine.iter().find(|(_, u, _, p)| (mid - u).abs() < p.diameter_mm / 2.0);
-            channel(&mut mesh, &fr, range[0], range[1], low, r, d.wall_mm, aperture.map(|(_, _, _, p)| p.diameter_mm));
+            channel(&mut mesh, run, &profile, range[0], range[1], aperture.map(|(_, _, _, p)| p.diameter_mm));
         }
-        // Close only the metal section at run ends; the water channel remains open on top.
-        for u in [0.0, fr.length] {
-            for k in 0..16 {
-                let a = k as f64 * PI / 16.0;
-                let c = (k + 1) as f64 * PI / 16.0;
-                let pt = |rad: f64, t: f64| fr.point(u, -r + rad * t.cos(), low - rad * t.sin());
-                let mut pts = [pt(r, a), pt(r, c), pt(r - d.wall_mm, c), pt(r - d.wall_mm, a)];
-                if u == 0.0 {
-                    pts.reverse();
-                }
-                mesh.quad(pts[0], pts[1], pts[2], pts[3]);
-            }
+        if run.stop_start {
+            stop_end(&mut mesh, run, &profile, 0.0, start, true)?;
         }
-        for w in [-d.gutter_width_mm, 0.0] {
-            tube(&mut mesh, &[fr.point(0.0, w, low), fr.point(fr.length, w, low)], 4.0, 1.0);
+        if run.stop_end {
+            stop_end(&mut mesh, run, &profile, end, fr.length, false)?;
         }
+        let (clear_start, clear_end) = run.straight_limits(&profile);
         for j in 1..=(fr.length / d.joint_spacing_mm) as usize {
             let u = j as f64 * d.joint_spacing_mm;
-            if u + 25.0 < fr.length && mine.iter().all(|(_, outlet, _, p)| (u - outlet).abs() > p.diameter_mm / 2.0 + 25.0) {
-                channel(&mut mesh, &fr, u - 25.0, u + 25.0, low, r + 2.0, 1.0, None);
+            if u - 25.0 > clear_start + d.wall_mm
+                && u + 25.0 < clear_end - d.wall_mm
+                && mine.iter().all(|(_, outlet, _, p)| (u - outlet).abs() > p.diameter_mm / 2.0 + 25.0)
+            {
+                sleeve(&mut mesh, run, u, r, profile.bead)?;
             }
         }
         parts.push(DrainPart { id: format!("{}.roof.gutter{k}", b.id), class: DrainClass::Gutter, mesh });
@@ -195,10 +230,14 @@ pub fn build(
                 [wall_pt[0], wall_pt[1], p.bottom_mm + p.shoe_mm.max(50.0)],
                 [wall_pt[0] + wall.n[0] * p.shoe_mm, wall_pt[1] + wall.n[1] * p.shoe_mm, p.bottom_mm],
             ];
-            tube(&mut mesh, &path, p.diameter_mm / 2.0, d.wall_mm);
-            // Explicit joint collars, with fixed count independent of pipe height.
-            for height in [z - 500.0, p.bottom_mm + 400.0] {
-                tube(&mut mesh, &[[wall_pt[0], wall_pt[1], height], [wall_pt[0], wall_pt[1], height + 40.0]], p.diameter_mm / 2.0 + 3.0, 2.0);
+            let stations = rounded_path(&path, p.diameter_mm / 2.0, d.wall_mm)?;
+            tube_stations(&mut mesh, &stations, p.diameter_mm / 2.0, d.wall_mm)?;
+            // Collars follow the same centreline, including short offsets/shoes. Separate,
+            // closed sleeves have 1 mm radial clearance and cannot fold across a knee.
+            let length = path_length(&stations);
+            for distance in [length / 3.0, 2.0 * length / 3.0] {
+                let collar = path_slice(&stations, distance - 20.0, distance + 20.0);
+                tube_stations(&mut mesh, &collar, p.diameter_mm / 2.0 + 3.0, 2.0)?;
             }
             parts.push(DrainPart { id: format!("{}.roof.downpipe.{}", b.id, p.id), class: DrainClass::Downpipe, mesh });
         }
@@ -206,73 +245,357 @@ pub fn build(
     Ok(parts)
 }
 
-fn channel(m: &mut Mesh, fr: &FacadeFrame, start: f64, end: f64, z: f64, r: f64, wall: f64, aperture: Option<f64>) {
-    for t in [0.0, PI] {
-        let pt = |u: f64, rad: f64| fr.point(u, -r + rad * t.cos(), z - rad * t.sin());
-        if t == 0.0 {
-            m.quad(pt(start, r - wall), pt(end, r - wall), pt(end, r), pt(start, r));
-        } else {
-            m.quad(pt(start, r), pt(end, r), pt(end, r - wall), pt(start, r - wall));
+const CHANNEL_STEPS: usize = 32;
+const PIPE_SIDES: usize = 32;
+
+/// A single closed metal section, with the rolled beads integrated into the channel rather
+/// than intersecting separate tubes. `s` is distance outward from the fascia, `v` relative Z.
+struct ChannelProfile {
+    points: Vec<[f64; 2]>,
+    inner: usize,
+    mouth_far: usize,
+    mouth_near: usize,
+    bead: f64,
+}
+
+impl ChannelProfile {
+    fn new(r: f64, wall: f64) -> Self {
+        let bead = 4_f64.max(wall + 1.0);
+        // Intersections of each channel circle with the bead circle centred at its rim.
+        let outer_s = bead * bead / (2.0 * r);
+        let inner_s = (r * r + bead * bead - (r - wall).powi(2)) / (2.0 * r);
+        let outer_angle = (1.0 - outer_s / r).acos();
+        let inner_angle = ((r - inner_s) / (r - wall)).acos();
+        let mut points: Vec<_> = (0..=CHANNEL_STEPS)
+            .map(|i| {
+                let t = outer_angle + (PI - 2.0 * outer_angle) * i as f64 / CHANNEL_STEPS as f64;
+                [r - r * t.cos(), -r * t.sin()]
+            })
+            .collect();
+        let mut angle = points[CHANNEL_STEPS][1].atan2(points[CHANNEL_STEPS][0] - 2.0 * r);
+        for end in [0.0, PI / 2.0, PI] {
+            profile_arc(&mut points, [2.0 * r, 0.0], bead, angle, end);
+            angle = end;
         }
-    }
-    for k in 0..16 {
-        let a = k as f64 * PI / 16.0;
-        let b = (k + 1) as f64 * PI / 16.0;
-        if aperture.is_some_and(|diam| (r * ((a + b) / 2.0).cos()).abs() < diam / 2.0) {
-            continue;
+        let mouth_far = points.len() - 1;
+        let inner_end = (-(r - wall) * inner_angle.sin()).atan2(-inner_s) + 2.0 * PI;
+        profile_arc(&mut points, [2.0 * r, 0.0], bead, angle, inner_end);
+        let inner = points.len() - 1;
+        for i in 1..=CHANNEL_STEPS {
+            let t = PI - inner_angle - (PI - 2.0 * inner_angle) * i as f64 / CHANNEL_STEPS as f64;
+            points.push([r - (r - wall) * t.cos(), -(r - wall) * t.sin()]);
         }
-        let pt = |u: f64, rad: f64, t: f64| fr.point(u, -r + rad * t.cos(), z - rad * t.sin());
-        m.quad(pt(start, r, a), pt(end, r, a), pt(end, r, b), pt(start, r, b));
-        m.quad(pt(start, r - wall, b), pt(end, r - wall, b), pt(end, r - wall, a), pt(start, r - wall, a));
+        let last = points[points.len() - 1];
+        let mut angle = last[1].atan2(last[0]);
+        profile_arc(&mut points, [0.0, 0.0], bead, angle, 0.0);
+        let mouth_near = points.len() - 1;
+        angle = 0.0;
+        let outer_end = points[0][1].atan2(points[0][0]) + 2.0 * PI;
+        for end in [PI / 2.0, PI, 1.5 * PI, outer_end] {
+            profile_arc(&mut points, [0.0, 0.0], bead, angle, end);
+            angle = end;
+        }
+        points.pop(); // The closing edge reuses the original outer-circle intersection.
+        Self { points, inner, mouth_far, mouth_near, bead }
     }
 }
 
-/// Hollow polygonal tube with annular end faces and connected bends. Fixed 16-sided sections;
-/// tangent bisectors give adjacent segments a shared section.
-fn tube(m: &mut Mesh, path: &[[f64; 3]], r: f64, wall: f64) {
-    let unit = |v: [f64; 3]| {
-        let l = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-9);
-        v.map(|x| x / l)
-    };
-    let sub = |a: [f64; 3], b: [f64; 3]| std::array::from_fn(|k| a[k] - b[k]);
-    // A constant reference normal to the bend plane prevents a circular section from
-    // rotating arbitrarily where a vertical segment changes to a knee. For a straight
-    // run, choose a world axis that is not parallel to it.
-    let directions: Vec<_> = path.windows(2).map(|p| unit(sub(p[1], p[0]))).collect();
-    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-    let reference = directions
-        .windows(2)
-        .map(|p| cross(p[0], p[1]))
-        .find(|p| p.iter().map(|v| v * v).sum::<f64>() > 1e-12)
-        .map(unit)
-        .unwrap_or_else(|| if directions.first().is_some_and(|p| p[0].abs() < 0.9) { [1., 0., 0.] } else { [0., 1., 0.] });
+fn profile_arc(points: &mut Vec<[f64; 2]>, centre: [f64; 2], radius: f64, a: f64, b: f64) {
+    let count = ((b - a).abs() / (PI / 16.0)).ceil().max(1.0) as usize;
+    for i in 1..=count {
+        let t = a + (b - a) * i as f64 / count as f64;
+        points.push([centre[0] + radius * t.cos(), centre[1] + radius * t.sin()]);
+    }
+}
+
+struct GutterRun {
+    fr: FacadeFrame,
+    start: [f64; 2],
+    end: [f64; 2],
+    end_origin: [f64; 2],
+    stop_start: bool,
+    stop_end: bool,
+    low: f64,
+}
+
+impl GutterRun {
+    fn point(&self, u: f64, p: [f64; 2]) -> [f64; 3] {
+        let (origin, axis) = if u == 0.0 {
+            (self.fr.origin, self.start)
+        } else if u == self.fr.length {
+            (self.end_origin, self.end)
+        } else {
+            ([self.fr.origin[0] + u * self.fr.t[0], self.fr.origin[1] + u * self.fr.t[1]], self.fr.n)
+        };
+        [origin[0] + p[0] * axis[0], origin[1] + p[0] * axis[1], self.low + p[1]]
+    }
+
+    fn straight_limits(&self, p: &ChannelProfile) -> (f64, f64) {
+        let along = |axis: [f64; 2], s: f64| s * (axis[0] * self.fr.t[0] + axis[1] * self.fr.t[1]);
+        let start = p.points.iter().map(|p| along(self.start, p[0])).fold(0.0, f64::max);
+        let end = p.points.iter().map(|p| self.fr.length + along(self.end, p[0])).fold(self.fr.length, f64::min);
+        (start, end)
+    }
+
+    fn validate(&self, p: &ChannelProfile, wall: f64) -> Result<()> {
+        checked("detailed gutter run length", self.fr.length, 100.0, 200000.0)?;
+        let (start, end) = self.straight_limits(p);
+        if end - start < 2.0 * wall + 1.0 {
+            return Err(invalid("gutter mitres consume the run"));
+        }
+        for &section in &p.points {
+            let (a, b) = (self.point(0.0, section), self.point(self.fr.length, section));
+            let along = (b[0] - a[0]) * self.fr.t[0] + (b[1] - a[1]) * self.fr.t[1];
+            if along < 2.0 * wall + 1.0 || [a, b].iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
+                return Err(invalid("gutter mitres cross or leave site-local coordinates"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn sweep(m: &mut Mesh, run: &GutterRun, profile: &[[f64; 2]], start: f64, end: f64, skip: &[usize]) {
+    for i in 0..profile.len() {
+        if skip.contains(&i) {
+            continue;
+        }
+        let j = (i + 1) % profile.len();
+        m.quad(run.point(start, profile[i]), run.point(end, profile[i]), run.point(end, profile[j]), run.point(start, profile[j]));
+    }
+}
+
+fn cap(m: &mut Mesh, run: &GutterRun, profile: &[[f64; 2]], u: f64, start: bool) -> Result<()> {
+    let first = m.triangles.len();
+    if !m.polygon(profile, &[], |p| run.point(u, p)) {
+        return Err(invalid("drainage end face could not be triangulated"));
+    }
+    // The triangulator normalises polygon winding; orient the resulting triangles explicitly.
+    for t in &mut m.triangles[first..] {
+        let p = t.map(|i| m.positions[i as usize]);
+        let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+        if (n[0] * run.fr.t[0] + n[1] * run.fr.t[1]) * if start { -1.0 } else { 1.0 } < 0.0 {
+            t.swap(1, 2);
+        }
+    }
+    Ok(())
+}
+
+fn stop_end(m: &mut Mesh, run: &GutterRun, p: &ChannelProfile, start: f64, end: f64, at_start: bool) -> Result<()> {
+    // Fill the water channel only over the end plate's real thickness. The cavity face is
+    // shared with the open channel; no coincident annular cap is hidden inside the assembly.
+    let filled: Vec<_> = p.points[..=p.mouth_far].iter().chain(&p.points[p.mouth_near..]).copied().collect();
+    let water: Vec<_> = p.points[p.mouth_far..=p.mouth_near].iter().rev().copied().collect();
+    sweep(m, run, &filled, start, end, &[]);
+    cap(m, run, &filled, if at_start { start } else { end }, at_start)?;
+    cap(m, run, &water, if at_start { end } else { start }, !at_start)
+}
+
+fn channel(m: &mut Mesh, run: &GutterRun, p: &ChannelProfile, start: f64, end: f64, aperture: Option<f64>) {
+    let r = (p.points[0][0] + p.points[CHANNEL_STEPS][0]) / 2.0;
+    let removed: Vec<_> =
+        (0..CHANNEL_STEPS).filter(|&k| aperture.is_some_and(|d| ((p.points[k][0] + p.points[k + 1][0]) / 2.0 - r).abs() < d / 2.0)).collect();
+    let skip: Vec<_> = removed.iter().flat_map(|&k| [k, p.inner + CHANNEL_STEPS - k - 1]).collect();
+    sweep(m, run, &p.points, start, end, &skip);
+    // Close the thickness around all four sides of the aperture rather than leaving raw
+    // mesh borders. This remains a presentation outlet, not a hydraulic connector/port.
+    for &k in &removed {
+        let (a, b, c, d) = (p.points[k], p.points[k + 1], p.points[p.inner + CHANNEL_STEPS - k - 1], p.points[p.inner + CHANNEL_STEPS - k]);
+        m.quad(run.point(start, b), run.point(start, a), run.point(start, d), run.point(start, c));
+        m.quad(run.point(end, a), run.point(end, b), run.point(end, c), run.point(end, d));
+    }
+    if let (Some(&first), Some(&last)) = (removed.first(), removed.last()) {
+        for (k, reverse) in [(first, false), (last + 1, true)] {
+            let (a, b) = (p.points[k], p.points[p.inner + CHANNEL_STEPS - k]);
+            let mut pts = [run.point(start, a), run.point(end, a), run.point(end, b), run.point(start, b)];
+            if reverse {
+                pts.reverse();
+            }
+            m.quad(pts[0], pts[1], pts[2], pts[3]);
+        }
+    }
+}
+
+fn sleeve(m: &mut Mesh, run: &GutterRun, u: f64, r: f64, bead: f64) -> Result<()> {
+    // A separate closed fitting, with 0.25 mm clearance to the sheet and clear of both rolls.
+    let angle = ((bead + 2.0) / r).asin();
+    let mut p = Vec::new();
+    for (rad, reverse) in [(r + 1.25, false), (r + 0.25, true)] {
+        for i in 0..=CHANNEL_STEPS {
+            let t = angle + (PI - 2.0 * angle) * if reverse { CHANNEL_STEPS - i } else { i } as f64 / CHANNEL_STEPS as f64;
+            p.push([r - rad * t.cos(), -rad * t.sin()]);
+        }
+    }
+    sweep(m, run, &p, u - 25.0, u + 25.0, &[]);
+    cap(m, run, &p, u - 25.0, true)?;
+    cap(m, run, &p, u + 25.0, false)
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|k| a[k] - b[k])
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.iter().zip(b).map(|(a, b)| a * b).sum()
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn unit(v: [f64; 3]) -> Result<[f64; 3]> {
+    let length = dot(v, v).sqrt();
+    if !length.is_finite() || length < 1e-9 {
+        return Err(invalid("drainage needs a nonzero finite direction"));
+    }
+    Ok(v.map(|v| v / length))
+}
+
+#[derive(Clone, Copy)]
+struct Station {
+    p: [f64; 3],
+    t: [f64; 3],
+}
+
+/// Circular fillets tangent to the actual incoming/outgoing directions. Radius is normally
+/// 1.5 diameters; tight paths reduce it consistently, leaving 10% straight clearance. A bend
+/// smaller than the tube's outside radius plus wall is rejected instead of folded.
+fn rounded_path(path: &[[f64; 3]], r: f64, wall: f64) -> Result<Vec<Station>> {
+    checked("tube radius", r, 1.0, 200.0)?;
+    checked("tube wall", wall, 0.1, r - 0.1)?;
+    if path.len() < 2 || path.len() > 32 || path.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
+        return Err(invalid("drainage needs 2 to 32 finite centreline points"));
+    }
+    let mut points = Vec::new();
+    for &p in path {
+        if points.last().is_none_or(|&prev| dot(sub(p, prev), sub(p, prev)) > 1e-12) {
+            points.push(p);
+        }
+    }
+    let mut i = 1;
+    while i + 1 < points.len() {
+        let before = unit(sub(points[i], points[i - 1]))?;
+        let after = unit(sub(points[i + 1], points[i]))?;
+        let c = dot(before, after).clamp(-1.0, 1.0);
+        if c > 1.0 - 1e-12 {
+            points.remove(i);
+        } else if c < -1.0 + 1e-9 {
+            return Err(invalid("a pipe centreline cannot reverse at a knee"));
+        } else {
+            i += 1;
+        }
+    }
+    if points.len() < 2 {
+        return Err(invalid("a pipe centreline needs a real run"));
+    }
+    let directions: Vec<_> = points.windows(2).map(|p| unit(sub(p[1], p[0]))).collect::<Result<_>>()?;
+    let lengths: Vec<_> = points.windows(2).map(|p| dot(sub(p[1], p[0]), sub(p[1], p[0])).sqrt()).collect();
+    let radius = 3.0 * r;
+    let mut cuts = vec![0.0; points.len()];
+    for i in 1..points.len() - 1 {
+        let c = dot(directions[i - 1], directions[i]).clamp(-1.0, 1.0);
+        cuts[i] = radius * ((1.0 - c) / (1.0 + c)).sqrt();
+    }
+    let scale = lengths
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| cuts[*i] + cuts[*i + 1] > 0.0)
+        .map(|(i, length)| 0.9 * length / (cuts[i] + cuts[i + 1]))
+        .fold(1.0, f64::min);
+    let radius = radius * scale;
+    if points.len() > 2 && radius <= r + wall {
+        return Err(invalid("pipe segments are too short for nonintersecting elbows"));
+    }
+    let mut stations = vec![Station { p: points[0], t: directions[0] }];
+    for i in 1..points.len() - 1 {
+        let (before, after) = (directions[i - 1], directions[i]);
+        let cut = cuts[i] * scale;
+        let entry = std::array::from_fn(|k| points[i][k] - cut * before[k]);
+        let exit = std::array::from_fn(|k| points[i][k] + cut * after[k]);
+        let axis = unit(cross(before, after))?;
+        let inward = cross(axis, before);
+        let centre: [f64; 3] = std::array::from_fn(|k| entry[k] + radius * inward[k]);
+        let radial = inward.map(|v| -v);
+        let sweep = dot(before, after).clamp(-1.0, 1.0).acos();
+        let steps = (sweep / (PI / 24.0)).ceil().max(1.0) as usize;
+        stations.push(Station { p: entry, t: before });
+        for j in 1..=steps {
+            let a = sweep * j as f64 / steps as f64;
+            let rotate = |v: [f64; 3]| {
+                let w = cross(axis, v);
+                std::array::from_fn(|k| v[k] * a.cos() + w[k] * a.sin())
+            };
+            let v = rotate(radial);
+            stations.push(Station {
+                p: if j == steps { exit } else { std::array::from_fn(|k| centre[k] + radius * v[k]) },
+                t: if j == steps { after } else { rotate(before) },
+            });
+        }
+    }
+    stations.push(Station { p: points[points.len() - 1], t: directions[directions.len() - 1] });
+    Ok(stations)
+}
+
+fn path_length(path: &[Station]) -> f64 {
+    path.windows(2).map(|p| dot(sub(p[1].p, p[0].p), sub(p[1].p, p[0].p)).sqrt()).sum()
+}
+
+fn path_slice(path: &[Station], start: f64, end: f64) -> Vec<Station> {
+    let mut out = Vec::new();
+    let mut length = 0.0;
+    for pair in path.windows(2) {
+        let segment = dot(sub(pair[1].p, pair[0].p), sub(pair[1].p, pair[0].p)).sqrt();
+        let sample = |distance: f64| {
+            let u = ((distance - length) / segment).clamp(0.0, 1.0);
+            Station {
+                p: std::array::from_fn(|k| pair[0].p[k] + (pair[1].p[k] - pair[0].p[k]) * u),
+                t: std::array::from_fn(|k| pair[0].t[k] + (pair[1].t[k] - pair[0].t[k]) * u),
+            }
+        };
+        if start >= length && start < length + segment {
+            out.push(sample(start));
+        }
+        if length + segment > start && length + segment < end {
+            out.push(pair[1]);
+        }
+        if end > length && end <= length + segment {
+            out.push(sample(end));
+            break;
+        }
+        length += segment;
+    }
+    out
+}
+
+fn tube_stations(m: &mut Mesh, path: &[Station], r: f64, wall: f64) -> Result<()> {
+    if path.len() < 2 {
+        return Err(invalid("a drainage sleeve needs two sections"));
+    }
+    let reference = path.windows(2).map(|s| cross(s[0].t, s[1].t)).find(|n| dot(*n, *n) > 1e-12);
+    let reference = unit(reference.unwrap_or_else(|| if path[0].t[0].abs() < 0.9 { [1., 0., 0.] } else { [0., 1., 0.] }))?;
     let mut sections = Vec::new();
-    for (i, &p) in path.iter().enumerate() {
-        let before = unit(sub(p, path[i.saturating_sub(1)]));
-        let after = unit(sub(path[(i + 1).min(path.len() - 1)], p));
-        let tangent = unit(std::array::from_fn(|k| before[k] + after[k]));
-        let projection: f64 = reference.iter().zip(tangent).map(|(a, b)| a * b).sum();
-        let x = unit(std::array::from_fn(|k| reference[k] - projection * tangent[k]));
-        let y = [tangent[1] * x[2] - tangent[2] * x[1], tangent[2] * x[0] - tangent[0] * x[2], tangent[0] * x[1] - tangent[1] * x[0]];
-        let ring = |radius: f64| -> [[f64; 3]; 16] {
-            std::array::from_fn(|k| {
-                let t = 2.0 * PI * k as f64 / 16.0;
-                std::array::from_fn(|a| p[a] + radius * (x[a] * t.cos() + y[a] * t.sin()))
+    for s in path {
+        let t = unit(s.t)?;
+        let x = unit(std::array::from_fn(|k| reference[k] - dot(reference, t) * t[k]))?;
+        let y = cross(t, x);
+        let ring = |radius: f64| -> [[f64; 3]; PIPE_SIDES] {
+            std::array::from_fn(|i| {
+                let a = 2.0 * PI * i as f64 / PIPE_SIDES as f64;
+                std::array::from_fn(|k| s.p[k] + radius * (x[k] * a.cos() + y[k] * a.sin()))
             })
         };
         sections.push((ring(r), ring(r - wall)));
     }
     for pair in sections.windows(2) {
         let [(a, ai), (b, bi)] = [pair[0], pair[1]];
-        for k in 0..16 {
-            let j = (k + 1) % 16;
+        for k in 0..PIPE_SIDES {
+            let j = (k + 1) % PIPE_SIDES;
             m.quad(a[k], a[j], b[j], b[k]);
             m.quad(ai[j], ai[k], bi[k], bi[j]);
         }
     }
     for (i, (a, b)) in sections.iter().enumerate().filter(|(i, _)| *i == 0 || *i + 1 == sections.len()) {
-        for k in 0..16 {
-            let j = (k + 1) % 16;
+        for k in 0..PIPE_SIDES {
+            let j = (k + 1) % PIPE_SIDES;
             if i == 0 {
                 m.quad(a[j], a[k], b[k], b[j]);
             } else {
@@ -280,11 +603,234 @@ fn tube(m: &mut Mesh, path: &[[f64; 3]], r: f64, wall: f64) {
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn tube(m: &mut Mesh, path: &[[f64; 3]], r: f64, wall: f64) {
+    tube_stations(m, &rounded_path(path, r, wall).unwrap(), r, wall).unwrap();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(p: [f64; 3]) -> [i64; 3] {
+        p.map(|v| (v * 1e6).round() as i64)
+    }
+
+    fn closed(m: &Mesh) {
+        use std::collections::BTreeMap;
+        let mut faces = BTreeSet::new();
+        let mut edges = BTreeMap::<_, (usize, i32)>::new();
+        assert!(!m.is_empty());
+        assert!(m.positions.iter().flatten().all(|v| v.is_finite() && v.abs() <= 1e8));
+        for t in &m.triangles {
+            let p = t.map(|i| m.positions[i as usize]);
+            let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
+            assert!(dot(n, n) > 1e-16, "zero-area triangle: {p:?}");
+            let mut face = p.map(key);
+            face.sort();
+            assert!(faces.insert(face), "duplicate or coincident face: {p:?}");
+            for i in 0..3 {
+                let (a, b) = (key(p[i]), key(p[(i + 1) % 3]));
+                let e = edges.entry([a.min(b), a.max(b)]).or_default();
+                e.0 += 1;
+                e.1 += if a < b { 1 } else { -1 };
+            }
+        }
+        let bad: Vec<_> = edges.iter().filter(|(_, (count, winding))| *count != 2 || *winding != 0).take(5).collect();
+        assert!(bad.is_empty(), "nonmanifold/open/misoriented edges: {bad:?}");
+        let volume: f64 = m
+            .triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| m.positions[i as usize]);
+                dot(a, cross(b, c)) / 6.0
+            })
+            .sum();
+        assert!(volume > 0.0, "closed metal must face outward: {volume}");
+    }
+
+    fn assembly(parts: &[DrainPart]) -> Mesh {
+        let mut mesh = Mesh::default();
+        for p in parts {
+            mesh.append(&p.mesh);
+        }
+        mesh
+    }
+
+    #[test]
+    fn architectural_corners_share_a_mitre_instead_of_disconnected_endcaps() {
+        for outline in [
+            vec![[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]],
+            vec![[0., 0.], [12000., 0.], [15000., 6000.], [0., 8000.]],
+            vec![[0., 0.], [12000., 0.], [12000., 4000.], [8000., 4000.], [8000., 8000.], [0., 8000.]],
+            vec![[0., 0.], [12000., 0.], [12000., 8000.], [8000., 8000.], [9000., 4000.], [0., 8000.]],
+        ] {
+            let b = Building::new("test", "Synthetic", &outline, 2, 3000.).unwrap();
+            let kept: Vec<_> = (0..outline.len()).collect();
+            let parts = build(&b, &kept, &outline, 6000., 0., 35., &[], &Drainage::default()).unwrap();
+            closed(&assembly(&parts));
+            assert_eq!(parts, build(&b, &kept, &outline, 6000., 0., 35., &[], &Drainage::default()).unwrap());
+            for k in 0..parts.len() {
+                let a: BTreeSet<_> = parts[k].mesh.positions.iter().copied().map(key).collect();
+                let c: BTreeSet<_> = parts[(k + 1) % parts.len()].mesh.positions.iter().copied().map(key).collect();
+                assert!(a.intersection(&c).count() > 60, "corner {k} must share the complete metal profile, not two isolated ends");
+                let seam: BTreeSet<_> = a.intersection(&c).copied().collect();
+                for part in [&parts[k], &parts[(k + 1) % parts.len()]] {
+                    assert!(
+                        part.mesh.triangles.iter().all(|t| !t.iter().all(|i| seam.contains(&key(part.mesh.positions[*i as usize])))),
+                        "connected corners must not contain hidden or overlapping endcaps"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pipe_facets_do_not_generate_longitudinal_crease_lines() {
+        use std::collections::BTreeMap;
+        let mut m = Mesh::default();
+        tube(&mut m, &[[0., 0., 2000.], [0., 0., 0.]], 40., 2.);
+        let mut edges = BTreeMap::<_, Vec<[f64; 3]>>::new();
+        for t in &m.triangles {
+            let p = t.map(|i| m.positions[i as usize]);
+            let a: [f64; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
+            let b: [f64; 3] = std::array::from_fn(|i| p[2][i] - p[0][i]);
+            let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+            let length = n.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let n = n.map(|v| v / length);
+            for i in 0..3 {
+                let mut e = [key(p[i]), key(p[(i + 1) % 3])];
+                e.sort();
+                if (e[0][2] - e[1][2]).abs() > 1_000_000 {
+                    edges.entry(e).or_default().push(n);
+                }
+            }
+        }
+        assert!(!edges.is_empty());
+        for normals in edges.values() {
+            assert_eq!(normals.len(), 2);
+            let dot: f64 = normals[0].iter().zip(normals[1]).map(|(a, b)| a * b).sum();
+            assert!(dot.abs() > 20_f64.to_radians().cos(), "a round pipe must stay below Studio's 20-degree crease threshold");
+        }
+    }
+
+    #[test]
+    fn outlet_and_short_offset_shoe_assemblies_have_closed_oriented_metal() {
+        let b = building();
+        for (overhang, offset, diameter, shoe, bottom) in [
+            (0., 75., 80., 0_f64, 150.),
+            (180., 110., 80., 180., 150.),
+            (0., 1000., 112.5, 1., 150.),
+            (2000., 76.25, 112.5, 500., 150.),
+            (0., 100., 80., 500., 6000. - 75. - 1080.),
+            (180., 110., 50., 50., 150.),
+        ] {
+            let d = Drainage {
+                downpipes: vec![Downpipe {
+                    id: "rain-a".into(),
+                    facade: "test.f1".into(),
+                    along_mm: 3000.,
+                    diameter_mm: diameter,
+                    wall_offset_mm: offset,
+                    bottom_mm: bottom,
+                    shoe_mm: shoe,
+                }],
+                ..Default::default()
+            };
+            let outline = crate::build::inner_ring(&b.footprint, -overhang);
+            let parts = build(&b, &[0, 1, 2, 3], &outline, 6000., overhang, 35., &[1, 3], &d).unwrap();
+            for part in &parts {
+                closed(&part.mesh);
+            }
+            assert_eq!(parts, build(&b, &[0, 1, 2, 3], &outline, 6000., overhang, 35., &[1, 3], &d).unwrap());
+        }
+    }
+
+    #[test]
+    fn elbows_are_circular_tangent_and_keep_nominal_terminal_sections() {
+        let path = [[0., 0., 2000.], [0., 0., 1800.], [0., 300., 1500.], [0., 300., 400.], [0., 500., 200.]];
+        let stations = rounded_path(&path, 40., 2.).unwrap();
+        assert_eq!(stations.first().unwrap().p, path[0]);
+        assert_eq!(stations.last().unwrap().p, path[4]);
+        let curved: Vec<_> = stations.windows(2).filter(|s| dot(s[0].t, s[1].t) < 1.0 - 1e-10).collect();
+        assert!(curved.len() >= 18, "all three knees need curved, rather than mitred, sections");
+        for s in curved {
+            let c = dot(s[0].t, s[1].t).clamp(-1.0, 1.0);
+            assert!(c >= (PI / 24.0).cos() - 1e-9);
+            let chord = sub(s[1].p, s[0].p);
+            let radius = dot(chord, chord).sqrt() / (2.0 * ((1.0 - c) / 2.0).sqrt());
+            assert!((radius - 120.).abs() < 1e-7, "centreline radius is 1.5 nominal diameters");
+            let direction = unit(chord).unwrap();
+            let bisector = unit(std::array::from_fn(|k| s[0].t[k] + s[1].t[k])).unwrap();
+            assert!(dot(direction, bisector) > 1.0 - 1e-10, "arc samples must follow their exact tangents");
+        }
+        let mut mesh = Mesh::default();
+        tube_stations(&mut mesh, &stations, 40., 2.).unwrap();
+        closed(&mesh);
+    }
+
+    #[test]
+    fn detailed_drainage_preserves_old_roof_documents_defaults_and_ids() {
+        let legacy = r#"{"kind":"pitched","pitch_deg":35,"gables":[],"gutters":true}"#;
+        let mut b = building();
+        b.roof = serde_json::from_str(legacy).unwrap();
+        let mut doc = crate::Document::default();
+        doc.buildings.push(b);
+        let before = crate::build(&doc).unwrap();
+        let encoded = serde_json::to_string(&doc).unwrap();
+        assert!(!encoded.contains("drainage"));
+        assert_eq!(before, crate::build(&serde_json::from_str(&encoded).unwrap()).unwrap());
+        if let crate::Roof::Pitched { drainage, .. } = &mut doc.buildings[0].roof {
+            *drainage = Some(serde_json::from_str(r#"{}"#).unwrap());
+        }
+        let detail = crate::build(&doc).unwrap();
+        let (old_roof, new_roof) = (before[0].roof.as_ref().unwrap(), detail[0].roof.as_ref().unwrap());
+        assert_eq!(old_roof.cover, new_roof.cover);
+        assert_eq!(old_roof.id, new_roof.id);
+        let ids: Vec<_> = new_roof.drainage.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["test.roof.gutter0", "test.roof.gutter1", "test.roof.gutter2", "test.roof.gutter3"]);
+        let mut changed = doc.clone();
+        if let crate::Roof::Pitched { drainage: Some(d), .. } = &mut changed.buildings[0].roof {
+            d.gutter_width_mm = 200.;
+        }
+        assert_eq!(
+            crate::build(&changed).unwrap()[0].roof.as_ref().unwrap().drainage.iter().map(|p| &p.id).collect::<Vec<_>>(),
+            new_roof.drainage.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        if let crate::Roof::Pitched { drainage, .. } = &mut doc.buildings[0].roof {
+            *drainage = None;
+        }
+        assert_eq!(before, crate::build(&doc).unwrap());
+    }
+
+    #[test]
+    fn short_reentrant_and_reversing_corners_are_rejected_instead_of_folded() {
+        let b = building();
+        for outline in [
+            vec![[0., 0.], [12000., 0.], [12000., 4000.], [8000., 4000.], [8000., 4100.], [0., 4100.]],
+            vec![[0., 0.], [12000., 0.], [0., 0.001], [0., 8000.]],
+            vec![[0., 0.], [12000., 0.], [12000., 0.1], [0., 8000.]],
+        ] {
+            let mut b = b.clone();
+            b.footprint = outline.clone();
+            let kept: Vec<_> = (0..outline.len()).collect();
+            assert!(build(&b, &kept, &outline, 6000., 0., 35., &[], &Drainage::default()).is_err());
+        }
+        for path in [
+            vec![],
+            vec![[0.; 3]],
+            vec![[0.; 3]; 3],
+            vec![[0., 0., 0.], [0., 0., 10.], [0., 0., 0.]],
+            vec![[0., 0., 0.], [0., 0., 10.], [0., 10., 10.]],
+            vec![[0., 0., 0.], [0., f64::NAN, 10.]],
+        ] {
+            assert!(rounded_path(&path, 40., 2.).is_err());
+        }
+    }
+
     fn building() -> Building {
         Building::new("test", "Synthetic", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 2, 3000.).unwrap()
     }
@@ -300,9 +846,12 @@ mod tests {
         // No sheet spans the open mouth. Old solid boxes fail this section check.
         assert!(parts[0].mesh.triangles.iter().all(|t| {
             let pts = t.map(|i| parts[0].mesh.positions[i as usize]);
-            !(pts.iter().all(|p| (p[2] - 6000.).abs() < 0.01)
+            // The 2 mm terminal stop plates intentionally close the water channel at gables.
+            // Its mouth stays open everywhere between those plates.
+            !(pts.iter().all(|p| p[0] > d.wall_mm && p[0] < 12000. - d.wall_mm && (p[2] - 6000.).abs() < 0.01)
                 && pts.iter().map(|p| p[1]).fold(f64::MIN, f64::max) - pts.iter().map(|p| p[1]).fold(f64::MAX, f64::min) > 50.)
         }));
+        closed(&assembly(&parts));
     }
     #[test]
     fn downpipe_bends_keep_sections_aligned_in_the_bend_plane() {
@@ -370,5 +919,33 @@ mod tests {
         }
         assert!(build(&b, &[], &[], 6000., 0., 35., &[], &Drainage::default()).is_err());
         assert!(build(&b, &[0, 1, 2, 3], &[[f64::NAN; 2]; 4], 6000., 0., 35., &[], &Drainage::default()).is_err());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            for field in 0..6 {
+                let mut p = Downpipe {
+                    id: "rain-a".into(),
+                    facade: "test.f1".into(),
+                    along_mm: 3000.,
+                    diameter_mm: 80.,
+                    wall_offset_mm: 100.,
+                    bottom_mm: 150.,
+                    shoe_mm: 180.,
+                };
+                match field {
+                    0 => p.along_mm = bad,
+                    1 => p.diameter_mm = bad,
+                    2 => p.wall_offset_mm = bad,
+                    3 => p.bottom_mm = bad,
+                    4 => p.shoe_mm = bad,
+                    _ => {
+                        assert!(build(&b, &[0, 1, 2, 3], &b.footprint, bad, 0., 35., &[], &Drainage::default()).is_err());
+                        continue;
+                    }
+                }
+                let d = Drainage { downpipes: vec![p], ..Default::default() };
+                assert!(build(&b, &[0, 1, 2, 3], &b.footprint, 6000., 0., 35., &[], &d).is_err());
+            }
+        }
+        assert!(build(&b, &[0, 1, 2, usize::MAX], &b.footprint, 6000., 0., 35., &[], &Drainage::default()).is_err());
+        assert!(build(&b, &[0, 1, 2, 3], &b.footprint, 6000., 0., 35., &[usize::MAX], &Drainage::default()).is_err());
     }
 }
