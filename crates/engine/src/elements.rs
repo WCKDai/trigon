@@ -852,7 +852,8 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             let building = doc.buildings.get(bi).ok_or_else(|| invalid("missing building"))?;
             let facade = building.facades.get(fi).ok_or_else(|| invalid("missing facade"))?;
             let placement = facade.placements.get(pi).ok_or_else(|| invalid("missing placement"))?;
-            let id = format!("placement:{}:{pi}", facade.id);
+            let facade_id = facade.id.clone();
+            let mut next = placement.clone();
             let original_type = doc.component(&placement.type_id)?.clone();
             let custom = properties
                 .keys()
@@ -905,25 +906,30 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             } else {
                 None
             };
-            let result = crate::edit::update_parameters(doc, &id, |item| {
-                let crate::edit::Item::Placement(p) = item else { return Err(invalid("wrong placement source")) };
-                if let Some(id) = new_type {
-                    p.type_id = id;
+            if let Some(id) = new_type {
+                next.type_id = id;
+            }
+            for (key, value) in properties {
+                match key.as_str() {
+                    "width_mm" => next.width = Some(numeric(key, value)?),
+                    "height_mm" => next.height = Some(numeric(key, value)?),
+                    "sill_mm" => next.sill = Some(numeric(key, value)?),
+                    "u_mm" => next.u = Some(numeric(key, value)?),
+                    "type" => next.type_id = text(key, value)?,
+                    "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" | "balcony_plan" => {}
+                    _ => return Err(invalid("unknown placement property")),
                 }
-                for (key, value) in properties {
-                    match key.as_str() {
-                        "width_mm" => p.width = Some(numeric(key, value)?),
-                        "height_mm" => p.height = Some(numeric(key, value)?),
-                        "sill_mm" => p.sill = Some(numeric(key, value)?),
-                        "u_mm" => p.u = Some(numeric(key, value)?),
-                        "type" => p.type_id = text(key, value)?,
-                        "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" | "balcony_plan" => {}
-                        _ => return Err(invalid("unknown placement property")),
-                    }
-                }
-                Ok(())
-            })?;
-            Ok(result)
+            }
+            let suffix = if doc.component(&next.type_id)?.kind.is_opening() { "" } else { ".balcony" };
+            let target = format!("{facade_id}.L{}.B{}{suffix}", next.level, next.bay);
+            // A placement is already one occurrence, so it never needs the shared-definition
+            // split/remove/append path. Keep its exact source slot and every sibling untouched.
+            *doc.buildings
+                .get_mut(bi)
+                .and_then(|b| b.facades.get_mut(fi))
+                .and_then(|f| f.placements.get_mut(pi))
+                .ok_or_else(|| invalid("missing placement"))? = next;
+            Ok(target)
         }
         Source::Interior(bi, wi, level) | Source::InteriorDoor(bi, wi, level, _) => {
             let root = ensure_definition_id(doc, bi, wi, "iw")?;
@@ -1440,6 +1446,77 @@ mod tests {
         assert_eq!(s.doc, before);
         assert!(!s.dirty);
         assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], false);
+    }
+
+    #[test]
+    fn placement_width_preview_keeps_source_order_and_changes_one_field_with_exact_undo() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let bytes = serde_json::to_vec(&before).unwrap();
+        let action = json!({"command":"element.set","params":{"id":"b.f1.L0.B0","properties":{"width_mm":1600}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        assert!(!s.dirty);
+        assert_eq!(preview["changes"], json!([{"path":"/buildings/0/facades/0/placements/0/width","before":null,"after":1600.0}]));
+        let applied = s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+        assert_eq!(applied["targets"], json!(["b.f1.L0.B0"]));
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        assert_eq!(s.doc.journal.last().unwrap().command, "element.set");
+        let mut expected = before.clone();
+        expected.buildings[0].facades[0].placements[0].width = Some(1600.0);
+        expected.journal = s.doc.journal.clone();
+        assert_eq!(s.doc, expected, "only the selected source field and one journal entry may change");
+        let after = serde_json::to_vec(&s.doc).unwrap();
+        let loaded: Document = serde_json::from_slice(&after).unwrap();
+        assert_eq!(trigon_model::build(&loaded).unwrap(), trigon_model::build(&s.doc).unwrap());
+        assert!(s.execute("precision.preview", json!({"action":action})).is_err(), "an equal explicit width makes no source change");
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), after);
+        assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), bytes);
+        assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), after);
+    }
+
+    #[test]
+    fn placement_properties_preserve_other_sources_and_phase_scopes_in_place() {
+        for (id, index, properties, phased) in [
+            ("b.f1.L0.B0", 0, json!({"type":"window.fixed","height_mm":1500,"sill_mm":800,"u_mm":5200}), false),
+            ("b.f1.L0.B1.slab", 2, json!({"depth_mm":1600,"slab_width_mm":3400,"rail_height_mm":1100}), false),
+            ("b.f1.L0.B0", 0, json!({"width_mm":1400}), true),
+        ] {
+            let mut s = session();
+            if phased {
+                s.execute("phase.set", json!({"phases":[{"id":"old","name":"Existing"},{"id":"new","name":"Proposal"}]})).unwrap();
+                s.execute("facade.place", json!({"facade":"b.f1","type":"window.fixed","levels":[0],"bays":[0]})).unwrap();
+                let placements = &mut s.doc.buildings[0].facades[0].placements;
+                let replacement = placements.iter().position(|p| p.created.as_deref() == Some("new")).unwrap();
+                placements.swap(0, replacement);
+                assert_eq!(placements[0].created.as_deref(), Some("new"));
+            }
+            let before = s.doc.clone();
+            let before_ids: Vec<_> = element_properties_from_built(&before, &trigon_model::build(&before).unwrap(), View::latest(&before))
+                .unwrap()
+                .into_iter()
+                .map(|r| r["id"].clone())
+                .collect();
+            assert_eq!(update(&mut s, id, properties), id);
+            let mut expected = before.clone();
+            expected.buildings[0].facades[0].placements[index] = s.doc.buildings[0].facades[0].placements[index].clone();
+            expected.types = s.doc.types.clone();
+            expected.journal = s.doc.journal.clone();
+            assert_eq!(s.doc, expected, "placement source order and every unrelated source must stay exact");
+            let old = &before.buildings[0].facades[0].placements[index];
+            let next = &s.doc.buildings[0].facades[0].placements[index];
+            assert_eq!((next.level, next.bay, &next.created, &next.demolished), (old.level, old.bay, &old.created, &old.demolished));
+            let after_ids: Vec<_> = element_properties_from_built(&s.doc, &trigon_model::build(&s.doc).unwrap(), View::latest(&s.doc))
+                .unwrap()
+                .into_iter()
+                .map(|r| r["id"].clone())
+                .collect();
+            assert_eq!(after_ids, before_ids);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.doc, before);
+        }
     }
 
     #[test]
