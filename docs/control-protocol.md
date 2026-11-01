@@ -92,9 +92,19 @@ The channel is untrusted input; nothing a client sends can crash Studio.
 | `ui.view` | `mode?`: `3d`, `plan` or `drawing`; `drawing?`: saved drawing view id (implies drawing mode); `level?`: a level index (the plan's level; in 3D, show up to that level, cut 1.2 m above its floor), or `null` for the whole model in 3D; `phase?`: a phase id; `filter?`: `complete`, `demolition`, `new` or `all`; `fit?`: bool; `focus?`: an element id (a facade's wall such as `b1.f3`, a placement such as `b1.f3.L2.B0`), framed and seen from outside its facade | the view: `mode`, `drawing`, `drawings`, `drawing_mapping`, `level`, `plan_level`, `levels`, `phase`, `phases`, `filter`, `selection`, `camera`, `model_box_m`, `window_hidden`. The parameters are checked whole before anything changes |
 | `ui.click` | `x`, `y`: window points from the top left; `button?`: `left` (default), `right`, `middle`; `double?`; `shift?`, `command?`, `alt?`, `ctrl?` | `{queued, window_hidden}`. Real pointer input: the events a click makes (move, press, release) are fed to the window one per frame, so they act exactly as the owner's click (picking an element, pressing a button). Nothing arrives while the window is hidden |
 | `ui.key` | `key`: an egui key name (`K`, `Escape`, `Enter`, `Z`…); `command?`, `shift?`, `alt?`, `ctrl?` | `{queued, window_hidden}`. A real key press and release (`{"key": "K", "command": true}` opens the command palette) |
+| `ui.drag` | `from`, `to`: `[x,y]` in window points; `steps?`: integer 1–60 (default 8); the same optional modifiers as `ui.click` | `{queued, window_hidden}`. Primary-button press, bounded intermediate moves, and release, delivered one event per frame. The entire request is checked before input is queued. |
 | `ui.screenshot` | `target?`: `viewport` (default) or `window`; `path?`: a `.png` file to write; `raise?`: bool | `{width, height, target}` plus `path`, or `png_base64` when no path is given. Answered once the view shows the latest change (a rebuild in progress is waited for). `viewport` is drawn offscreen at the viewport's size (the 3D view on the GPU, the plan with resvg) and works with the window covered. `window` captures the whole window with the activity feed; a minimised or covered window draws nothing, so the request fails at once unless `raise: true` brings the window to the front first (it takes focus from the owner: only when they asked for it). Window captures wider than 2400 pixels are halved |
 
 Any other method is answered `unknown method`, with the list.
+
+`ui.view` also returns `viewport_window_points: [x,y,width,height]` and `handles`, the currently
+available dimensional handles for the selected element. Each handle gives its `key`, `label`,
+`point: [x,y]` in window points, and `value_mm`. These are the same projected markers drawn by the
+window; stale, historical, ambiguous or noneditable selections expose no handles. Use `ui.drag`
+to operate one through the same input path as a pointer, then read the refreshed source properties.
+`window_focused` reports the native focus flag (or null if the platform has not supplied it).
+Handle drags cancel on lost focus; an explicitly requested window screenshot with `raise: true`
+requests focus even if the window reports that it is already unoccluded.
 
 ## Example
 

@@ -161,6 +161,7 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
     let mut poche: Vec<(Poche, Vec<Shape>)> = Vec::new();
     let mut open: Vec<(Poche, Vec<[f64; 2]>)> = Vec::new();
     let mut cut_elements = Vec::new();
+    let mut cut_regions = Vec::new();
     for g in groups {
         let mut segs = Vec::new();
         let mut kind = None;
@@ -169,6 +170,15 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
             cut::segments(p.source.mesh, &|q| look.map(q), &mut segs);
             if let Some(element) = &p.source.element {
                 cut_elements.extend(segs[start..].iter().map(|segment| element.segment(*segment)));
+                let rings = cut::chain(&segs[start..], 0.5, 5.0).closed;
+                if !rings.is_empty() {
+                    cut_regions.push(crate::views::DrawingElementRegion {
+                        id: element.id.clone(),
+                        kind: element.kind,
+                        rings,
+                        depth_plane: Some([0.0, 0.0, 0.0]),
+                    });
+                }
             }
             kind.get_or_insert(Poche::of(p.source.class, p.material));
         }
@@ -202,6 +212,8 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
     let cover = bbox(&all_poche);
     let mut beyond = Scene::new(scale);
     style::fills(&mut beyond, &projection);
+    scene.element_regions.extend(beyond.element_regions);
+    scene.element_regions.extend(cut_regions);
     for item in beyond.items {
         let crate::sheet::Item::Path(mut p) = item else { continue };
         let face = cut::even_odd(&p.rings);

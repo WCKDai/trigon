@@ -5,7 +5,10 @@
 //! (MTEXT for long labels) and the title block under the drawing is MTEXT. The file is in its declared code page,
 //! Windows-1252 (æ, ø, å, ×, – as single bytes); anything outside it is written `\U+XXXX`.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+
+use trigon_model::annotation::{FontFamily, TextStyle};
 
 use super::{Anchor, Fill, Item, Layer, Path, Rgb, Scene, Stroke, Text, scale_text};
 
@@ -327,7 +330,7 @@ fn text(w: &mut W, t: &Text, scale: f64) {
     w.num(40, t.size * scale * CAP);
     w.pair(1, value);
     w.num(50, t.deg.rem_euclid(360.0));
-    w.pair(7, "Standard");
+    w.pair(7, style_name(t.style));
     let h = match t.anchor {
         Anchor::Start => 0,
         Anchor::Middle => 1,
@@ -376,7 +379,7 @@ fn long_text(w: &mut W, t: &Text, scale: f64) {
         w.pair(3, chunk.iter().collect::<String>());
     }
     w.pair(1, remainder.iter().collect::<String>());
-    w.pair(7, "Standard");
+    w.pair(7, style_name(t.style));
     w.num(11, cos);
     w.num(21, sin);
     w.num(31, 0.0);
@@ -403,6 +406,54 @@ fn mtext(w: &mut W, layer: Layer, at: [f64; 2], height: f64, s: &str) {
         w.pair(if k + 1 == chunks.len() { 1 } else { 3 }, chunk);
     }
     w.pair(7, "Standard");
+}
+
+fn style_name(style: TextStyle) -> String {
+    if style.is_default() {
+        return "Standard".into();
+    }
+    let family = match style.family {
+        FontFamily::Sans => "SANS",
+        FontFamily::Serif => "SERIF",
+        FontFamily::Mono => "MONO",
+    };
+    let face = match (style.bold, style.italic) {
+        (false, false) => "R",
+        (true, false) => "B",
+        (false, true) => "I",
+        (true, true) => "BI",
+    };
+    format!("TRIGON_{family}_{face}")
+}
+
+fn font_file(style: TextStyle) -> String {
+    let family = match style.family {
+        FontFamily::Sans => "Sans",
+        FontFamily::Serif => "Serif",
+        FontFamily::Mono => "Mono",
+    };
+    let face = match (style.bold, style.italic) {
+        (false, false) => "Regular",
+        (true, false) => "Bold",
+        (false, true) => "Italic",
+        (true, true) => "BoldItalic",
+    };
+    format!("Liberation{family}-{face}.ttf")
+}
+
+fn write_style(w: &mut W, style: TextStyle) {
+    w.record("STYLE", H_STYLES, "AcDbTextStyleTableRecord");
+    w.pair(2, style_name(style));
+    w.pair(70, 0);
+    w.num(40, 0.0);
+    w.num(41, 1.0);
+    w.num(50, 0.0);
+    w.pair(71, 0);
+    w.num(42, 2.5);
+    // Preserve the legacy Standard record exactly. New styles refer to the actual OFL faces
+    // shipped with Trigon; a DXF consumer may install them or choose its own substitutes.
+    w.pair(3, if style.is_default() { "arial.ttf".into() } else { font_file(style) });
+    w.pair(4, "");
 }
 
 /// The whole DXF file for `scene` with `block` lettered under the drawing.
@@ -477,17 +528,19 @@ pub(crate) fn write(scene: &Scene, block: &TitleBlock<'_>) -> String {
     }
     w.pair(0, "ENDTAB");
 
-    w.table("STYLE", H_STYLES, 1);
-    w.record("STYLE", H_STYLES, "AcDbTextStyleTableRecord");
-    w.pair(2, "Standard");
-    w.pair(70, 0);
-    w.num(40, 0.0);
-    w.num(41, 1.0);
-    w.num(50, 0.0);
-    w.pair(71, 0);
-    w.num(42, 2.5);
-    w.pair(3, "arial.ttf");
-    w.pair(4, "");
+    let styles: BTreeSet<_> = scene
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Text(text) if !text.style.is_default() => Some(text.style),
+            _ => None,
+        })
+        .collect();
+    w.table("STYLE", H_STYLES, styles.len() + 1);
+    write_style(&mut w, TextStyle::default());
+    for style in styles {
+        write_style(&mut w, style);
+    }
     w.pair(0, "ENDTAB");
 
     for (name, handle) in [("VIEW", H_VIEWS), ("UCS", H_UCS)] {
@@ -866,6 +919,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn annotation_font_styles_define_actual_faces_for_short_and_long_text() {
+        let mut scene = Scene::new(100.0);
+        let serif = TextStyle { family: FontFamily::Serif, bold: true, italic: true };
+        let mono = TextStyle { family: FontFamily::Mono, ..Default::default() };
+        for (style, value) in
+            [(TextStyle::default(), "Default".into()), (serif, "Serif ø".into()), (serif, "x".repeat(300)), (mono, "MONO 012".into())]
+        {
+            let mut label = Text::new(Layer::Annotation, [0.0, 0.0], value, 2.5);
+            label.style = style;
+            let mut writer = W { out: String::new(), next: FIRST };
+            text(&mut writer, &label, 100.0);
+            assert!(pairs(&writer.out).iter().any(|(code, value)| *code == 7 && *value == style_name(style)));
+            scene.text(label);
+        }
+        let dxf = write(&scene, &TitleBlock { title: "", project: "", caption: "", note: None });
+        assert_eq!(dxf.matches("\n0\nSTYLE\n").count(), 3, "Standard plus two used styles, without duplicates");
+        assert!(dxf.contains("\n3\narial.ttf\n"), "the legacy Standard face remains unchanged");
+        assert!(dxf.contains("\n3\nLiberationSerif-BoldItalic.ttf\n"));
+        assert!(dxf.contains("\n3\nLiberationMono-Regular.ttf\n"));
+        assert!(dxf.contains("\n7\nTRIGON_SERIF_BI\n"));
+        assert!(dxf.contains("\n7\nTRIGON_MONO_R\n"));
+        assert!(dxf.contains("\n1\nAC1015\n"), "new styles do not change the DXF version");
     }
 
     #[test]

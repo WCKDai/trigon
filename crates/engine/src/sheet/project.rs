@@ -13,7 +13,7 @@ use trigon_model::mesh::Mesh;
 
 use super::cut::{self, Ring, Shape};
 use super::{Element, overlap};
-use crate::views::DrawingElementSegment;
+use crate::views::{DrawingElementRegion, DrawingElementSegment};
 
 /// How a view looks at the model: drawing x along `t`, drawing y up (model z), depth along `d`
 /// (into the drawing, away from the viewer). `t` and `d` are horizontal unit vectors.
@@ -78,6 +78,8 @@ pub(crate) struct Face {
     pub(crate) rings: Vec<Ring>,
     pub(crate) class: Class,
     pub(crate) depth: f64,
+    pub(crate) element: Option<Element>,
+    pub(crate) depth_plane: [f64; 3],
 }
 
 /// What happens at the near end of the depth range.
@@ -97,6 +99,7 @@ pub(crate) struct Projection {
     pub(crate) faces: Vec<Face>,
     /// Triangles that can hide something.
     pub(crate) triangles: usize,
+    pub(crate) element_regions: Vec<DrawingElementRegion>,
 }
 
 /// Faces folding by less than this are one surface (cos 10°).
@@ -492,6 +495,7 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
     // Clipped triangles per (group, class) for the fills: welded corners and the 3D normal.
     let mut fill_tris: Vec<(usize, Class, [P3; 3], P3)> = Vec::new();
     let mut cap_faces: Vec<Face> = Vec::new();
+    let mut element_regions = Vec::new();
     if let Near::Caps(shapes) = near {
         caps(shapes, range.0, &mut occ);
     }
@@ -536,6 +540,17 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                 );
                 if s.element.is_some() {
                     owned_edges.extend(near_segs[start..].iter().map(|segment| (si, segment.map(|point| [point[0], point[1], at]))));
+                    let rings = cut::chain(&near_segs[start..], 0.5, 5.0).closed;
+                    if let Some(element) = &s.element
+                        && !rings.is_empty()
+                    {
+                        element_regions.push(DrawingElementRegion {
+                            id: element.id.clone(),
+                            kind: element.kind,
+                            rings,
+                            depth_plane: Some([at, 0.0, 0.0]),
+                        });
+                    }
                 }
             }
         }
@@ -565,7 +580,7 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                 }
             }
             caps(&shapes, at, &mut occ);
-            cap_faces.extend(shapes.into_iter().map(|rings| Face { rings, class, depth: at }));
+            cap_faces.extend(shapes.into_iter().map(|rings| Face { rings, class, depth: at, element: None, depth_plane: [at, 0.0, 0.0] }));
         }
     }
     let grid = Grid::new(&occ);
@@ -636,7 +651,7 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
     let mut faces = faces(&fill_tris, sources);
     // Caps are nearest of all.
     faces.extend(cap_faces);
-    Projection { edges, faces, triangles: occ.len() }
+    Projection { edges, faces, triangles: occ.len(), element_regions }
 }
 
 /// Merges coplanar neighbouring triangles of one source into faces, back to front.
@@ -725,7 +740,15 @@ fn faces(tris: &[(usize, Class, [P3; 3], P3)], sources: &[Source<'_>]) -> Vec<Fa
                 .collect();
             let rings = cut::chain(&segs, 0.01, 0.01).closed;
             if !rings.is_empty() {
-                out.push(Face { rings, class, depth: depth / area });
+                let plane =
+                    m.first().and_then(|index| Occluder::new(tris[list[*index]].2)).map_or([depth / area, 0.0, 0.0], |triangle| triangle.plane);
+                out.push(Face {
+                    rings,
+                    class,
+                    depth: depth / area,
+                    element: sources.get(key).and_then(|source| source.element.clone()),
+                    depth_plane: plane,
+                });
             }
         }
     }

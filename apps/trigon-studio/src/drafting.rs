@@ -5,7 +5,7 @@ use eframe::egui;
 use serde_json::json;
 use trigon_engine::SnapOptions;
 use trigon_model::Document;
-use trigon_model::annotation::{Annotation, AnnotationKind, DrawingViewKind};
+use trigon_model::annotation::{Annotation, AnnotationKind, DrawingViewKind, FontFamily, TextStyle};
 
 use crate::{authoring::Run, theme};
 
@@ -31,6 +31,10 @@ pub struct Drafting {
     text: String,
     size: f64,
     rotation: f64,
+    style: TextStyle,
+    region_points: Vec<[f64; 2]>,
+    region_fill: [u8; 3],
+    region_border: bool,
     offset: f64,
     datum: f64,
     pub picking: Option<usize>,
@@ -60,6 +64,10 @@ impl Default for Drafting {
             text: "Note".into(),
             size: 2.5,
             rotation: 0.0,
+            style: TextStyle::default(),
+            region_points: Vec::new(),
+            region_fill: [232, 232, 220],
+            region_border: true,
             offset: 500.0,
             datum: 0.0,
             picking: None,
@@ -86,6 +94,19 @@ fn point(ui: &mut egui::Ui, label: &str, value: &mut [f64; 2]) {
 
 fn unique_id(prefix: &str, used: impl Fn(&str) -> bool) -> String {
     (1..=10000).map(|n| format!("{prefix}-{n}")).find(|id| !used(id)).unwrap_or_else(|| format!("{prefix}-new"))
+}
+
+fn polygon_contains(points: &[[f64; 2]], point: [f64; 2]) -> bool {
+    if !point.iter().all(|v| v.is_finite()) || points.iter().flatten().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let mut inside = false;
+    for (a, b) in points.iter().zip(points.iter().cycle().skip(1)).take(points.len()) {
+        if (a[1] > point[1]) != (b[1] > point[1]) && point[0] < (b[0] - a[0]) * (point[1] - a[1]) / (b[1] - a[1]) + a[0] {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 impl Drafting {
@@ -187,12 +208,14 @@ impl Drafting {
         self.selected = None;
         self.note_id = unique_id("annotation", |id| doc.annotations.iter().any(|a| a.id == id));
         self.picking = None;
+        self.region_points.clear();
     }
 
     pub fn select(&mut self, a: &Annotation) {
         self.selected = Some(a.id.clone());
         self.note_id = a.id.clone();
         self.size = a.size_mm;
+        self.style = a.style;
         self.picking = None;
         match &a.kind {
             AnnotationKind::Text { at, text, rotation_deg } => {
@@ -218,6 +241,12 @@ impl Drafting {
                 self.datum = *datum_mm;
                 self.text = label.clone();
             }
+            AnnotationKind::Region { points, fill, border } => {
+                self.kind = 4;
+                self.region_points = points.clone();
+                self.region_fill = *fill;
+                self.region_border = *border;
+            }
         }
     }
 
@@ -230,7 +259,7 @@ impl Drafting {
             self.picking = None;
         }
         let view = doc.views.iter().find(|v| v.id == id);
-        for (i, label) in ["Text", "Dimension", "Leader", "Level"].into_iter().enumerate() {
+        for (i, label) in ["Text", "Dimension", "Leader", "Level", "Area fill"].into_iter().enumerate() {
             let enabled = view.is_some_and(|v| i != 3 || !matches!(v.kind, DrawingViewKind::Plan { .. }));
             if ui.add_enabled(enabled, egui::Button::selectable(self.picking.is_some() && self.kind == i, label)).clicked() {
                 self.new_note(doc);
@@ -245,6 +274,13 @@ impl Drafting {
     }
 
     pub fn picked(&mut self, p: [f64; 2]) {
+        if self.kind == 4 && self.picking.is_some() {
+            if self.region_points.len() < 256 && self.region_points.last().is_none_or(|last| (last[0] - p[0]).hypot(last[1] - p[1]) > 0.001) {
+                self.region_points.push(p);
+            }
+            self.picking = (self.region_points.len() < 256).then_some(self.region_points.len());
+            return;
+        }
         if let Some(i) = self.picking.filter(|i| *i < 3) {
             self.points[i] = p;
             self.picking = match (self.kind, i) {
@@ -266,9 +302,9 @@ impl Drafting {
             .iter()
             .filter(|a| a.view == view)
             .filter_map(|a| {
-                let distance = match a.kind {
-                    AnnotationKind::Text { at, .. } | AnnotationKind::Level { at, .. } => segment_distance(at, at),
-                    AnnotationKind::Leader { tip, elbow, at, .. } => segment_distance(tip, elbow).min(segment_distance(elbow, at)),
+                let distance = match &a.kind {
+                    AnnotationKind::Text { at, .. } | AnnotationKind::Level { at, .. } => segment_distance(*at, *at),
+                    AnnotationKind::Leader { tip, elbow, at, .. } => segment_distance(*tip, *elbow).min(segment_distance(*elbow, *at)),
                     AnnotationKind::Dimension { from, to, offset_mm } => {
                         let length = (to[0] - from[0]).hypot(to[1] - from[1]);
                         if length < 0.001 {
@@ -277,21 +313,43 @@ impl Drafting {
                         let shift = [-(to[1] - from[1]) / length * offset_mm, (to[0] - from[0]) / length * offset_mm];
                         let a = [from[0] + shift[0], from[1] + shift[1]];
                         let b = [to[0] + shift[0], to[1] + shift[1]];
-                        segment_distance(a, b).min(segment_distance(from, a)).min(segment_distance(to, b))
+                        segment_distance(a, b).min(segment_distance(*from, a)).min(segment_distance(*to, b))
+                    }
+                    AnnotationKind::Region { points, .. } => {
+                        if points.len() < 3 || points.len() > 256 {
+                            return None;
+                        }
+                        if polygon_contains(points, point) {
+                            0.0
+                        } else {
+                            points
+                                .iter()
+                                .zip(points.iter().cycle().skip(1))
+                                .take(points.len())
+                                .map(|(a, b)| segment_distance(*a, *b))
+                                .min_by(f64::total_cmp)?
+                        }
                     }
                 };
-                (distance <= tolerance).then_some((distance, a))
+                (distance <= tolerance).then_some((matches!(a.kind, AnnotationKind::Region { .. }), distance, a))
             })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, a)| a)
+            .min_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.id.cmp(&b.2.id)))
+            .map(|(_, _, a)| a)
     }
 
     pub fn points(&self) -> &[[f64; 2]] {
+        if self.kind == 4 {
+            return &self.region_points;
+        }
         &self.points[..match self.kind {
             1 => 2,
             2 => 3,
             _ => 1,
         }]
+    }
+
+    pub fn is_region(&self) -> bool {
+        self.kind == 4
     }
 
     pub fn properties(&mut self, ui: &mut egui::Ui, doc: &Document, id: &str) -> Option<Run> {
@@ -311,6 +369,7 @@ impl Drafting {
                 AnnotationKind::Dimension { .. } => format!("Dimension · {}", a.id),
                 AnnotationKind::Leader { text, .. } => format!("Tag · {text}"),
                 AnnotationKind::Level { label, .. } => format!("Level · {label}"),
+                AnnotationKind::Region { points, .. } => format!("Area fill · {} · {} vertices", a.id, points.len()),
             };
             if ui.selectable_label(self.selected.as_deref() == Some(&a.id), label).clicked() {
                 self.select(a);
@@ -324,7 +383,7 @@ impl Drafting {
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            for (i, name) in ["Text", "Dimension", "Leader", "Level"].into_iter().enumerate() {
+            for (i, name) in ["Text", "Dimension", "Leader", "Level", "Area fill"].into_iter().enumerate() {
                 if ui
                     .add_enabled(i != 3 || !matches!(view.kind, DrawingViewKind::Plan { .. }), egui::Button::selectable(self.kind == i, name))
                     .clicked()
@@ -339,6 +398,7 @@ impl Drafting {
         let labels: &[&str] = match self.kind {
             1 => &["From", "To"],
             2 => &["Arrow tip", "Bend", "Text position"],
+            4 => &[],
             _ => &["Position"],
         };
         for (i, label) in labels.iter().enumerate() {
@@ -372,22 +432,69 @@ impl Drafting {
                 ui.label("Tag text");
                 ui.text_edit_singleline(&mut self.text);
             }
-            _ => {
+            3 => {
                 ui.label("Level label");
                 ui.text_edit_singleline(&mut self.text);
                 ui.label("Zero datum height");
                 number(ui, &mut self.datum);
             }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.label("Fill colour");
+                    ui.color_edit_button_srgb(&mut self.region_fill);
+                });
+                ui.checkbox(&mut self.region_border, "Draw boundary");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(if self.picking.is_some() { "Finish picking" } else { "Pick vertices" }).clicked() {
+                        self.picking = if self.picking.is_some() { None } else { Some(self.region_points.len()) };
+                    }
+                    if ui.add_enabled(self.region_points.len() < 256, egui::Button::new("Add vertex")).clicked() {
+                        let last = self.region_points.last().copied().unwrap_or([-1000.0, 0.0]);
+                        self.region_points.push([last[0] + 1000.0, last[1]]);
+                    }
+                    if ui.add_enabled(!self.region_points.is_empty(), egui::Button::new("Remove last")).clicked() {
+                        self.region_points.pop();
+                        self.picking = None;
+                    }
+                });
+                for (index, point) in self.region_points.iter_mut().enumerate() {
+                    ui.push_id(index, |ui| {
+                        ui.label(format!("Vertex {}", index + 1));
+                        ui.horizontal(|ui| {
+                            number(ui, &mut point[0]);
+                            number(ui, &mut point[1]);
+                        });
+                    });
+                }
+                ui.weak("Pick at least three corners. Do not repeat the first corner; Trigon closes and validates the boundary.");
+            }
         }
-        ui.horizontal(|ui| {
-            ui.label("Paper text size");
-            ui.add(egui::DragValue::new(&mut self.size).range(0.5..=12.0).speed(0.1).suffix(" mm"));
-        });
+        if self.kind != 4 {
+            ui.horizontal(|ui| {
+                ui.label("Paper text size");
+                ui.add(egui::DragValue::new(&mut self.size).range(0.5..=12.0).speed(0.1).suffix(" mm"));
+            });
+            egui::ComboBox::from_id_salt("annotation-font")
+                .selected_text(match self.style.family {
+                    FontFamily::Sans => "Sans",
+                    FontFamily::Serif => "Serif",
+                    FontFamily::Mono => "Monospace",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.style.family, FontFamily::Sans, "Sans");
+                    ui.selectable_value(&mut self.style.family, FontFamily::Serif, "Serif");
+                    ui.selectable_value(&mut self.style.family, FontFamily::Mono, "Monospace");
+                });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.style.bold, "Bold");
+                ui.checkbox(&mut self.style.italic, "Italic");
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             if theme::primary(ui, if self.selected.is_some() { "Update annotation" } else { "Add annotation" }).clicked() {
                 run = Some(Run {
                     command: "annotation.define",
-                    params: json!({"id":self.note_id,"view":id,"size_mm":self.size,"kind":self.annotation_kind()}),
+                    params: json!({"id":self.note_id,"view":id,"size_mm":self.size,"style":self.style,"kind":self.annotation_kind()}),
                 });
             }
             if let Some(selected) = &self.selected
@@ -429,6 +536,7 @@ impl Drafting {
             1 => AnnotationKind::Dimension { from: self.points[0], to: self.points[1], offset_mm: self.offset },
             2 => AnnotationKind::Leader { tip: self.points[0], elbow: self.points[1], at: self.points[2], text: self.text.clone() },
             3 => AnnotationKind::Level { at: self.points[0], datum_mm: self.datum, label: self.text.clone() },
+            4 => AnnotationKind::Region { points: self.region_points.clone(), fill: self.region_fill, border: self.region_border },
             _ => AnnotationKind::Text { at: self.points[0], text: self.text.clone(), rotation_deg: self.rotation },
         }
     }
@@ -486,12 +594,42 @@ mod tests {
     }
 
     #[test]
+    fn region_picking_and_font_controls_round_trip_without_masking_text_selection() {
+        let mut tool = Drafting { kind: 4, picking: Some(0), ..Default::default() };
+        for p in [[0.0, 0.0], [3000.0, 0.0], [3000.0, 2000.0], [0.0, 2000.0]] {
+            tool.picked(p);
+        }
+        assert_eq!(tool.points().len(), 4);
+        assert_eq!(tool.picking, Some(4));
+        let region = Annotation { id: "fill".into(), view: "plan".into(), size_mm: 2.5, style: TextStyle::default(), kind: tool.annotation_kind() };
+        region.validate().unwrap();
+        let note = Annotation {
+            id: "note".into(),
+            view: "plan".into(),
+            size_mm: 3.5,
+            style: TextStyle { family: FontFamily::Serif, bold: true, italic: true },
+            kind: AnnotationKind::Text { at: [1000.0, 1000.0], text: "Room".into(), rotation_deg: 0.0 },
+        };
+        let doc = Document { annotations: vec![region.clone(), note.clone()], ..Default::default() };
+        assert_eq!(Drafting::hit(&doc, "plan", [1001.0, 1000.0], 10.0), Some(&note));
+        assert_eq!(Drafting::hit(&doc, "plan", [2000.0, 1500.0], 10.0), Some(&region));
+        assert!(Drafting::hit(&doc, "plan", [4000.0, 1500.0], 10.0).is_none());
+        tool.select(&note);
+        assert_eq!(tool.style, note.style);
+        assert_eq!(tool.annotation_kind(), note.kind);
+        tool.select(&region);
+        assert_eq!(tool.annotation_kind(), region.kind);
+        assert_eq!(tool.points().len(), 4);
+    }
+
+    #[test]
     fn annotation_picking_follows_dimension_offsets_and_view_ownership() {
         let mut doc = Document::default();
         let annotation = Annotation {
             id: "d".into(),
             view: "elevation".into(),
             size_mm: 2.5,
+            style: TextStyle::default(),
             kind: AnnotationKind::Dimension { from: [0.0, 0.0], to: [1000.0, 0.0], offset_mm: 500.0 },
         };
         doc.annotations.push(annotation.clone());

@@ -69,20 +69,27 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
                     continue;
                 }
                 for (m, mesh) in &e.parts {
-                    let element =
-                        matches!(e.class, ElementClass::Window | ElementClass::Door).then(|| Element::new(&e.id, DrawingElementKind::Opening));
+                    let kind = match e.class {
+                        ElementClass::Window | ElementClass::Door => DrawingElementKind::Opening,
+                        ElementClass::Railing => DrawingElementKind::Railing,
+                        ElementClass::BalconySlab => DrawingElementKind::Balcony,
+                        ElementClass::Stair => DrawingElementKind::Stair,
+                    };
+                    let element = Some(Element::new(&e.id, kind));
                     out.push(part(mesh, class_of(e.class, *m), next(), *m, Role::Both, element));
                 }
             }
         }
         if let Some(r) = &b.roof {
-            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both, None));
-            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both, None));
-            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both, None));
+            let element = Some(Element::new(&r.id, DrawingElementKind::Roof));
+            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both, element.clone()));
+            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both, element.clone()));
+            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both, element));
         }
         if inside {
             for s in &b.slabs {
-                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both, None));
+                let kind = if s.kind == trigon_model::SlabKind::Roof { DrawingElementKind::Roof } else { DrawingElementKind::Slab };
+                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both, Some(Element::new(&s.id, kind))));
             }
             for iw in &b.interior {
                 let class = if iw.load_bearing { Class::Wall } else { Class::Partition };
@@ -101,8 +108,9 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
                 }
             }
             for st in &b.stairs {
-                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both, None));
-                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both, None));
+                let element = Some(Element::new(&st.id, DrawingElementKind::Stair));
+                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both, element.clone()));
+                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both, element));
             }
         }
     }
@@ -171,7 +179,16 @@ fn towards_white(c: Rgb, k: f64) -> Rgb {
 /// The projection's faces (back to front) as tonal fills, each face's rings oriented (outlines
 /// counter-clockwise, holes clockwise) so neighbouring faces of one tone can be filled as one.
 pub(crate) fn fills(scene: &mut Scene, p: &Projection) {
+    scene.element_regions.extend(p.element_regions.iter().cloned());
     for f in &p.faces {
+        if let Some(element) = &f.element {
+            scene.element_regions.push(crate::views::DrawingElementRegion {
+                id: element.id.clone(),
+                kind: element.kind,
+                rings: f.rings.clone(),
+                depth_plane: Some(f.depth_plane),
+            });
+        }
         let Some(c) = tone(f.class) else { continue };
         let c = towards_white(c, [0.0, 0.45, 0.7][band(f.depth)]);
         let rings: Vec<Vec<[f64; 2]>> = super::cut::even_odd(&f.rings).into_iter().flatten().collect();

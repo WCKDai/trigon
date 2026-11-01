@@ -7,6 +7,48 @@ use crate::{Document, ModelError, Result, checked};
 
 pub const MAX_VIEWS: usize = 256;
 pub const MAX_ANNOTATIONS: usize = 5000;
+pub const MAX_REGION_POINTS: usize = 256;
+
+/// A bundled, portable font family. Documents cannot request a local font path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FontFamily {
+    #[default]
+    Sans,
+    Serif,
+    Mono,
+}
+
+impl FontFamily {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sans => "Liberation Sans",
+            Self::Serif => "Liberation Serif",
+            Self::Mono => "Liberation Mono",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TextStyle {
+    #[serde(default)]
+    pub family: FontFamily,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+}
+
+impl TextStyle {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn default_region_border() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +93,8 @@ pub struct Annotation {
     /// Lettering height (em), paper mm, independent of the drawing's scale.
     #[serde(default = "default_size")]
     pub size_mm: f64,
+    #[serde(default, skip_serializing_if = "TextStyle::is_default")]
+    pub style: TextStyle,
     pub kind: AnnotationKind,
 }
 
@@ -76,6 +120,13 @@ pub enum AnnotationKind {
         #[serde(default)]
         label: String,
     },
+    /// An opaque area fill in drawing-plane mm, without a repeated closing point.
+    Region {
+        points: Vec<[f64; 2]>,
+        fill: [u8; 3],
+        #[serde(default = "default_region_border")]
+        border: bool,
+    },
 }
 
 pub fn identifier(id: &str) -> Result<()> {
@@ -95,6 +146,55 @@ fn text(value: &str, empty: bool) -> Result<()> {
 fn point(p: [f64; 2]) -> Result<()> {
     for v in p {
         checked("drawing coordinate (mm)", v, -1_000_000.0, 1_000_000.0)?;
+    }
+    Ok(())
+}
+
+fn region(points: &[[f64; 2]]) -> Result<()> {
+    let invalid =
+        || ModelError::Invalid("a filled region needs a simple nonzero ring of 3 to 256 distinct points, without a repeated closing point".into());
+    if !(3..=MAX_REGION_POINTS).contains(&points.len()) {
+        return Err(invalid());
+    }
+    for p in points {
+        point(*p)?;
+    }
+    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let contains = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| {
+        cross(a, b, p).abs() <= 1e-7 && (0..2).all(|axis| p[axis] >= a[axis].min(b[axis]) - 1e-7 && p[axis] <= a[axis].max(b[axis]) + 1e-7)
+    };
+    let n = points.len();
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        let previous = points[(i + n - 1) % n];
+        // Adjacent edges may meet at their corner, but cannot double back over each other.
+        if cross(previous, a, b).abs() <= 1e-7 && (a[0] - previous[0]) * (b[0] - a[0]) + (a[1] - previous[1]) * (b[1] - a[1]) < 0.0 {
+            return Err(invalid());
+        }
+        for j in i + 1..n {
+            if (points[j][0] - a[0]).hypot(points[j][1] - a[1]) <= 1e-6 {
+                return Err(invalid());
+            }
+            if j == i + 1 || (i == 0 && j == n - 1) {
+                continue;
+            }
+            let c = points[j];
+            let d = points[(j + 1) % n];
+            if (cross(a, b, c) * cross(a, b, d) < 0.0 && cross(c, d, a) * cross(c, d, b) < 0.0)
+                || contains(a, b, c)
+                || contains(a, b, d)
+                || contains(c, d, a)
+                || contains(c, d, b)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    let origin = points[0];
+    let twice_area: f64 = (1..n - 1).map(|i| cross(origin, points[i], points[i + 1])).sum();
+    if twice_area.abs() < 0.002 {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -172,6 +272,7 @@ impl Annotation {
                 checked("datum_mm", *datum_mm, -1_000_000.0, 1_000_000.0)?;
                 text(label, true)?;
             }
+            AnnotationKind::Region { points, .. } => region(points)?,
         }
         Ok(())
     }
@@ -242,6 +343,7 @@ mod tests {
             id: "a".into(),
             view: "v".into(),
             size_mm: 2.5,
+            style: TextStyle::default(),
             kind: AnnotationKind::Text { at: [0.0, 0.0], text: "Æøå & <masonry>".into(), rotation_deg: 0.0 },
         };
         base.validate().unwrap();
@@ -264,5 +366,67 @@ mod tests {
             serde_json::from_value::<Annotation>(json!({"id":"a", "view":"v", "kind":{"annotation":"text", "at":[0,0], "text":"x", "ignored":1}}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn legacy_annotations_omit_default_style_and_selected_fonts_round_trip() {
+        let old = json!({"id":"note","view":"plan","size_mm":2.5,"kind":{"annotation":"text","at":[50.0,100.0],"text":"Køkken","rotation_deg":0.0}});
+        let annotation: Annotation = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(annotation.style, TextStyle::default());
+        assert_eq!(serde_json::to_value(&annotation).unwrap(), old);
+        for family in [FontFamily::Sans, FontFamily::Serif, FontFamily::Mono] {
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut annotation = annotation.clone();
+                annotation.style = TextStyle { family, bold, italic };
+                annotation.validate().unwrap();
+                let serialized = serde_json::to_value(&annotation).unwrap();
+                assert_eq!(serialized.get("style").is_none(), annotation.style.is_default());
+                assert_eq!(serde_json::from_value::<Annotation>(serialized).unwrap(), annotation);
+            }
+        }
+        for style in [json!({"family":"/local/private/font.ttf"}), json!({"bold":"yes"}), json!({"path":"font.ttf"})] {
+            let mut payload = old.clone();
+            payload["style"] = style;
+            assert!(serde_json::from_value::<Annotation>(payload).is_err());
+        }
+    }
+
+    #[test]
+    fn filled_regions_accept_simple_concave_rings_and_reject_hostile_or_crossing_geometry() {
+        let payload = |points| json!({"id":"zone","view":"plan","kind":{"annotation":"region","points":points,"fill":[220,230,240]}});
+        for points in [
+            vec![[0.0, 0.0], [1000.0, 0.0], [1000.0, 1000.0], [0.0, 1000.0]],
+            vec![[0.0, 1000.0], [1000.0, 1000.0], [1000.0, 0.0], [0.0, 0.0]],
+            vec![[0.0, 0.0], [1000.0, 0.0], [1000.0, 400.0], [400.0, 400.0], [400.0, 1000.0], [0.0, 1000.0]],
+            vec![[999998.0, 999998.0], [999999.0, 999998.0], [999999.0, 999999.0], [999998.0, 999999.0]],
+        ] {
+            let annotation: Annotation = serde_json::from_value(payload(points)).unwrap();
+            annotation.validate().unwrap();
+            assert!(matches!(annotation.kind, AnnotationKind::Region { border: true, .. }));
+            assert_eq!(serde_json::from_str::<Annotation>(&serde_json::to_string(&annotation).unwrap()).unwrap(), annotation);
+        }
+        for points in [
+            vec![],
+            vec![[0.0, 0.0], [1000.0, 0.0]],
+            vec![[0.0, 0.0], [1000.0, 0.0], [1000.0, 1000.0], [0.0, 0.0]],
+            vec![[0.0, 0.0], [1000.0, 1000.0], [0.0, 1000.0], [1000.0, 0.0]],
+            vec![[0.0, 0.0], [1000.0, 0.0], [1000.0, 1000.0], [500.0, 0.0], [0.0, 1000.0]],
+            vec![[0.0, 0.0], [1000.0, 0.0], [500.0, 0.0], [500.0, 1000.0], [0.0, 1000.0]],
+            vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+            vec![[0.0, 0.0], [0.001, 0.0], [0.0, 0.001]],
+            vec![[0.0, 0.0], [1e8, 0.0], [0.0, 1000.0]],
+            vec![[0.0, 0.0]; MAX_REGION_POINTS + 1],
+        ] {
+            let annotation: Annotation = serde_json::from_value(payload(points)).unwrap();
+            assert!(annotation.validate().is_err());
+        }
+        let mut annotation: Annotation = serde_json::from_value(payload(vec![[0.0, 0.0], [1000.0, 0.0], [0.0, 1000.0]])).unwrap();
+        if let AnnotationKind::Region { points, .. } = &mut annotation.kind {
+            points[1][0] = f64::NAN;
+        }
+        assert!(annotation.validate().is_err());
+        let mut invalid_colour = payload(vec![[0.0, 0.0], [1000.0, 0.0], [0.0, 1000.0]]);
+        invalid_colour["kind"]["fill"] = json!([256, 0, 0]);
+        assert!(serde_json::from_value::<Annotation>(invalid_colour).is_err());
     }
 }

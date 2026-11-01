@@ -410,6 +410,15 @@ pub struct Building {
     #[serde(default)]
     pub ground_floor: f64,
     pub storeys: Vec<Storey>,
+    /// Floor slab thickness per storey, mm; omitted entries retain the historical 200 mm default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floor_thicknesses: Vec<f64>,
+    /// Pitched-roof attic slab thickness, mm (default 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attic_thickness_mm: Option<f64>,
+    /// Flat roof slab thickness above the eaves, mm (default 300).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roof_slab_thickness_mm: Option<f64>,
     pub facades: Vec<Facade>,
     pub evidence: Vec<Evidence>,
     /// Facts from registers (BBR: year built, use, wall and roof material, areas).
@@ -654,6 +663,9 @@ impl Building {
             wall_schedule: Vec::new(),
             ground_floor: 0.0,
             storeys: Vec::new(),
+            floor_thicknesses: Vec::new(),
+            attic_thickness_mm: None,
+            roof_slab_thickness_mm: None,
             facades: Vec::new(),
             evidence: Vec::new(),
             attributes: Default::default(),
@@ -814,6 +826,7 @@ impl Building {
     /// repeats its top value on added storeys.
     fn fit_schedule(&mut self) {
         let count = self.storeys.len();
+        self.floor_thicknesses.truncate(count);
         for schedule in std::iter::once(&mut self.wall_schedule).chain(self.facades.iter_mut().map(|f| &mut f.wall_schedule)) {
             if let Some(&top) = schedule.last() {
                 schedule.resize(count, top);
@@ -823,7 +836,26 @@ impl Building {
 
     /// Bottom of the outer walls, mm (below the terrain when there is a basement).
     pub fn bottom(&self) -> f64 {
-        self.storeys.first().map_or(0.0, |s| (s.elevation - 200.0).min(0.0))
+        self.storeys.first().map_or(0.0, |s| (s.elevation - self.floor_thickness(0)).min(0.0))
+    }
+
+    pub fn floor_thickness(&self, level: usize) -> f64 {
+        self.floor_thicknesses.get(level).copied().unwrap_or(200.0)
+    }
+
+    pub fn attic_thickness(&self) -> f64 {
+        self.attic_thickness_mm.unwrap_or(200.0)
+    }
+
+    /// Thickness closing this room/storey's ceiling, preserving the existing flat-roof clearance.
+    pub fn ceiling_thickness(&self, level: usize) -> f64 {
+        if level + 1 < self.storeys.len() {
+            self.floor_thickness(level + 1)
+        } else if matches!(self.roof, crate::roof::Roof::Pitched { .. }) {
+            self.attic_thickness()
+        } else {
+            200.0
+        }
     }
 
     /// Adds a basement storey below the lowest one, with its floor at `floor` mm (below the terrain),
@@ -835,6 +867,9 @@ impl Building {
             return Err(ModelError::Invalid("at most 60 storeys".into()));
         }
         self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor });
+        if !self.floor_thicknesses.is_empty() {
+            self.floor_thicknesses.insert(0, 200.0);
+        }
         if let Some(&lowest) = self.wall_schedule.first() {
             self.wall_schedule.insert(0, (lowest + HALF_BRICK).min(MAX_WALL));
         }

@@ -8,7 +8,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Instant;
 
 use trigon_engine::resvg::usvg;
-use trigon_engine::{DrawingElementSegment, DrawingPreview, DrawingTransform, OpeningSchedule, opening_schedule_from_built};
+use trigon_engine::{
+    DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingTransform, OpeningSchedule, element_properties_from_built,
+    opening_schedule_from_built,
+};
 use trigon_model::Document;
 use trigon_model::build::View;
 
@@ -26,6 +29,7 @@ pub struct PreparedDrawing {
     pub segments: Vec<[[f64; 2]; 2]>,
     /// Visible model linework, in drawing-plane mm, with the built element id that owns each stroke.
     pub element_segments: Vec<DrawingElementSegment>,
+    pub element_regions: Vec<DrawingElementRegion>,
 }
 
 pub struct Job {
@@ -51,6 +55,7 @@ pub struct Done {
 pub struct PreparedScene {
     pub scene: Scene,
     pub schedule: OpeningSchedule,
+    pub properties: Vec<serde_json::Value>,
 }
 
 pub struct Worker {
@@ -78,7 +83,8 @@ pub fn run(job: &Job) -> Done {
         let scene = built.and_then(|b| {
             guarded("preparing the view", || {
                 let schedule = opening_schedule_from_built(&job.doc, &b).map_err(|e| e.to_string())?;
-                Ok(PreparedScene { scene: Scene::from_built(&b, phases), schedule })
+                let properties = element_properties_from_built(&job.doc, &b, job.view).map_err(|e| e.to_string())?;
+                Ok(PreparedScene { scene: Scene::from_built(&b, phases).with_rooms(&job.doc), schedule, properties })
             })
         });
         scene_ms = ms(t);
@@ -87,13 +93,13 @@ pub fn run(job: &Job) -> Done {
     let drawing = job.drawing.as_ref().map(|request| {
         let t = Instant::now();
         let tree = guarded("drawing the workspace", || {
-            let DrawingPreview { svg, transform, segments, element_segments } = match request {
+            let DrawingPreview { svg, transform, segments, element_segments, element_regions } = match request {
                 DrawingRequest::Plan(level) => trigon_engine::plan_drawing(&job.doc, *level, job.view),
                 DrawingRequest::Saved(id) => trigon_engine::drawing_view(&job.doc, id, job.view),
             }
             .map_err(|e| e.to_string())?;
             let tree = trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())?;
-            Ok(PreparedDrawing { tree, transform, segments, element_segments })
+            Ok(PreparedDrawing { tree, transform, segments, element_segments, element_regions })
         });
         plan_ms = ms(t);
         (request.clone(), tree)
@@ -233,6 +239,7 @@ mod tests {
                 transform: drawing.transform,
                 segments: drawing.segments,
                 element_segments: drawing.element_segments,
+                element_regions: drawing.element_regions,
             };
             let (point, expected) = match &request {
                 DrawingRequest::Saved(id) if id == "facade" => ([session.doc.buildings[0].facades[0].bays[0], 850.0], "b.f1.L0.B0"),

@@ -44,6 +44,22 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "element.get",
+        summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::elements::Get>,
+        run: |s, v| crate::elements::get(s, parse("element.get", v)?),
+    },
+    CommandSpec {
+        id: "element.set",
+        summary: "Update the selected element's advertised source properties. Shared parametric model for plans and 3D; validated, atomic and undoable. Ambiguous and historical edits are refused.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::elements::Set>,
+        run: |s, v| crate::elements::set(s, parse("element.set", v)?),
+    },
+    CommandSpec {
         id: "schedule.export",
         summary: "Write an opening schedule to .csv or .json with the same building/storey/phase filters as schedule.openings. CSV uses UTF-8, model millimetres, m2 areas and an apostrophe prefix for formula-like text. Atomic file output; document and history are unchanged.",
         mutates: false,

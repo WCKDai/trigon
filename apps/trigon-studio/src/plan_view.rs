@@ -90,6 +90,7 @@ impl PlanView {
             transform: drawing.transform,
             segments: drawing.segments,
             element_segments: drawing.element_segments,
+            element_regions: drawing.element_regions,
         });
     }
 
@@ -153,6 +154,15 @@ impl PlanView {
         for line in drawing.element_segments.iter().filter(|line| line.id == id) {
             if let (Some(a), Some(b)) = (self.model_to_screen(rect, line.segment[0]), self.model_to_screen(rect, line.segment[1])) {
                 painter.line_segment([a, b], egui::Stroke::new(2.0, theme::ACCENT));
+            }
+        }
+        for region in drawing.element_regions.iter().filter(|region| region.id == id) {
+            for ring in &region.rings {
+                for (a, b) in ring.iter().zip(ring.iter().cycle().skip(1)).take(ring.len()) {
+                    if let (Some(a), Some(b)) = (self.model_to_screen(rect, *a), self.model_to_screen(rect, *b)) {
+                        painter.line_segment([a, b], egui::Stroke::new(2.0, theme::ACCENT));
+                    }
+                }
             }
         }
     }
@@ -222,7 +232,7 @@ impl PlanView {
         if resp.double_clicked() && !picking {
             self.fit_to(rect.size());
         }
-        if resp.hovered() {
+        if resp.hovered() && !(picking && ui.input(|i| i.pointer.primary_down())) {
             let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
             let factor = pinch * (scroll / 300.0).exp();
             if (factor - 1.0).abs() > 1e-4
@@ -263,6 +273,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn room_region_interiors_are_pickable_through_the_live_drawing_transform() {
+        let mut view = PlanView::new(egui::Context::default());
+        view.geometry = Some(DrawingPreview {
+            svg: String::new(),
+            transform: trigon_engine::DrawingTransform { x0: 0.0, y1: 5000.0, mm_per_px: 10.0 },
+            segments: vec![],
+            element_segments: vec![],
+            element_regions: vec![trigon_engine::DrawingElementRegion {
+                id: "living.space.L0".into(),
+                kind: trigon_engine::DrawingElementKind::Room,
+                rings: vec![vec![[1000.0, 1000.0], [4000.0, 1000.0], [4000.0, 4000.0], [1000.0, 4000.0]]],
+                depth_plane: None,
+            }],
+        });
+        view.centre = [250.0, 250.0];
+        view.zoom = 1.0;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let point = view.model_to_screen(rect, [2200.0, 2300.0]).unwrap();
+        assert_eq!(view.pick_element(rect, point).unwrap().id, "living.space.L0");
+    }
+
+    #[test]
     fn picking_inverts_the_real_drawing_transform_after_pan_and_zoom() {
         let mut view = PlanView::new(egui::Context::default());
         view.geometry = Some(DrawingPreview {
@@ -270,6 +302,7 @@ mod tests {
             transform: trigon_engine::DrawingTransform { x0: -24000.0, y1: 18000.0, mm_per_px: 40.0 },
             segments: vec![],
             element_segments: vec![],
+            element_regions: vec![],
         });
         view.centre = [860.0, 380.0];
         view.zoom = 3.5;
@@ -305,6 +338,7 @@ mod tests {
                 kind: DrawingElementKind::Opening,
                 segment: [[200.0, 200.0], [700.0, 200.0]],
             }],
+            element_regions: vec![],
         });
         view.centre = [45.0, 55.0];
         view.zoom = 4.0;

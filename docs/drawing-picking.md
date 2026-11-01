@@ -2,21 +2,25 @@
 
 Generated presentation plans and saved plan, facade and section views expose model-element
 ownership alongside their existing SVG, transform and snap segments. This is additive, read-only
-engine metadata: documents, model schemas, drawing geometry, export formats and defaults do not
-change. GitHub issue WCKDai/trigon#15 is the authorized temporary tracker.
+engine metadata. The coordinated authoring extension (#23, continuing #15) adds filled semantic
+areas and further element kinds without changing existing drawing geometry or export bytes.
+Source property editing is documented in [coordinated authoring](coordinated-authoring.md).
 
 ## Rust API
 
 `trigon_engine::drawing_view` and `trigon_engine::plan_drawing` return `DrawingPreview` with an
-additional `element_segments` vector. Each `DrawingElementSegment` has:
+`element_segments` and `element_regions` vectors. Each `DrawingElementSegment` has:
 
 - `id: String`: an existing built semantic element ID.
-- `kind: DrawingElementKind`: `Opening`, `InteriorWall` or `FacadeWall` (JSON `opening`,
-  `interior_wall`, `facade_wall`).
+- `kind: DrawingElementKind`: `Opening`, `InteriorWall`, `FacadeWall`, `Room`, `Stair`,
+  `Balcony`, `Railing`, `Roof` or `Slab` (snake_case JSON).
 - `segment: [[f64; 2]; 2]`: the owned portion of an actual visible stroked drawing path.
 
 `preview.pick_element(point, tolerance_mm)` returns `Option<DrawingElementHit>`. A hit has `id`,
-`kind`, the nearest `point` on the owned segment, and `distance_mm`. It never changes the document.
+`kind`, the nearest `point` on the owned segment, and `distance_mm`. Filled-area hits return the
+query point with zero distance. Picking never changes the document. Each `DrawingElementRegion`
+has an `id`, `kind`, even-odd polygon `rings`, and an optional affine `depth_plane`
+(`[constant, x_gradient, y_gradient]`). Regions respect logical scene clipping and the sheet crop.
 The types are public in the engine's drawing implementation; consumers can use the preview's
 fields and inherent method without importing their names.
 
@@ -60,16 +64,19 @@ path or existing snap segment. Nearest-hit calculations use these canonical meta
 
 The attribution checks accommodate existing mesh welding (0.1 mm in projected 3D provenance,
 0.5 mm for chained/unioned drawing boundaries); returned segments follow the drawn path within
-the 0.00000001 mm metadata precision. These are not cursor hit tolerances. No model bounding box,
-reconstructed rectangle, image recognition, hidden mesh edge or projected opening void is used
-as a pick target.
+the 0.00000001 mm metadata precision. These are not cursor hit tolerances. No model bounding box, image recognition, hidden mesh edge or projected opening void is
+used as a boundary target. Filled areas come from the corresponding model plan polygons,
+projected faces or mesh cut rings; rooms use their source polygons. An attic above a plan cut
+does not replace the selected floor slab.
 
 ## Nearest hit and validation
 
 The helper measures Euclidean distance to the finite segment centerline, clamping to its
 endpoints. It includes a hit exactly at `tolerance_mm`. It does not expand for paper pen width,
-fill an enclosed area or snap to the cursor grid. A blank room, the middle of a thick wall far
-from its boundary, and a window's blank glazing away from its drawn lines can therefore miss.
+snap to the cursor grid. If no visible owned stroke is within tolerance, it tests the even-odd
+filled areas. Holes remain misses. Where areas overlap, the closest orthographic depth wins,
+then the smallest area, then kind and lexical ID. Plan areas use equal depth, allowing a room
+or stair area to win over the larger floor below it.
 
 Candidates sort by exact floating-point distance, then kind (`Opening`, `InteriorWall`,
 `FacadeWall`), then case-sensitive lexical ID, then nearest point X and Y. Kind precedence only
@@ -79,7 +86,7 @@ door/window reveal lines belong to the host wall when only that wall line is vis
 visible frame/leaf lines belong to the fill.
 
 Query coordinates must be finite and within ±1,000,000 mm; tolerance must be finite and within
-0–100,000 mm, inclusive. Zero requests an exact line hit. The Rust helper returns `None` for an
+0–100,000 mm, inclusive. Zero requests an exact boundary or an interior-area hit. The Rust helper returns `None` for an
 invalid query or a miss. It ignores empty IDs, degenerate segments and non-finite or out-of-range
 metadata coordinates (beyond ±100,000,000 mm).
 
@@ -164,9 +171,11 @@ an independently movable target.
 Integration checks cover all metadata IDs resolving in Studio's scene across an unsaved plan and
 saved plan/facade/section; selecting a visible partition or window, running `edit.move`, and exact
 document restoration through `edit.undo`; and a screen-sized tolerance after pan/zoom with stale
-geometry cleared on drawing failure. Native OS input remains unverified in this environment:
-computer automation returned `noWindowsAvailable`; no desktop mouse pass is claimed. Large-model
-performance benchmarking also remains open.
+geometry cleared on drawing failure. The #23 native pass also exercises Studio pointer events
+on AB Knudepunktet: 3D dimension edits regenerate drawings, and 2D elevation edits regenerate
+the exported model, with one command and exact Undo. Whole-window and GPU viewport captures
+provide visual evidence. These checks use the app control input path; an independent physical
+mouse pass and large-model performance benchmarking remain unverified.
 
 ## Reproduce the complete local workflow
 
@@ -184,4 +193,5 @@ report no failures, match every model element, and agree with its bounds within 
 exercise the desktop selection workflow; the example itself does not certify native mouse input.
 No vendor/reference assets, account, paid service, external data or AI calls are needed.
 
-Rollback is a revert of the single semantic-picking commit; no document migration is needed.
+Picking metadata needs no document migration. Revert the corresponding feature commit to roll
+back the code; see [coordinated authoring](coordinated-authoring.md) for new authoring file variants.

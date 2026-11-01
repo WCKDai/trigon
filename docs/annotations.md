@@ -113,3 +113,7 @@ instead of selecting model geometry. The editing command still decides which ele
 support a change; facade hosts and individual interior door leaves remain inspection targets.
 See [the drawing-picking contract](drawing-picking.md) for boundary-only hit testing, exact IDs,
 phase visibility and the read-only `view.pick` command.
+
+Saved annotations also support sans/serif/mono fonts, bold/italic faces and filled polygon regions.
+See [coordinated authoring](coordinated-authoring.md#drawing-text-and-filled-regions) for styles,
+export behaviour and current editing boundaries.
