@@ -982,11 +982,13 @@ mod picking_tests {
         let session = session();
         // Opening-detail baseline (#27): stepped sashes, separated panes, recessed door
         // panels, hardware and sloped sills intentionally change facade/section paths.
+        // Sill seating correction: only the facade fingerprint changes after the bed
+        // moves above the rough-opening bottom; plan/section bytes stay locked below.
         // The plan remains identical. Keep exact exports and legacy segment extraction
         // locked together; semantic ownership and picking invariants below are unchanged.
         for (id, expected) in [
             ("plan", [10244507659954298824, 11109581394211914227]),
-            ("facade", [7252864978991160264, 12503913643375835528]),
+            ("facade", [438406319699206948, 14362770858810793046]),
             ("section", [18028250061707514544, 14549507134392012572]),
         ] {
             let sheet = sheet(&session.doc, id, View::latest(&session.doc)).unwrap();

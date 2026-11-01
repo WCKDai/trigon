@@ -1344,7 +1344,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             detail =
                 opening::historic_window(fr, rect, w, shape, *lights, *top_light, *panes_across, *panes_down, *muntin_width_mm, *muntins, *operable);
             if !matches!(shape, crate::component::WindowShape::Round) {
-                detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
+                detail.sill = opening::sill(fr, (u0, u1), v0, reveal, 30.0);
             }
         }
         ComponentKind::PanelDoor { leaves, panel_columns, panel_rows, glazed_rows } => {
@@ -1352,11 +1352,11 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
         }
         ComponentKind::Window { lights, top_light } => {
             detail = opening::window(fr, rect, w, *lights, *top_light, true, false);
-            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
+            detail.sill = opening::sill(fr, (u0, u1), v0, reveal, 30.0);
         }
         ComponentKind::FixedWindow => {
             detail = opening::window(fr, rect, w, 1, 0.0, false, false);
-            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
+            detail.sill = opening::sill(fr, (u0, u1), v0, reveal, 30.0);
         }
         ComponentKind::EntranceDoor => {
             let gate = u1 - u0 > 2000.0;
@@ -1375,7 +1375,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
                 parts.push((at.finish, fbox(fr, (wr.u0, wr.u1), (0.0, w.1), (v0, ws))));
             }
             detail.append(opening::window(fr, Rect { v0: ws, ..wr }, w, *lights, 0.0, true, *door_side == Side::Left));
-            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, reveal));
+            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, reveal, 0.0));
         }
         ComponentKind::Loggia { depth, rail_height, door_width, door_side } => {
             // Set back behind the facade: brick returns, a soffit, and the back wall with its
