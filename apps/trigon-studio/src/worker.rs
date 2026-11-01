@@ -242,7 +242,7 @@ mod tests {
                 element_regions: drawing.element_regions,
             };
             let (point, expected) = match &request {
-                DrawingRequest::Saved(id) if id == "facade" => ([session.doc.buildings[0].facades[0].bays[0], 850.0], "b.f1.L0.B0"),
+                DrawingRequest::Saved(id) if id == "facade" => ([session.doc.buildings[0].facades[0].bays[0], 896.0], "b.f1.L0.B0"),
                 DrawingRequest::Saved(id) if id == "section" => ([2000.0, 1500.0], "partition.L0"),
                 _ => ([3000.0, 3925.0], "partition.L0"),
             };
