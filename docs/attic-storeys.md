@@ -99,6 +99,9 @@ level, including copies and tracing paths. The model builder rejects externally 
 unsupported roof interiors, and IFC does not fabricate roof spaces from the knee dimension.
 This prevents fictitious 550 mm high attic interiors and room volumes for a 750 mm knee with a
 200 mm slab. Interior rooms on full storeys below the new floor remain supported.
+With `levels` omitted, `interior.detect_rooms` selects all full storeys, including the basement,
+and excludes the explicit roof level. An explicit list containing the roof level is still refused
+atomically, including a list that also contains supported full storeys.
 
 The serialized opt-in marker is `Storey.roof_level: true`. It is omitted when false, so old
 unmarked files retain their exact serialization/default geometry/export behavior. New files

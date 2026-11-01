@@ -271,6 +271,38 @@ mod tests {
     }
 
     #[test]
+    /// Default detection matches explicit full-storey selection, including the basement;
+    /// refused roof requests must leave the detection transaction available for Redo.
+    fn room_detection_defaults_to_full_storeys_and_keeps_explicit_roof_requests_atomic() {
+        for attic in [false, true] {
+            let mut s = session();
+            s.execute("building.add_basement", json!({"floor":-2200})).unwrap();
+            if attic {
+                s.execute("building.set_attic", json!({"floor":9450})).unwrap();
+            }
+            let initial = bytes(&s);
+            let mut explicit = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+            explicit.doc = s.doc.clone();
+            let expected = explicit.execute("interior.detect_rooms", json!({"levels":[0,1,2,3],"use_scan":false})).unwrap();
+            let actual = s.execute("interior.detect_rooms", json!({"use_scan":false})).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.as_array().unwrap().iter().map(|v| v["level"].as_u64().unwrap()).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+            assert_eq!(s.doc.buildings[0].rooms, explicit.doc.buildings[0].rooms);
+            assert!(s.doc.buildings[0].rooms.iter().any(|r| r.levels.contains(&0)), "basement detection stays included");
+            assert!(s.doc.buildings[0].rooms.iter().all(|r| r.levels.iter().all(|l| *l < 4)));
+            let detected = bytes(&s);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(bytes(&s), initial);
+            if attic {
+                assert_atomic(&mut s, "interior.detect_rooms", json!({"levels":[4],"use_scan":false}));
+                assert_atomic(&mut s, "interior.detect_rooms", json!({"levels":[0,4],"use_scan":false}));
+            }
+            s.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(bytes(&s), detected, "explicit roof refusals preserve the pending Redo");
+        }
+    }
+
+    #[test]
     fn attic_refuses_unclipped_interiors_and_dangling_level_references() {
         let mut s = session();
         s.execute("building.set_attic", json!({"floor":9450})).unwrap();

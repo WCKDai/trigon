@@ -1357,14 +1357,14 @@ static COMMANDS: &[CommandSpec] = &[
         id: "interior.detect_rooms",
         summary: "Find the rooms on the given storeys: the spaces enclosed by the modelled walls and, where a plan is \
                   registered, the drawn lines (partitions, door leaves); door gaps up to 1.1 m are closed. Stores them, replacing earlier detected rooms on those storeys. Rooms smaller than min_area_m2 \
-                  (default 1.0) are ignored. Plans label each room with its area.",
+                  (default 1.0) are ignored. Omitted levels select all full storeys, including basements, but exclude an explicit roof level. Plans label each room with its area.",
         mutates: true,
         journaled: true,
         schema: schema::<DetectRooms>,
         run: |s, v| {
             let p: DetectRooms = parse("interior.detect_rooms", v)?;
             let b = s.doc.building(p.building.as_deref())?;
-            let levels = p.levels.clone().unwrap_or_else(|| (0..b.storeys.len()).collect());
+            let levels = p.levels.clone().unwrap_or_else(|| (0..b.storeys.len()).filter(|l| b.attic_level() != Some(*l)).collect());
             if levels.iter().any(|l| *l >= b.storeys.len()) {
                 return Err(ModelError::Invalid("levels must be existing storeys".into()).into());
             }
