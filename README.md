@@ -1,4 +1,7 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/trigon-dark.svg">
+  <img src="assets/brand/trigon-light.svg" height="44" alt="Trigon">
+</picture>
 
 # Trigon
 
@@ -11,7 +14,7 @@ The AI **controls** Trigon through the same commands a person uses. It never gen
 every wall, window and balcony is built by deterministic, parametric code from numbers you can
 read and change.
 
-Status: early MVP (week 1). Planning notes are in [`docs/planning`](docs/planning) and the
+Site: [trigon.sh](https://trigon.sh). Status: early MVP (week 1). Planning notes are in [`docs/planning`](docs/planning) and the
 open-source landscape in [`docs/research`](docs/research).
 
 ## Try it
