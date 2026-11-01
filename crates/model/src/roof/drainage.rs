@@ -123,7 +123,9 @@ pub fn build(
         checked("downpipe along", p.along_mm, p.diameter_mm, wall.length - p.diameter_mm)?;
         checked("downpipe wall offset", p.wall_offset_mm, p.diameter_mm / 2.0 + 20.0, 1000.0)?;
         checked("downpipe shoe", p.shoe_mm, 0.0, 500.0)?;
-        checked("downpipe bottom", p.bottom_mm, -5000.0, low - r - 800.0)?;
+        // Keep a real straight run between offset knees and shoe, and keep the lower
+        // collar's full 40 mm extent below the upper collar (even with a small shoe).
+        checked("downpipe bottom", p.bottom_mm, -5000.0, (low - r - 500.0 - p.shoe_mm.max(50.0) - p.diameter_mm.max(50.0)).min(low - r - 940.0))?;
         let fr = FacadeFrame::new(outline[k], outline[(k + 1) % outline.len()]).ok_or_else(|| invalid("invalid eave"))?;
         let anchor = wall.point(p.along_mm, 0.0, 0.0);
         let u = (anchor[0] - fr.origin[0]) * fr.t[0] + (anchor[1] - fr.origin[1]) * fr.t[1];
@@ -311,6 +313,46 @@ mod tests {
         // Arbitrary 90-degree frame changes produce twisted, flattened knees in the render.
         for pair in mesh.positions[..(path.len() - 1) * 16 * 8].chunks(8) {
             assert!((pair[0][0] - pair[3][0]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn downpipe_rejects_reversed_shoe_runs_and_overlapping_collars() {
+        let b = building();
+        let z = 6000. - 75.;
+        for (shoe, bottom) in [(500., z - 800.), (0., z - 800.), (100., z - 900.)] {
+            let d = Drainage {
+                downpipes: vec![Downpipe {
+                    id: "p".into(),
+                    facade: "test.f1".into(),
+                    along_mm: 3000.,
+                    diameter_mm: 80.,
+                    wall_offset_mm: 100.,
+                    bottom_mm: bottom,
+                    shoe_mm: shoe,
+                }],
+                ..Default::default()
+            };
+            assert!(
+                build(&b, &[0, 1, 2, 3], &b.footprint, 6000., 0., 35., &[1, 3], &d).is_err(),
+                "shoe {shoe}, bottom {bottom} must not fold or overlap collars"
+            );
+        }
+        for shoe in [0_f64, 50., 100., 500.] {
+            let bottom = (z - 500. - shoe.max(50.) - 80.).min(z - 940.);
+            let d = Drainage {
+                downpipes: vec![Downpipe {
+                    id: "p".into(),
+                    facade: "test.f1".into(),
+                    along_mm: 3000.,
+                    diameter_mm: 80.,
+                    wall_offset_mm: 100.,
+                    bottom_mm: bottom,
+                    shoe_mm: shoe,
+                }],
+                ..Default::default()
+            };
+            assert!(build(&b, &[0, 1, 2, 3], &b.footprint, 6000., 0., 35., &[1, 3], &d).is_ok(), "valid lower bound for shoe {shoe}");
         }
     }
 
