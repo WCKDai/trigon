@@ -24,6 +24,7 @@ struct Job {
 
 pub struct PlanView {
     tree: Option<(u64, Arc<usvg::Tree>)>,
+    display_trees: Vec<Arc<usvg::Tree>>,
     geometry: Option<DrawingPreview>,
     /// Sheet pixel at the middle of the view, and screen points per sheet pixel.
     centre: [f32; 2],
@@ -59,6 +60,7 @@ impl PlanView {
             }
         });
         PlanView {
+            display_trees: Vec::new(),
             tree: None,
             geometry: None,
             centre: [800.0, 450.0],
@@ -79,11 +81,13 @@ impl PlanView {
     /// A new sheet (another level, a changed model). The view stays where it is.
     pub fn set_tree(&mut self, generation: u64, tree: Arc<usvg::Tree>) {
         self.tree = Some((generation, tree));
+        self.display_trees.clear();
         self.error = None;
     }
 
     pub fn set_drawing(&mut self, generation: u64, drawing: crate::worker::PreparedDrawing) {
         self.set_tree(generation, drawing.tree);
+        self.display_trees = drawing.display_trees;
         self.geometry = Some(DrawingPreview {
             svg: String::new(),
             transform: drawing.transform,
@@ -95,6 +99,7 @@ impl PlanView {
 
     pub fn fail(&mut self, error: String) {
         self.tree = None;
+        self.display_trees.clear();
         self.geometry = None;
         self.picture = None;
         self.asked = None;
@@ -212,6 +217,7 @@ impl PlanView {
         let generation = self.tree.as_ref()?.0;
         let key = drawing_raster::exact_key(generation, self.centre, self.zoom, [rect.width(), rect.height()], ppp)?;
         let (_, tree) = self.tree.as_ref()?;
+        let tree = if key.detail > 0 { self.display_trees.get(usize::from(key.detail) - 1).unwrap_or(tree) } else { tree };
         rasterize(tree, key.origin, key.scale, key.size)
     }
 
@@ -284,6 +290,7 @@ impl PlanView {
                 && self.asked != Some(key)
                 && let Some((_, tree)) = &self.tree
             {
+                let tree = if key.detail > 0 { self.display_trees.get(usize::from(key.detail) - 1).unwrap_or(tree) } else { tree };
                 let _ = self.jobs.send(Job { tree: tree.clone(), key });
                 self.asked = Some(key);
             }

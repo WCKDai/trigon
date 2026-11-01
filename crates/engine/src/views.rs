@@ -361,6 +361,25 @@ fn preview(sheet: Sheet) -> DrawingPreview {
     }
 }
 
+/// Three immutable display variants per document generation. Only `exact` supplies picking data.
+/// Reduced/overview styles are for screens; all exports continue to use the exact scene.
+pub struct DrawingDisplay {
+    pub exact: DrawingPreview,
+    pub reduced_svg: String,
+    pub overview_svg: String,
+}
+fn display(sheet: Sheet) -> DrawingDisplay {
+    let reduced_svg = crate::sheet::display::svg_at(&sheet, 1);
+    let overview_svg = crate::sheet::display::svg_at(&sheet, 2);
+    DrawingDisplay { exact: preview(sheet), reduced_svg, overview_svg }
+}
+pub fn drawing_view_display(doc: &Document, id: &str, phase: View) -> Result<DrawingDisplay> {
+    Ok(display(sheet(doc, id, phase)?))
+}
+pub fn plan_drawing_display(doc: &Document, level: usize, phase: View) -> Result<DrawingDisplay> {
+    Ok(display(crate::plan::drawing_sheet(doc, level, phase)?))
+}
+
 pub fn drawing_view(doc: &Document, id: &str, phase: View) -> Result<DrawingPreview> {
     Ok(preview(sheet(doc, id, phase)?))
 }
@@ -771,6 +790,27 @@ mod picking_tests {
         assert_eq!(s.doc, original);
         s.execute("view.configure", json!({"id":"plan","template":null})).unwrap();
         assert!(serde_json::to_value(&s.doc.views[0]).unwrap().get("template").is_none());
+    }
+
+    #[test]
+    fn screen_detail_variants_keep_exact_geometry_transforms_and_legacy_exports() {
+        let s = session();
+        for id in ["plan", "facade", "section"] {
+            // Compare the same generated scene before/after LOD preparation. Separate projection
+            // runs may order raw snap rings differently; semantic picks and export fingerprints
+            // have their independent repeated-generation regressions below.
+            let source = sheet(&s.doc, id, View::latest(&s.doc)).unwrap();
+            let original = preview(source.clone());
+            let display = display(source);
+            assert_eq!(display.exact.svg, original.svg);
+            assert_eq!(display.exact.transform, original.transform);
+            assert_eq!(display.exact.segments, original.segments);
+            assert_eq!(display.exact.element_segments, original.element_segments);
+            assert_eq!(display.exact.element_regions, original.element_regions);
+            for svg in [display.reduced_svg, display.overview_svg] {
+                assert_eq!(crate::parse_svg(&svg).unwrap().size(), crate::parse_svg(&original.svg).unwrap().size());
+            }
+        }
     }
 
     fn fingerprint(bytes: &[u8]) -> u64 {

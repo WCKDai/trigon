@@ -6,6 +6,7 @@ use trigon_engine::resvg::{self, tiny_skia, usvg};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Key {
     pub generation: u64,
+    pub detail: u8,
     pub origin: [f32; 2],
     pub scale: f32,
     pub size: [u32; 2],
@@ -18,7 +19,15 @@ pub fn exact_key(generation: u64, centre: [f32; 2], zoom: f32, view: [f32; 2], p
     }
     let origin = [centre[0] - view[0] / 2.0 / zoom, centre[1] - view[1] / 2.0 / zoom];
     let size = [(view[0] * ppp).round().max(1.0) as u32, (view[1] * ppp).round().max(1.0) as u32];
-    Some(Key { generation, origin, scale: zoom * ppp, size })
+    let band = 2.0_f32.powf((zoom.log2() * 8.0).ceil() / 8.0);
+    let detail = if band < 0.4 {
+        2
+    } else if band < 0.8 {
+        1
+    } else {
+        0
+    };
+    Some(Key { generation, detail, origin, scale: zoom * ppp, size })
 }
 /// Cache an overscanned region on a 128-pixel grid, with 1/8-octave upward resolution buckets.
 /// The cached image remains at least screen resolution unless the bounded raster budget is hit.
@@ -38,7 +47,7 @@ pub fn key(generation: u64, centre: [f32; 2], zoom: f32, view: [f32; 2], ppp: f3
     if origin.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    Some(Key { generation, origin, scale, size: size.map(|v| v.clamp(1, MAX_SIDE)) })
+    Some(Key { generation, detail: exact.detail, origin, scale, size: size.map(|v| v.clamp(1, MAX_SIDE)) })
 }
 /// Interaction uses exact current-generation vector geometry, while its cached pixels move live.
 pub fn ready(shown: Key, wanted: Key) -> bool {
@@ -126,6 +135,15 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn display_detail_tracks_zoom_buckets_and_returns_to_full_detail() {
+        let k = |zoom, ppp| key(1, [800.0, 450.0], zoom, [1000.0, 700.0], ppp).unwrap();
+        assert_eq!(k(0.3, 1.0).detail, 2);
+        assert_eq!(k(0.6, 1.0).detail, 1);
+        assert_eq!(k(1.0, 1.0).detail, 0);
+        assert_eq!(k(0.3, 1.0).detail, k(0.3, 2.0).detail, "density follows window scale, independently of Retina pixel ratio");
+        assert_eq!(k(0.6001, 1.0), k(0.6002, 1.0), "tiny zoom increments share raster resolution and display detail");
     }
     #[test]
     fn obsolete_generations_and_superseded_rasters_are_rejected_before_upload() {

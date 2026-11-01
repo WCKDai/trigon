@@ -44,8 +44,8 @@ pub use schedules::{
     opening_schedule_from_built,
 };
 pub use views::{
-    DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap, DrawingTransform, SnapKind,
-    SnapOptions, drawing_view, plan_drawing, snap_drawing,
+    DrawingDisplay, DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap,
+    DrawingTransform, SnapKind, SnapOptions, drawing_view, drawing_view_display, plan_drawing, plan_drawing_display, snap_drawing,
 };
 
 #[derive(Debug, thiserror::Error)]

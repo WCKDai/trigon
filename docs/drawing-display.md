@@ -47,3 +47,19 @@ before/after runs on the same machine and input, not a cross-machine speed ranki
 `ui.view` exposes `drawing_raster` counters and last allocation/render/conversion/texture-enqueue
 CPU timings for native profiling. The texture enqueue timer measures the UI call, not GPU upload
 completion; `gpu_upload_measured` is explicitly false.
+
+## Adaptive screen detail
+
+The worker prepares full, reduced and overview SVG trees once per drawing generation. Zoom
+buckets select among those immutable trees; pan never reparses SVG or rebuilds model geometry.
+Below roughly 80% sheet zoom, display pens become finer and masonry hatch becomes a pale solid
+fill. Fine glazing/stair/railing lines shorter than 0.75 screen points are omitted; dense parallel
+fine detail is sampled on sheet-anchored cells. Cut walls, major wall/roof/floor silhouettes and
+manual annotations are retained. Overview below roughly 40% uses a coarser sampling cell.
+Full detail returns on zoom-in. The detail band follows window zoom independently of Retina DPI.
+
+These are display styles. Export SVG/PNG/PDF/DXF retain the selected paper pens and full detail.
+The exact vector scene still supplies every pick, snap and handle; no semantic ID is deleted by
+screen LOD. Each band is deterministic and pan-invariant, and shares the bounded raster cache.
+Preparing three parsed trees adds initial generation work and memory; it is not a model-building
+or first-load optimization. The CPU profile reports preparation and parse time separately.

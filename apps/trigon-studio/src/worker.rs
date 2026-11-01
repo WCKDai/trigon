@@ -25,6 +25,7 @@ pub enum DrawingRequest {
 
 pub struct PreparedDrawing {
     pub tree: Arc<usvg::Tree>,
+    pub display_trees: Vec<Arc<usvg::Tree>>,
     pub transform: DrawingTransform,
     pub segments: Vec<[[f64; 2]; 2]>,
     /// Visible model linework, in drawing-plane mm, with the built element id that owns each stroke.
@@ -95,13 +96,18 @@ pub fn run(job: &Job) -> Done {
     let drawing = job.drawing.as_ref().map(|request| {
         let t = Instant::now();
         let tree = guarded("drawing the workspace", || {
-            let DrawingPreview { svg, transform, segments, element_segments, element_regions } = match request {
-                DrawingRequest::Plan(level) => trigon_engine::plan_drawing(&job.doc, *level, job.view),
-                DrawingRequest::Saved(id) => trigon_engine::drawing_view(&job.doc, id, job.view),
+            let display = match request {
+                DrawingRequest::Plan(level) => trigon_engine::plan_drawing_display(&job.doc, *level, job.view),
+                DrawingRequest::Saved(id) => trigon_engine::drawing_view_display(&job.doc, id, job.view),
             }
             .map_err(|e| e.to_string())?;
+            let DrawingPreview { svg, transform, segments, element_segments, element_regions } = display.exact;
+            let display_trees = [display.reduced_svg, display.overview_svg]
+                .iter()
+                .map(|svg| trigon_engine::parse_svg(svg).map(Arc::new).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
             let tree = trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())?;
-            Ok(PreparedDrawing { tree, transform, segments, element_segments, element_regions })
+            Ok(PreparedDrawing { tree, display_trees, transform, segments, element_segments, element_regions })
         });
         plan_ms = ms(t);
         (request.clone(), tree)
@@ -252,6 +258,7 @@ mod tests {
             let (actual, drawing) = result.drawing.unwrap();
             assert_eq!(actual, request);
             let drawing = drawing.unwrap();
+            assert_eq!(drawing.display_trees.len(), 2);
             assert!(!drawing.element_segments.is_empty());
             for line in &drawing.element_segments {
                 assert!(scene.find(&line.id).is_some(), "{request:?}: {} must resolve to a real scene element", line.id);

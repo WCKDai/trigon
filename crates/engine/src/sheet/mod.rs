@@ -4,6 +4,7 @@
 //! feeds the PNG and PDF output) and DXF.
 
 pub(crate) mod cut;
+pub(crate) mod display;
 pub(crate) mod dxf;
 pub(crate) mod project;
 pub(crate) mod style;
@@ -52,6 +53,7 @@ pub(crate) fn overlap<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; D
 }
 
 /// The shared presentation scene, used both by file exports and live drafting workspaces.
+#[derive(Clone)]
 pub(crate) struct Sheet {
     pub(crate) scene: Scene,
     pub(crate) vp: Viewport,

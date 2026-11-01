@@ -4,7 +4,7 @@
 mod drawing_raster;
 use serde_json::json;
 use std::{error::Error, time::Instant};
-use trigon_engine::{Session, drawing_view};
+use trigon_engine::{Session, drawing_view_display};
 use trigon_model::build::View;
 
 fn percentile(values: &[f64], q: f64) -> f64 {
@@ -31,13 +31,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     for (id, kind) in [("plan", json!({"view":"plan","level":0})), ("elevation", json!({"view":"facade","facade":"b1.f1"}))] {
         s.execute("view.define", json!({"id":id,"name":id,"kind":kind}))?;
-        let drawing = drawing_view(&s.doc, id, View::latest(&s.doc))?;
+        let prepare = Instant::now();
+        let display = drawing_view_display(&s.doc, id, View::latest(&s.doc))?;
+        let prepare_ms = prepare.elapsed().as_secs_f64() * 1000.0;
         let start = Instant::now();
-        let tree = trigon_engine::parse_svg(&drawing.svg)?;
+        let trees = [display.exact.svg, display.reduced_svg, display.overview_svg]
+            .iter()
+            .map(|svg| trigon_engine::parse_svg(svg))
+            .collect::<Result<Vec<_>, _>>()?;
         let parse_ms = start.elapsed().as_secs_f64() * 1000.0;
         // Warm up raster code/fonts/allocator before the five measured repetitions.
         std::hint::black_box(
-            drawing_raster::rasterize(&tree, [0.0, 0.0], 0.65 * ppp, [(1000.0 * ppp) as u32, (700.0 * ppp) as u32]).ok_or("raster warmup failed")?,
+            drawing_raster::rasterize(&trees[1], [0.0, 0.0], 0.65 * ppp, [(1000.0 * ppp) as u32, (700.0 * ppp) as u32])
+                .ok_or("raster warmup failed")?,
         );
         for gesture in ["pan", "zoom"] {
             for repeat in 0..5 {
@@ -59,7 +65,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     let before = Instant::now();
                     if shown != Some(key) {
-                        let (image, times) = drawing_raster::profiled(&tree, key.origin, key.scale, key.size).ok_or("raster failed")?;
+                        let (image, times) =
+                            drawing_raster::profiled(&trees[usize::from(key.detail)], key.origin, key.scale, key.size).ok_or("raster failed")?;
                         if !drawing_raster::accept_result(key, key) {
                             return Err("current raster rejected".into());
                         }
@@ -74,7 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 println!(
                     "{}",
-                    json!({"view":id,"gesture":gesture,"repeat":repeat,"frames":96,"pixels_per_point":ppp,"viewport_points":[1000,700],"parse_ms":parse_ms,"gesture_ms":start.elapsed().as_secs_f64()*1000.0,"raster_jobs":renders.len(),"readiness_stalls":stalls,"texture_bytes_candidate":bytes,"frame_cpu_p50_ms":percentile(&costs,0.5),"frame_cpu_p95_ms":percentile(&costs,0.95),"raster_render_p50_ms":percentile(&renders,0.5),"raster_render_p95_ms":percentile(&renders,0.95),"allocation_p50_ms":percentile(&alloc,0.5),"conversion_p50_ms":percentile(&converts,0.5)})
+                    json!({"view":id,"gesture":gesture,"repeat":repeat,"frames":96,"pixels_per_point":ppp,"viewport_points":[1000,700],"parse_ms":parse_ms,"prepare_ms":prepare_ms,"gesture_ms":start.elapsed().as_secs_f64()*1000.0,"raster_jobs":renders.len(),"readiness_stalls":stalls,"texture_bytes_candidate":bytes,"frame_cpu_p50_ms":percentile(&costs,0.5),"frame_cpu_p95_ms":percentile(&costs,0.95),"raster_render_p50_ms":percentile(&renders,0.5),"raster_render_p95_ms":percentile(&renders,0.95),"allocation_p50_ms":percentile(&alloc,0.5),"conversion_p50_ms":percentile(&converts,0.5)})
                 );
             }
         }

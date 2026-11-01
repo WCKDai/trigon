@@ -19,6 +19,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let baseline = s.doc.clone();
     s.execute("view.configure",json!({"id":"plan","template":{"name":"Presentation fit","line_weights":"fine","sizing":{"mode":"fit"},"range":{"top_mm":2300,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000}}}))?;
     let configured = s.doc.clone();
+    let display = trigon_engine::drawing_view_display(&s.doc, "plan", trigon_model::build::View::latest(&s.doc))?;
+    for (name, svg) in [("screen-full", display.exact.svg), ("screen-reduced", display.reduced_svg), ("screen-overview", display.overview_svg)] {
+        std::fs::write(directory.join(format!("{name}.svg")), &svg)?;
+        let tree = trigon_engine::parse_svg(&svg)?;
+        let mut pixels = trigon_engine::resvg::tiny_skia::Pixmap::new(480, 270).ok_or("cannot allocate display evidence")?;
+        pixels.fill(trigon_engine::resvg::tiny_skia::Color::WHITE);
+        trigon_engine::resvg::render(&tree, trigon_engine::resvg::tiny_skia::Transform::from_scale(0.3, 0.3), &mut pixels.as_mut());
+        std::fs::write(directory.join(format!("{name}.png")), pixels.encode_png()?)?;
+    }
     for ext in ["svg", "png", "pdf", "dxf"] {
         s.execute("view.export", json!({"id":"plan","path":directory.join(format!("fit.{ext}"))}))?;
     }
