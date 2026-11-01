@@ -371,3 +371,15 @@ fn the_client_authenticates_and_calls() {
     let wrong = format!("{}0", &TOKEN[..TOKEN.len() - 1]);
     assert!(crate::Client::connect(&addr, &wrong).is_err(), "a wrong token fails at connect");
 }
+
+#[test]
+fn silent_refused_client_does_not_block_the_next_accept() {
+    let app = start(Options { max_connections: 0, ..Default::default() });
+    let mut first = Conn::open(app.port);
+    assert!(is_error(&first.read().expect("first refusal"), "too many connections"));
+    // Keep the refused stream's write half open and silent. Its 500 ms drain deadline
+    // must not delay a second connection's refusal on the independent accept thread.
+    let mut second = Conn::open(app.port);
+    second.lines.get_mut().set_read_timeout(Some(Duration::from_millis(350))).unwrap();
+    assert!(is_error(&second.read().expect("accept must continue while the first refused stream drains"), "too many connections"));
+}

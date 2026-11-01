@@ -70,7 +70,10 @@ The channel is untrusted input; nothing a client sends can crash Studio.
 - A request line may be at most **16 MiB**; a longer one is answered `request too large` and the
   connection is closed.
 - A connection that sends **8** lines that are not JSON is closed.
-- At most **16** connections are served at once; further ones get `too many connections`.
+- At most **16** connections are served at once. Up to **4** independent refusal workers send
+  `too many connections`, then drain at most 64 KiB for at most 500 ms. The accept thread keeps
+  accepting while those drains wait. With all refusal workers occupied, excess sockets close
+  immediately; worker creation remains bounded. No refused request reaches the app.
 - At most **64** requests wait for the window at once (more are answered `busy`), and the window
   takes at most 64 per frame, so a flood can't starve drawing.
 - A request the window hasn't answered within **60 s** is answered
