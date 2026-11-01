@@ -218,7 +218,19 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         ty.validate()?;
         let (left, right) = (spec.u_mm - ty.width / 2.0, spec.u_mm + ty.width / 2.0);
         let front = spec.setback_mm;
-        let (top, bottom) = (plane(&original, &fr, [spec.u_mm, front + FRONT], true)?, plane(&original, &fr, [spec.u_mm, front + FRONT], false)?);
+        let sample = |u, w, up| {
+            plane(&original, &fr, [u, w], up).map_err(|error| match error {
+                ModelError::Invalid(message) => ModelError::Invalid(format!(
+                    "{message}; dormer {} on {}: sampled (u={u:.6} mm, w={w:.6} mm), surface={}; \
+                     no intersecting host surface, so no height is available at this sample",
+                    spec.id,
+                    spec.facade,
+                    if up { "top" } else { "underside" }
+                )),
+                other => other,
+            })
+        };
+        let (top, bottom) = (sample(spec.u_mm, front + FRONT, true)?, sample(spec.u_mm, front + FRONT, false)?);
         if top.0[0].abs() > EPS || bottom.0[0].abs() > EPS {
             let correction = (-top.0[0]).atan2(top.0[1]);
             let required = (spec.yaw_deg + correction.to_degrees() + 180.0).rem_euclid(360.0) - 180.0;
@@ -272,7 +284,22 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
             (corners.iter().flatten().copied().fold(f64::INFINITY, f64::min), corners.iter().flatten().copied().fold(f64::NEG_INFINITY, f64::max))
         };
         if projection.0 < 100.0 || projection.1 > source.length - 100.0 {
-            return Err(ModelError::Invalid("dormer runs too close to a facade end".into()));
+            return Err(ModelError::Invalid(format!(
+                "dormer runs too close to a facade end; dormer {} on {}: u_mm={:.6} mm, \
+                 projected along span=[{:.6}, {:.6}] mm, permitted end range=[100.000000, {:.6}] mm; \
+                 shortfall start={:.6} mm, end={:.6} mm; centre end limits=[{:.6}, {:.6}] mm for this projected envelope only \
+                 (an empty range cannot fit). Other host checks still apply; no placement is changed",
+                spec.id,
+                spec.facade,
+                spec.u_mm,
+                projection.0,
+                projection.1,
+                source.length - 100.0,
+                (100.0 - projection.0).max(0.0),
+                (projection.1 - (source.length - 100.0)).max(0.0),
+                spec.u_mm + (100.0 - projection.0),
+                spec.u_mm + (source.length - 100.0 - projection.1)
+            )));
         }
         if reserved.iter().any(|(f, l, r): &(&str, f64, f64)| *f == spec.facade && projection.0 < *r + 100.0 && *l < projection.1 + 100.0) {
             return Err(ModelError::Invalid("dormers need at least 100 mm between their roof projections".into()));
@@ -281,9 +308,23 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         for u in [extent.0, spec.u_mm, extent.1] {
             for w in [front - OVERHANG, front + FRONT, back, back + UNDERLAP] {
                 for (p, up) in [(top, true), (bottom, false)] {
-                    let found = plane(&original, &fr, [u, w], up)?;
+                    let found = sample(u, w, up)?;
                     if (found.z(u, w) - p.z(u, w)).abs() > 0.01 {
-                        return Err(ModelError::Invalid("dormer crosses a hip or slope break; reduce its width, height or setback".into()));
+                        return Err(ModelError::Invalid(format!(
+                            "dormer crosses a hip or slope break; reduce its width, height or setback; dormer {} on {}: \
+                             sampled (u={u:.6} mm, w={w:.6} mm), surface={}; expected z={:.6} mm, found z={:.6} mm, \
+                             found-expected={:.6} mm exceeds 0.010000 mm absolute tolerance. \
+                             Expected height extends the front reference plane sampled at (u={:.6} mm, w={:.6} mm); \
+                             this is a rejected sample, not a fit elsewhere",
+                            spec.id,
+                            spec.facade,
+                            if up { "top" } else { "underside" },
+                            p.z(u, w),
+                            found.z(u, w),
+                            found.z(u, w) - p.z(u, w),
+                            spec.u_mm,
+                            front + FRONT
+                        )));
                     }
                 }
             }
@@ -598,6 +639,113 @@ mod tests {
             let error = crate::build(&doc).unwrap_err().to_string();
             assert!(error.contains(&format!("requires yaw_deg={required:.9} deg")), "{error}");
             assert!(error.contains("supported range is -45 to 45"), "{error}");
+        }
+    }
+
+    #[test]
+    fn end_feedback_quantifies_both_shortfalls_and_centre_limits_in_site_frames() {
+        for (rotation, offset) in [(0.0_f64, [0., 0.]), (37., [410000., -270000.])] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let outline =
+                [[0., 0.], [12000., 0.], [12000., 11000.], [0., 11000.]].map(|[x, y]| [offset[0] + x * cos - y * sin, offset[1] + x * sin + y * cos]);
+            let mut b = Building::new("b", "Synthetic end clearance", &outline, 3, 3400.).unwrap();
+            b.roof = serde_json::from_value(serde_json::json!({
+                "kind":"pitched","pitch_deg":46,"thickness_mm":220,"gables":["b.f2","b.f4"]
+            }))
+            .unwrap();
+            let mut doc = Document::default();
+            doc.buildings.push(b);
+            for (u, span, shortfalls) in [
+                (937.5, "[87.500000, 1787.500000]", "start=12.500000 mm, end=0.000000 mm"),
+                (11062.5, "[10212.500000, 11912.500000]", "start=0.000000 mm, end=12.500000 mm"),
+            ] {
+                *doc.buildings[0].roof.dormers_mut().unwrap() = vec![
+                    serde_json::from_value(serde_json::json!({
+                        "id":"end","facade":"b.f1","u_mm":u,"window_type":"window.casement.2","width_mm":1400,"height_mm":1000
+                    }))
+                    .unwrap(),
+                ];
+                let source = serde_json::to_vec(&doc).unwrap();
+                let error = crate::build(&doc).unwrap_err().to_string();
+                assert!(error.starts_with("invalid: dormer runs too close to a facade end"), "{error}");
+                assert!(error.contains("dormer end on b.f1"), "{error}");
+                assert!(error.contains(&format!("u_mm={u:.6} mm")), "{error}");
+                assert!(error.contains(&format!("projected along span={span} mm")), "{error}");
+                assert!(error.contains("permitted end range=[100.000000, 11900.000000] mm"), "{error}");
+                assert!(error.contains(shortfalls), "{error}");
+                assert!(error.contains("centre end limits=[950.000000, 11050.000000] mm"), "{error}");
+                assert_eq!(serde_json::to_vec(&doc).unwrap(), source);
+            }
+            doc.buildings[0].roof.dormers_mut().unwrap()[0].u_mm = 975.;
+            assert!(crate::build(&doc).is_ok(), "feedback must leave the guard's accepted geometry unchanged");
+        }
+    }
+
+    #[test]
+    fn end_feedback_uses_the_full_skew_envelope_projection() {
+        for positive in [false, true] {
+            for (rotation, offset) in [(0., [0., 0.]), (-118., [-30000., 41000.])] {
+                let (mut doc, mut spec) = skew_eave(positive, rotation, offset, "pitched");
+                doc.buildings[0].roof.dormers_mut().unwrap().push(spec.clone());
+                let valid = crate::build(&doc).unwrap();
+                let roof = &valid[0].roof.as_ref().unwrap().dormers[0].roof;
+                let (a, b) = doc.buildings[0].edge(0).unwrap();
+                let source = FacadeFrame::new(a, b).unwrap();
+                // Independent reference: project an actually built shed solid, then move
+                // its wall-line anchor. The roof depth and dimensions stay unchanged.
+                let stations: Vec<_> = roof.positions.iter().map(|&p| local(&source, p)[0]).collect();
+                let delta = if positive { 820. - spec.u_mm } else { 11180. - spec.u_mm };
+                let expected = [
+                    stations.iter().copied().fold(f64::INFINITY, f64::min) + delta,
+                    stations.iter().copied().fold(f64::NEG_INFINITY, f64::max) + delta,
+                ];
+                spec.u_mm += delta;
+                doc.buildings[0].roof.dormers_mut().unwrap()[0] = spec;
+                let error = crate::build(&doc).unwrap_err().to_string();
+                assert!(error.contains("dormer skew on b.f1"), "{error}");
+                let span = error.split_once("projected along span=[").unwrap().1.split_once("] mm").unwrap().0;
+                let found: Vec<f64> = span.split(", ").map(|s| s.parse().unwrap()).collect();
+                assert_eq!(found.len(), 2);
+                for (got, want) in found.iter().zip(expected) {
+                    assert!((got - want).abs() < 1e-5, "{error}; expected {expected:?} mm");
+                }
+                assert!(error.contains("shortfall start=") && error.contains("centre end limits="), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn hip_feedback_identifies_the_sample_surface_and_height_residual_on_skew_hosts() {
+        for kind in ["pitched", "mansard"] {
+            for (rotation, offset) in [(0., [0., 0.]), (37., [410000., -270000.])] {
+                let (mut doc, mut spec) = skew_eave(false, rotation, offset, kind);
+                if let crate::Roof::Mansard { parameters } = &mut doc.buildings[0].roof {
+                    parameters.break_run_mm = 1300.;
+                    spec.height_mm = 2200.;
+                } else {
+                    spec.u_mm = 1600.;
+                }
+                let uncut = crate::build(&doc).unwrap();
+                let host = &uncut[0].roof.as_ref().unwrap().cover;
+                let b = &doc.buildings[0];
+                let (a, e) = b.edge(0).unwrap();
+                let anchor = FacadeFrame::new(a, e).unwrap().point(spec.u_mm, 0., 0.);
+                let eave = FacadeFrame::new(b.footprint[0], b.footprint[2]).unwrap();
+                let reference = FacadeFrame { origin: [anchor[0] - spec.u_mm * eave.t[0], anchor[1] - spec.u_mm * eave.t[1]], ..eave };
+                doc.buildings[0].roof.dormers_mut().unwrap().push(spec.clone());
+                let error = crate::build(&doc).unwrap_err().to_string();
+                assert!(error.starts_with("invalid: dormer crosses a hip or slope break; reduce its width, height or setback"), "{error}");
+                assert!(error.contains("dormer skew on b.f1") && error.contains("surface=top"), "{error}");
+                let number = |label| error.split_once(label).unwrap().1.split_whitespace().next().unwrap().parse::<f64>().unwrap();
+                let (u, w) = (number("sampled (u="), number("w="));
+                let expected = plane(host, &reference, [spec.u_mm, spec.setback_mm + FRONT], true).unwrap().z(u, w);
+                let found = plane(host, &reference, [u, w], true).unwrap().z(u, w);
+                assert!((number("expected z=") - expected).abs() < 1e-5, "{error}");
+                assert!((number("found z=") - found).abs() < 1e-5, "{error}");
+                assert!((number("found-expected=") - (found - expected)).abs() < 1e-5, "{error}");
+                assert!((found - expected).abs() > 0.01);
+                assert!(error.contains("0.010000 mm absolute tolerance"), "{error}");
+            }
         }
     }
 
