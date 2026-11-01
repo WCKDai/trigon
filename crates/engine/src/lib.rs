@@ -25,6 +25,7 @@ mod facade_image;
 mod fbx;
 mod lettering_audit;
 mod libraries;
+mod local_building;
 mod plan;
 mod plan_output;
 mod plan_range;
@@ -116,7 +117,16 @@ impl Session {
                     self.undo.remove(0);
                 }
                 self.redo.clear();
-                self.doc.journal.push(JournalEntry { command: id.to_string(), params });
+                // Preflight tokens are ephemeral conflict guards. Journal the actual typed
+                // operation so a saved model can be replayed without a preview from this build.
+                let entry = if id == "precision.apply" {
+                    params
+                        .get("action")
+                        .and_then(|a| Some(JournalEntry { command: a.get("command")?.as_str()?.to_string(), params: a.get("params")?.clone() }))
+                } else {
+                    None
+                };
+                self.doc.journal.push(entry.unwrap_or_else(|| JournalEntry { command: id.to_string(), params }));
                 self.dirty = true;
             }
             _ => {}

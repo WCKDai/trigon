@@ -13,6 +13,8 @@ use crate::{Result, Session, edit};
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", content = "params", deny_unknown_fields)]
 pub(crate) enum Action {
+    #[serde(rename = "building.add")]
+    AddBuilding(crate::local_building::Add),
     #[serde(rename = "edit.move")]
     Move(edit::Move),
     #[serde(rename = "edit.align")]
@@ -55,6 +57,7 @@ fn token(s: &Session, action: &Action) -> Result<String> {
 
 fn run(s: &mut Session, action: Action) -> Result<Value> {
     let result = match action {
+        Action::AddBuilding(p) => crate::local_building::add(s, p),
         Action::Move(p) => edit::move_elements(s, p),
         Action::Align(p) => edit::align(s, p),
         Action::AlignWalls(p) => edit::align_walls(s, p),

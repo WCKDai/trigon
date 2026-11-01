@@ -2164,7 +2164,7 @@ fn precision_preview_connect_apply_audit_preserves_doors_other_storeys_and_histo
     assert_eq!(s.doc, before);
     s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
     assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
-    assert_eq!(s.doc.journal.last().unwrap().command, "precision.apply");
+    assert_eq!(s.doc.journal.last().unwrap().command, "edit.connect_walls");
     let walls = &s.doc.buildings[0].interior_walls;
     let west = walls.iter().find(|w| w.levels == [0] && w.id.starts_with("west.")).unwrap();
     let east = walls.iter().find(|w| w.levels == [0] && w.id.starts_with("east.")).unwrap();
@@ -2412,4 +2412,68 @@ fn precision_sanity_checks_find_kinks_misalignment_and_overlaps_without_straight
         !audit["findings"].as_array().unwrap().iter().any(|f| matches!(f["kind"].as_str(), Some("misaligned_wall_run" | "sudden_wall_angle_change"))),
         "{audit}"
     );
+}
+
+#[test]
+fn measured_local_buildings_keep_small_features_other_buildings_and_exact_undo() {
+    let mut s = Session::new(Box::new(Canned));
+    let outline = json!([[0, 0], [6000, 0], [6000, 4000], [3000, 4100], [0, 4000], [0, 0]]);
+    let before = s.doc.clone();
+    let params = json!({"id":"west","name":"Measured west","footprint":outline,"storeys":3,"storey_height_mm":3050.125,"ground_floor_mm":650.25,"wall_thickness_mm":480,"evidence":[{"source":"synthetic:plan","supplies":"measured footprint","attribution":"test"}]});
+    let action = json!({"command":"building.add","params":params});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    assert_eq!(s.doc, before);
+    let result = s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    assert_eq!(s.doc.buildings[0].footprint.len(), 5, "100 mm deviation must not be removed");
+    assert_eq!(s.doc.buildings[0].footprint[3], [3000., 4100.]);
+    assert_eq!(s.doc.buildings[0].storeys[1].elevation, 3700.375);
+    assert_eq!(result["facades"].as_array().unwrap().len(), 5);
+    let first = s.doc.clone();
+    s.execute(
+        "building.add",
+        json!({"id":"east","name":"Measured east","footprint":[[10000,0],[16000,0],[16000,4000],[10000,4000]],"storeys":2,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    assert_eq!(s.doc.buildings[0], first.buildings[0]);
+    let changed = s.doc.clone();
+    assert_eq!(s.doc.journal.len(), 2);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, first);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("edit.redo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, changed);
+    for params in [
+        json!({"id":"west","name":"Duplicate","footprint":outline,"storeys":1,"storey_height_mm":3000}),
+        json!({"id":"crossed","name":"Crossed","footprint":[[20000,0],[26000,0],[20000,4000],[26000,4000]],"storeys":1,"storey_height_mm":3000}),
+        json!({"id":"hostile","name":"Hostile","footprint":[[1e300,0],[26000,0],[26000,4000],[20000,4000]],"storeys":usize::MAX,"storey_height_mm":3000}),
+    ] {
+        assert!(s.execute("building.add", params).is_err());
+        assert_eq!(s.doc, changed);
+    }
+    let mut contextual = Session::new(Box::new(Canned));
+    contextual.execute("building.add",json!({"id":"context","name":"Explicit context simplification","footprint":outline,"storeys":1,"storey_height_mm":3000,"preserve_vertices":false})).unwrap();
+    assert_eq!(contextual.doc.buildings[0].footprint.len(), 4);
+}
+
+#[test]
+fn precision_journal_replays_underlying_actions_without_ephemeral_tokens() {
+    let mut s = Session::new(Box::new(Canned));
+    s.execute(
+        "building.add",
+        json!({"id":"b","name":"Replay fixture","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":2,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    s.execute("interior.add_walls", json!({"walls":[{"id":"wall","levels":[0,1],"a":[1000,3000],"b":[6000,3000],"thickness":100}]})).unwrap();
+    let action = json!({"command":"edit.move","params":{"targets":["wall.L0"],"delta":[0.125,0.375,0]}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    assert!(s.doc.journal.iter().all(|entry| entry.command != "precision.apply"), "ephemeral conflict tokens must not be required for replay");
+    let persisted: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&s.doc).unwrap()).unwrap();
+    let mut replay = Session::new(Box::new(Canned));
+    for entry in persisted.journal {
+        replay.execute(&entry.command, entry.params).unwrap();
+    }
+    assert_eq!(replay.doc, s.doc);
 }

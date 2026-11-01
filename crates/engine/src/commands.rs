@@ -485,6 +485,14 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| load_address(s, parse("site.load_address", v)?),
     },
     CommandSpec {
+        id: "building.add",
+        summary: "Create a local parametric building from an explicit measured footprint, storey count/height and optional evidence. Preserves vertices by default; optional context simplification is explicit. Multiple buildings share one local frame. No data service, credentials or file generation; validated, atomic, undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::local_building::Add>,
+        run: |s, v| crate::local_building::add(s, parse("building.add", v)?),
+    },
+    CommandSpec {
         id: "building.set_storeys",
         summary: "Set the number of storeys, the floor-to-floor height and the ground floor's level above the terrain (mm). \
                   Placements above the new top storey are removed.",

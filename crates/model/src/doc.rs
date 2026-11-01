@@ -240,7 +240,7 @@ pub struct Site {
 }
 
 /// Where a piece of the model came from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Evidence {
     /// Source id, for example `osm:way/174985023` or `nominatim:node/340506214`.
     pub source: String,

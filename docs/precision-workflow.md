@@ -56,7 +56,8 @@ channel and CLI use dotted IDs; MCP replaces dots with underscores (`precision.p
    dirty state, Undo and Redo stay intact. No file or provider operation is allowed in an action.
 4. Pass the returned `preview_token` and unchanged action to `precision.apply`. A changed document
    or action invalidates the token. Success produces exactly one journal/Undo step. Failed edits
-   leave the document unchanged. Tokens are opaque, same-build conflict checks, not credentials,
+   leave the document unchanged. The journal records the underlying typed action, without its
+   ephemeral preview token, so model command replay remains usable. Tokens are opaque, same-build conflict checks, not credentials,
    authorization, durable revision IDs or a cryptographic security mechanism.
 5. Audit again, inspect drawings/3D and export the affected IFC/drawing deliverables. Use
    `edit.undo` if the correction is unsatisfactory. A successful build establishes constructible
@@ -88,7 +89,7 @@ is refused. Groups, overlapping source/occurrence selectors and ambiguous IDs ar
 A centre-line junction is explicit: this command does not decide which side of a thick wall
 should align. Use `edit.align_walls` for source axis/left/right face alignment first.
 
-Other preview actions are `edit.move`, `edit.align`, `edit.align_walls`, `element.set`,
+Other preview actions are `building.add`, `edit.move`, `edit.align`, `edit.align_walls`, `element.set`,
 `annotation.move_label` and `edit.delete`. These reuse the normal edit implementations.
 A zero-change or overly large (>4096 changed fields) preview is refused; split the work.
 
@@ -133,3 +134,16 @@ corroboration. Preserve contradictory evidence for review. Recognition confidenc
 precision and dimensional uncertainty are separate concepts. The current scan registration
 supplies mm/pixel resolution, not a survey residual or a physical accuracy guarantee. FilArkiv
 provider access remains optional; ordinary local PDF/image workflows do not depend on it.
+
+
+## Starting a local measured project
+
+`building.add` creates one parametric building from a site-local `footprint`, explicit `id`,
+`name`, `storeys` and `storey_height_mm`. Optional `ground_floor_mm`, `wall_thickness_mm` and
+`evidence` describe its basis. It requires no account/provider and does not clear earlier
+buildings. The default `preserve_vertices: true` keeps small measured deviations, normalizing
+only winding and an exactly repeated closing vertex. Self-intersecting/touching outlines,
+zero edges, duplicate building IDs and hostile coordinates are refused. Setting
+`preserve_vertices: false` explicitly chooses the legacy 200 mm context simplification.
+Use `building.set_levels` for unequal measured floors and `building.add_basement` for levels
+below ground. A numeric source value is not a claim that its dimension was actually measured.
