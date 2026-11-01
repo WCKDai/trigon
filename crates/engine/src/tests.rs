@@ -1089,6 +1089,33 @@ fn dxf_count(pairs: &[(i32, String)], kind: &str) -> usize {
 }
 
 #[test]
+fn section_level_names_from_multiple_wings_stay_inside_the_sheet() {
+    let mut s = Session::new(Box::new(Canned));
+    for (id, name, y) in [("north", "North wing beside the crossing", 0.), ("south", "South wing beside the courtyard", 20000.)] {
+        s.execute(
+            "building.add",
+            json!({"id":id,"name":name,"footprint":[[0,y],[24000,y],[24000,y+12000.],[0,y+12000.]],"storeys":3,"storey_height_mm":3400}),
+        )
+        .unwrap();
+        s.execute("building.set_roof", json!({"building":id,"kind":"pitched","pitch_deg":35})).unwrap();
+        s.execute("building.set_attic", json!({"building":id,"floor":9450})).unwrap();
+    }
+    let section =
+        crate::section::scene(&s.doc, [[6000., -1000.], [6000., 33000.]], false, 1000., trigon_model::build::View::latest(&s.doc), "Both wings", "")
+            .unwrap();
+    let texts: Vec<_> = section.scene.items.iter().filter_map(|i| if let crate::sheet::Item::Text(t) = i { Some(t.clone()) } else { None }).collect();
+    let ink = crate::plan_output::text_ink_bounds(&texts).unwrap();
+    assert!(texts.iter().any(|t| t.text.contains("North wing") && t.text.contains("South wing")));
+    for (text, bounds) in texts.iter().zip(ink) {
+        assert_eq!(text.size, 2.6, "datum lettering stays at its physical reading size");
+        let bounds = bounds.unwrap();
+        let lo = section.vp.px([text.at[0] + bounds[0] * section.scene.scale, text.at[1] + bounds[1] * section.scene.scale]);
+        let hi = section.vp.px([text.at[0] + bounds[2] * section.scene.scale, text.at[1] + bounds[3] * section.scene.scale]);
+        assert!(lo[0] >= 16. && hi[0] <= 1584. && hi[1] >= 120. && lo[1] <= 820., "{} at {lo:?}..{hi:?}", text.text);
+    }
+}
+
+#[test]
 fn sections_cut_the_model_and_mark_the_levels() {
     let mut s = session();
     let facade = first_facade_facing(&mut s, "S");

@@ -204,8 +204,8 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
     ys.extend(all_poche.iter().flatten().flatten().map(|p| p[1]));
     ys.extend(projection.edges.iter().filter(|e| (0.0..=length).contains(&e.a[0])).flat_map(|e| [e.a[1], e.b[1]]));
     let (y0, y1) = ys.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), y| (lo.min(*y), hi.max(*y)));
-    let vp = Viewport::fit([0.0, y0, length, y1.max(y0 + 1000.0)], AREA);
-    let scale = vp.scale();
+    let mut vp = Viewport::fit([0.0, y0, length, y1.max(y0 + 1000.0)], AREA);
+    let mut scale = vp.scale();
     let mut scene = Scene::new(scale);
 
     // Tones beyond, minus what the cut covers.
@@ -247,7 +247,6 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
         scene.line(Layer::Ground, [a, 0.0], [b, 0.0], Stroke::new(0.7));
     }
     // Levels: a dashed line across, a mark and the level at the right, the name at the left.
-    let s = scale;
     let mut levels: Vec<(f64, String)> = Vec::new();
     let roof_levels = doc.buildings.iter().any(|b| b.attic_level().is_some());
     let cuts_building = |b: &trigon_model::Building| {
@@ -296,6 +295,30 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
             }
             same
         });
+        // Combined wing names can be much wider than the original fixed side margin.
+        // Reserve their actual bundled-font ink width without shrinking physical lettering.
+        // Existing layouts that already fit retain their viewport and exported bytes.
+        let labels: Vec<_> = levels
+            .iter()
+            .map(|(_, name)| {
+                let mut text = Text::new(Layer::Level, [0.0, 0.0], name.clone(), 2.6);
+                text.anchor = Anchor::End;
+                text.middle = false;
+                text
+            })
+            .collect();
+        let ink = crate::plan_output::text_ink_bounds(&labels)?;
+        let left = ink.into_iter().flatten().map(|b| 16.0 + (5.0 - b[0]) / crate::sheet::MM_PER_PX).fold(AREA[0], f64::max);
+        if vp.px([0.0, 0.0])[0] < left {
+            let width = AREA[0] + AREA[2] - left;
+            if width < 100.0 {
+                return Err(ModelError::Invalid("section level names leave no drawing space; shorten the building or storey names".into()).into());
+            }
+            vp = Viewport::fit([0.0, y0, length, y1.max(y0 + 1000.0)], [left, AREA[1], width, AREA[3]]);
+            scale = vp.scale();
+            scene.scale = scale;
+        }
+        let s = scale;
         for (k, (z, name)) in levels.iter().enumerate() {
             let (x0, x1) = (-3.0 * s, length + 3.0 * s);
             let dashed = Stroke { dashed: true, ..Stroke::new(0.18) };
