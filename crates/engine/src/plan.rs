@@ -276,7 +276,12 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let centre = (r.rect.u0 + r.rect.u1) / 2.0;
                 let (u0, u1) = (centre - slab_width / 2.0, centre + slab_width / 2.0);
                 let color = status_color(status, LINE);
-                let corners = [pt(fr, u0, 0.0), pt(fr, u1, 0.0), pt(fr, u1, -depth), pt(fr, u0, -depth)];
+                let shaped = matches!(r.ty.kind, ComponentKind::ShapedBalcony { .. });
+                let corners = if let ComponentKind::ShapedBalcony { ref plan, .. } = r.ty.kind {
+                    plan.outline(slab_width, depth)?.iter().map(|p| pt(fr, centre + p[0], -p[1])).collect::<Vec<_>>()
+                } else {
+                    vec![pt(fr, u0, 0.0), pt(fr, u1, 0.0), pt(fr, u1, -depth), pt(fr, u0, -depth)]
+                };
                 let prefix = if r.is_opening() {
                     format!("{}.L{}.B{}", w.id, level, r.placement.bay)
                 } else {
@@ -315,11 +320,27 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 }
                 let detail_start = prims.len();
                 let dashed = status == Status::Demolished;
-                for k in 0..4 {
-                    prims.push(Prim::Line { a: corners[k], b: corners[(k + 1) % 4], color, width: 30.0, dashed });
+                for k in 0..corners.len() {
+                    prims.push(Prim::Line { a: corners[k], b: corners[(k + 1) % corners.len()], color, width: 30.0, dashed });
                 }
                 let mut detail_end = prims.len();
-                if presentation && status != Status::Demolished {
+                if presentation && status != Status::Demolished && shaped {
+                    if let ComponentKind::ShapedBalcony { ref plan, .. } = r.ty.kind {
+                        let path = plan.guard_path(slab_width, depth)?;
+                        for pair in path.windows(2) {
+                            rail_indices.push(prims.len());
+                            prims.push(Prim::Line {
+                                a: pt(fr, centre + pair[0][0], -pair[0][1]),
+                                b: pt(fr, centre + pair[1][0], -pair[1][1]),
+                                color,
+                                width: 14.0,
+                                dashed: false,
+                            });
+                        }
+                    }
+                    detail_end = prims.len();
+                }
+                if presentation && status != Status::Demolished && !shaped {
                     // The deck and perimeter rail are separate from the cut wall.
                     for (edge, v) in [70.0, depth - 70.0].into_iter().enumerate() {
                         if edge == 1 {

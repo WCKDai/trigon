@@ -17,6 +17,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         3400.,
     )?);
     s.execute("types.install_copenhagen", json!({}))?;
+    for ty in trigon_model::balcony::copenhagen_types() {
+        s.execute("types.define", serde_json::to_value(ty)?)?;
+    }
     let facades = s.doc.buildings[0].facades.iter().map(|f| f.id.clone()).collect::<Vec<_>>();
     for facade in &facades {
         let b = &s.doc.buildings[0];
@@ -28,6 +31,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         s.execute("facade.place", json!({"facade":facade,"type":"dk.window.dannebrog","levels":[0,1,2,3,4]}))?;
     }
     s.execute("facade.place", json!({"facade":"b.f2","type":"dk.door.double-panel","levels":[0],"bays":[3]}))?;
+    for (facade, bays, ty) in [("b.f2", vec![1, 5], "dk.balcony.bowed"), ("b.f4", vec![1, 3, 5], "dk.balcony.chamfered")] {
+        s.execute("facade.place", json!({"facade":facade,"type":"door.french","levels":[1,2,3,4],"bays":bays}))?;
+        s.execute("facade.place", json!({"facade":facade,"type":ty,"levels":[1,2,3,4],"bays":bays}))?;
+    }
     s.execute("facade.set_finish", json!({"facades":facades,"finish":"yellow_brick"}))?;
     s.execute(
         "facade.set_bands",
@@ -48,6 +55,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     s.execute("export.ifc", json!({"path":dir.join("building.ifc")}))?;
     s.execute("document.save", json!({"path":dir.join("building.trigon")}))?;
     s.execute("schedule.export", json!({"path":dir.join("schedule.json")}))?;
+    s.execute("view.define", json!({"id":"balcony-plan","name":"Original balcony plan","kind":{"view":"plan","level":1}}))?;
+    for ext in ["svg", "png", "dxf"] {
+        s.execute("view.export", json!({"id":"balcony-plan","path":dir.join(format!("plan.{ext}"))}))?;
+    }
     let before = s.doc.clone();
     s.execute("element.set", json!({"id":"b.roof","properties":{"break_run_mm":1500}}))?;
     s.execute("edit.undo", json!({}))?;

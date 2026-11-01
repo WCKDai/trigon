@@ -128,11 +128,12 @@ fn cellar_id(building: &Building, index: usize) -> Option<String> {
 fn component_properties(ty: &trigon_model::ComponentType) -> Vec<Value> {
     let mut result = Vec::new();
     let depth = match ty.kind {
-        ComponentKind::Loggia { depth, .. } => Some((depth, 4000.0)),
-        _ => ty.kind.depth().map(|depth| (depth, 3000.0)),
+        ComponentKind::Loggia { depth, .. } => Some((depth, 300.0, 4000.0)),
+        ComponentKind::ShapedBalcony { depth, .. } => Some((depth, 400.0, 3000.0)),
+        _ => ty.kind.depth().map(|depth| (depth, 300.0, 3000.0)),
     };
-    if let Some((depth, max)) = depth {
-        result.push(number("depth_mm", "Depth (this assembly)", depth, "mm", 300.0, max));
+    if let Some((depth, min, max)) = depth {
+        result.push(number("depth_mm", "Depth (this assembly)", depth, "mm", min, max));
     }
     match &ty.kind {
         ComponentKind::FrenchBalcony { rail_height, .. } | ComponentKind::Balcony { rail_height, .. } | ComponentKind::Loggia { rail_height, .. } => {
@@ -144,8 +145,12 @@ fn component_properties(ty: &trigon_model::ComponentType) -> Vec<Value> {
     if let ComponentKind::Balcony { slab_width, .. } = &ty.kind {
         result.push(number("slab_width_mm", "Slab width (this assembly)", *slab_width, "mm", ty.width, 12000.0));
     }
-    if let ComponentKind::BalconySlab { thickness, .. } = &ty.kind {
-        result.push(number("slab_thickness_mm", "Slab thickness (this assembly)", *thickness, "mm", 60.0, 400.0));
+    if let ComponentKind::BalconySlab { thickness, .. } | ComponentKind::ShapedBalcony { thickness, .. } = &ty.kind {
+        let min = if matches!(ty.kind, ComponentKind::ShapedBalcony { .. }) { 80.0 } else { 60.0 };
+        result.push(number("slab_thickness_mm", "Slab thickness (this assembly)", *thickness, "mm", min, 400.0));
+    }
+    if let ComponentKind::ShapedBalcony { plan, .. } = &ty.kind {
+        result.push(field("balcony_plan", "Convex parametric plan", json!(plan), true));
     }
     result
 }
@@ -304,9 +309,11 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                 let u = placement.u.or_else(|| facade.bays.get(placement.bay).copied()).ok_or_else(|| invalid("placement has no bay centre"))?;
                 let floor = building.storeys.get(placement.level).ok_or_else(|| invalid("placement has no storey"))?.elevation;
                 let assembly = if owner != element.id { " (host assembly)" } else { "" };
+                let (min_width, min_height, max_height) =
+                    if matches!(ty.kind, ComponentKind::ShapedBalcony { .. }) { (600.0, 900.0, 1500.0) } else { (300.0, 300.0, 4000.0) };
                 let mut properties = vec![
-                    number("width_mm", format!("Width{assembly}"), width, "mm", 300.0, 6000.0),
-                    number("height_mm", format!("Height{assembly}"), height, "mm", 300.0, 4000.0),
+                    number("width_mm", format!("Width{assembly}"), width, "mm", min_width, 6000.0),
+                    number("height_mm", format!("Height{assembly}"), height, "mm", min_height, max_height),
                     number("sill_mm", format!("Sill / base above floor{assembly}"), sill, "mm", -floor, 3000.0),
                     number("u_mm", format!("Centre along facade{assembly}"), u, "mm", 0.0, wall.frame.length),
                     choice(
@@ -768,7 +775,9 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             let placement = facade.placements.get(pi).ok_or_else(|| invalid("missing placement"))?;
             let id = format!("placement:{}:{pi}", facade.id);
             let original_type = doc.component(&placement.type_id)?.clone();
-            let custom = properties.keys().any(|k| matches!(k.as_str(), "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm"));
+            let custom = properties
+                .keys()
+                .any(|k| matches!(k.as_str(), "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" | "balcony_plan"));
             if custom && properties.contains_key("type") {
                 return Err(invalid("change the component type separately from its assembly parameters"));
             }
@@ -782,6 +791,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             ComponentKind::Balcony { depth, .. }
                             | ComponentKind::BalconySlab { depth, .. }
                             | ComponentKind::SteelBalcony { depth, .. }
+                            | ComponentKind::ShapedBalcony { depth, .. }
                             | ComponentKind::Loggia { depth, .. },
                         ) => *depth = n()?,
                         (
@@ -791,7 +801,13 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             | ComponentKind::Loggia { rail_height, .. },
                         ) => *rail_height = n()?,
                         ("slab_width_mm", ComponentKind::Balcony { slab_width, .. }) => *slab_width = n()?,
-                        ("slab_thickness_mm", ComponentKind::BalconySlab { thickness, .. }) => *thickness = n()?,
+                        ("slab_thickness_mm", ComponentKind::BalconySlab { thickness, .. } | ComponentKind::ShapedBalcony { thickness, .. }) => {
+                            *thickness = n()?
+                        }
+                        ("balcony_plan", ComponentKind::ShapedBalcony { plan, .. }) => {
+                            *plan = serde_json::from_value(value.clone()).map_err(|_| invalid("balcony_plan requires a typed convex balcony plan"))?
+                        }
+                        ("balcony_plan", _) => return Err(invalid("balcony_plan requires a shaped balcony")),
                         _ => {}
                     }
                 }
@@ -821,7 +837,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "sill_mm" => p.sill = Some(numeric(key, value)?),
                         "u_mm" => p.u = Some(numeric(key, value)?),
                         "type" => p.type_id = text(key, value)?,
-                        "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" => {}
+                        "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" | "balcony_plan" => {}
                         _ => return Err(invalid("unknown placement property")),
                     }
                 }

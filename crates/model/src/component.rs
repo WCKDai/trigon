@@ -77,6 +77,8 @@ pub enum ComponentKind {
     /// A balcony on its own, hung on the wall in front of an opening: a slab `depth` deep and the
     /// type's `width` wide, with a plain guard rail. Doesn't cut the wall. For existing balconies.
     BalconySlab { depth: f64, thickness: f64 },
+    /// Convex bowed, chamfered or custom-plan slab and guard. Does not cut the host wall.
+    ShapedBalcony { depth: f64, thickness: f64, plan: crate::balcony::Plan },
     /// A loggia: the facade is opened from the sill up and the glazing (a door and a window) is set
     /// back `depth` mm from the outer face, between brick returns, under a soffit, with a guard
     /// rail across the opening. The parapet below the sill is the facade wall.
@@ -200,13 +202,15 @@ impl ComponentKind {
     /// Cuts an opening in the wall (windows and doors). Attachments (balconies hung on the
     /// wall) don't, and a slot can hold one opening and one attachment.
     pub fn is_opening(&self) -> bool {
-        !matches!(self, Self::BalconySlab { .. } | Self::SteelBalcony { .. })
+        !matches!(self, Self::BalconySlab { .. } | Self::SteelBalcony { .. } | Self::ShapedBalcony { .. })
     }
 
     /// Projection from the wall, mm, for attachments.
     pub fn depth(&self) -> Option<f64> {
         match self {
-            Self::BalconySlab { depth, .. } | Self::SteelBalcony { depth, .. } | Self::Balcony { depth, .. } => Some(*depth),
+            Self::BalconySlab { depth, .. } | Self::SteelBalcony { depth, .. } | Self::Balcony { depth, .. } | Self::ShapedBalcony { depth, .. } => {
+                Some(*depth)
+            }
             _ => None,
         }
     }
@@ -284,6 +288,13 @@ impl ComponentType {
                 checked("depth", *depth, 300.0, 3000.0)?;
                 checked("thickness", *thickness, 60.0, 400.0)?;
                 checked("rail height (the type's height)", self.height, 900.0, 1500.0).map(|_| ())
+            }
+            ComponentKind::ShapedBalcony { depth, thickness, plan } => {
+                checked("shaped balcony width", self.width, 600.0, 6000.0)?;
+                checked("shaped balcony depth", *depth, 400.0, 3000.0)?;
+                checked("shaped balcony slab", *thickness, 80.0, 400.0)?;
+                checked("shaped balcony guard", self.height, 900.0, 1500.0)?;
+                plan.outline(self.width, *depth).map(|_| ())
             }
             ComponentKind::SteelBalcony { depth, .. } => {
                 checked("depth", *depth, 300.0, 3000.0)?;

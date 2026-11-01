@@ -11,6 +11,7 @@ use crate::mesh::{Material, Mesh};
 use crate::walls::{Span, WallSegment};
 use crate::{ModelError, Result};
 
+mod balcony;
 mod opening;
 
 /// Window and door frames sit this far behind the outer wall face, mm.
@@ -427,7 +428,7 @@ impl Resolved {
 /// Underside of an attachment below its storey's floor, mm.
 fn attachment_drop(kind: &ComponentKind) -> f64 {
     match kind {
-        ComponentKind::BalconySlab { thickness, .. } => *thickness,
+        ComponentKind::BalconySlab { thickness, .. } | ComponentKind::ShapedBalcony { thickness, .. } => *thickness,
         ComponentKind::SteelBalcony { .. } => STEEL_FRAME,
         _ => 0.0,
     }
@@ -683,14 +684,11 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 o
             })
             .collect();
-        let mut attachments: Vec<BuiltElement> = shown
-            .iter()
-            .filter(|(r, _)| !r.is_opening())
-            .flat_map(|(r, status)| {
-                let id = format!("{}.L{}.B{}.balcony", f.id, r.placement.level, r.placement.bay);
-                attachment(&fr, &id, r, elevation_of(r), *status).into_iter().map(|e| clip_element(e, cut)).collect::<Vec<_>>()
-            })
-            .collect();
+        let mut attachments = Vec::new();
+        for (r, status) in shown.iter().filter(|(r, _)| !r.is_opening()) {
+            let id = format!("{}.L{}.B{}.balcony", f.id, r.placement.level, r.placement.bay);
+            attachments.extend(attachment(&fr, &id, r, elevation_of(r), *status)?.into_iter().map(|e| clip_element(e, cut)));
+        }
         let mut openings: Vec<BuiltOpening> = openings;
         for (id, c, level, rect) in &cellars {
             let at = Fill {
@@ -1326,7 +1324,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             }
             parts.push((Material::Frame, rail));
         }
-        ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
+        ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } | ComponentKind::ShapedBalcony { .. } => return Vec::new(),
     }
     parts.extend(detail.finish());
     parts
@@ -1464,7 +1462,7 @@ fn styled_rail(fr: &FacadeFrame, from: (f64, f64), to: (f64, f64), z0: f64, heig
 }
 
 /// A balcony hung on the wall without an opening: slab and railing elements.
-fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> Vec<BuiltElement> {
+fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> Result<Vec<BuiltElement>> {
     let ty = &r.ty;
     let level = r.placement.level;
     let Rect { u0, u1, .. } = r.rect;
@@ -1480,7 +1478,14 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
         parts,
         status,
     };
-    match ty.kind {
+    Ok(match ty.kind {
+        ComponentKind::ShapedBalcony { depth, thickness, ref plan } => {
+            let (slab, rail) = balcony::meshes(fr, (u0 + u1) / 2.0, ty.width, depth, thickness, ty.height, deck_top, plan)?;
+            vec![
+                mk("slab", &ty.name, ElementClass::BalconySlab, vec![(Material::Slab, slab)]),
+                mk("rail", &format!("{} rail", ty.name), ElementClass::Railing, vec![(Material::Railing, rail)]),
+            ]
+        }
         ComponentKind::BalconySlab { depth, thickness } => {
             let slab = fbox(fr, (u0, u1), (-depth, 0.0), (deck_top - thickness, deck_top));
             let mut rail = rail_run(fr, (u0 + 40.0, -depth + 40.0), (u1 - 40.0, -depth + 40.0), deck_top, ty.height);
@@ -1539,7 +1544,7 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
             ]
         }
         _ => Vec::new(),
-    }
+    })
 }
 
 fn element(id: &str, suffix: &str, name: &str, class: ElementClass, ty: &ComponentType, level: usize, mesh: Mesh, status: Status) -> BuiltElement {

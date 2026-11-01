@@ -11,6 +11,50 @@ fn session() -> Session {
 }
 
 #[test]
+fn shaped_balcony_is_a_separate_undoable_attachment_with_a_portable_outline() {
+    let mut s = session();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","count":8})).unwrap();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[1],"bays":[2]})).unwrap();
+    s.execute("types.define",json!({"id":"original.bowed","name":"Original bowed balcony","width":3000,"height":1100,"sill":0,"kind":{"family":"shaped_balcony","depth":1500,"thickness":180,"plan":{"shape":"bowed","return_fraction":0.35}}})).unwrap();
+    s.execute("view.define", json!({"id":"plan","name":"Original balcony plan","kind":{"view":"plan","level":1}})).unwrap();
+    let before = s.doc.clone();
+    let opening_before = build(&s.doc).unwrap()[0].walls[0].openings.clone();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"original.bowed","levels":[1],"bays":[2]})).unwrap();
+    let built = build(&s.doc).unwrap();
+    let wall = &built[0].walls[0];
+    assert_eq!(wall.openings, opening_before, "adding a balcony must not change the host opening");
+    assert_eq!(wall.attachments.len(), 2, "slab and railing have separate source-derived identities");
+    let centre = s.doc.buildings[0].facades[0].bays[2];
+    assert!(
+        s.execute("view.pick", json!({"id":"plan","point":[centre,-750],"tolerance_mm":0})).unwrap()["hit"]["id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with(".slab"))
+    );
+    assert_eq!(
+        s.execute("view.pick", json!({"id":"plan","point":[centre-1450.0,-1450],"tolerance_mm":0})).unwrap()["hit"],
+        serde_json::Value::Null,
+        "empty corner outside a bowed slab must stay empty"
+    );
+    let text = trigon_io::ifc::write(&s.doc, &built, "original-bowed.ifc", "2026-01-01T00:00:00");
+    assert!(text.contains("IFCELEMENTASSEMBLY"));
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        assert!(read.failures.is_empty(), "{:?}", read.failures);
+    }
+    let placed = s.doc.clone();
+    s.execute("element.set", json!({"id":wall.attachments[0].id,"properties":{"depth_mm":1800}})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, placed);
+    s.execute("element.set", json!({"id":wall.attachments[0].id,"properties":{"balcony_plan":{"shape":"chamfered","corner_mm":300}}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), built);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, placed);
+    assert!(s.execute("element.set", json!({"id":wall.attachments[0].id,"properties":{"balcony_plan":{"shape":"polygon","points":[]}}})).is_err());
+    assert_eq!(s.doc, placed);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
 fn mansard_roof_is_opt_in_parametric_atomic_and_exactly_undoable() {
     let mut s = session();
     let original = s.doc.clone();
