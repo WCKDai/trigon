@@ -3,6 +3,8 @@
 //! neighbour, or a gable end) keep their wall: the skeleton nodes of their face are slid onto the
 //! edge, so the ridge runs out to the gable and the face turns into a vertical gable triangle.
 
+pub mod drainage;
+
 use geo_straight_skeleton::Skeleton;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +41,9 @@ pub enum Roof {
         /// Gutters along the eaves.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         gutters: bool,
+        /// Optional detailed channels and explicit downpipes. Missing keeps legacy geometry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drainage: Option<drainage::Drainage>,
     },
 }
 

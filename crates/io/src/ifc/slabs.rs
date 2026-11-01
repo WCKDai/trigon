@@ -130,13 +130,24 @@ impl Ifc<'_> {
         if !planes.is_empty() {
             self.w.add(format!("IFCRELAGGREGATES({},$,$,$,#{roof},({}))", gid(&format!("{}.parts", r.id)), refs(&planes)));
         }
-        for (key, mesh) in split::gutters(r) {
+        for (key, mesh, pipe) in
+            split::gutters(r).into_iter().map(|(k, m)| (k, m, false)).chain(split::downpipes(r).into_iter().map(|(k, m)| (k, m, true)))
+        {
             let frame = fl.at(top).frame;
             let lp = self.w.place(Some(fl.at(top)), frame);
             let Some(item) = self.w.faceset(&mesh, &frame) else { continue };
             self.cat.paint(&mut self.w, item, catalog::ZINC);
             let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
-            let id = self.w.add(format!("IFCPIPESEGMENT({},$,'Tagrende',$,$,#{},#{shape},{},.GUTTER.)", gid(&key), lp.id, string(&key)));
+            let kind = if pipe { ".RIGIDSEGMENT." } else { ".GUTTER." };
+            let name = if pipe {
+                "Downpipe assembly (geometric)"
+            } else if r.drainage.is_empty() {
+                "Tagrende"
+            } else {
+                "Half-round gutter"
+            };
+            let id =
+                self.w.add(format!("IFCPIPESEGMENT({},$,{name},$,$,#{},#{shape},{},{kind})", gid(&key), lp.id, string(&key), name = string(name)));
             self.made_of(id, catalog::ZINC);
             fl.contain(top, id);
         }

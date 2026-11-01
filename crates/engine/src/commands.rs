@@ -1944,6 +1944,8 @@ struct SetRoof {
     thickness_mm: Option<f64>,
     /// Gutters along the eaves (default false).
     gutters: Option<bool>,
+    /// Opt-in channel detail and explicit pipe positions; requires gutters.
+    drainage: Option<trigon_model::roof::drainage::Drainage>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -2338,6 +2340,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 verge_mm: trigon_model::checked("verge_mm", p.verge_mm.unwrap_or(0.0), 0.0, 1500.0)?,
                 thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,
                 gutters: p.gutters.unwrap_or(false),
+                drainage: p.drainage,
             }
         }
         other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),

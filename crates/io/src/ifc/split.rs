@@ -417,8 +417,21 @@ pub fn roof_solid(p: &RoofPiece, walls: &[BuiltWall]) -> Mesh {
     }
 }
 
+/// Explicit pipe assemblies, separate from gutter segments in exchange.
+pub fn downpipes(r: &BuiltRoof) -> Vec<(String, Mesh)> {
+    r.drainage.iter().filter(|p| p.class == trigon_model::roof::drainage::DrainClass::Downpipe).map(|p| (p.id.clone(), p.mesh.clone())).collect()
+}
+
 /// The gutters along the eaves, one per eave.
 pub fn gutters(r: &BuiltRoof) -> Vec<(String, Mesh)> {
+    if !r.drainage.is_empty() {
+        return r
+            .drainage
+            .iter()
+            .filter(|p| p.class == trigon_model::roof::drainage::DrainClass::Gutter)
+            .map(|p| (p.id.clone(), p.mesh.clone()))
+            .collect();
+    }
     if r.gutters.is_empty() {
         return Vec::new();
     }
@@ -533,6 +546,7 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
             out.extend(gutters(r));
+            out.extend(downpipes(r));
         }
         for iw in &b.interior {
             out.push((iw.id.clone(), iw.mesh.clone()));

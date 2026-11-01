@@ -1679,3 +1679,37 @@ fn drawing_commands_refuse_hostile_values_without_changing_history() {
     s.execute("edit.undo", json!({})).unwrap();
     assert!(s.doc.views.is_empty());
 }
+
+#[test]
+fn detailed_roof_drainage_is_explicit_atomic_and_undoable() {
+    let mut s = session();
+    s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":35,"gutters":true})).unwrap();
+    let before = s.doc.clone();
+    let legacy = trigon_model::build(&before).unwrap();
+    let facade = before.buildings[0].facades[0].id.clone();
+    let drainage = json!({"gutter_width_mm":160,"wall_mm":2,"joint_spacing_mm":3000,
+        "downpipes":[{"id":"rain-a","facade":facade,"along_mm":2000,"diameter_mm":80,"wall_offset_mm":100,"bottom_mm":150,"shoe_mm":200}]});
+    s.execute("element.set", json!({"id":"b1.roof","properties":{"drainage":drainage}})).unwrap();
+    let detailed = trigon_model::build(&s.doc).unwrap();
+    assert_eq!(legacy[0].roof.as_ref().unwrap().cover, detailed[0].roof.as_ref().unwrap().cover);
+    assert_eq!(legacy[0].roof.as_ref().unwrap().id, detailed[0].roof.as_ref().unwrap().id);
+    let mesh = &detailed[0].roof.as_ref().unwrap().gutters;
+    assert!(mesh.triangles.len() > legacy[0].roof.as_ref().unwrap().gutters.triangles.len());
+    assert!(mesh.bounds().unwrap().0[2] < 400.0, "only the explicit pipe reaches ground");
+    let text = serde_json::to_string(&s.doc).unwrap();
+    let restored: trigon_model::Document = serde_json::from_str(&text).unwrap();
+    assert_eq!(restored, s.doc);
+    assert_eq!(trigon_model::build(&restored).unwrap(), detailed);
+    let good = s.doc.clone();
+    for bad in [
+        json!({"gutter_width_mm":1e300}),
+        json!({"downpipes":[{"id":"x","facade":"absent","along_mm":0,"diameter_mm":80,"wall_offset_mm":100,"bottom_mm":0,"shoe_mm":200}]}),
+        json!({"joint_spacing_mm":0}),
+    ] {
+        assert!(s.execute("element.set", json!({"id":"b1.roof","properties":{"drainage":bad}})).is_err());
+        assert_eq!(s.doc, good);
+    }
+    assert!(s.undo());
+    assert_eq!(s.doc, before);
+    assert_eq!(trigon_model::build(&s.doc).unwrap(), legacy);
+}
