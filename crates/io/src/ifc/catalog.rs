@@ -44,6 +44,7 @@ pub const STAIR: Mat = mat("Trappe", "stair", [0.70, 0.62, 0.52]);
 pub const PLINTH: Mat = mat("Sokkel, puds", "plaster", [0.55, 0.55, 0.53]);
 pub const RENDER: Mat = mat("Facadepuds", "plaster", [0.91, 0.90, 0.87]);
 pub const BRICK_RED: Mat = mat("Tegl, røde sten", "brick", [0.62, 0.25, 0.17]);
+pub const BRICK_YELLOW: Mat = mat("Tegl, gule sten", "brick", [0.78, 0.68, 0.47]);
 pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
 /// Spaces: a translucent volume, no material.
 pub const SPACE: Mat = Mat { name: "Rum", category: "space", rgb: [0.55, 0.75, 0.95], transparency: 0.75 };
@@ -65,6 +66,7 @@ pub fn of(m: Material) -> Mat {
         Material::Plaster => PLASTER,
         Material::Render => RENDER,
         Material::BrickRed => BRICK_RED,
+        Material::BrickYellow => BRICK_YELLOW,
     }
 }
 
@@ -152,6 +154,7 @@ pub fn facade(t: f64, party: bool, finish: Material) -> BuildUp {
     let (wall, brick, render) = match finish {
         Material::Render => ("pudset mur", BRICK, true),
         Material::BrickRed => ("massiv mur, røde sten", BRICK_RED, false),
+        Material::BrickYellow => ("massiv mur, gule sten", BRICK_YELLOW, false),
         _ => ("massiv mur", BRICK, false),
     };
     let name = match sten(t) {

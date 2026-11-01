@@ -13,8 +13,8 @@ use std::ops::Range;
 use trigon_model::build::Status;
 use trigon_model::{Built, BuiltElement, Material, Mesh, SlabKind};
 
-/// Floats per triangle vertex: position (3), normal (3), linear RGBA (4).
-pub const VERTEX_FLOATS: usize = 10;
+/// Floats per triangle vertex: position (3), normal (3), linear RGBA (4), masonry UV/enable (3).
+pub const VERTEX_FLOATS: usize = 13;
 /// Floats per edge-quad vertex: both ends (3 + 3), along (0 or 1), side (-1 or 1).
 pub const EDGE_FLOATS: usize = 8;
 /// Two faces meeting at more than this angle draw an edge between them.
@@ -75,6 +75,7 @@ pub struct Scene {
 struct Part<'a> {
     mesh: &'a Mesh,
     rgba: [f32; 4],
+    material: Material,
 }
 
 fn status_rgba(m: Material, status: Status, phases: bool) -> [f32; 4] {
@@ -138,6 +139,7 @@ impl Builder {
             for c in part.rgba {
                 c.to_bits().hash(&mut hasher);
             }
+            part.material.hash(&mut hasher);
             let translucent = part.rgba[3] < 0.999;
             let start = if translucent { self.clear.len() } else { self.opaque.len() } / VERTEX_FLOATS;
             for t in &m.triangles {
@@ -152,11 +154,19 @@ impl Builder {
                 }
                 let (pa, pb, pc) = (self.local(*a), self.local(*b), self.local(*c));
                 let n = normal(pa, pb, pc);
+                // Texture coordinates stay anchored to original site millimetres, independent of
+                // camera movement and the scene origin used for f32 rendering precision.
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let surface_normal = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]];
                 let out = if translucent { &mut self.clear } else { &mut self.opaque };
-                for p in [pa, pb, pc] {
+                for (p, source) in [pa, pb, pc].into_iter().zip([a, b, c]) {
                     out.extend_from_slice(&p);
                     out.extend_from_slice(&n);
                     out.extend_from_slice(&part.rgba);
+                    let uv = part.material.masonry_uv(*source, surface_normal);
+                    let [u, v] = uv.unwrap_or([0.0; 2]);
+                    out.extend_from_slice(&[u, v, if uv.is_some() && !translucent { 1.0 } else { 0.0 }]);
                     for (k, v) in p.iter().enumerate() {
                         lo[k] = lo[k].min(*v);
                         hi[k] = hi[k].max(*v);
@@ -332,14 +342,15 @@ impl Scene {
                     ],
                     true,
                     &[
-                        Part { mesh: &w.mesh, rgba: w.finish.rgba() },
-                        Part { mesh: &w.plinth, rgba: Material::Plinth.rgba() },
-                        Part { mesh: &w.trim, rgba: Material::Render.rgba() },
+                        Part { mesh: &w.mesh, rgba: w.finish.rgba(), material: w.finish },
+                        Part { mesh: &w.plinth, rgba: Material::Plinth.rgba(), material: Material::Plinth },
+                        Part { mesh: &w.trim, rgba: Material::Render.rgba(), material: Material::Render },
                     ],
                 );
                 let elements = w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments);
                 for e in elements {
-                    let parts: Vec<Part<'_>> = e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases) }).collect();
+                    let parts: Vec<Part<'_>> =
+                        e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases), material: *m }).collect();
                     b.add(
                         &e.id,
                         element_kind(e),
@@ -371,7 +382,7 @@ impl Scene {
                     Some(s.level),
                     vec![("thickness", mm(s.thickness)), ("underside", mm(s.z_bottom)), ("area", format!("{:.1} m²", area / 1e6))],
                     true,
-                    &[Part { mesh: &s.mesh, rgba: m.rgba() }],
+                    &[Part { mesh: &s.mesh, rgba: m.rgba(), material: m }],
                 );
             }
             if let Some(r) = &building.roof {
@@ -382,9 +393,9 @@ impl Scene {
                     vec![("eaves", mm(r.eaves)), ("ridge", mm(r.ridge)), ("pitch", format!("{:.1}°", r.pitch_deg))],
                     true,
                     &[
-                        Part { mesh: &r.cover, rgba: Material::Roof.rgba() },
-                        Part { mesh: &r.gables, rgba: Material::Wall.rgba() },
-                        Part { mesh: &r.gutters, rgba: Material::Steel.rgba() },
+                        Part { mesh: &r.cover, rgba: Material::Roof.rgba(), material: Material::Roof },
+                        Part { mesh: &r.gables, rgba: Material::Wall.rgba(), material: Material::Wall },
+                        Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
                     ],
                 );
             }
@@ -401,11 +412,12 @@ impl Scene {
                         ("from", mm(iw.z_bottom)),
                     ],
                     false,
-                    &[Part { mesh: &iw.mesh, rgba: if iw.load_bearing { BEARING } else { PARTITION } }],
+                    &[Part { mesh: &iw.mesh, rgba: if iw.load_bearing { BEARING } else { PARTITION }, material: Material::Plaster }],
                 );
                 for door in &iw.doors {
                     let e = &door.fill;
-                    let parts: Vec<Part<'_>> = e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases) }).collect();
+                    let parts: Vec<Part<'_>> =
+                        e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases), material: *m }).collect();
                     b.add(
                         &e.id,
                         "door",
@@ -431,7 +443,10 @@ impl Scene {
                     Some(st.level),
                     vec![("layout", format!("{:?}", st.kind)), ("winding", if st.winding { "yes" } else { "no" }.to_string())],
                     false,
-                    &[Part { mesh: &st.mesh, rgba: Material::Sill.rgba() }, Part { mesh: &st.railing, rgba: Material::Railing.rgba() }],
+                    &[
+                        Part { mesh: &st.mesh, rgba: Material::Sill.rgba(), material: Material::Sill },
+                        Part { mesh: &st.railing, rgba: Material::Railing.rgba(), material: Material::Railing },
+                    ],
                 );
             }
         }
@@ -482,6 +497,7 @@ impl Scene {
                     out.extend_from_slice(&[v[0] + shift[0], v[1] + shift[1], v[2] + shift[2]]);
                     out.extend_from_slice(&v[3..6]);
                     out.extend_from_slice(&rgba);
+                    out.extend_from_slice(&v[10..]);
                 }
             }
         }
@@ -645,6 +661,49 @@ mod tests {
         d.buildings[0].finish = trigon_model::doc::WallFinish::Render;
         let rendered = Scene::from_built(&build(&d).unwrap(), false);
         assert_ne!(plinth.elements[0].fingerprint, rendered.elements[0].fingerprint, "the facade finish must be visible");
+    }
+
+    #[test]
+    fn masonry_uvs_stay_at_site_scale_when_scene_origin_changes_and_overlays_keep_the_vertex_layout() {
+        let mut d = doc();
+        d.buildings[0].finish = trigon_model::doc::WallFinish::YellowBrick;
+        let a = Scene::from_built(&build(&d).unwrap(), false);
+        d.buildings
+            .push(Building::new("annex", "Annex", &[[100000.0, 0.0], [109000.0, 0.0], [109000.0, 8000.0], [100000.0, 8000.0]], 1, 3000.0).unwrap());
+        let b = Scene::from_built(&build(&d).unwrap(), false);
+        assert_ne!(a.origin, b.origin);
+        let uvs = |scene: &Scene, id: &str| {
+            let element = &scene.elements[scene.find(id).unwrap()];
+            element
+                .ranges
+                .iter()
+                .flat_map(|range| {
+                    scene.vertices[range.start as usize * VERTEX_FLOATS..range.end as usize * VERTEX_FLOATS]
+                        .as_chunks::<VERTEX_FLOATS>()
+                        .0
+                        .iter()
+                        .map(|vertex| [vertex[10], vertex[11], vertex[12]])
+                })
+                .collect::<Vec<_>>()
+        };
+        let wall = uvs(&a, "b1.f1");
+        assert!(!wall.is_empty());
+        assert!(wall.iter().all(|uv| uv.iter().all(|value| value.is_finite()) && uv[2] == 1.0));
+        assert_eq!(wall, uvs(&b, "b1.f1"));
+        let overlay = a.overlay(&[a.find("b1.f1").unwrap()], [1.0, 0.5, 0.0, 0.6], [3.0, 0.0, 0.0]);
+        let overlay_uvs: Vec<_> = overlay.as_chunks::<VERTEX_FLOATS>().0.iter().map(|vertex| [vertex[10], vertex[11], vertex[12]]).collect();
+        assert_eq!(overlay_uvs, wall);
+        for element in a.elements.iter().filter(|e| !matches!(e.kind, "wall")) {
+            for range in &element.ranges {
+                assert!(
+                    a.vertices[range.start as usize * VERTEX_FLOATS..range.end as usize * VERTEX_FLOATS]
+                        .as_chunks::<VERTEX_FLOATS>()
+                        .0
+                        .iter()
+                        .all(|vertex| vertex[12] == 0.0)
+                );
+            }
+        }
     }
 
     #[test]

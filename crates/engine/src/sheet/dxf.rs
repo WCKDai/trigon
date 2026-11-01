@@ -235,7 +235,6 @@ fn hatch(w: &mut W, p: &Path, fill: Fill, scale: f64) {
             (aci(c).or(Some(250)), None)
         }
         Fill::Masonry => (Some(8), Some(MASONRY_SPACING * scale / ANSI31)),
-        Fill::Dots => return,
     };
     w.entity("HATCH", layer, colour, None);
     w.pair(100, "AcDbHatch");

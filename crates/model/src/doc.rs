@@ -339,6 +339,8 @@ pub enum WallFinish {
     Brick,
     /// Red facing brick.
     RedBrick,
+    /// Yellow facing brick. Existing `brick` defaults and old files retain their meaning.
+    YellowBrick,
     /// White render.
     Render,
 }

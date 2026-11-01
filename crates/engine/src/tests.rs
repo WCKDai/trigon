@@ -1404,6 +1404,31 @@ fn a_3d_plan_cut_closes_the_walls_at_the_cut_and_leaves_out_what_is_above() {
 }
 
 #[test]
+fn explicit_yellow_brick_finish_is_undoable_without_changing_geometry_or_other_facades() {
+    let mut s = session();
+    let south = first_facade_facing(&mut s, "S");
+    let before = s.doc.clone();
+    let geometry = trigon_model::build(&s.doc).unwrap();
+    s.execute("facade.set_finish", json!({"facades":[south],"finish":"yellow_brick"})).unwrap();
+    let changed = trigon_model::build(&s.doc).unwrap();
+    for (a, b) in geometry[0].walls.iter().zip(&changed[0].walls) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.mesh, b.mesh, "a finish cannot change wall geometry");
+        if a.id == south {
+            assert_eq!(b.finish, trigon_model::Material::BrickYellow);
+        } else {
+            assert_eq!(a.finish, b.finish, "the finish is scoped to the requested facade");
+        }
+    }
+    assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+    assert_eq!(s.doc, before);
+    assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
+    assert_eq!(s.doc.buildings[0].facade(&south).unwrap().finish, Some(trigon_model::doc::WallFinish::YellowBrick));
+    let encoded = serde_json::to_value(&before).unwrap();
+    assert_eq!(serde_json::from_value::<trigon_model::Document>(encoded).unwrap(), before);
+}
+
+#[test]
 fn street_fronts_loggias_bands_finishes_and_cellar_stairs() {
     let mut s = session();
     s.execute("building.add_basement", json!({"floor": -2480})).unwrap();

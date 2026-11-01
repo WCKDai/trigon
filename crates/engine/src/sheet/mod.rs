@@ -223,8 +223,6 @@ pub(crate) enum Fill {
     Solid(Rgb),
     /// Masonry: 45° lines over white.
     Masonry,
-    /// A stair core: dots over near-white.
-    Dots,
 }
 
 #[derive(Clone, Debug, PartialEq)]

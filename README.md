@@ -60,6 +60,10 @@ dimensions, phase status and lining areas. It includes interior/cellar doors and
 excludes loggia facade-hole areas from the totals. `schedule.export` saves the inventory as
 CSV or JSON. See [opening schedules](docs/schedules.md).
 
+Masonry uses physical-scale brick courses in Studio and self-contained GLB exports, with original
+colour and joint-relief maps. `facade.set_finish` supports explicit yellow and red brick as well
+as render; finish changes preserve geometry and are undoable. See [materials](docs/materials.md).
+
 ```sh
 cargo build --release -p trigon-studio -p trigon
 ./target/release/trigon-studio path/to/model.trigon

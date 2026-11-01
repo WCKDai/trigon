@@ -75,6 +75,13 @@ enum Prim {
         width: f64,
         dashed: bool,
     },
+    /// Model-derived stair detail has its own layer and neutral direction-line styling.
+    StairLine {
+        a: [f64; 2],
+        b: [f64; 2],
+        width: f64,
+        dashed: bool,
+    },
     /// `away`: the unit direction a label may step out along when it collides with another.
     Text {
         at: [f64; 2],
@@ -354,22 +361,24 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         for st in &visible {
             if presentation {
                 prims.push(Prim::Poly { pts: trigon_model::stair::opening(st)?, fill: [245, 245, 245], surface: Surface::Stair });
-                continue;
             }
+            let line = |a, b, width, dashed| {
+                if presentation { Prim::StairLine { a, b, width, dashed } } else { Prim::Line { a, b, color: LINE, width, dashed } }
+            };
             let departure = if st.levels.contains(&level) { level } else { level.saturating_sub(1) };
             let h = b.storeys.get(departure).map_or(3000.0, |s| s.height);
             let Ok(sym) = trigon_model::stair::symbol(st, h) else { continue };
             for (a, e) in &sym.outline {
-                prims.push(Prim::Line { a: *a, b: *e, color: LINE, width: 18.0, dashed: false });
+                prims.push(line(*a, *e, 18.0, false));
             }
             for (a, e) in &sym.treads {
-                prims.push(Prim::Line { a: *a, b: *e, color: LINE, width: 9.0, dashed: false });
+                prims.push(line(*a, *e, 9.0, false));
             }
             for k in 1..sym.landing.len() {
-                prims.push(Prim::Line { a: sym.landing[k - 1], b: sym.landing[k], color: LINE, width: 18.0, dashed: false });
+                prims.push(line(sym.landing[k - 1], sym.landing[k], 18.0, false));
             }
             for k in 1..sym.walk.len() {
-                prims.push(Prim::Line { a: sym.walk[k - 1], b: sym.walk[k], color: LINE, width: 7.0, dashed: true });
+                prims.push(line(sym.walk[k - 1], sym.walk[k], 7.0, true));
             }
             // Arrowhead at the start of the walking line, pointing up the first flight.
             if let [w0, w1, ..] = sym.walk.as_slice() {
@@ -379,10 +388,10 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let tip = [w0[0] + ux * 450.0, w0[1] + uy * 450.0];
                 for side in [-1.0, 1.0] {
                     let base = [tip[0] - ux * 180.0 - uy * 90.0 * side, tip[1] - uy * 180.0 + ux * 90.0 * side];
-                    prims.push(Prim::Line { a: base, b: tip, color: LINE, width: 9.0, dashed: false });
+                    prims.push(line(base, tip, 9.0, false));
                 }
                 let dot = [w0[0] + ux * 60.0, w0[1] + uy * 60.0];
-                prims.push(Prim::Line { a: [dot[0] - 40.0, dot[1]], b: [dot[0] + 40.0, dot[1]], color: LINE, width: 70.0, dashed: false });
+                prims.push(line([dot[0] - 40.0, dot[1]], [dot[0] + 40.0, dot[1]], 70.0, false));
             }
         }
         // Entrances: house number on the staircase's floor landing, the apartments' doors either side
@@ -741,7 +750,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         let (layer, fill, pen) = match surface {
             Surface::Exterior => (Layer::WallCut, Fill::Masonry, 0.35),
             Surface::Interior => (Layer::WallCut, Fill::Solid([0xd6, 0xd6, 0xd6]), 0.35),
-            Surface::Stair => (Layer::Stair, Fill::Dots, 0.25),
+            Surface::Stair => (Layer::Stair, Fill::Solid([250, 250, 250]), 0.18),
         };
         for shape in trigon_model::footprint::union(&polys)? {
             let rings = shape.iter().map(|ring| ring.iter().map(|p| f.rot(*p)).collect()).collect();
@@ -753,6 +762,10 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
     for (index, p) in prims.iter().enumerate() {
         match p {
             Prim::Poly { .. } => {}
+            Prim::StairLine { a, b, width, dashed } => {
+                let pen = if *width >= 14.0 { 0.18 } else { 0.13 };
+                sc.line(Layer::Stair, f.rot(*a), f.rot(*b), Stroke { pen, colour: [0x33; 3], dashed: *dashed });
+            }
             Prim::Line { a, b, width, dashed, color } => {
                 let colour = if *dashed || *color == DEMOLISHED { [0xbd, 0x30, 0x30] } else { [0x33, 0x33, 0x33] };
                 let pen = if *width >= 25.0 {
@@ -902,7 +915,11 @@ fn svg(prims: &[Prim], f: &Frame, background: Option<&[u8]>, title: &str) -> Res
                 let d: Vec<String> = pts.iter().map(|p| f.px(*p)).map(|q| format!("{:.1},{:.1}", q[0], q[1])).collect();
                 let _ = writeln!(out, r#"<polygon points="{}" fill="{}"/>"#, d.join(" "), hex(*fill));
             }
-            Prim::Line { a, b, color, width, dashed } => {
+            Prim::Line { a, b, width, dashed, .. } | Prim::StairLine { a, b, width, dashed } => {
+                let color = match p {
+                    Prim::Line { color, .. } => *color,
+                    _ => LINE,
+                };
                 let (pa, pb) = (f.px(*a), f.px(*b));
                 let dash = if *dashed { r#" stroke-dasharray="6 6""# } else { "" };
                 let _ = writeln!(
@@ -912,7 +929,7 @@ fn svg(prims: &[Prim], f: &Frame, background: Option<&[u8]>, title: &str) -> Res
                     pa[1],
                     pb[0],
                     pb[1],
-                    hex(*color),
+                    hex(color),
                     (width / f.mm).max(0.6)
                 );
             }
@@ -999,6 +1016,67 @@ pub(crate) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_stairs_retain_model_detail_at_departure_and_receiving_storeys() {
+        use crate::sheet::Item;
+
+        for (kind, rounded, winders) in
+            [("straight", false, None), ("u_turn", true, None), ("u_turn", false, Some(6)), ("double_quarter_turn", false, None)]
+        {
+            let mut doc = Document::default();
+            let mut building = trigon_model::Building::new("b", "test", &[[0., 0.], [12000., 0.], [12000., 10000.], [0., 10000.]], 2, 3000.).unwrap();
+            building.storeys[1].height = 3900.0;
+            let stair: trigon_model::Stair = serde_json::from_value(json!({
+                "id":"measured-stair", "levels":[0], "outline":[[3500.,3500.],[6000.,3500.],[6000.,5500.],[3500.,5500.]],
+                "kind":kind, "rounded":rounded, "winders":winders
+            }))
+            .unwrap();
+            let symbol = trigon_model::stair::symbol(&stair, building.storeys[0].height).unwrap();
+            assert!(!symbol.treads.is_empty());
+            building.stairs.push(stair);
+            doc.buildings.push(building);
+            let original = doc.clone();
+            for level in [0, 1] {
+                for rotation in [0.0, 27.5] {
+                    let sheet = sheet_scene(&doc, level, View::latest(&doc), rotation, None, "").unwrap();
+                    let frame = sheet_frame(&doc, None, rotation).unwrap();
+                    let paths: Vec<_> = sheet
+                        .scene
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::Path(path) if path.layer == Layer::Stair && !path.closed => Some(path),
+                            _ => None,
+                        })
+                        .collect();
+                    for (a, b) in &symbol.treads {
+                        let expected = vec![vec![frame.rot(*a), frame.rot(*b)]];
+                        // An end tread may coincide with the heavier stringer/landing outline.
+                        let tread = paths.iter().find(|path| path.rings == expected && path.stroke.is_some_and(|stroke| stroke.pen == 0.13));
+                        assert!(tread.is_some(), "{kind} at level {level}, rotation {rotation}: model tread is missing from the presentation plan");
+                        let stroke = tread.unwrap().stroke.unwrap();
+                        assert_eq!(stroke.pen, 0.13);
+                        assert!(!stroke.dashed);
+                    }
+                    for points in symbol.walk.windows(2) {
+                        let expected = vec![vec![frame.rot(points[0]), frame.rot(points[1])]];
+                        let walk = paths.iter().find(|path| path.rings == expected).unwrap();
+                        let stroke = walk.stroke.unwrap();
+                        assert!(stroke.dashed);
+                        assert_eq!(stroke.colour, [0x33; 3], "direction lines must not take demolition red");
+                    }
+                    for points in symbol.landing.windows(2) {
+                        let expected = vec![vec![frame.rot(points[0]), frame.rot(points[1])]];
+                        assert!(paths.iter().any(|path| path.rings == expected), "model landing outline is missing");
+                    }
+                    assert!(paths.iter().all(|path| path.stroke.unwrap().pen < 0.35), "stair detail must remain finer than cut walls");
+                    assert_eq!(doc, original, "drawing must not change the model");
+                }
+            }
+        }
+    }
+
     #[test]
     fn receiving_floor_shows_its_stair_and_rotated_box_crop_is_valid() {
         let mut b = trigon_model::Building::new("b", "test", &[[0., 0.], [10000., 0.], [10000., 10000.], [0., 10000.]], 2, 3000.).unwrap();
