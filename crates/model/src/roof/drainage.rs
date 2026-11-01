@@ -128,7 +128,9 @@ pub fn build_selected(
             .ok_or_else(|| invalid(&format!("selected gutter run for {} is too short", f.id)))?;
         let direction = run.t[0] * source.t[0] + run.t[1] * source.t[1];
         let offset = (run.origin[0] - source.origin[0]) * source.n[0] + (run.origin[1] - source.origin[1]) * source.n[1];
-        if direction < 1.0 - 1e-10 || (!gables.contains(&k) && (offset - overhang).abs() > 1e-5) {
+        let end = outline[(k + 1) % outline.len()];
+        let end_offset = (end[0] - source.origin[0]) * source.n[0] + (end[1] - source.origin[1]) * source.n[1];
+        if direction < 1.0 - 1e-10 || (end_offset - offset).abs() > 1e-5 || (!gables.contains(&k) && (offset - overhang).abs() > 1e-5) {
             return Err(invalid(&format!(
                 "selected gutter run {k} does not follow source facade {} at its declared overhang; revise eave_facades",
                 f.id
@@ -790,6 +792,12 @@ mod tests {
         assert_eq!(
             build(&b, &[0, 1, 2, 3], &outline, 6000., 180., 46., &[], &d).unwrap(),
             build_selected(&b, &[0, 1, 2, 3], &outline, 6000., 180., 46., &[], &d).unwrap()
+        );
+        let mut crooked = outline.clone();
+        crooked[0][0] += 0.1;
+        assert!(
+            build_selected(&b, &[0, 1, 2, 3], &crooked, 6000., 180., 46., &[], &d).is_err(),
+            "both endpoints must follow their original source offset, even when an angular cosine check would accept a 0.1 mm drift"
         );
     }
 
