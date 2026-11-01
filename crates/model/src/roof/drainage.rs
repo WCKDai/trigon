@@ -233,12 +233,24 @@ fn tube(m: &mut Mesh, path: &[[f64; 3]], r: f64, wall: f64) {
         v.map(|x| x / l)
     };
     let sub = |a: [f64; 3], b: [f64; 3]| std::array::from_fn(|k| a[k] - b[k]);
+    // A constant reference normal to the bend plane prevents a circular section from
+    // rotating arbitrarily where a vertical segment changes to a knee. For a straight
+    // run, choose a world axis that is not parallel to it.
+    let directions: Vec<_> = path.windows(2).map(|p| unit(sub(p[1], p[0]))).collect();
+    let cross = |a: [f64; 3], b: [f64; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let reference = directions
+        .windows(2)
+        .map(|p| cross(p[0], p[1]))
+        .find(|p| p.iter().map(|v| v * v).sum::<f64>() > 1e-12)
+        .map(unit)
+        .unwrap_or_else(|| if directions.first().is_some_and(|p| p[0].abs() < 0.9) { [1., 0., 0.] } else { [0., 1., 0.] });
     let mut sections = Vec::new();
     for (i, &p) in path.iter().enumerate() {
         let before = unit(sub(p, path[i.saturating_sub(1)]));
         let after = unit(sub(path[(i + 1).min(path.len() - 1)], p));
         let tangent = unit(std::array::from_fn(|k| before[k] + after[k]));
-        let x = unit(if tangent[2].abs() < 0.9 { [-tangent[1], tangent[0], 0.0] } else { [0.0, -tangent[2], tangent[1]] });
+        let projection: f64 = reference.iter().zip(tangent).map(|(a, b)| a * b).sum();
+        let x = unit(std::array::from_fn(|k| reference[k] - projection * tangent[k]));
         let y = [tangent[1] * x[2] - tangent[2] * x[1], tangent[2] * x[0] - tangent[0] * x[2], tangent[0] * x[1] - tangent[1] * x[0]];
         let ring = |radius: f64| -> [[f64; 3]; 16] {
             std::array::from_fn(|k| {
@@ -290,6 +302,18 @@ mod tests {
                 && pts.iter().map(|p| p[1]).fold(f64::MIN, f64::max) - pts.iter().map(|p| p[1]).fold(f64::MAX, f64::min) > 50.)
         }));
     }
+    #[test]
+    fn downpipe_bends_keep_sections_aligned_in_the_bend_plane() {
+        let path = [[0., 0., 2000.], [0., 0., 1800.], [0., 300., 1500.], [0., 300., 400.], [0., 500., 200.]];
+        let mut mesh = Mesh::default();
+        tube(&mut mesh, &path, 40., 2.);
+        // Every corresponding radial sample keeps its distance from the bend plane.
+        // Arbitrary 90-degree frame changes produce twisted, flattened knees in the render.
+        for pair in mesh.positions[..(path.len() - 1) * 16 * 8].chunks(8) {
+            assert!((pair[0][0] - pair[3][0]).abs() < 1e-9);
+        }
+    }
+
     #[test]
     fn hostile_detail_is_rejected_without_panics() {
         let b = building();
