@@ -84,6 +84,22 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| crate::views::define_view(s, parse("view.define", v)?),
     },
     CommandSpec {
+        id: "view.configure",
+        summary: "Set or clear a saved view's persistent template: line weights, physical scale or fit/crop, and optional plan-only floor-relative cut/top/bottom/depth. Null template restores legacy drawing defaults. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::view_config::Configure>,
+        run: |s, v| crate::view_config::configure(s, parse("view.configure", v)?),
+    },
+    CommandSpec {
+        id: "view.apply_template",
+        summary: "Copy a configured saved view's template to 1 to 256 distinct target views, preserving their coordinate frames and annotations. All targets validate before any change; atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::view_config::Apply>,
+        run: |s, v| crate::view_config::apply(s, parse("view.apply_template", v)?),
+    },
+    CommandSpec {
         id: "view.list",
         summary: "List saved drawing views with validity and annotation counts. Stale model references remain repairable.",
         mutates: false,

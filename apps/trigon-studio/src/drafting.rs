@@ -5,7 +5,10 @@ use eframe::egui;
 use serde_json::json;
 use trigon_engine::SnapOptions;
 use trigon_model::Document;
-use trigon_model::annotation::{Annotation, AnnotationKind, DrawingViewKind, FontFamily, LinePattern, LineStyle, TextStyle};
+use trigon_model::annotation::{
+    Annotation, AnnotationKind, DrawingTemplate, DrawingViewKind, FontFamily, LinePattern, LineStyle, LineWeightProfile, PlanRange, TextStyle,
+    ViewSizing,
+};
 
 use crate::{authoring::Run, theme};
 
@@ -15,6 +18,9 @@ pub enum Action {
 }
 
 pub struct Drafting {
+    template: DrawingTemplate,
+    loaded_template: Option<(String, Option<DrawingTemplate>)>,
+    template_source: String,
     view_id: String,
     view_name: String,
     view_kind: usize,
@@ -51,6 +57,9 @@ pub struct Drafting {
 impl Default for Drafting {
     fn default() -> Self {
         Self {
+            template: DrawingTemplate::default(),
+            loaded_template: None,
+            template_source: String::new(),
             view_id: "drawing-1".into(),
             view_name: "Ground floor".into(),
             view_kind: 0,
@@ -388,6 +397,9 @@ impl Drafting {
             return None;
         };
         let mut run = None;
+        if let Some(run) = self.template_ui(ui, doc, view) {
+            return Some(run);
+        }
         ui.heading(&view.name);
         ui.weak("Drawing-plane millimetres · paper-size lettering");
         ui.separator();
@@ -588,6 +600,123 @@ impl Drafting {
         run
     }
 
+    fn template_ui(&mut self, ui: &mut egui::Ui, doc: &Document, view: &trigon_model::annotation::DrawingView) -> Option<Run> {
+        let key = (view.id.clone(), view.template.clone());
+        if self.loaded_template.as_ref() != Some(&key) {
+            self.template = view.template.clone().unwrap_or_default();
+            self.loaded_template = Some(key);
+        }
+        let mut run = None;
+        egui::CollapsingHeader::new("View template · paper · range").show(ui, |ui| {
+            ui.weak(if view.template.is_some() {
+                "Saved configuration · Apply commits changes"
+            } else {
+                "Legacy automatic drawing · Apply enables this template"
+            });
+            ui.label("Template name");
+            ui.text_edit_singleline(&mut self.template.name);
+            egui::ComboBox::from_id_salt("line-profile").selected_text(format!("{:?} pens", self.template.line_weights)).show_ui(ui, |ui| {
+                for (profile, label) in [
+                    (LineWeightProfile::Fine, "Fine · 75%"),
+                    (LineWeightProfile::Standard, "Standard · 100%"),
+                    (LineWeightProfile::Bold, "Bold · 140%"),
+                ] {
+                    ui.selectable_value(&mut self.template.line_weights, profile, label);
+                }
+            });
+            ui.weak("Model linework only; manual line paper weights remain explicit.");
+            let mut fixed = matches!(self.template.sizing, ViewSizing::Fixed { .. });
+            if ui.checkbox(&mut fixed, "Fixed physical scale · crop to paper").changed() {
+                let b = doc.buildings.first();
+                let centre = if matches!(view.kind, DrawingViewKind::Plan { .. }) {
+                    b.map(|b| {
+                        let mut lo = [f64::INFINITY; 2];
+                        let mut hi = [f64::NEG_INFINITY; 2];
+                        for p in &b.footprint {
+                            for k in 0..2 {
+                                lo[k] = lo[k].min(p[k]);
+                                hi[k] = hi[k].max(p[k]);
+                            }
+                        }
+                        [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
+                    })
+                    .unwrap_or([0.0; 2])
+                } else {
+                    [5000.0, 5000.0]
+                };
+                self.template.sizing = if fixed { ViewSizing::Fixed { denominator: 100.0, centre } } else { ViewSizing::Fit };
+            }
+            if let ViewSizing::Fixed { denominator, centre } = &mut self.template.sizing {
+                ui.horizontal(|ui| {
+                    ui.label("1 :");
+                    ui.add(egui::DragValue::new(denominator).range(1.0..=10000.0));
+                });
+                point(ui, "Paper centre · drawing x / y", centre);
+                ui.weak("338.67 × 190.50 mm paper at 100% print size. Content outside the viewport is cropped.");
+            } else {
+                ui.weak("Fit uses an actual fitted paper scale; the footer reports that scale.");
+            }
+            let mut cropped = self.template.crop.is_some();
+            if ui.checkbox(&mut cropped, "Drawing crop rectangle").changed() {
+                self.template.crop = if cropped { Some([0.0, 0.0, 10000.0, 8000.0]) } else { None };
+            }
+            if let Some(crop) = &mut self.template.crop {
+                for (label, value) in ["Min x", "Min y", "Max x", "Max y"].into_iter().zip(crop) {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        number(ui, value);
+                    });
+                }
+            }
+            if matches!(view.kind, DrawingViewKind::Plan { .. }) {
+                let mut ranged = self.template.range.is_some();
+                if ui.checkbox(&mut ranged, "Explicit floor-plan view range").changed() {
+                    self.template.range = if ranged { Some(PlanRange::default()) } else { None };
+                }
+                if let Some(range) = &mut self.template.range {
+                    ui.weak("Offsets from selected storey floor · mm. Depth ≤ bottom < cut < top.");
+                    for (label, value) in [
+                        ("Top", &mut range.top_mm),
+                        ("Cut plane", &mut range.cut_mm),
+                        ("Bottom", &mut range.bottom_mm),
+                        ("View depth", &mut range.depth_mm),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.add(egui::DragValue::new(value).range(-100000.0..=100000.0).speed(10.0).suffix(" mm"));
+                        });
+                    }
+                    ui.weak("Dashed overhead; dotted below primary range. Uses actual mesh cuts and hidden lines, including adjacent storeys.");
+                }
+            }
+            let error = self.template.validate().err();
+            if let Some(error) = &error {
+                ui.colored_label(theme::ACCENT, error.to_string());
+            }
+            if ui.add_enabled(error.is_none(), egui::Button::new("Apply view template")).clicked() {
+                run = Some(Run { command: "view.configure", params: json!({"id":view.id,"template":self.template}) });
+            }
+            if ui.add_enabled(view.template.is_some(), egui::Button::new("Restore legacy drawing defaults")).clicked() {
+                run = Some(Run { command: "view.configure", params: json!({"id":view.id,"template":null}) });
+            }
+            egui::ComboBox::from_id_salt("copy-view-template")
+                .selected_text(if self.template_source.is_empty() { "Choose saved template" } else { &self.template_source })
+                .show_ui(ui, |ui| {
+                    for v in doc.views.iter().filter(|v| v.template.is_some() && v.id != view.id) {
+                        ui.selectable_value(
+                            &mut self.template_source,
+                            v.id.clone(),
+                            format!("{} · {}", v.template.as_ref().map_or("", |t| t.name.as_str()), v.name),
+                        );
+                    }
+                });
+            if ui.add_enabled(!self.template_source.is_empty(), egui::Button::new("Use saved template")).clicked() {
+                run = Some(Run { command: "view.apply_template", params: json!({"source":self.template_source,"targets":[view.id]}) });
+            }
+        });
+        run
+    }
+
     fn annotation_kind(&self) -> AnnotationKind {
         match self.kind {
             5 => AnnotationKind::Line { from: self.points[0], to: self.points[1], stroke: self.stroke },
@@ -634,6 +763,7 @@ mod tests {
             id: "drawing-1".into(),
             name: "Ground floor".into(),
             kind: DrawingViewKind::Plan { level: 0 },
+            template: None,
         });
         let mut tool = Drafting::default();
         tool.opened(&doc, "drawing-1");
@@ -647,6 +777,7 @@ mod tests {
             id: "measured-section".into(),
             name: "Measured section".into(),
             kind: DrawingViewKind::Plan { level: 0 },
+            template: None,
         });
         tool.opened(&doc, "drawing-1");
         assert_eq!(tool.view_id, "drawing-2", "a newly taken ID must be replaced");

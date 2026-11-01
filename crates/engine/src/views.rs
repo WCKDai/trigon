@@ -106,13 +106,35 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
     let view = find(doc, id)?;
     view.validate_source(doc)?;
     let mut sheet = match &view.kind {
-        DrawingViewKind::Plan { level } => crate::plan::drawing_sheet(doc, *level, phase)?,
+        DrawingViewKind::Plan { level } => match view.template.as_ref().and_then(|t| t.range) {
+            Some(range) => crate::plan_range::sheet(doc, *level, phase, range)?,
+            None => crate::plan::drawing_sheet(doc, *level, phase)?,
+        },
         DrawingViewKind::Facade { facade } => {
             crate::elevation::scene(doc, crate::elevation::Side::Facade(facade), phase, (None, None), &view.name, "")?
         }
         DrawingViewKind::Section { from, to, flip, depth_mm } => crate::section::scene(doc, [*from, *to], *flip, *depth_mm, phase, &view.name, "")?,
     };
     sheet.title = view.name.clone();
+    if let Some(template) = &view.template {
+        let mut extent = sheet.scene.clone();
+        for a in doc.annotations.iter().filter(|a| a.view == id) {
+            draw(&mut extent, a);
+        }
+        let mut bounds = extent.bounds();
+        for item in &extent.items {
+            if let Item::Text(t) = item {
+                let b = bounds.get_or_insert([t.at[0], t.at[1], t.at[0], t.at[1]]);
+                // A conservative lettering box keeps insertion points and complete labels in fit.
+                let pad = t.size * extent.scale;
+                b[0] = b[0].min(t.at[0] - pad);
+                b[1] = b[1].min(t.at[1] - pad);
+                b[2] = b[2].max(t.at[0] + pad * t.text.chars().count() as f64);
+                b[3] = b[3].max(t.at[1] + pad);
+            }
+        }
+        crate::view_config::prepare(&mut sheet, template, bounds);
+    }
     let mut regions = Scene::new(sheet.scene.scale);
     for a in doc.annotations.iter().filter(|a| a.view == id && matches!(a.kind, AnnotationKind::Region { .. })) {
         draw(&mut regions, a);
@@ -121,6 +143,9 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
     sheet.scene.items = regions.items;
     for a in doc.annotations.iter().filter(|a| a.view == id && !matches!(a.kind, AnnotationKind::Region { .. })) {
         draw(&mut sheet.scene, a);
+    }
+    if let Some(template) = &view.template {
+        crate::view_config::finish(&mut sheet, template);
     }
     sheet.metrics["view"] = json!(id);
     sheet.metrics["annotations"] = json!(doc.annotations.iter().filter(|a| a.view == id).count());
@@ -616,6 +641,136 @@ mod picking_tests {
             session.execute("edit.undo", json!({})).unwrap();
             assert_eq!(session.doc, before);
         }
+    }
+
+    #[test]
+    fn configured_views_have_physical_scale_clipping_reusable_pens_and_exact_undo() {
+        let mut session = session();
+        session.execute("annotation.define",json!({"id":"manual","view":"plan","kind":{"annotation":"line","from":[0,2000],"to":[12000,2000],"stroke":{"colour":[184,65,44],"width_mm":0.5,"pattern":"dotted"}}})).unwrap();
+        let before = session.doc.clone();
+        let template = json!({"name":"Plan 100","line_weights":"fine","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]},"crop":[-1000,-1000,10000,7000]});
+        session.execute("view.configure", json!({"id":"plan","template":template})).unwrap();
+        let configured = session.doc.clone();
+        let plan = sheet(&session.doc, "plan", View::latest(&session.doc)).unwrap();
+        let a = plan.vp.px([0.0, 0.0]);
+        let b = plan.vp.px([10000.0, 0.0]);
+        assert!(((b[0] - a[0]) * crate::sheet::MM_PER_PX - 100.0).abs() < 1e-8, "10m must print as 100mm at 1:100");
+        assert_eq!(plan.scene.scale, 100.0);
+        assert_eq!(plan.metrics["sizing"], "fixed");
+        let pdf = crate::plan_output::pdf(&[plan.svg()], crate::sheet::PAGE_MM).unwrap();
+        let parsed = lopdf::Document::load_mem(&pdf).unwrap();
+        let page = parsed.get_dictionary(*parsed.get_pages().values().next().unwrap()).unwrap();
+        let media = page.get(b"MediaBox").unwrap().as_array().unwrap();
+        assert!((f64::from(media[2].as_float().unwrap()) * 25.4 / 72.0 - crate::sheet::PAGE_MM[0]).abs() < 0.001);
+
+        assert!(
+            plan.scene
+                .items
+                .iter()
+                .filter_map(|i| if let Item::Path(p) = i { Some(p) } else { None })
+                .flat_map(|p| p.rings.iter().flatten())
+                .all(|p| p[0] >= -1000.0 - 1e-8 && p[0] <= 10000.0 + 1e-8 && p[1] >= -1000.0 - 1e-8 && p[1] <= 7000.0 + 1e-8)
+        );
+        let line = plan
+            .scene
+            .items
+            .iter()
+            .filter_map(|i| if let Item::Path(p) = i { Some(p) } else { None })
+            .find(|p| p.stroke.is_some_and(|s| s.colour == [184, 65, 44]))
+            .unwrap();
+        assert_eq!(line.stroke.unwrap().pen, 0.5, "manual paper weights are explicit and preserved");
+        assert!(
+            plan.scene
+                .items
+                .iter()
+                .any(|i| matches!(i,Item::Path(p) if p.layer==Layer::WallCut && p.stroke.is_some_and(|s|(s.pen-0.2625).abs()<1e-8)))
+        );
+        let loaded: Document = serde_json::from_str(&serde_json::to_string(&session.doc).unwrap()).unwrap();
+        assert_eq!(loaded, session.doc);
+        session.execute("view.apply_template", json!({"source":"plan","targets":["facade"]})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&session.doc.views[0]).unwrap()["template"],
+            serde_json::to_value(&session.doc.views[1]).unwrap()["template"]
+        );
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, configured);
+        let invalid = [
+            json!({"name":"bad","sizing":{"mode":"fixed","denominator":0,"centre":[0,0]}}),
+            json!({"name":"bad","crop":[10,0,0,10]}),
+            json!({"name":"bad","range":{"top_mm":2300,"cut_mm":-10,"bottom_mm":0,"depth_mm":-1000}}),
+        ];
+        for template in invalid {
+            assert!(session.execute("view.configure", json!({"id":"plan","template":template})).is_err());
+            assert_eq!(session.doc, configured);
+        }
+        assert!(session.execute("view.apply_template", json!({"source":"plan","targets":["facade","missing"]})).is_err());
+        assert_eq!(session.doc, configured);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+    }
+
+    #[test]
+    fn plan_ranges_change_cut_geometry_and_include_adjacent_overhead_only_within_top() {
+        let mut s = session();
+        s.execute("interior.add_walls", json!({"walls":[{"id":"upper","a":[2000,2000],"b":[10000,2000],"thickness":150,"levels":[1]}]})).unwrap();
+        let before = s.doc.clone();
+        let configure = |s: &mut Session, top, cut| {
+            s.execute(
+                "view.configure",
+                json!({"id":"plan","template":{"name":"Range","range":{"top_mm":top,"cut_mm":cut,"bottom_mm":0,"depth_mm":-1000}}}),
+            )
+            .unwrap()
+        };
+        configure(&mut s, 2300, 1200);
+        let low = sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert!(!drawing_view(&s.doc, "plan", View::latest(&s.doc)).unwrap().element_segments.iter().any(|e| e.id == "upper.L1"));
+        configure(&mut s, 4500, 1200);
+        let high = sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert!(drawing_view(&s.doc, "plan", View::latest(&s.doc)).unwrap().element_segments.iter().any(|e| e.id == "upper.L1"));
+        assert!(
+            high.scene
+                .items
+                .iter()
+                .any(|i| matches!(i,Item::Path(p) if p.stroke.is_some_and(|s|s.dashed) && p.element_segments.iter().any(|e|e.id=="upper.L1")))
+        );
+        assert_ne!(low.svg(), high.svg());
+        configure(&mut s, 2300, 500);
+        let lower_cut = sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert_ne!(low.scene.items, lower_cut.scene.items, "cut plane must change actual wall/opening intersections");
+        for _ in 0..3 {
+            s.execute("edit.undo", json!({})).unwrap();
+        }
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn fit_includes_far_manual_notes_and_range_settings_cannot_leak_into_facades() {
+        let mut s = session();
+        s.execute("annotation.define", json!({"id":"outside","view":"plan","kind":{"annotation":"text","at":[28000,20000],"text":"Proposal"}}))
+            .unwrap();
+        s.execute("view.configure", json!({"id":"plan","template":{"name":"Fit notes"}})).unwrap();
+        let plan = sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        let p = plan.vp.px([28000.0, 20000.0]);
+        assert!(p[0] >= plan.clip[0] && p[0] <= plan.clip[0] + plan.clip[2] && p[1] >= plan.clip[1] && p[1] <= plan.clip[1] + plan.clip[3]);
+        let original = s.doc.clone();
+        for bad in [
+            json!({"top_mm":1000,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000}),
+            json!({"top_mm":2300,"cut_mm":1200,"bottom_mm":0,"depth_mm":500}),
+            json!({"top_mm":1e300,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000}),
+        ] {
+            assert!(s.execute("view.configure", json!({"id":"plan","template":{"name":"Bad","range":bad}})).is_err());
+            assert_eq!(s.doc, original);
+        }
+        assert!(
+            s.execute(
+                "view.configure",
+                json!({"id":"facade","template":{"name":"Bad","range":{"top_mm":2300,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000}}})
+            )
+            .is_err()
+        );
+        assert_eq!(s.doc, original);
+        s.execute("view.configure", json!({"id":"plan","template":null})).unwrap();
+        assert!(serde_json::to_value(&s.doc.views[0]).unwrap().get("template").is_none());
     }
 
     fn fingerprint(bytes: &[u8]) -> u64 {

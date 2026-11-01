@@ -22,12 +22,14 @@ mod elevation;
 mod facade_image;
 mod plan;
 mod plan_output;
+mod plan_range;
 mod rooms;
 mod schedule_export;
 mod schedules;
 mod section;
 mod sheet;
 mod time;
+mod view_config;
 mod views;
 
 pub use commands::{CommandSpec, commands};
