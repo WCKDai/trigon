@@ -153,6 +153,9 @@ pub(crate) fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&t
 
 /// The storey's cut as primitives in site mm.
 fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result<(Vec<Prim>, String, BTreeMap<usize, Element>)> {
+    if !doc.buildings.iter().any(|b| b.storeys.get(level).is_some()) {
+        return Err(ModelError::Invalid(format!("level {level} doesn't exist")).into());
+    }
     let mut prims = Vec::new();
     let mut elements = BTreeMap::new();
     let mut title = String::new();
@@ -177,7 +180,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
     }
     let built = build_view(doc, view)?;
     for b in &built {
-        let storey = b.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("level {level} doesn't exist")))?;
+        let Some(storey) = b.storeys.get(level) else { continue };
         title = format!("{} — {}", b.name, storey.name);
         let cut = storey.elevation + CUT;
         for slab in
@@ -473,7 +476,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         }
     }
     // Outdoor cellar stairs: cut in the basement, seen from above on the ground storey.
-    for b in &doc.buildings {
+    for b in doc.buildings.iter().filter(|b| b.storeys.get(level).is_some()) {
         if level != 0 && level != b.ground_level {
             continue;
         }
@@ -528,7 +531,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             }
         }
     }
-    for b in &doc.buildings {
+    for b in doc.buildings.iter().filter(|b| b.storeys.get(level).is_some()) {
         let visible = visible_stairs(b, level);
         for st in &visible {
             let start = prims.len();
@@ -832,7 +835,7 @@ impl Label {
 }
 
 fn plan_extents(doc: &Document, level: usize, view: View) -> Result<Vec<[f64; 2]>> {
-    let mut points: Vec<_> = doc.buildings.iter().flat_map(|b| b.footprint.iter().copied()).collect();
+    let mut points: Vec<_> = doc.buildings.iter().filter(|b| b.storeys.get(level).is_some()).flat_map(|b| b.footprint.iter().copied()).collect();
     if level == doc.buildings.first().map_or(0, |b| b.ground_level) {
         for o in trigon_model::site::build(doc, view, None)? {
             points.extend(o.footprint);
@@ -919,8 +922,9 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
     let (prims, _, elements) = scene(doc, level, view, true)?;
     let f = sheet_frame(doc, region, rotation, level, view)?;
     let vp = Viewport { x0: f.x0, y1: f.y1, mm: f.mm };
-    let floor = doc.buildings.first().and_then(|b| b.storeys.get(level)).map(|s| s.name.clone()).unwrap_or_default();
-    let project = doc.buildings.first().map(|b| b.name.clone()).unwrap_or_default();
+    let source = doc.buildings.iter().find(|b| b.storeys.get(level).is_some());
+    let floor = source.and_then(|b| b.storeys.get(level)).map(|s| s.name.clone()).unwrap_or_default();
+    let project = source.map(|b| b.name.clone()).unwrap_or_default();
     let caption = if caption.is_empty() { project.clone() } else { caption.to_string() };
     let clip = if let Some(region) = region {
         let mut lo = [f64::INFINITY; 2];

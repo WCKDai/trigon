@@ -390,7 +390,7 @@ impl DrawingView {
         self.validate()?;
         match &self.kind {
             DrawingViewKind::Plan { level } => {
-                if doc.building(None)?.storeys.get(*level).is_none() {
+                if !doc.buildings.iter().any(|b| b.storeys.get(*level).is_some()) {
                     return Err(ModelError::NotFound(format!("plan level {level}")));
                 }
             }

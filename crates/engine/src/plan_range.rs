@@ -12,7 +12,8 @@ use trigon_model::{Document, ModelError};
 pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange) -> Result<Sheet> {
     range.validate()?;
     let built = build_view(doc, phase)?;
-    let first = built.first().ok_or_else(|| ModelError::Invalid("a plan needs a building".into()))?;
+    let first =
+        built.iter().find(|b| b.storeys.get(level).is_some()).ok_or_else(|| ModelError::Invalid(format!("plan level {level} does not exist")))?;
     let storey = first.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("plan level {level} does not exist")))?;
     let floor = storey.elevation;
     let (top, plane, bottom, depth) = (floor + range.top_mm, floor + range.cut_mm, floor + range.bottom_mm, floor + range.depth_mm);

@@ -160,3 +160,9 @@ parameter dictionaries are supported. Group 3, indexed palettes, image masks, by
 CCITT rows and compound filter chains remain unsupported and return explicit errors.
 The existing 1 GiB file and 400-million-pixel limits still apply; Group 4 dimensions must also
 fit the codec's 16-bit width/height. No external converter or service is required.
+
+A plan storey index may exist in only some buildings. Symbolic plans omit buildings without
+that storey; their footprints and incoming stair symbols do not expand or contaminate that
+floor's drawing. Saved views accept a level present in any building. Physical-range plans
+anchor their absolute cut to the first building containing that level, preserving the existing
+single-building convention, and show other geometry only within the specified height range.

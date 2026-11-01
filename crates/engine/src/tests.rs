@@ -2477,3 +2477,34 @@ fn precision_journal_replays_underlying_actions_without_ephemeral_tokens() {
     }
     assert_eq!(replay.doc, s.doc);
 }
+
+#[test]
+fn multi_building_plans_keep_upper_floors_when_another_building_is_lower() {
+    for low_first in [false, true] {
+        let mut s = Session::new(Box::new(Canned));
+        let high =
+            json!({"id":"high","name":"High building","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":3,"storey_height_mm":3000});
+        let low =
+            json!({"id":"low","name":"Low building","footprint":[[20000,0],[25000,0],[25000,6000],[20000,6000]],"storeys":1,"storey_height_mm":3000});
+        for params in if low_first { [low, high] } else { [high, low] } {
+            s.execute("building.add", params).unwrap();
+        }
+        s.execute("view.define", json!({"id":"upper","name":"Upper floor","kind":{"view":"plan","level":2}})).unwrap();
+        for ranged in [false, true] {
+            if ranged {
+                s.execute(
+                    "view.configure",
+                    json!({"id":"upper","template":{"name":"Actual cut","range":{"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300}}}),
+                )
+                .unwrap();
+            }
+            let drawing = crate::drawing_view(&s.doc, "upper", trigon_model::build::View::latest(&s.doc)).unwrap();
+            assert!(drawing.element_regions.iter().any(|r| r.id.starts_with("high.")), "high building present");
+            assert!(!drawing.element_regions.iter().any(|r| r.id.starts_with("low.")), "absent floor must not be invented");
+            assert!(drawing.svg.contains("Upper floor"));
+        }
+        let before = s.doc.clone();
+        assert!(s.execute("view.define", json!({"id":"invalid","name":"Missing floor","kind":{"view":"plan","level":9}})).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
