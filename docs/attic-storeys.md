@@ -52,8 +52,21 @@ they do not confer survey accuracy.
 
 `building.set_storeys` and `building.set_levels` reject an active explicit roof level; remove it
 before resetting the full stack. `building.set_roof` rejects a flat host while the marker is
-active. `building.add_basement` shifts the marker and band references with the other storey
-references. Editing other full-floor properties retains their existing scope; a full-storey
+active. `building.add_basement` shifts the marker, bands and selected-building group occurrences,
+including groups whose facade placements are inactive in the current phase. Source-definition
+handles retain their identities. Saved plan levels and registered underlay levels advance
+automatically in a single-building project; their templates and annotations keep their site frame.
+Already-stale or ambiguous group references remain available for inspection.
+
+Plans currently use project-wide level indices. If multiple buildings already share saved or
+registered plans, an insertion requires `remap_global_plan_levels`: `true` advances all those
+indices, while `false` retains them. This explicit choice applies only to the global plans;
+group occurrences follow the selected building, and other buildings stay unchanged. A request
+without the choice fails atomically and retains Redo. Multi-building projects without plan
+references keep the existing default behavior. Existing files still load; replaying an old
+ambiguous multi-building insertion requires adding this choice to that command.
+
+Editing other full-floor properties retains their existing scope; a full-storey
 height change can still move the storeys and roof above it.
 
 **No stair flights are copied or inferred by this command.** Existing explicit departure levels

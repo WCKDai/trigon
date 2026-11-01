@@ -539,22 +539,46 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "building.add_basement",
         summary: "Add a basement storey below the lowest storey, its floor `floor` mm relative to the terrain (negative, e.g. \
-                  read from a section). Every storey reference (placements, interior, registered plans) moves up by one; \
-                  the outer walls then reach down to the basement floor. `source` is recorded as evidence.",
+                  read from a section). Building occurrences and their group references move up by one. Saved/registered \
+                  plan indices move automatically in a single-building project. With multiple buildings and plan references, \
+                  choose remap_global_plan_levels=true to advance all global plan indices or false to retain them. \
+                  The outer walls reach down to the basement floor. `source` is recorded as evidence.",
         mutates: true,
         journaled: true,
         schema: schema::<AddBasement>,
         run: |s, v| {
             let p: AddBasement = parse("building.add_basement", v)?;
+            let id = s.doc.building(p.building.as_deref())?.id.clone();
+            let building = s.doc.buildings.iter().position(|b| b.id == id).ok_or_else(|| ModelError::NotFound(format!("building {id}")))?;
+            let global_plans = s.doc.views.iter().any(|view| matches!(view.kind, trigon_model::annotation::DrawingViewKind::Plan { .. }))
+                || s.doc.drawings.iter().any(|drawing| drawing.plans.iter().any(|plan| !plan.levels.is_empty()));
+            let remap = p.remap_global_plan_levels.or_else(|| (s.doc.buildings.len() == 1 || !global_plans).then_some(true)).ok_or_else(|| {
+                ModelError::Invalid(
+                    "multiple buildings share global plan indices; set remap_global_plan_levels to true to advance all saved/registered plans, or false to retain their indices".into(),
+                )
+            })?;
+            let groups = crate::edit::basement_group_targets(&s.doc, building)?;
             let b = s.doc.building_mut(p.building.as_deref())?;
             b.add_basement(p.floor, p.name.as_deref().unwrap_or("Kælder"))?;
             if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
                 b.evidence.push(trigon_model::Evidence { source: src, supplies: "levels".into(), attribution: p.attribution.unwrap_or_default() });
             }
-            for d in &mut s.doc.drawings {
-                for r in &mut d.plans {
-                    r.levels.iter_mut().for_each(|l| *l += 1);
+            if remap {
+                for view in &mut s.doc.views {
+                    if let trigon_model::annotation::DrawingViewKind::Plan { level } = &mut view.kind {
+                        *level = level.checked_add(1).ok_or_else(|| ModelError::Invalid("saved plan storey overflows".into()))?;
+                    }
                 }
+                for drawing in &mut s.doc.drawings {
+                    for plan in &mut drawing.plans {
+                        for level in &mut plan.levels {
+                            *level = level.checked_add(1).ok_or_else(|| ModelError::Invalid("registered plan storey overflows".into()))?;
+                        }
+                    }
+                }
+            }
+            for (group, targets) in s.doc.groups.iter_mut().zip(groups) {
+                group.targets = targets;
             }
             Ok(info(&s.doc))
         },
@@ -2140,6 +2164,9 @@ struct AddBasement {
     /// Basement floor, mm relative to the terrain (negative).
     floor: f64,
     name: Option<String>,
+    /// Global saved/registered plans share one level index across buildings. Required when
+    /// inserting into a multi-building project that already has plan references.
+    remap_global_plan_levels: Option<bool>,
     source: Option<String>,
     attribution: Option<String>,
 }

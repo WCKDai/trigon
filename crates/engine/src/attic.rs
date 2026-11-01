@@ -128,6 +128,102 @@ mod tests {
             .collect()
     }
 
+    fn roof_reference_session() -> Session {
+        let mut s = session();
+        s.execute("building.set_attic", json!({"floor":9450})).unwrap();
+        s.execute("view.define", json!({"id":"roof-plan","name":"Roof plan","kind":{"view":"plan","level":3}})).unwrap();
+        s.execute("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[3],"height":300,"sill":100})).unwrap();
+        s.execute("group.define", json!({"id":"roof-windows","name":"Roof windows","targets":["b.f1.L3.B0"]})).unwrap();
+        s.execute("group.define", json!({"id":"stair-source","name":"Stair source","targets":["stair:core"]})).unwrap();
+        s.execute("group.define", json!({"id":"stair-floor","name":"Stair floor","targets":["core.L1"]})).unwrap();
+        s.execute("annotation.define", json!({"id":"roof-note","view":"roof-plan","kind":{"annotation":"text","at":[100,100],"text":"Roof"}}))
+            .unwrap();
+        s.doc.drawings.push(trigon_model::doc::Drawing {
+            name: "Synthetic underlay".into(),
+            path: "unused-synthetic.png".into(),
+            page: 1,
+            rotate: 0,
+            width: 10,
+            height: 10,
+            note: String::new(),
+            facades: Vec::new(),
+            plans: vec![trigon_model::doc::PlanRegistration { levels: vec![3], a: 1., b: 0., tx: 0., ty: 0. }],
+        });
+        s
+    }
+
+    #[test]
+    fn basement_preserves_saved_roof_plan_and_group_occurrences() {
+        let mut s = roof_reference_session();
+        let before = bytes(&s);
+        let annotations = s.doc.annotations.clone();
+        let roof = roof_meshes(&build(&s.doc).unwrap()[0]);
+        s.execute("building.add_basement", json!({"floor":-2500})).unwrap();
+        assert_eq!(s.doc.buildings[0].attic_level(), Some(4));
+        assert_eq!(serde_json::to_value(&s.doc.views[0].kind).unwrap()["level"], 4);
+        assert_eq!(s.doc.groups[0].targets, vec!["b.f1.L4.B0"]);
+        assert_eq!(s.doc.groups[1].targets, vec!["stair:core"]);
+        assert_eq!(s.doc.groups[2].targets, vec!["core.L2"]);
+        assert_eq!(s.doc.drawings[0].plans[0].levels, vec![4]);
+        assert_eq!(s.doc.annotations, annotations);
+        assert_eq!(roof_meshes(&build(&s.doc).unwrap()[0]), roof);
+        assert_eq!(s.execute("group.list", json!({})).unwrap()["groups"][0]["valid"], true);
+        let after = bytes(&s);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(bytes(&s), before);
+        assert_atomic(&mut s, "building.add_basement", json!({"floor":1e20}));
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(bytes(&s), after);
+    }
+
+    #[test]
+    fn basement_requires_a_choice_for_shared_global_plans_and_only_rebases_its_groups() {
+        for remap in [false, true] {
+            let mut s = roof_reference_session();
+            s.execute("building.add", json!({"id":"other","name":"Other","footprint":[[30000,0],[50000,0],[50000,12000],[30000,12000]],"storeys":4,"storey_height_mm":3400})).unwrap();
+            s.execute("facade.set_bays", json!({"facade":"other.f1","centres":[5000]})).unwrap();
+            s.execute("facade.place", json!({"facade":"other.f1","type":"window.casement.2","levels":[3]})).unwrap();
+            s.execute("group.define", json!({"id":"roof-windows","name":"Both buildings","targets":["b.f1.L3.B0","other.f1.L3.B0"]})).unwrap();
+            let before = bytes(&s);
+            let other = s.doc.buildings[1].clone();
+            assert_atomic(&mut s, "building.add_basement", json!({"building":"b","floor":-2500}));
+            s.execute("building.add_basement", json!({"building":"b","floor":-2500,"remap_global_plan_levels":remap})).unwrap();
+            let level = if remap { 4 } else { 3 };
+            assert_eq!(serde_json::to_value(&s.doc.views[0].kind).unwrap()["level"], level);
+            assert_eq!(s.doc.drawings[0].plans[0].levels, vec![level]);
+            assert_eq!(s.doc.groups[0].targets, vec!["b.f1.L4.B0", "other.f1.L3.B0"]);
+            assert_eq!(s.doc.buildings[1], other);
+            assert!(s.execute("group.list", json!({})).unwrap()["groups"].as_array().unwrap().iter().all(|g| g["valid"] == true));
+            let after = bytes(&s);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(bytes(&s), before);
+            assert_atomic(&mut s, "building.add_basement", json!({"building":"b","floor":-2500}));
+            s.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(bytes(&s), after);
+        }
+    }
+
+    #[test]
+    fn basement_rebases_inactive_facade_groups_without_renaming_source_handles() {
+        let mut s = roof_reference_session();
+        s.doc.phases.push(trigon_model::Phase { id: "later".into(), name: "Later".into() });
+        s.doc.active_phase = Some("later".into());
+        s.doc.buildings[0].facades[0].placements.iter_mut().find(|p| p.level == 3).unwrap().demolished = Some("later".into());
+        assert_eq!(s.execute("group.list", json!({})).unwrap()["groups"][0]["valid"], false);
+        s.execute("building.add_basement", json!({"floor":-2500})).unwrap();
+        assert_eq!(s.doc.groups[0].targets, vec!["b.f1.L4.B0"]);
+        assert_eq!(s.doc.groups[1].targets, vec!["stair:core"]);
+        s.doc.active_phase = Some("existing".into());
+        assert_eq!(s.execute("group.list", json!({})).unwrap()["groups"][0]["valid"], true);
+    }
+
+    #[test]
+    fn basement_refuses_overflowing_external_plan_references_atomically() {
+        let mut s = roof_reference_session();
+        s.doc.views[0].kind = trigon_model::annotation::DrawingViewKind::Plan { level: usize::MAX };
+        assert_atomic(&mut s, "building.add_basement", json!({"floor":-2500}));
+    }
+
     #[test]
     fn attic_geometry_preserves_roof_dormers_bands_openings_floors_and_source_stairs() {
         let mut s = session();

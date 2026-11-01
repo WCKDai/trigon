@@ -284,6 +284,10 @@ impl Entry {
 }
 
 fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
+    selected_at(doc, targets, doc.active_index())
+}
+
+fn selected_at(doc: &Document, targets: &[String], phase: usize) -> Result<Vec<Entry>> {
     if targets.len() > MAX_TARGETS {
         return Err(invalid("select at most 256 elements"));
     }
@@ -353,7 +357,7 @@ fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
                 for (i, p) in f.placements.iter().enumerate() {
                     let hit = exact == Some(i)
                         || native.is_some_and(|(l, bay, attachment)| {
-                            let active = doc.lifetime(p).is_ok_and(|(c, d)| c <= doc.active_index() && doc.active_index() < d);
+                            let active = doc.lifetime(p).is_ok_and(|(c, d)| c <= phase && phase < d);
                             p.level == l && p.bay == bay && active && doc.component(&p.type_id).is_ok_and(|t| t.kind.is_opening() != attachment)
                         });
                     if hit {
@@ -432,6 +436,52 @@ pub(crate) fn list_groups(s: &Session) -> Value {
         let error=selected(&s.doc,&g.targets).err().map(|e|e.to_string());
         json!({"id":g.id,"name":g.name,"targets":g.targets,"valid":error.is_none(),"error":error})
     }).collect::<Vec<_>>()})
+}
+
+/// Rebase only resolved storey occurrences of the selected building. Definition and indexed
+/// placement handles keep their source identity; inactive occurrences resolve in their phase.
+pub(crate) fn basement_group_targets(doc: &Document, building: usize) -> Result<Vec<Vec<String>>> {
+    doc.groups
+        .iter()
+        .map(|group| {
+            group
+                .targets
+                .iter()
+                .map(|target| {
+                    let mut phases = std::iter::once(doc.active_index()).chain((0..doc.phases.len()).filter(|&p| p != doc.active_index()));
+                    let Some(mut entry) =
+                        phases.find_map(|phase| selected_at(doc, std::slice::from_ref(target), phase).ok().and_then(|mut v| v.pop()))
+                    else {
+                        return Ok(target.clone()); // Preserve already-stale or ambiguous references.
+                    };
+                    if entry.building != building {
+                        return Ok(target.clone());
+                    }
+                    let root = entry.original.id();
+                    let room_alias = matches!(entry.original, Item::Room(_)) && target.starts_with(&format!("{root}.space.L"));
+                    let occurrence = if matches!(entry.original, Item::Placement(_)) {
+                        entry.facade.as_ref().is_some_and(|id| target.starts_with(&format!("{id}.L")))
+                    } else {
+                        target.strip_prefix(&format!("{root}.L")).and_then(|v| v.parse::<usize>().ok()).is_some() || room_alias
+                    };
+                    if !occurrence {
+                        return Ok(target.clone());
+                    }
+                    let levels = entry
+                        .item
+                        .levels()
+                        .into_iter()
+                        .map(|level| level.checked_add(1).ok_or_else(|| invalid("group storey reference overflows")))
+                        .collect::<Result<Vec<_>>>()?;
+                    if room_alias {
+                        return Ok(format!("{root}.space.L{}", levels.first().copied().unwrap_or(0)));
+                    }
+                    entry.item.set_levels(levels);
+                    handle(doc, &entry)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
