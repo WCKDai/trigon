@@ -244,6 +244,10 @@ impl Authoring {
         }
     }
 
+    pub(crate) fn command_controls_first(&self) -> bool {
+        self.tab != Tab::Families && self.tool != Tool::Move
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, doc: &Document, current: Option<&Element>, level: usize) -> Option<Run> {
         if self.tab == Tab::Families {
             return self.family_editor(ui, doc, level);

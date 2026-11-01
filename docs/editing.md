@@ -35,6 +35,8 @@ source definition once in a batch.
   model joins still resolve generated junctions; neighbouring wall and room sources stay
   independent. Studio's **Align → Wall line / face** captures a picked reference without
   typing coordinates, then aligns the next picked wall through this same command.
+  Active Align, Copy, To levels and Delete controls appear above model parameters in the
+  Properties panel, so long parameter forms cannot bury the command's fields or Apply button.
 - `edit.delete`: `{"targets":["partition.L1"]}` removes that storey instance and preserves the
   definition on its other storeys. Deletion removes source data in every phase; use
   `facade.demolish` for demolition in a particular phase.
