@@ -265,7 +265,7 @@ pub struct BuiltRoof {
     pub cover: Mesh,
     /// Vertical gable triangles above gable walls.
     pub gables: Mesh,
-    /// Opt-in compound roofs retain each gable's explicit host finish for display/export.
+    /// Explicit host finishes for display/export; empty retains the legacy default Wall path.
     pub gable_parts: Vec<(Material, Mesh)>,
     pub covering: Vec<(Material, Mesh)>,
     /// Gutters along the eaves.
@@ -960,7 +960,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             }
             let dormers = dormer::build(doc, b, &mut r.cover, b.roof.dormers())?;
             let mut gable_parts = std::collections::BTreeMap::<Material, Mesh>::new();
-            if compound {
+            if compound || walls.iter().any(|w| gables.contains(&w.id) && w.finish != Material::Wall) {
                 for tri in &r.gables.triangles {
                     let points = tri.map(|i| r.gables.positions.get(i as usize).copied().unwrap_or_default());
                     let wall = walls
@@ -972,7 +972,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                                 (d[0] * w.frame.n[0] + d[1] * w.frame.n[1]).abs() < 0.01 && along >= -0.01 && along <= w.frame.length + 0.01
                             })
                         })
-                        .ok_or_else(|| ModelError::Invalid("mansard gable has no matching host facade".into()))?;
+                        .ok_or_else(|| ModelError::Invalid("roof gable has no matching host facade".into()))?;
                     let mesh = gable_parts.entry(wall.finish).or_default();
                     let base = mesh.positions.len() as u32;
                     mesh.positions.extend(points);
@@ -1888,6 +1888,45 @@ mod tests {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].placements[1].height = Some(2900.0);
         assert!(format!("{}", build(&doc).unwrap_err()).contains("storey above"));
+    }
+
+    #[test]
+    fn ordinary_pitched_gables_inherit_each_source_facade_finish_without_moving_geometry() {
+        let mut doc = Document::default();
+        let mut b = Building::new("b", "Synthetic gable finishes", &[[0., 0.], [24000., 0.], [24000., 10000.], [0., 10000.]], 2, 3400.).unwrap();
+        b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":40,"gables":["b.f2","b.f4"],
+            "thickness_mm":200,"overhang_mm":180,"verge_mm":100,"gutters":true}))
+        .unwrap();
+        doc.buildings.push(b);
+        let legacy = build(&doc).unwrap();
+        let old_roof = legacy[0].roof.as_ref().unwrap();
+        assert!(old_roof.gable_parts.is_empty(), "default Wall finish keeps the exact legacy display/export path");
+        doc.buildings[0].facades[1].finish = Some(crate::doc::WallFinish::YellowBrick);
+        doc.buildings[0].facades[3].finish = Some(crate::doc::WallFinish::Render);
+        let source = serde_json::to_vec(&doc).unwrap();
+        let built = build(&doc).unwrap();
+        let r = built[0].roof.as_ref().unwrap();
+        assert_eq!(r.id, old_roof.id);
+        assert_eq!(r.cover, old_roof.cover);
+        assert_eq!(r.gables, old_roof.gables);
+        assert_eq!(r.gutters, old_roof.gutters);
+        assert_eq!(r.ridge, old_roof.ridge);
+        assert!(!r.compound);
+        assert_eq!(source, serde_json::to_vec(&doc).unwrap());
+        assert_eq!(r.gable_parts.len(), 2, "ordinary gables must carry their actual facade finishes");
+        for (material, mesh) in &r.gable_parts {
+            let x = match material {
+                Material::BrickYellow => 24000.,
+                Material::Render => 0.,
+                _ => panic!("wrong gable finish {material:?}"),
+            };
+            assert!(mesh.positions.iter().all(|p| (p[0] - x).abs() < 1e-6));
+        }
+        let triangles: Vec<_> = r.gable_parts.iter().flat_map(|(_, m)| m.triangles.iter().map(|t| t.map(|i| m.positions[i as usize]))).collect();
+        assert_eq!(triangles.len(), r.gables.triangles.len());
+        for t in &r.gables.triangles {
+            assert!(triangles.contains(&t.map(|i| r.gables.positions[i as usize])));
+        }
     }
 
     #[test]
