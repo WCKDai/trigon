@@ -41,8 +41,15 @@ impl Ifc<'_> {
             let foot = pieces.iter().find(|p| p.wall == wall.id).map(|p| (p.id, p.seg.level));
             self.covering(wall, &wall.plinth, "plinth", "Sokkel", ".CLADDING.", catalog::PLINTH, foot, fl);
             // Bands stand proud of the pieces they run along; the covering relates to the first.
-            let band = band_piece(wall, &pieces);
-            self.covering(wall, &wall.trim, "trim", "Bånd", ".MOLDING.", catalog::RENDER, band, fl);
+            if wall.trim_parts.is_empty() {
+                let band = band_piece(wall, &wall.trim, &pieces);
+                self.covering(wall, &wall.trim, "trim", "Bånd", ".MOLDING.", catalog::RENDER, band, fl);
+            } else {
+                for (material, mesh) in &wall.trim_parts {
+                    let band = band_piece(wall, mesh, &pieces);
+                    self.covering(wall, mesh, &format!("trim.{}", material.name()), "Bånd", ".MOLDING.", catalog::of(*material), band, fl);
+                }
+            }
         }
         let mut interior = BTreeMap::new();
         for iw in &b.interior {
@@ -285,8 +292,8 @@ impl Ifc<'_> {
 }
 
 /// The piece a facade's bands start on: the one their lowest point stands in front of.
-fn band_piece(wall: &BuiltWall, pieces: &[Piece]) -> Option<(usize, usize)> {
-    let low = wall.trim.positions.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
+fn band_piece(wall: &BuiltWall, mesh: &trigon_model::Mesh, pieces: &[Piece]) -> Option<(usize, usize)> {
+    let low = mesh.positions.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min);
     let mine: Vec<&Piece> = pieces.iter().filter(|p| p.wall == wall.id).collect();
     mine.iter().find(|p| low < p.seg.z1).or(mine.last()).map(|p| (p.id, p.seg.level))
 }

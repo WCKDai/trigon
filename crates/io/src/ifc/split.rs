@@ -569,7 +569,11 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
         }
         for w in b.exterior_walls() {
             out.push((format!("{}.plinth", w.id), w.plinth.clone()));
-            out.push((format!("{}.trim", w.id), w.trim.clone()));
+            if w.trim_parts.is_empty() {
+                out.push((format!("{}.trim", w.id), w.trim.clone()));
+            } else {
+                out.extend(w.trim_parts.iter().map(|(material, mesh)| (format!("{}.trim.{}", w.id, material.name()), mesh.clone())));
+            }
         }
         if let Some(bd) = doc.buildings.iter().find(|x| x.id == b.building_id) {
             for st in stairs(bd) {

@@ -694,7 +694,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "facade.set_finish",
-        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick, yellow_brick or render (white). Without \
+        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick, yellow_brick, render (white) or render_terracotta. Without \
                   `facades` it sets the building's default; `clear: true` makes the listed facades follow the building again.",
         mutates: true,
         journaled: true,
@@ -738,12 +738,7 @@ static COMMANDS: &[CommandSpec] = &[
             let b = s.doc.building_mut(p.building.as_deref())?;
             let storeys = b.storeys.len();
             for band in &p.bands {
-                trigon_model::checked("band bottom", band.bottom, -10_000.0, 10_000.0)?;
-                trigon_model::checked("band top", band.top, band.bottom + 10.0, 10_000.0)?;
-                trigon_model::checked("band projection", band.projection, 1.0, 500.0)?;
-                if band.levels.is_empty() || band.levels.iter().any(|l| *l >= storeys) {
-                    return Err(ModelError::Invalid(format!("band levels must be storey indices below {storeys}")).into());
-                }
+                band.validate(storeys)?;
             }
             for id in &p.facades {
                 b.facade_mut(id)?.bands = p.bands.clone();

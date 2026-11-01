@@ -222,7 +222,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                     "finish",
                     "Facade finish",
                     serde_json::to_value(facade.finish.unwrap_or(building.finish)).map_err(|e| invalid(e.to_string()))?,
-                    json!(["brick", "red_brick", "yellow_brick", "render"]),
+                    json!(["brick", "red_brick", "yellow_brick", "render", "render_terracotta"]),
                 ),
                 choice(
                     "facade_kind",
@@ -230,6 +230,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                     serde_json::to_value(facade.kind).map_err(|e| invalid(e.to_string()))?,
                     json!(["unknown", "street", "courtyard", "party"]),
                 ),
+                field("bands", "Facade bands: levels, heights, projection and finish", json!(facade.bands), true),
                 field("length_mm", "Length", wall.frame.length, false),
                 field("height_mm", "Eaves height", wall.height, false),
             ];
@@ -810,6 +811,17 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                     b.facades[fi].wall_schedule[level] = checked(key, numeric(key, value)?, 100.0, 1500.0)?;
                 } else {
                     match key.as_str() {
+                        "bands" => {
+                            let bands: Vec<trigon_model::doc::Band> =
+                                serde_json::from_value(value.clone()).map_err(|_| invalid("bands require typed facade band parameters"))?;
+                            if bands.len() > 50 {
+                                return Err(invalid("at most 50 facade bands are allowed"));
+                            }
+                            for band in &bands {
+                                band.validate(b.storeys.len())?;
+                            }
+                            b.facades[fi].bands = bands;
+                        }
                         "a" | "b" => {
                             let i = if key == "a" { edge } else { (edge + 1) % b.footprint.len().max(1) };
                             let p = point(key, value)?;
@@ -1526,6 +1538,27 @@ mod tests {
         let target = update(&mut s, "b.f1.L0.B1.slab", json!({"type":"door.french"}));
         assert_eq!(target, "b.f1.L0.B1");
         assert_eq!(property(&descriptor(&mut s, &target), "type"), "door.french");
+    }
+
+    #[test]
+    fn facade_band_materials_are_typed_property_edits_with_atomic_validation_and_undo() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let bands = json!([{"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0,"finish":"render_terracotta"}]);
+        update(&mut s, "b.f1", json!({"bands":bands}));
+        assert_eq!(property(&descriptor(&mut s, "b.f1"), "bands"), bands);
+        assert_eq!(trigon_model::build(&s.doc).unwrap()[0].walls[0].trim_parts[0].0, trigon_model::Material::RenderTerracotta);
+        let valid = s.doc.clone();
+        assert!(
+            s.execute(
+                "element.set",
+                json!({"id":"b.f1","properties":{"bands":[{"levels":[999],"bottom":0,"top":2400,"projection":20,"finish":"render_terracotta"}]}})
+            )
+            .is_err()
+        );
+        assert_eq!(s.doc, valid);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
     }
 
     #[test]

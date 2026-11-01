@@ -439,6 +439,15 @@ impl Scene {
             for w in building.exterior_walls() {
                 let first = b.elements.len();
                 let length = w.frame.length;
+                let mut parts = vec![
+                    Part { mesh: &w.mesh, rgba: w.finish.rgba(), material: w.finish },
+                    Part { mesh: &w.plinth, rgba: Material::Plinth.rgba(), material: Material::Plinth },
+                ];
+                if w.trim_parts.is_empty() {
+                    parts.push(Part { mesh: &w.trim, rgba: Material::Render.rgba(), material: Material::Render });
+                } else {
+                    parts.extend(w.trim_parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
+                }
                 b.add(
                     &w.id,
                     "wall",
@@ -453,11 +462,7 @@ impl Scene {
                         ("bearing", format!("{:.0}°", w.frame.bearing())),
                     ],
                     true,
-                    &[
-                        Part { mesh: &w.mesh, rgba: w.finish.rgba(), material: w.finish },
-                        Part { mesh: &w.plinth, rgba: Material::Plinth.rgba(), material: Material::Plinth },
-                        Part { mesh: &w.trim, rgba: Material::Render.rgba(), material: Material::Render },
-                    ],
+                    &parts,
                 );
                 let elements = w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments);
                 for e in elements {
@@ -1028,6 +1033,22 @@ mod tests {
             );
         }
         assert!(!scene.overlay(&[room], [1.0, 0.4, 0.0, 0.4], [0.0; 3]).is_empty());
+    }
+
+    #[test]
+    fn coloured_facade_bands_reach_vertices_without_drawing_duplicate_trim() {
+        let mut d = doc();
+        d.buildings[0].facades[0].bands = serde_json::from_value(serde_json::json!([
+            {"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0}
+        ]))
+        .unwrap();
+        let white = Scene::from_built(&build(&d).unwrap(), false);
+        d.buildings[0].facades[0].bands[0].finish = Some(trigon_model::WallFinish::RenderTerracotta);
+        let coloured = Scene::from_built(&build(&d).unwrap(), false);
+        assert_eq!(white.vertices.len(), coloured.vertices.len());
+        assert_ne!(white.elements[0].fingerprint, coloured.elements[0].fingerprint);
+        let rgba = Material::RenderTerracotta.rgba();
+        assert!(coloured.vertices.as_chunks::<VERTEX_FLOATS>().0.iter().any(|v| v[6..10] == rgba && v[12] == 0.0));
     }
 
     #[test]

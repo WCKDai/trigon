@@ -49,10 +49,12 @@ pub enum Material {
     Slate,
     /// Bituminous roofing felt (tagpap).
     Felt,
+    /// Warm painted render; appended to retain every existing material index.
+    RenderTerracotta,
 }
 
 impl Material {
-    pub const ALL: [Material; 29] = [
+    pub const ALL: [Material; 30] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -82,6 +84,7 @@ impl Material {
         Material::Ground,
         Material::Slate,
         Material::Felt,
+        Material::RenderTerracotta,
     ];
 
     pub fn name(self) -> &'static str {
@@ -115,6 +118,7 @@ impl Material {
             Material::Ground => "ground",
             Material::Slate => "slate",
             Material::Felt => "felt",
+            Material::RenderTerracotta => "render_terracotta",
         }
     }
 
@@ -150,6 +154,7 @@ impl Material {
             Material::Ground => [0.38, 0.40, 0.35, 1.0],
             Material::Slate => [0.12, 0.14, 0.16, 1.0],
             Material::Felt => [0.065, 0.07, 0.075, 1.0],
+            Material::RenderTerracotta => [0.60, 0.21, 0.15, 1.0],
         }
     }
 

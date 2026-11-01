@@ -178,3 +178,18 @@ picking, `element.get` / `element.set`, precision previews, Undo and exchange. E
 dormer lists are omitted in saved files, preserving legacy serialization and geometry. Feature
 files require a reader supporting pitched dormers; older readers can discard this new optional
 field. Roof coverings remain mansard-only; flat roofs reject dormer parameters explicitly.
+
+
+Facade bands accept an optional `finish`: `brick`, `red_brick`, `yellow_brick`,
+`render` (white) or `render_terracotta` (a warm presentation preset, not a paint survey).
+Missing `finish` preserves legacy white geometry and serialized fields. Explicit finishes
+share the same opening cuts, and material-separated parts are drawn/exported once in Studio,
+GLB and IFC. IFC gives each finish its own covering identity and material. Existing GLB
+material indices are unchanged; the new preset is appended and omitted when unused.
+
+`element.get` / `element.set` expose facade `bands` as a typed property array, so the same
+checked parameters are available through Properties, MCP previews and Undo. Each band
+requires existing storeys, finite bounded heights and 1–500 mm projection; at most 50 bands
+are accepted per facade. Files using the new finish need an updated reader. The additive
+Rust `Band.finish` and derived `BuiltWall.trim_parts` fields require source consumers that
+construct those structs directly to initialize them; legacy JSON is unchanged.

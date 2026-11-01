@@ -18,6 +18,27 @@ fn count(text: &str, entity: &str) -> usize {
 }
 
 #[test]
+fn material_separated_facade_bands_keep_covering_ids_and_declared_colours() {
+    let mut doc = sample::document().unwrap();
+    let id = doc.buildings[0].facades[0].id.clone();
+    doc.buildings[0].facades[0].bands = serde_json::from_value(serde_json::json!([
+        {"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0,"finish":"render_terracotta"},
+        {"levels":[1],"bottom":2700.0,"top":2800.0,"projection":50.0,"finish":"yellow_brick"}
+    ]))
+    .unwrap();
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "bands.ifc", "2026-01-01T00:00:00");
+    for material in [trigon_model::Material::RenderTerracotta, trigon_model::Material::BrickYellow] {
+        let key = format!("{id}.trim.{}", material.name());
+        assert!(text.lines().any(|line| line.contains("=IFCCOVERING(") && line.contains(&string(&key))));
+        let mat = catalog::of(material);
+        assert!(text.contains(&format!("IFCMATERIAL({},$,{})", string(mat.name), string(mat.category))));
+        assert!(split::model_shapes(&doc, &built).iter().any(|(name, mesh)| name == &key && !mesh.is_empty()));
+    }
+    assert!(!text.lines().any(|line| line.contains("=IFCCOVERING(") && line.contains(&string(&format!("{id}.trim")))));
+}
+
+#[test]
 fn custom_balcony_plan_json_uses_unbounded_ifc_text_without_losing_parameters() {
     let points = trigon_model::balcony::Plan::Bowed { return_fraction: 0.35 }
         .outline(3000.0, 1500.0)

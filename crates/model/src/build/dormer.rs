@@ -301,6 +301,7 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
             segments: vec![segment],
             plinth: Mesh::default(),
             trim: Mesh::default(),
+            trim_parts: Vec::new(),
             finish: Material::Render,
             openings: vec![opening],
             attachments: Vec::new(),

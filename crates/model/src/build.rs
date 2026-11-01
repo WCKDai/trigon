@@ -200,6 +200,9 @@ pub struct BuiltWall {
     pub plinth: Mesh,
     /// Rendered bands standing proud of the wall (empty without any).
     pub trim: Mesh,
+    /// Material-separated bands when any explicit finish is used. `trim` remains their
+    /// combined geometry for drawing/picking; display/export must choose these parts once.
+    pub trim_parts: Vec<(Material, Mesh)>,
     /// The wall's outer finish: brick, red brick or render.
     pub finish: Material,
     pub openings: Vec<BuiltOpening>,
@@ -640,12 +643,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         if spans.is_empty() {
             continue;
         }
-        let finish = match f.finish.unwrap_or(b.finish) {
-            crate::doc::WallFinish::Brick => Material::Wall,
-            crate::doc::WallFinish::RedBrick => Material::BrickRed,
-            crate::doc::WallFinish::YellowBrick => Material::BrickYellow,
-            crate::doc::WallFinish::Render => Material::Render,
-        };
+        let finish = f.finish.unwrap_or(b.finish).material();
         let all = resolve_facade(doc, b, f)?;
         // What this view shows, with each element's status.
         let shown: Vec<(&Resolved, Status)> =
@@ -771,7 +769,13 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         };
         // Rendered bands standing proud of the wall, on each of their storeys.
         let mut trim = Mesh::default();
+        let explicit_finishes = f.bands.iter().any(|band| band.finish.is_some());
+        let mut trim_parts = std::collections::BTreeMap::<Material, Mesh>::new();
+        if f.bands.len() > 50 {
+            return Err(ModelError::Invalid("at most 50 facade bands are allowed".into()));
+        }
         for band in &f.bands {
+            band.validate(levels)?;
             let projection = crate::checked("band projection", band.projection, 1.0, 500.0)?;
             let line = inner_ring(&b.footprint, -projection);
             for &level in &band.levels {
@@ -780,10 +784,12 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 if !(z1 - z0 >= 10.0) || above(z0) {
                     continue;
                 }
-                trim.append(
-                    &facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes, shaped.then_some(profiles.as_slice()))
-                        .ok_or_else(unbuildable)?,
-                );
+                let piece = facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes, shaped.then_some(profiles.as_slice()))
+                    .ok_or_else(unbuildable)?;
+                trim.append(&piece);
+                if explicit_finishes {
+                    trim_parts.entry(band.finish.map_or(Material::Render, |finish| finish.material())).or_default().append(&piece);
+                }
             }
         }
         walls.push(BuiltWall {
@@ -797,6 +803,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             segments,
             plinth,
             trim,
+            trim_parts: trim_parts.into_iter().collect(),
             openings,
             attachments,
         });
@@ -838,6 +845,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 segments: vec![segment],
                 plinth: Mesh::default(),
                 trim: Mesh::default(),
+                trim_parts: Vec::new(),
                 openings: Vec::new(),
                 attachments: Vec::new(),
             });
@@ -1830,6 +1838,35 @@ mod tests {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].placements[1].height = Some(2900.0);
         assert!(format!("{}", build(&doc).unwrap_err()).contains("storey above"));
+    }
+
+    #[test]
+    fn facade_bands_preserve_declared_finish_and_legacy_defaults() {
+        let mut doc = doc_with_block();
+        let legacy = serde_json::json!({"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0});
+        let band: crate::doc::Band = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&band).unwrap(), legacy);
+        let coloured = serde_json::json!({"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0,"finish":"render_terracotta"});
+        let band: crate::doc::Band = serde_json::from_value(coloured.clone()).expect("band finish must be a typed optional source parameter");
+        assert_eq!(serde_json::to_value(&band).unwrap(), coloured);
+        doc.buildings[0].facades[0].bands.push(band);
+        doc.buildings[0].facades[0].bands.push(
+            serde_json::from_value(serde_json::json!({"levels":[1],"bottom":2700.0,"top":2800.0,"projection":40.0,"finish":"yellow_brick"})).unwrap(),
+        );
+        let built = build(&doc).unwrap();
+        let wall = &built[0].walls[0];
+        assert_eq!(wall.trim_parts.len(), 2);
+        assert!(wall.trim_parts.iter().any(|(m, _)| *m == Material::RenderTerracotta));
+        assert!(wall.trim_parts.iter().any(|(m, _)| *m == Material::BrickYellow));
+        assert_eq!(wall.trim_parts.iter().map(|(_, m)| m.triangles.len()).sum::<usize>(), wall.trim.triangles.len());
+        for band in &mut doc.buildings[0].facades[0].bands {
+            band.finish = None;
+        }
+        let legacy = build(&doc).unwrap();
+        assert_eq!(wall.trim, legacy[0].walls[0].trim, "colour cannot alter opening cuts or band geometry");
+        assert!(legacy[0].walls[0].trim_parts.is_empty());
+        doc.buildings[0].facades[0].bands[0].top = f64::NAN;
+        assert!(build(&doc).is_err());
     }
 
     #[test]

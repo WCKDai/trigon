@@ -352,6 +352,20 @@ pub enum WallFinish {
     YellowBrick,
     /// White render.
     Render,
+    /// Warm terracotta painted render; a presentation palette, not a measured paint specification.
+    RenderTerracotta,
+}
+
+impl WallFinish {
+    pub fn material(self) -> crate::Material {
+        match self {
+            Self::Brick => crate::Material::Wall,
+            Self::RedBrick => crate::Material::BrickRed,
+            Self::YellowBrick => crate::Material::BrickYellow,
+            Self::Render => crate::Material::Render,
+            Self::RenderTerracotta => crate::Material::RenderTerracotta,
+        }
+    }
 }
 
 /// A horizontal band on the listed storeys, from `bottom` to `top` mm relative to each storey's
@@ -364,6 +378,21 @@ pub struct Band {
     pub top: f64,
     #[serde(default = "band_projection")]
     pub projection: f64,
+    /// Missing preserves the legacy white rendered band, independently of the host wall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish: Option<WallFinish>,
+}
+
+impl Band {
+    pub fn validate(&self, storeys: usize) -> crate::Result<()> {
+        crate::checked("band bottom", self.bottom, -10_000.0, 10_000.0)?;
+        crate::checked("band top", self.top, self.bottom + 10.0, 10_000.0)?;
+        crate::checked("band projection", self.projection, 1.0, 500.0)?;
+        if self.levels.is_empty() || self.levels.iter().any(|level| *level >= storeys) {
+            return Err(crate::ModelError::Invalid(format!("band levels must be storey indices below {storeys}")));
+        }
+        Ok(())
+    }
 }
 
 fn band_projection() -> f64 {

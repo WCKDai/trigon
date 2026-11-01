@@ -193,7 +193,13 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
             add(&mut w, "site.terrain", &[(Material::Ground, terrain)]);
         }
         for wall in b.exterior_walls() {
-            add(&mut w, &wall.id, &[(wall.finish, &wall.mesh), (Material::Plinth, &wall.plinth), (Material::Render, &wall.trim)]);
+            let mut parts = vec![(wall.finish, &wall.mesh), (Material::Plinth, &wall.plinth)];
+            if wall.trim_parts.is_empty() {
+                parts.push((Material::Render, &wall.trim));
+            } else {
+                parts.extend(wall.trim_parts.iter().map(|(material, mesh)| (*material, mesh)));
+            }
+            add(&mut w, &wall.id, &parts);
             let elements = wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments);
             for e in elements {
                 // What a phase tears down is drawn in translucent red, as in Revit's demolition views.
@@ -323,6 +329,32 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
 mod tests {
     use super::*;
     use trigon_model::{Building, Document, build};
+
+    #[test]
+    fn explicit_band_finishes_export_once_without_changing_legacy_white_material_bytes() {
+        let mut doc = Document::default();
+        let mut b = Building::new("b", "Band material fixture", &[[0., 0.], [9000., 0.], [9000., 6000.], [0., 6000.]], 1, 3000.).unwrap();
+        b.facades[0].bands.push(serde_json::from_value(json!({"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0})).unwrap());
+        doc.buildings.push(b);
+        let legacy = write(&build(&doc).unwrap(), &[]);
+        doc.buildings[0].facades[0].bands[0].finish = Some(trigon_model::WallFinish::Render);
+        assert_eq!(legacy, write(&build(&doc).unwrap(), &[]), "explicit white must preserve legacy export bytes");
+        doc.buildings[0].facades[0].bands[0].finish = Some(trigon_model::WallFinish::RenderTerracotta);
+        let built = build(&doc).unwrap();
+        let (data, _) = parse(&write(&built, &[]));
+        let index = Material::ALL.iter().position(|m| *m == Material::RenderTerracotta).unwrap();
+        assert_eq!(data["materials"][index]["pbrMetallicRoughness"]["baseColorFactor"], json!(Material::RenderTerracotta.rgba()));
+        assert!(data["materials"][index]["pbrMetallicRoughness"].get("baseColorTexture").is_none());
+        let node = data["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "b.f1").unwrap();
+        let primitives = data["meshes"][node["mesh"].as_u64().unwrap() as usize]["primitives"].as_array().unwrap();
+        let triangles = primitives
+            .iter()
+            .map(|p| data["accessors"][p["indices"].as_u64().unwrap() as usize]["count"].as_u64().unwrap() as usize / 3)
+            .sum::<usize>();
+        let wall = &built[0].walls[0];
+        assert_eq!(triangles, wall.mesh.triangles.len() + wall.plinth.triangles.len() + wall.trim.triangles.len());
+        assert_eq!(primitives.iter().filter(|p| p["material"] == index).count(), 1);
+    }
 
     #[test]
     fn site_sources_keep_mesh_identity_required_by_rendering_exchange() {

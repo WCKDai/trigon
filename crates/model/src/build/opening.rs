@@ -830,7 +830,7 @@ mod tests {
             });
             let mut b = Building::new("b", "Profile fixture", &[[0.0, 0.0], [6000.0, 0.0], [6000.0, 6000.0], [0.0, 6000.0]], 2, 3000.0).unwrap();
             b.plinth = Some(crate::doc::Plinth { height: 2200.0, projection: 20.0 });
-            b.facades[0].bands.push(crate::doc::Band { levels: vec![0], bottom: 2000.0, top: 2200.0, projection: 40.0 });
+            b.facades[0].bands.push(crate::doc::Band { levels: vec![0], bottom: 2000.0, top: 2200.0, projection: 40.0, finish: None });
             b.facades[0].bays = vec![3000.0];
             b.facades[0].placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":0,"type":"shape"})).unwrap());
             doc.buildings.push(b);

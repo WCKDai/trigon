@@ -46,6 +46,7 @@ pub const DECK: Mat = mat("Træ, terrassebrædder", "wood", [0.55, 0.35, 0.20]);
 pub const STAIR: Mat = mat("Trappe", "stair", [0.70, 0.62, 0.52]);
 pub const PLINTH: Mat = mat("Sokkel, puds", "plaster", [0.55, 0.55, 0.53]);
 pub const RENDER: Mat = mat("Facadepuds", "plaster", [0.91, 0.90, 0.87]);
+pub const RENDER_TERRACOTTA: Mat = mat("Terracotta painted render", "plaster", [0.798, 0.496, 0.424]);
 pub const BRICK_RED: Mat = mat("Tegl, røde sten", "brick", [0.62, 0.25, 0.17]);
 pub const BRICK_YELLOW: Mat = mat("Tegl, gule sten", "brick", [0.78, 0.68, 0.47]);
 pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
@@ -69,6 +70,7 @@ pub fn of(m: Material) -> Mat {
         Material::Plinth => PLINTH,
         Material::Plaster => PLASTER,
         Material::Render => RENDER,
+        Material::RenderTerracotta => RENDER_TERRACOTTA,
         Material::BrickRed => BRICK_RED,
         Material::BrickYellow => BRICK_YELLOW,
         Material::SteelWhite => STEEL_WHITE,
@@ -169,6 +171,7 @@ pub fn facade(t: f64, party: bool, finish: Material) -> BuildUp {
     let what = if party { "Brandgavl" } else { "Ydervæg" };
     let (wall, brick, render) = match finish {
         Material::Render => ("pudset mur", BRICK, true),
+        Material::RenderTerracotta => ("pudset mur, terrakotta", BRICK, true),
         Material::BrickRed => ("massiv mur, røde sten", BRICK_RED, false),
         Material::BrickYellow => ("massiv mur, gule sten", BRICK_YELLOW, false),
         _ => ("massiv mur", BRICK, false),
@@ -177,7 +180,7 @@ pub fn facade(t: f64, party: bool, finish: Material) -> BuildUp {
         Some(s) => format!("{what}, {wall} {s} sten, {}", mm(t)),
         None => format!("{what}, {wall}, {}", mm(t)),
     };
-    let outside = render.then_some((RENDER, 15.0));
+    let outside = render.then_some((of(finish), 15.0));
     // From the outside in: render if any, brick, then the interior plaster.
     let mut layers = sandwich(t, (PLASTER, 15.0), brick, outside);
     layers.reverse();
