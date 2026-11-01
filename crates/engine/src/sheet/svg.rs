@@ -136,7 +136,6 @@ pub(crate) fn items(out: &mut String, scene: &Scene, vp: &Viewport) {
                 let fill = match p.fill {
                     Some(Fill::Solid(c)) => hex(c),
                     Some(Fill::Masonry) => "url(#masonry)".into(),
-                    Some(Fill::Dots) => "url(#stair)".into(),
                     None => "none".into(),
                 };
                 let stroke = match (p.stroke, p.fill) {

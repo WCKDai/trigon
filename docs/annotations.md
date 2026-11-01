@@ -4,6 +4,11 @@
 stores a note in that frame. Studio, the CLI and MCP use the same command schemas. Every
 change is atomic, journaled and undoable through `edit.undo` / `edit.redo`.
 
+Presentation plans retain the model's stair treads, landing outlines and direction lines, on the
+`A-STAIR` layer with 0.18/0.13 mm pens finer than the wall cut. Departure and receiving storeys use
+the same source stair, including rounded turns and winders; drawing a plan does not change its
+geometry. A pale background replaces the former dotted shaft-only presentation.
+
 ```json
 {"command":"view.define","params":{"id":"ground","name":"Ground floor","kind":{"view":"plan","level":0}}}
 {"command":"annotation.define","params":{"id":"wall-note","view":"ground","size_mm":2.5,"kind":{"annotation":"text","at":[1000,2000],"text":"Existing brickwork"}}}
