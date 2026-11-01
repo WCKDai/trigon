@@ -101,9 +101,28 @@ impl Ifc<'_> {
         let thickness = pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness());
         let up = catalog::pitched_roof((thickness * 10.0).round() / 10.0);
         let placed = self.w.place(Some(fl.at(top)), fl.at(top).frame);
-        let kind = if r.gables.is_empty() { ".HIP_ROOF." } else { ".GABLE_ROOF." };
+        let kind = if r.compound {
+            ".MANSARD_ROOF."
+        } else if r.gables.is_empty() {
+            ".HIP_ROOF."
+        } else {
+            ".GABLE_ROOF."
+        };
+        // Mitred slope breaks have different top/soffit boundaries. Export the real shell,
+        // rather than reconstructing it as unrelated plane extrusions with overlaps or gaps.
+        let shape = if r.compound {
+            self.w
+                .faceset(&r.cover, &placed.frame)
+                .and_then(|item| {
+                    self.cat.paint(&mut self.w, item, catalog::TILES);
+                    self.shape("Tessellation", &[item], None, catalog::L_ROOF)
+                })
+                .map_or_else(|| "$".into(), |id| format!("#{id}"))
+        } else {
+            "$".into()
+        };
         let roof = self.w.add(format!(
-            "IFCROOF({},$,{},$,$,#{},$,{},{kind})",
+            "IFCROOF({},$,{},$,$,#{},{shape},{},{kind})",
             gid(&r.id),
             string(&format!("Tag {:.0}°", r.pitch_deg)),
             placed.id,

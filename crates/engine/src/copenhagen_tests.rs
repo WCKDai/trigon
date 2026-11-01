@@ -11,6 +11,41 @@ fn session() -> Session {
 }
 
 #[test]
+fn mansard_roof_is_opt_in_parametric_atomic_and_exactly_undoable() {
+    let mut s = session();
+    let original = s.doc.clone();
+    let params =
+        json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gutters":true});
+    s.execute("building.set_roof", params.clone()).unwrap();
+    assert_eq!(s.doc.buildings[0].roof, serde_json::from_value(json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gutters":true})).unwrap());
+    let before = s.doc.clone();
+    let built_before = build(&s.doc).unwrap();
+    let r = built_before[0].roof.as_ref().unwrap();
+    let expected =
+        s.doc.buildings[0].height() + 1300.0 * 68f64.to_radians().tan() + 3700.0 * 25f64.to_radians().tan() + 220.0 / 25f64.to_radians().cos();
+    assert!((r.ridge - expected).abs() < 0.01);
+    let record = s.execute("element.get", json!({"id":"b.roof"})).unwrap();
+    assert!(record.to_string().contains("lower_pitch_deg"));
+    s.execute("element.set", json!({"id":"b.roof","properties":{"break_run_mm":1500}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), built_before);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(build(&s.doc).unwrap(), built_before);
+    for bad in [
+        json!({"kind":"mansard","lower_pitch_deg":10,"upper_pitch_deg":60}),
+        json!({"kind":"mansard","break_run_mm":10000}),
+        json!({"kind":"mansard","upper_pitch_deg":1e300}),
+        json!({"kind":"pitched","pitch_deg":35,"break_run_mm":1300}),
+        json!({"kind":"mansard","ridge":20000}),
+    ] {
+        assert!(s.execute("building.set_roof", bad).is_err());
+        assert_eq!(s.doc, before);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, original);
+}
+
+#[test]
 fn copenhagen_library_is_explicit_atomic_and_undoable() {
     let mut s = session();
     let before = s.doc.clone();

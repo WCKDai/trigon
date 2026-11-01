@@ -265,6 +265,8 @@ pub struct BuiltRoof {
     pub eaves: f64,
     pub ridge: f64,
     pub pitch_deg: f64,
+    /// Multiple slopes/mitres require their actual shell in exchange, not one-plane extrusion.
+    pub compound: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -859,7 +861,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             });
             None
         }
-        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters } => {
+        crate::roof::Roof::Pitched { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. }
+        | crate::roof::Roof::Mansard {
+            parameters: crate::roof::Mansard { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. },
+        } => {
             let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
@@ -883,7 +888,11 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
-            let r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            let (r, pitch_deg, compound) = match &b.roof {
+                crate::Roof::Pitched { pitch_deg, .. } => (crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?, *pitch_deg, false),
+                crate::Roof::Mansard { parameters } => (crate::roof::mansard(&outline, h, &edges, parameters)?, parameters.lower_pitch_deg, true),
+                crate::Roof::Flat => return Err(ModelError::Invalid("a sloping roof configuration is required".into())),
+            };
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
                 cover: r.cover,
@@ -891,7 +900,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 gutters: r.gutters,
                 eaves: h,
                 ridge: r.ridge,
-                pitch_deg: *pitch_deg,
+                pitch_deg,
+                compound,
             })
         }
     };

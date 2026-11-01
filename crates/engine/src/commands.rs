@@ -1976,10 +1976,16 @@ struct AddBasement {
 #[serde(deny_unknown_fields)]
 struct SetRoof {
     building: Option<String>,
-    /// flat or pitched.
+    /// flat, pitched or mansard.
     kind: String,
     /// Roof pitch in degrees.
     pitch_deg: Option<f64>,
+    /// Mansard lower slope (default 68°).
+    lower_pitch_deg: Option<f64>,
+    /// Mansard upper slope (default 25°).
+    upper_pitch_deg: Option<f64>,
+    /// Mansard underside break, horizontal inward run from the exterior wall (default 1300 mm).
+    break_run_mm: Option<f64>,
     /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
     ridge: Option<f64>,
     /// Facades that end in a gable.
@@ -2359,6 +2365,9 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
 fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+    if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some()) {
+        return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg and break_run_mm require kind mansard".into()).into());
+    }
     let b = s.doc.building_mut(p.building.as_deref())?;
     let roof = match p.kind.as_str() {
         "flat" => trigon_model::Roof::Flat,
@@ -2391,7 +2400,25 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 gutters: p.gutters.unwrap_or(false),
             }
         }
-        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
+        "mansard" => {
+            if p.pitch_deg.is_some() || p.ridge.is_some() {
+                return Err(ModelError::Invalid("mansard roofs use lower_pitch_deg, upper_pitch_deg and break_run_mm".into()).into());
+            }
+            trigon_model::Roof::Mansard {
+                parameters: trigon_model::roof::Mansard {
+                    lower_pitch_deg: p.lower_pitch_deg.unwrap_or(68.0),
+                    upper_pitch_deg: p.upper_pitch_deg.unwrap_or(25.0),
+                    break_run_mm: p.break_run_mm.unwrap_or(1300.0),
+                    gables: p.gables.unwrap_or_default(),
+                    straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                    overhang_mm: p.overhang_mm.unwrap_or(0.0),
+                    verge_mm: p.verge_mm.unwrap_or(0.0),
+                    thickness_mm: p.thickness_mm.unwrap_or(0.0),
+                    gutters: p.gutters.unwrap_or(false),
+                },
+            }
+        }
+        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat, pitched or mansard")).into()),
     };
     b.roof = roof;
     if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {

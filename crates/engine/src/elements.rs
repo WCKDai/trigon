@@ -538,8 +538,12 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
     let mut properties = vec![choice(
         "roof_kind",
         "Roof kind",
-        if matches!(building.roof, trigon_model::roof::Roof::Flat) { "flat" } else { "pitched" },
-        json!(["flat", "pitched"]),
+        match building.roof {
+            trigon_model::Roof::Flat => "flat",
+            trigon_model::Roof::Pitched { .. } => "pitched",
+            trigon_model::Roof::Mansard { .. } => "mansard",
+        },
+        json!(["flat", "pitched", "mansard"]),
     )];
     match &building.roof {
         trigon_model::roof::Roof::Flat => {
@@ -554,6 +558,19 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 number("straighten_mm", "Eave straightening", *straighten_mm, "mm", 0.0, 10000.0),
                 field("gutters", "Gutters", *gutters, true),
                 field("gables", "Gable facade IDs", json!(gables), true),
+            ]);
+        }
+        trigon_model::Roof::Mansard { parameters: p } => {
+            properties.extend([
+                number("lower_pitch_deg", "Lower roof pitch", p.lower_pitch_deg, "deg", 40.0, 80.0),
+                number("upper_pitch_deg", "Upper roof pitch", p.upper_pitch_deg, "deg", 5.0, 45.0),
+                number("break_run_mm", "Horizontal run to slope break", p.break_run_mm, "mm", 200.0, 10000.0),
+                number("overhang_mm", "Eave overhang", p.overhang_mm, "mm", 0.0, 2000.0),
+                number("verge_mm", "Verge overhang", p.verge_mm, "mm", 0.0, 1500.0),
+                number("thickness_mm", "Roof build-up normal to each slope", p.thickness_mm, "mm", 0.0, 1000.0),
+                number("straighten_mm", "Eave straightening", p.straighten_mm, "mm", 0.0, 10000.0),
+                field("gutters", "Half-round gutters", p.gutters, true),
+                field("gables", "Gable facade IDs", json!(p.gables), true),
             ]);
         }
     }
@@ -964,7 +981,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             if let Some(kind) = properties.get("roof_kind") {
                 match kind.as_str() {
                     Some("flat") => b.roof = trigon_model::roof::Roof::Flat,
-                    Some("pitched") if matches!(b.roof, trigon_model::roof::Roof::Flat) => {
+                    Some("pitched") if !matches!(b.roof, trigon_model::roof::Roof::Pitched { .. }) => {
                         b.roof = trigon_model::roof::Roof::Pitched {
                             pitch_deg: 35.0,
                             gables: Vec::new(),
@@ -976,6 +993,10 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         }
                     }
                     Some("pitched") => {}
+                    Some("mansard") if !matches!(b.roof, trigon_model::Roof::Mansard { .. }) => {
+                        b.roof = trigon_model::Roof::Mansard { parameters: trigon_model::roof::Mansard::default() };
+                    }
+                    Some("mansard") => {}
                     _ => return Err(invalid("unknown roof kind")),
                 }
             }
@@ -1009,6 +1030,24 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             _ => return Err(invalid("unknown roof property")),
                         }
                     }
+                    trigon_model::Roof::Mansard { parameters: p } => match key.as_str() {
+                        "lower_pitch_deg" => p.lower_pitch_deg = numeric(key, value)?,
+                        "upper_pitch_deg" => p.upper_pitch_deg = numeric(key, value)?,
+                        "break_run_mm" => p.break_run_mm = numeric(key, value)?,
+                        "straighten_mm" => p.straighten_mm = numeric(key, value)?,
+                        "overhang_mm" => p.overhang_mm = numeric(key, value)?,
+                        "verge_mm" => p.verge_mm = numeric(key, value)?,
+                        "thickness_mm" => p.thickness_mm = numeric(key, value)?,
+                        "gutters" => p.gutters = boolean(key, value)?,
+                        "gables" => {
+                            let ids: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| invalid("gables must be facade IDs"))?;
+                            if ids.len() > 200 {
+                                return Err(invalid("at most 200 gables"));
+                            }
+                            p.gables = ids;
+                        }
+                        _ => return Err(invalid("unknown mansard roof property")),
+                    },
                 }
             }
             Ok(selected_id.to_string())

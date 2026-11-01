@@ -276,7 +276,7 @@ fn centroid(p: &[[f64; 3]]) -> [f64; 3] {
 pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
     let mut up = Vec::new();
     let mut down = Vec::new();
-    for face in components(&r.cover, false) {
+    for face in components(&r.cover, false).into_iter().filter(|_| !r.compound) {
         let Some(polygon) = outline(&face) else { continue };
         // Which way the face looks, from its triangles; the outline is turned to run
         // counter-clockwise seen from above.
@@ -532,6 +532,9 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
             out.push((s.id.clone(), s.mesh.clone()));
         }
         if let Some(r) = &b.roof {
+            if r.compound {
+                out.push((r.id.clone(), r.cover.clone()));
+            }
             for p in roof(r, &b.walls) {
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }

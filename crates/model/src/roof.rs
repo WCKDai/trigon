@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::mesh::Mesh;
 use crate::{ModelError, Result};
 
+mod mansard;
+pub use mansard::{Mansard, build as mansard};
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Roof {
@@ -39,6 +42,11 @@ pub enum Roof {
         /// Gutters along the eaves.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         gutters: bool,
+    },
+    /// Two continuous roof pitches with a shared hip/ridge skeleton and a real slope break.
+    Mansard {
+        #[serde(flatten)]
+        parameters: Mansard,
     },
 }
 

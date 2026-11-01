@@ -854,7 +854,7 @@ impl Building {
     pub fn ceiling_thickness(&self, level: usize) -> f64 {
         if level + 1 < self.storeys.len() {
             self.floor_thickness(level + 1)
-        } else if matches!(self.roof, crate::roof::Roof::Pitched { .. }) {
+        } else if !matches!(self.roof, crate::roof::Roof::Flat) {
             self.attic_thickness()
         } else {
             200.0
