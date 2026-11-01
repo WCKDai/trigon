@@ -7,7 +7,7 @@ GitHub tracking exception recorded in #15 while Plane and the engineering kit ar
 
 Existing `gutters: true` documents retain their original geometry and omitted fields. Set the
 roof's `drainage` property with `element.set`, or supply `drainage` to `building.set_roof`, to opt
-into half-round metal channels, rolled rims, capped run ends and sleeve joints. Roof cover,
+into half-round metal channels, rolled rims, mitred corners, terminal stop ends and sleeve joints. Roof cover,
 gables, building source and roof identity stay unchanged. `null` restores legacy gutters.
 
 ```json
@@ -22,8 +22,27 @@ gables, building source and roof identity stay unchanged. `null` restores legacy
 The distances are explicit design inputs in millimetres. A downpipe needs an eave facade that
 survives roof straightening. Its open channel aperture, outlet, offset knees, pipe and shoe are
 one geometric assembly; no pipe is inferred from a photograph or placed automatically. An empty
-`downpipes` list adds channels only. Adjacent gutter runs have capped ends; corner fittings,
-hydraulic sizing, roof falls, underground drainage and collision checking are not implemented.
+`downpipes` list adds channels only. Adjacent eaves meet at a common mitre computed from their
+actual directions, for convex and reentrant corners; no square-corner assumption is used. There
+are no endcaps between connected runs. Gable terminations have full metal stop plates of
+`wall_mm` thickness. Rolled rims are integrated into the channel section; separate closed sleeve
+fittings have 0.25 mm clearance. Aperture edges close the sheet thickness.
+
+Pipe knees and shoes use tangent circular elbows at the actual change in direction. Their
+centreline radius is normally 1.5 pipe diameters; short legs reduce the radius while leaving 10%
+straight clearance. Paths needing a radius no larger than the outside pipe radius plus wall
+thickness are refused. The 32-sided pipes and at most 7.5-degree elbow samples stay below Studio's
+20-degree feature-edge threshold. Two closed collars follow that same centreline at its thirds,
+with 1 mm radial clearance, including short shoes. No internal knee endcaps are generated.
+
+This intentionally corrects the opt-in detailed geometry. Serialized drainage parameters,
+per-eave `building.roof.gutterN` IDs and explicit `building.roof.downpipe.ID` IDs are unchanged.
+Individual eave meshes share open mitre boundaries; the assembled metal shell is closed and
+oriented, without coincident joint caps. Reversing corners, mitres that consume a short run and
+outlets crossing a mitre are refused rather than folded or silently resized. `drainage: null`
+and omitted drainage still produce the exact legacy gutter geometry.
+
+Hydraulic sizing, roof falls, underground drainage and general collision checking are not implemented.
 These presentation details are not measured evidence or construction documentation.
 
 Limits include 100–300 mm gutters, 1–5 mm walls, 1–10 m joint spacing, 256 eave corners,
@@ -34,6 +53,31 @@ IFC4 exports use `IfcPipeSegment` with `GUTTER` for channels and `RIGIDSEGMENT` 
 positioned downpipe assemblies. These are tessellated geometric assemblies without hydraulic
 ports. Their IDs are stable under dimension edits. See the public buildingSMART
 [IfcPipeSegmentTypeEnum specification](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2/HTML/schema/ifchvacdomain/lexical/ifcpipesegmenttypeenum.htm).
+
+### Seating an eave cornice
+
+On an opted-in detailed pitched roof, a band whose top is exactly the wall bearing height gets
+a bevelled upper face against the roof underside. Other bands, gable bands and legacy `None`
+drainage retain their existing geometry. This changes neither the roof planes nor their bearing,
+cover thickness, wall height, source band dimensions or material ownership. A cut view clips
+the seated geometry rather than rebuilding a flat top at the cut.
+
+Let `H` be the top storey's elevation plus height, `P` the projection, `a` the roof pitch, and `d`
+distance outward from the wall. The cap top at the wall is `H`, and its top outward is
+`H - d * tan(a)`. Set the band's storey-relative `top` to that storey's height. Its bottom and
+any opening head must stay at least 1 mm below `H - P * tan(a)`; a practical cap has further
+construction clearance. `P` must fit inside `overhang_mm`, and the facade must survive roof
+straightening. Violations return an error rather than producing inverted or crossing faces.
+
+For example, a 135 mm projection at 46 degrees needs more than 140.8 mm of cap depth at the
+wall; 180 mm leaves about 40.2 mm at its outer face. Merely raising a 50 mm rectangular band to
+`H` cannot fit. Place the lower stepped courses beneath this cap, retaining their own finishes.
+The roof's underside already bears at `H`; its outer eave is at `H - overhang_mm * tan(a)` and
+its cover rises vertically by `thickness_mm / cos(a)`. Do not add that cover lift to the cornice.
+
+At an adjacent gable, the existing band mitre can project past the gable wall. A covered cornice
+return requires sufficient `verge_mm` for that actual plan projection, or a separately designed
+termination. This seating operation does not invent those returns or change gable topology.
 
 ## Courtyard/site sources
 

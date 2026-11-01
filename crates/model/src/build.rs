@@ -784,8 +784,25 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 if !(z1 - z0 >= 10.0) || above(z0) {
                     continue;
                 }
-                let piece = facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes, shaped.then_some(profiles.as_slice()))
-                    .ok_or_else(unbuildable)?;
+                let bearing_cap =
+                    (z1 - h).abs() < 1e-6 && matches!(&b.roof, crate::Roof::Pitched { drainage: Some(_), gables, .. } if !gables.contains(&f.id));
+                let mut piece = facing_piece(
+                    &fr,
+                    f,
+                    (a, e),
+                    &line,
+                    projection,
+                    (z0, if bearing_cap { z1 } else { top_at(z1) }),
+                    &holes,
+                    shaped.then_some(profiles.as_slice()),
+                )
+                .ok_or_else(unbuildable)?;
+                if bearing_cap {
+                    seat_cornice(&mut piece, b, f, &fr, z1)?;
+                    if let Some(cut) = cut {
+                        piece = piece.below(cut);
+                    }
+                }
                 trim.append(&piece);
                 if explicit_finishes {
                     trim_parts.entry(band.finish.map_or(Material::Render, |finish| finish.material())).or_default().append(&piece);
@@ -1033,6 +1050,39 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
 
 /// The plinth runs this far below the terrain, mm.
 const PLINTH_FOOT: f64 = 300.0;
+
+/// A cap explicitly ending at the wall bearing on a detailed pitched roof follows the soffit.
+/// Its declared height remains the height at the wall; projection consumes height at tan(pitch).
+/// Moving only the upper face preserves a closed solid and all opening edges/material ownership.
+fn seat_cornice(piece: &mut Mesh, b: &Building, f: &Facade, fr: &FacadeFrame, top: f64) -> Result<()> {
+    let crate::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, drainage: Some(_), .. } = &b.roof else {
+        return Ok(());
+    };
+    if (top - b.height()).abs() > 1e-6 || gables.contains(&f.id) {
+        return Ok(());
+    }
+    let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
+    if !kept.iter().enumerate().any(|(k, &i)| i == f.edge && kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len()) {
+        return Err(ModelError::Invalid("a roof-bearing cornice needs an eave facade retained by roof straightening".into()));
+    }
+    let rise = crate::checked("cornice roof pitch", *pitch_deg, 5.0, 75.0)?.to_radians().tan();
+    let overhang = crate::checked("cornice roof overhang", *overhang_mm, 0.0, 2000.0)?;
+    for p in &mut piece.positions {
+        let outward = ((p[0] - fr.origin[0]) * fr.n[0] + (p[1] - fr.origin[1]) * fr.n[1]).max(0.0);
+        let soffit = top - outward * rise;
+        if outward > overhang + 1e-6 {
+            return Err(ModelError::Invalid("a roof-bearing cornice projection must fit under the roof overhang".into()));
+        }
+        if (p[2] - top).abs() < 1e-6 {
+            p[2] = soffit;
+        } else if p[2] > soffit - 1.0 {
+            return Err(ModelError::Invalid(
+                "a roof-bearing cornice needs a lower bottom/opening head: projection times tan(pitch) plus 1 mm clear below its top".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// A facing in front of one facade (a plinth, a band): a closed piece from `z0` to `z1` between
 /// the wall's outer face and the facing's face `projection` mm out along `line` (the footprint
@@ -1838,6 +1888,59 @@ mod tests {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].placements[1].height = Some(2900.0);
         assert!(format!("{}", build(&doc).unwrap_err()).contains("storey above"));
+    }
+
+    #[test]
+    fn detailed_roof_cornice_seats_at_wall_top_without_crossing_the_soffit() {
+        let mut doc = Document::default();
+        let mut b = Building::new("b1", "Synthetic", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.).unwrap();
+        b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,"gutters":true,"overhang_mm":180,
+            "thickness_mm":200,"drainage":{}}))
+        .unwrap();
+        for f in &mut b.facades {
+            f.bands.push(crate::doc::Band {
+                levels: vec![0],
+                bottom: 2820.,
+                top: 3000.,
+                projection: 135.,
+                finish: Some(crate::doc::WallFinish::YellowBrick),
+            });
+        }
+        doc.buildings.push(b);
+        let built = build(&doc).unwrap();
+        let rise = 46_f64.to_radians().tan();
+        for w in &built[0].walls {
+            let outward = |p: &[f64; 3]| (p[0] - w.frame.origin[0]) * w.frame.n[0] + (p[1] - w.frame.origin[1]) * w.frame.n[1];
+            assert!(
+                w.trim.positions.iter().all(|p| p[2] <= 3000. - outward(p).max(0.0) * rise + 1e-6),
+                "flat projecting caps intersect the sloping roof underside"
+            );
+            assert!(
+                w.trim.positions.iter().any(|p| outward(p).abs() < 1e-6 && (p[2] - 3000.).abs() < 1e-6),
+                "the cap must reach the bearing at the wall, with no exposed strip"
+            );
+            assert!(w.trim.positions.iter().any(|p| (outward(p) - 135.).abs() < 1e-6 && (p[2] - (3000. - 135. * rise)).abs() < 1e-6));
+            assert_eq!(w.trim_parts.len(), 1);
+            assert_eq!(w.trim_parts[0].0, Material::BrickYellow);
+            assert_eq!(w.trim_parts[0].1, w.trim);
+        }
+        let clipped = build_cut(&doc, View::latest(&doc), Some(2950.)).unwrap();
+        assert_eq!(clipped[0].walls[0].trim, built[0].walls[0].trim.below(2950.));
+        assert_eq!(built, build(&doc).unwrap());
+        let mut legacy = doc.clone();
+        if let crate::Roof::Pitched { drainage, .. } = &mut legacy.buildings[0].roof {
+            *drainage = None;
+        }
+        let old = build(&legacy).unwrap();
+        assert_eq!(old[0].roof.as_ref().unwrap().cover, built[0].roof.as_ref().unwrap().cover);
+        let flat_top = old[0].walls[0].trim.positions.iter().filter(|p| (p[2] - 3000.).abs() < 1e-6).count();
+        assert!(flat_top > 4, "legacy None cornices keep their original flat caps");
+        for (bottom, projection) in [(2950., 135.), (2820., 200.)] {
+            let mut bad = doc.clone();
+            bad.buildings[0].facades[0].bands[0].bottom = bottom;
+            bad.buildings[0].facades[0].bands[0].projection = projection;
+            assert!(build(&bad).is_err(), "a shallow cap or one extending past the overhang must be refused");
+        }
     }
 
     #[test]
