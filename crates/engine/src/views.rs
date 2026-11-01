@@ -813,6 +813,42 @@ mod picking_tests {
         }
     }
 
+    #[test]
+    fn ranged_plan_keeps_demolition_geometry_visible_only_in_requested_phase_filters() {
+        let mut s = session();
+        s.doc.phases.push(trigon_model::doc::Phase { id: "proposal".into(), name: "Proposal".into() });
+        s.doc.active_phase = Some("proposal".into());
+        let original = &mut s.doc.buildings[0].facades[0].placements[0];
+        original.demolished = Some("proposal".into());
+        let mut replacement = original.clone();
+        replacement.created = Some("proposal".into());
+        replacement.demolished = None;
+        replacement.bay = 1;
+        s.doc.buildings[0].facades[0].placements.push(replacement);
+        s.execute(
+            "view.configure",
+            json!({"id":"plan","template":{"name":"Phases","range":{"top_mm":2300,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000}}}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let phase = s.doc.phase_index("proposal").unwrap();
+        for (filter, old, new) in [
+            (trigon_model::build::PhaseFilter::Complete, false, true),
+            (trigon_model::build::PhaseFilter::All, true, true),
+            (trigon_model::build::PhaseFilter::Demolition, true, false),
+        ] {
+            let drawing = drawing_view(&s.doc, "plan", View { phase, filter }).unwrap();
+            assert_eq!(
+                drawing.element_segments.iter().any(|e| e.id == "b.f1.L0.B0"),
+                old,
+                "{filter:?}: demolished source must follow requested visibility"
+            );
+            assert_eq!(drawing.svg.contains("#bd3030"), old);
+            assert_eq!(drawing.element_segments.iter().any(|e| e.id == "b.f1.L0.B1"), new, "{filter:?}: new source must follow requested visibility");
+        }
+        assert_eq!(s.doc, before);
+    }
+
     fn fingerprint(bytes: &[u8]) -> u64 {
         bytes.iter().fold(0xcbf29ce484222325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
     }

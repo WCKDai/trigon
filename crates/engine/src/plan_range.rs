@@ -110,6 +110,7 @@ pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange)
             });
         }
     }
+    let demolition = draw_demolition(&mut scene, &built, top, plane, depth);
     // Keep semantic regions only for shapes actually shown; overhead has visible edges but no
     // opaque pick area that could cover a floor or room under it.
     let bounds = scene.bounds().unwrap_or([0.0, 0.0, 1000.0, 1000.0]);
@@ -125,9 +126,73 @@ pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange)
         title: storey.name.clone(),
         project: first.name.clone(),
         caption: String::new(),
-        note: Some("Dashed: overhead · Dotted: below primary range".into()),
+        note: Some(
+            if demolition > 0 {
+                "Dashed: overhead · Dotted: below primary range · Red dashed: demolition"
+            } else {
+                "Dashed: overhead · Dotted: below primary range"
+            }
+            .into(),
+        ),
         metrics,
     })
+}
+
+/// Demolition is a non-occluding red overlay. The ordinary section-style sources intentionally
+/// omit it; a phase-aware plan must retain the components supplied by build_view(All/Demolition).
+fn draw_demolition(scene: &mut Scene, built: &[trigon_model::Built], top: f64, plane: f64, depth: f64) -> usize {
+    use crate::sheet::Element;
+    use trigon_model::build::{ElementClass, Status};
+    let elements: Vec<_> = built
+        .iter()
+        .flat_map(|b| {
+            b.walls
+                .iter()
+                .flat_map(|w| w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments))
+                .chain(b.interior.iter().flat_map(|w| w.doors.iter().map(|d| &d.fill)))
+        })
+        .filter(|e| e.status == Status::Demolished)
+        .collect();
+    if elements.is_empty() {
+        return 0;
+    }
+    let stroke = Stroke { colour: [0xbd, 0x30, 0x30], dashed: true, ..Stroke::new(0.18) };
+    let mut meshes = Vec::new();
+    for e in elements {
+        let kind = if matches!(e.class, ElementClass::Window | ElementClass::Door) {
+            crate::DrawingElementKind::Opening
+        } else if matches!(e.class, ElementClass::BalconySlab) {
+            crate::DrawingElementKind::Balcony
+        } else if matches!(e.class, ElementClass::Stair) {
+            crate::DrawingElementKind::Stair
+        } else {
+            crate::DrawingElementKind::Railing
+        };
+        let owner = Element::new(&e.id, kind);
+        for (material, mesh) in &e.parts {
+            let class = style::class_of(e.class, *material);
+            let mut segments = Vec::new();
+            cut::segments(mesh, &|p| [p[0], p[1], p[2] - plane], &mut segments);
+            for segment in segments {
+                scene.line(style::layer(class), segment[0], segment[1], stroke);
+                scene.attribute_last(&[owner.segment(segment)]);
+            }
+            meshes.push((
+                owner.clone(),
+                class,
+                Mesh { positions: mesh.positions.iter().map(|p| [p[0], -p[2], p[1]]).collect(), triangles: mesh.triangles.clone() },
+            ));
+        }
+    }
+    let sources: Vec<_> =
+        meshes.iter().enumerate().map(|(group, (owner, class, mesh))| Source { mesh, class: *class, group, element: Some(owner.clone()) }).collect();
+    let look = Look { origin: [0.0, 0.0], t: [1.0, 0.0], d: [0.0, 1.0] };
+    let projection = project(&sources, &look, (-top, -depth), Near::Cut);
+    for edge in &projection.edges {
+        scene.line(style::layer(edge.class), edge.a, edge.b, stroke);
+        scene.attribute_last(&edge.element_segments);
+    }
+    meshes.len()
 }
 
 fn draw_below(scene: &mut Scene, projection: &crate::sheet::project::Projection, bottom: f64) -> usize {

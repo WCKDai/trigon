@@ -192,3 +192,13 @@ type and its instances** changes the definition for all referencing placements. 
 overrides remain local. **Duplicate as new type** creates an independent definition. This UI does
 not imply live file watching or automatic external-library reload. It ships no client branding,
 reference page assets or copied starter geometry.
+
+Explicit plan ranges retain requested phase visibility: demolished components supplied by `All`
+or `Demolition` draw as a non-occluding red dashed overlay, with source IDs preserved. Complete
+views exclude removed components. The normal section/elevation styles remain unchanged.
+
+Existing `trigon/1` files without these optional features load and serialize unchanged. Older
+releases with strict annotation/view schemas cannot read the new `line` kind or `template` field.
+For a downgrade, keep the original file, export drawings, clear templates through `view.configure`
+with null and remove new line annotations from a separate copy. Reverting code does not migrate
+saved files automatically. No destructive downgrade is performed by Studio.
