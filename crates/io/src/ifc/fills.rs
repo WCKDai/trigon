@@ -13,18 +13,19 @@ use super::{Floors, Ifc};
 
 pub(crate) fn window_partitioning(kind: &ComponentKind) -> &'static str {
     match kind {
-        ComponentKind::Window { lights: 1, .. } | ComponentKind::FixedWindow => ".SINGLE_PANEL.",
-        ComponentKind::Window { lights: 2, .. } => ".DOUBLE_PANEL_VERTICAL.",
-        ComponentKind::Window { lights: 3, .. } => ".TRIPLE_PANEL_VERTICAL.",
+        ComponentKind::Window { lights: 1, .. } | ComponentKind::HistoricWindow { lights: 1, .. } | ComponentKind::FixedWindow => ".SINGLE_PANEL.",
+        ComponentKind::Window { lights: 2, .. } | ComponentKind::HistoricWindow { lights: 2, .. } => ".DOUBLE_PANEL_VERTICAL.",
+        ComponentKind::Window { lights: 3, .. } | ComponentKind::HistoricWindow { lights: 3, .. } => ".TRIPLE_PANEL_VERTICAL.",
         _ => ".NOTDEFINED.",
     }
 }
 
 pub(crate) fn door_operation(kind: &ComponentKind) -> &'static str {
     match kind {
-        ComponentKind::FrenchDoor { leaves: 2 } | ComponentKind::FrenchBalcony { leaves: 2, .. } | ComponentKind::Balcony { leaves: 2, .. } => {
-            ".DOUBLE_DOOR_SINGLE_SWING."
-        }
+        ComponentKind::FrenchDoor { leaves: 2 }
+        | ComponentKind::FrenchBalcony { leaves: 2, .. }
+        | ComponentKind::Balcony { leaves: 2, .. }
+        | ComponentKind::PanelDoor { leaves: 2, .. } => ".DOUBLE_DOOR_SINGLE_SWING.",
         ComponentKind::FrenchDoor { leaves } | ComponentKind::FrenchBalcony { leaves, .. } | ComponentKind::Balcony { leaves, .. } if *leaves > 2 => {
             ".NOTDEFINED."
         }
@@ -69,8 +70,19 @@ impl Ifc<'_> {
                 // At the opening's outer bottom-left corner, seen from outside; through the piece.
                 let frame = p.placed.frame.shifted([r.u0, 0.0, v0 - seg.z0]);
                 let placed = self.w.place(Some(p.placed), frame);
-                let profile = self.w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,{},{})", real(w), real(h)));
-                let position = self.w.axis2([w / 2.0, 0.0, h / 2.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+                let (profile, position) = if o.profile.is_empty() {
+                    (
+                        self.w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,{},{})", real(w), real(h))),
+                        self.w.axis2([w / 2.0, 0.0, h / 2.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]),
+                    )
+                } else {
+                    let poly = trigon_model::profile::clip(&o.profile, trigon_model::Rect { v0, v1, ..r });
+                    // The extrusion axis is +Y into the wall and profile X is +X along it;
+                    // their cross product makes profile Y point down (-Z). Negate V so
+                    // the real opening rises above its bottom, like the centred rectangle.
+                    let poly: Vec<_> = poly.into_iter().map(|p| [p[0] - r.u0, v0 - p[1]]).collect();
+                    (self.w.profile(&poly, &[]), self.w.axis2([0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]))
+                };
                 let solid = self.w.extrusion(profile, position, seg.thickness);
                 let Some(shape) = self.shape("SweptSolid", &[solid], None, catalog::L_OPENING) else { continue };
                 let key = if seg.level == o.level { o.id.clone() } else { format!("{}.L{}", o.id, seg.level) };
@@ -144,7 +156,11 @@ impl Ifc<'_> {
                 &mut self.w,
                 &quantity_key,
                 if door { "Qto_DoorBaseQuantities" } else { "Qto_WindowBaseQuantities" },
-                &[Qty::Length("Height", e.height), Qty::Length("Width", e.width), Qty::Area("Area", e.width * e.height / 1e6)],
+                &[
+                    Qty::Length("Height", e.height),
+                    Qty::Length("Width", e.width),
+                    Qty::Area("Area", kind.map_or(e.width * e.height, |kind| trigon_model::profile::area(kind, e.width, e.height)) / 1e6),
+                ],
                 id,
             );
         }

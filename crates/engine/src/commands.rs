@@ -79,6 +79,30 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "export.fbx",
+        summary: "Export binary FBX through an optional locally installed Blender, for Lumion and rendering tools. Pure Rust model geometry passes through GLB; an isolated public-API converter embeds textures and verifies source IDs, triangle counts, UVs and vertices within 0.1 mm on re-import before atomic file replacement. No account or GUI required. TRIGON_BLENDER selects an operator-configured executable.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::fbx::Export>,
+        run: |s, v| crate::fbx::export(s, parse("export.fbx", v)?),
+    },
+    CommandSpec {
+        id: "site.set_terrain",
+        summary: "Set/remove a parametric ground height grid in site-local mm. Buildings trim the surface, keeping ground out of floors. Bounded, validated, atomic and undoable; unmeasured flat ground is a presentation assumption.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::terrain::Set>,
+        run: |s, v| crate::terrain::set(s, parse("site.set_terrain", v)?),
+    },
+    CommandSpec {
+        id: "site.sample_terrain",
+        summary: "Sample a bounded ground grid from Danmarks Højdemodel DTM using configured Dataforsyningen access. Converts DVR90 metres to site-local mm, records source attribution, rejects missing data. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::terrain::Sample>,
+        run: |s, v| crate::terrain::sample(s, parse("site.sample_terrain", v)?),
+    },
+    CommandSpec {
         id: "element.get",
         summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
         mutates: false,
@@ -104,7 +128,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "schedule.openings",
-        summary: "List actual built windows and doors with semantic IDs, building/host/storey/type, phase status and dimensions. Areas are rectangular outer-lining m2; loggia facade-hole areas are excluded. Optional building, levels and phase/filter. Read-only and deterministic; does not change history.",
+        summary: "List actual built windows and doors with semantic IDs, building/host/storey/type, phase status and dimensions. Areas are outer-lining profile m2 (width × height for rectangular families); loggia facade-hole areas are excluded. Optional building, levels and phase/filter. Read-only and deterministic; does not change history.",
         mutates: false,
         journaled: false,
         schema: schema::<crate::schedules::OpeningScheduleRequest>,
@@ -803,8 +827,35 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "types.install_copenhagen",
+        summary: "Install original parametric Danish Dannebrog, crosspost, segmental/round, true/applied muntin and panel-door families. Explicit style defaults, not surveyed or certified products. Existing definitions are never overwritten. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("types.install_copenhagen", v)?;
+            let mut installed = Vec::new();
+            for ty in trigon_model::component::copenhagen_types() {
+                ty.validate()?;
+                if let Some(existing) = s.doc.types.iter().find(|t| t.id == ty.id) {
+                    if existing != &ty {
+                        return Err(ModelError::Invalid(format!(
+                            "type {} already has different parameters; rename it or install in a new document",
+                            ty.id
+                        ))
+                        .into());
+                    }
+                } else {
+                    installed.push(ty.id.clone());
+                    s.doc.types.push(ty);
+                }
+            }
+            Ok(json!({"installed":installed,"family_defaults":true}))
+        },
+    },
+    CommandSpec {
         id: "types.define",
-        summary: "Add a component type or replace one with the same id. Every facade using it is re-checked.",
+        summary: "Add a component type or replace one with the same id. Facade uses are re-checked and all hosted geometry, including dormer windows, is built before committing.",
         mutates: true,
         journaled: true,
         schema: schema::<ComponentType>,
@@ -818,6 +869,7 @@ static COMMANDS: &[CommandSpec] = &[
             for b in s.doc.buildings.clone() {
                 check_building(&s.doc, Some(&b.id))?;
             }
+            trigon_model::build(&s.doc)?;
             Ok(json!({"defined": t.id}))
         },
     },
@@ -2010,10 +2062,20 @@ struct AddBasement {
 #[serde(deny_unknown_fields)]
 struct SetRoof {
     building: Option<String>,
-    /// flat or pitched.
+    /// flat, pitched or mansard.
     kind: String,
     /// Roof pitch in degrees.
     pitch_deg: Option<f64>,
+    /// Mansard lower slope (default 68°).
+    lower_pitch_deg: Option<f64>,
+    /// Mansard upper slope (default 25°).
+    upper_pitch_deg: Option<f64>,
+    /// Mansard underside break, horizontal inward run from the exterior wall (default 1300 mm).
+    break_run_mm: Option<f64>,
+    /// Shed dormers with coordinated roof voids, on one straight mansard face each.
+    dormers: Option<Vec<trigon_model::roof::Dormer>>,
+    /// Optional lower/upper slate or tagpap construction, with typed family dimensions.
+    covering: Option<trigon_model::roof::Covering>,
     /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
     ridge: Option<f64>,
     /// Facades that end in a gable.
@@ -2395,6 +2457,11 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
 fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+    if p.kind != "mansard"
+        && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.dormers.is_some() || p.covering.is_some())
+    {
+        return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg, break_run_mm, dormers and covering require kind mansard".into()).into());
+    }
     let b = s.doc.building_mut(p.building.as_deref())?;
     let roof = match p.kind.as_str() {
         "flat" => trigon_model::Roof::Flat,
@@ -2428,7 +2495,32 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 drainage: p.drainage,
             }
         }
-        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
+        "mansard" => {
+            if p.drainage.is_some() {
+                return Err(
+                    ModelError::Invalid("detailed drainage is supported only on pitched roofs; mansard drainage is not implemented".into()).into()
+                );
+            }
+            if p.pitch_deg.is_some() || p.ridge.is_some() {
+                return Err(ModelError::Invalid("mansard roofs use lower_pitch_deg, upper_pitch_deg and break_run_mm".into()).into());
+            }
+            trigon_model::Roof::Mansard {
+                parameters: trigon_model::roof::Mansard {
+                    lower_pitch_deg: p.lower_pitch_deg.unwrap_or(68.0),
+                    upper_pitch_deg: p.upper_pitch_deg.unwrap_or(25.0),
+                    break_run_mm: p.break_run_mm.unwrap_or(1300.0),
+                    gables: p.gables.unwrap_or_default(),
+                    straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                    overhang_mm: p.overhang_mm.unwrap_or(0.0),
+                    verge_mm: p.verge_mm.unwrap_or(0.0),
+                    thickness_mm: p.thickness_mm.unwrap_or(0.0),
+                    gutters: p.gutters.unwrap_or(false),
+                    dormers: p.dormers.unwrap_or_default(),
+                    covering: p.covering,
+                },
+            }
+        }
+        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat, pitched or mansard")).into()),
     };
     b.roof = roof;
     if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {

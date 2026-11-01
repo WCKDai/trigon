@@ -185,11 +185,14 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
             return;
         }
         meshes.push(json!({"name": name, "primitives": prims}));
-        nodes.push(json!({"name": name, "mesh": meshes.len() - 1}));
+        nodes.push(json!({"name": name, "mesh": meshes.len() - 1,"extras":{"trigon_id":name}}));
     };
 
     for b in built {
-        for wall in &b.walls {
+        if let Some(terrain) = &b.terrain {
+            add(&mut w, "site.terrain", &[(Material::Ground, terrain)]);
+        }
+        for wall in b.exterior_walls() {
             add(&mut w, &wall.id, &[(wall.finish, &wall.mesh), (Material::Plinth, &wall.plinth), (Material::Render, &wall.trim)]);
             let elements = wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments);
             for e in elements {
@@ -205,7 +208,18 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
             add(&mut w, &s.id, &[(m, &s.mesh)]);
         }
         if let Some(r) = &b.roof {
-            add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables), (Material::Steel, &r.gutters)]);
+            let mut parts = vec![(Material::Roof, &r.cover), (Material::Steel, &r.gutters)];
+            if r.gable_parts.is_empty() {
+                parts.insert(1, (Material::Wall, &r.gables));
+            } else {
+                parts.extend(r.gable_parts.iter().map(|(m, mesh)| (*m, mesh)));
+            }
+            parts.extend(r.covering.iter().map(|(m, mesh)| (*m, mesh)));
+            add(&mut w, &r.id, &parts);
+            for d in &r.dormers {
+                add(&mut w, &format!("{}.roof", d.id), &[(Material::Steel, &d.roof)]);
+                add(&mut w, &format!("{}.cheeks", d.id), &[(Material::Steel, &d.cheeks)]);
+            }
         }
         for iw in &b.interior {
             add(&mut w, &iw.id, &[(Material::Plaster, &iw.mesh)]);
@@ -228,7 +242,9 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
     }
     for o in site {
         if let Some(node) = nodes.iter_mut().find(|n| n["name"] == o.id) {
-            node["extras"] = json!({"trigon_source":o.source,"phase_status":o.status.name(),"exchange_classification":format!("Trigon {} (presentation geometry)",o.class.name())});
+            node["extras"]["trigon_source"] = json!(o.source);
+            node["extras"]["phase_status"] = json!(o.status.name());
+            node["extras"]["exchange_classification"] = json!(format!("Trigon {} (presentation geometry)", o.class.name()));
         }
     }
     // Keep all legacy indices stable and include every appended material actually referenced.
@@ -307,6 +323,26 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
 mod tests {
     use super::*;
     use trigon_model::{Building, Document, build};
+
+    #[test]
+    fn site_sources_keep_mesh_identity_required_by_rendering_exchange() {
+        let doc: Document = serde_json::from_str(include_str!("../../model/tests/fixtures/courtyard.trigon")).unwrap();
+        let built = build(&doc).unwrap();
+        let site = trigon_model::site::build(&doc, trigon_model::build::View::latest(&doc), None).unwrap();
+        assert!(!site.is_empty());
+        let bytes = write_with_site(&built, &site, &[]);
+        let (glb, _) = parse(&bytes);
+        let nodes = glb["nodes"].as_array().unwrap();
+        for node in nodes.iter().filter(|node| node.get("mesh").is_some()) {
+            assert_eq!(node["extras"]["trigon_id"], node["name"], "every mesh needs its exact source identity for FBX: {}", node["name"]);
+        }
+        for source in site {
+            let node = nodes.iter().find(|node| node["name"] == source.id).unwrap();
+            assert_eq!(node["extras"]["trigon_source"], serde_json::to_value(source.source).unwrap());
+            assert_eq!(node["extras"]["phase_status"], source.status.name());
+            assert!(node["extras"]["exchange_classification"].as_str().unwrap().contains(source.class.name()));
+        }
+    }
 
     fn parse(bytes: &[u8]) -> (Value, &[u8]) {
         assert_eq!(&bytes[..4], b"glTF");

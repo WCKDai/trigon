@@ -276,7 +276,7 @@ fn centroid(p: &[[f64; 3]]) -> [f64; 3] {
 pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
     let mut up = Vec::new();
     let mut down = Vec::new();
-    for face in components(&r.cover, false) {
+    for face in components(&r.cover, false).into_iter().filter(|_| !r.compound) {
         let Some(polygon) = outline(&face) else { continue };
         // Which way the face looks, from its triangles; the outline is turned to run
         // counter-clockwise seen from above.
@@ -517,7 +517,10 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
     };
     let kind_of = |e: &BuiltElement| doc.component(&e.type_id).ok().map(|t| t.kind.clone());
     for b in built {
-        for w in &b.walls {
+        if let Some(terrain) = &b.terrain {
+            out.push(("site.terrain".into(), terrain.clone()));
+        }
+        for w in b.exterior_walls() {
             for seg in &w.segments {
                 out.push((seg.id.clone(), seg.mesh.clone()));
             }
@@ -542,11 +545,21 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
             out.push((s.id.clone(), s.mesh.clone()));
         }
         if let Some(r) = &b.roof {
+            if r.compound {
+                out.push((r.id.clone(), r.cover.clone()));
+            }
             for p in roof(r, &b.walls) {
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
             out.extend(gutters(r));
             out.extend(downpipes(r));
+            for (material, mesh) in &r.covering {
+                out.push((format!("{}.covering.{}", r.id, material.name()), mesh.clone()));
+            }
+            for d in &r.dormers {
+                out.push((format!("{}.roof", d.id), d.roof.clone()));
+                out.push((format!("{}.cheeks", d.id), d.cheeks.clone()));
+            }
         }
         for iw in &b.interior {
             out.push((iw.id.clone(), iw.mesh.clone()));
@@ -554,7 +567,7 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((d.fill.id.clone(), merged(&d.fill.parts)));
             }
         }
-        for w in &b.walls {
+        for w in b.exterior_walls() {
             out.push((format!("{}.plinth", w.id), w.plinth.clone()));
             out.push((format!("{}.trim", w.id), w.trim.clone()));
         }

@@ -240,6 +240,9 @@ pub fn validate(doc: &Document) -> Result<()> {
     let mut vertices = 0usize;
     let mut ids = BTreeSet::new();
     for o in &doc.site_objects {
+        if doc.terrain.is_some() && o.id == "site.terrain" {
+            return Err(invalid("site.terrain is reserved while a terrain grid is defined"));
+        }
         if !ids.insert(&o.id) {
             return Err(invalid("site IDs must be unique"));
         }

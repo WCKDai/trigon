@@ -57,7 +57,7 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
     };
     for b in built {
         let walls = next();
-        for w in &b.walls {
+        for w in b.exterior_walls() {
             let element = Element::new(&w.id, DrawingElementKind::FacadeWall);
             out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, Role::Seen, Some(element.clone())));
             for seg in &w.segments {
@@ -83,8 +83,35 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
         if let Some(r) = &b.roof {
             let element = Some(Element::new(&r.id, DrawingElementKind::Roof));
             out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both, element.clone()));
-            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both, element.clone()));
+            if r.gable_parts.is_empty() {
+                out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both, element.clone()));
+            } else {
+                for (material, mesh) in &r.gable_parts {
+                    out.push(part(mesh, Class::Wall, walls, *material, Role::Both, element.clone()));
+                }
+            }
+            for (material, mesh) in &r.covering {
+                out.push(part(mesh, Class::Roof, next(), *material, Role::Both, element.clone()));
+            }
             out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both, element));
+            for d in &r.dormers {
+                out.push(part(
+                    &d.roof,
+                    Class::Roof,
+                    next(),
+                    Material::Steel,
+                    Role::Both,
+                    Some(Element::new(&format!("{}.roof", d.id), DrawingElementKind::Roof)),
+                ));
+                out.push(part(
+                    &d.cheeks,
+                    Class::Wall,
+                    next(),
+                    Material::Steel,
+                    Role::Both,
+                    Some(Element::new(&format!("{}.cheeks", d.id), DrawingElementKind::FacadeWall)),
+                ));
+            }
         }
         if inside {
             for s in &b.slabs {

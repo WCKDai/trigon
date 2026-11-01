@@ -198,12 +198,21 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             let Some(seg) = w.segment(level) else { continue };
             let d = seg.thickness;
             // Openings crossing the cut, by position along the wall.
-            let mut cuts: Vec<_> = w.openings.iter().filter(|o| o.rect.v0 <= cut && o.rect.v1 >= cut).collect();
-            cuts.sort_by(|x, y| x.rect.u0.total_cmp(&y.rect.u0));
+            let mut cuts: Vec<_> = w
+                .openings
+                .iter()
+                .filter_map(|o| {
+                    if o.rect.v0 > cut || o.rect.v1 < cut {
+                        return None;
+                    }
+                    let (u0, u1) = if o.profile.is_empty() { (o.rect.u0, o.rect.u1) } else { trigon_model::profile::width_at(&o.profile, cut)? };
+                    (u1 - u0 > 1e-8).then_some((o, u0, u1))
+                })
+                .collect();
+            cuts.sort_by(|x, y| x.1.total_cmp(&y.1));
             let [a, e, qe, qs] = seg.plan;
             let mut start = (a, qs);
-            for o in &cuts {
-                let (u0, u1) = (o.rect.u0, o.rect.u1);
+            for &(o, u0, u1) in &cuts {
                 elements.insert(prims.len(), Element::new(&w.id, DrawingElementKind::FacadeWall));
                 prims.push(Prim::Poly { pts: vec![start.0, pt(fr, u0, 0.0), pt(fr, u0, d), start.1], fill: WALL, surface: Surface::Exterior });
                 start = (pt(fr, u1, 0.0), pt(fr, u1, d));
@@ -223,7 +232,9 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     prims.push(Prim::Line { a: pt(fr, hinge, d * 0.5), b: pt(fr, other, d * 0.5), color, width: 45.0, dashed: false });
                 };
                 match kind {
-                    Some(ComponentKind::Window { .. } | ComponentKind::FixedWindow) => window(&mut prims, u0, u1),
+                    Some(ComponentKind::Window { .. } | ComponentKind::HistoricWindow { .. } | ComponentKind::FixedWindow) => {
+                        window(&mut prims, u0, u1)
+                    }
                     Some(ComponentKind::Loggia { depth, door_width, door_side, .. }) => {
                         // Open to the cut: brick returns, the glazing set back, a rail across the parapet.
                         let back = depth.max(d + 300.0);
@@ -298,7 +309,12 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let centre = (r.rect.u0 + r.rect.u1) / 2.0;
                 let (u0, u1) = (centre - slab_width / 2.0, centre + slab_width / 2.0);
                 let color = status_color(status, LINE);
-                let corners = [pt(fr, u0, 0.0), pt(fr, u1, 0.0), pt(fr, u1, -depth), pt(fr, u0, -depth)];
+                let shaped = matches!(r.ty.kind, ComponentKind::ShapedBalcony { .. });
+                let corners = if let ComponentKind::ShapedBalcony { ref plan, .. } = r.ty.kind {
+                    plan.outline(slab_width, depth)?.iter().map(|p| pt(fr, centre + p[0], -p[1])).collect::<Vec<_>>()
+                } else {
+                    vec![pt(fr, u0, 0.0), pt(fr, u1, 0.0), pt(fr, u1, -depth), pt(fr, u0, -depth)]
+                };
                 let prefix = if r.is_opening() {
                     format!("{}.L{}.B{}", w.id, level, r.placement.bay)
                 } else {
@@ -372,11 +388,27 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 }
                 let detail_start = prims.len();
                 let dashed = status == Status::Demolished;
-                for k in 0..4 {
-                    prims.push(Prim::Line { a: corners[k], b: corners[(k + 1) % 4], color, width: 30.0, dashed });
+                for k in 0..corners.len() {
+                    prims.push(Prim::Line { a: corners[k], b: corners[(k + 1) % corners.len()], color, width: 30.0, dashed });
                 }
                 let mut detail_end = prims.len();
-                if presentation && status != Status::Demolished {
+                if presentation && status != Status::Demolished && shaped {
+                    if let ComponentKind::ShapedBalcony { ref plan, .. } = r.ty.kind {
+                        let path = plan.guard_path(slab_width, depth)?;
+                        for pair in path.windows(2) {
+                            rail_indices.push(prims.len());
+                            prims.push(Prim::Line {
+                                a: pt(fr, centre + pair[0][0], -pair[0][1]),
+                                b: pt(fr, centre + pair[1][0], -pair[1][1]),
+                                color,
+                                width: 14.0,
+                                dashed: false,
+                            });
+                        }
+                    }
+                    detail_end = prims.len();
+                }
+                if presentation && status != Status::Demolished && !shaped {
                     // The deck and perimeter rail are separate from the cut wall.
                     for (edge, v) in [70.0, depth - 70.0].into_iter().enumerate() {
                         if edge == 1 {
@@ -1220,6 +1252,63 @@ pub(crate) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_opening_plan_cuts_and_picking_follow_the_actual_profile() {
+        let mut doc = Document::default();
+        let mut b = trigon_model::Building::new("b", "Round plan fixture", &[[0., 0.], [9000., 0.], [9000., 6000.], [0., 6000.]], 1, 3000.).unwrap();
+        b.facades[0].bays = vec![4500.0];
+        b.facades[0].placements = serde_json::from_value(json!([{"level":0,"bay":0,"type":"round"}])).unwrap();
+        doc.buildings.push(b);
+        doc.types.push(
+            serde_json::from_value(json!({"id":"round","name":"Round window","width":700,"height":700,"sill":850,
+            "kind":{"family":"historic_window","shape":{"kind":"round"},"operable":false}}))
+            .unwrap(),
+        );
+        doc.views.push(serde_json::from_value(json!({"id":"plan","name":"Plan","kind":{"view":"plan","level":0}})).unwrap());
+        for sill in [850.0, 1000.0, 1750.0, 300.0] {
+            doc.types.last_mut().unwrap().sill = sill;
+            let built = build_view(&doc, View::latest(&doc)).unwrap();
+            let opening = &built[0].walls[0].openings[0];
+            let (prims, _, _) = scene(&doc, 0, View::latest(&doc), true).unwrap();
+            let windows: Vec<_> = prims
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Line { a, b, width, .. } if *width == 25.0 => Some([*a, *b]),
+                    _ => None,
+                })
+                .collect();
+            let preview = crate::drawing_view(&doc, "plan", View::latest(&doc)).unwrap();
+            if sill == 850.0 {
+                assert_eq!(windows.len(), 2);
+                let (left, right) = trigon_model::profile::width_at(&opening.profile, CUT).unwrap();
+                let analytic = 2.0 * (350.0_f64.powi(2) - 200.0_f64.powi(2)).sqrt();
+                assert!((right - left - analytic).abs() < 2.0, "48-chord profile must agree with the analytic circular opening");
+                for end in [left, right] {
+                    assert!(
+                        prims.iter().any(|p| matches!(p, Prim::Poly {pts,surface:Surface::Exterior,..}
+                        if pts.iter().any(|p|(p[0]-end).abs()<1e-8 && p[1].abs()<1e-8))),
+                        "the actual masonry outline must end at the same horizontal cut as the symbol"
+                    );
+                }
+                for [a, b] in windows {
+                    assert!(
+                        (a[0] - left).abs() < 1e-8 && (b[0] - right).abs() < 1e-8,
+                        "plan window must use the actual horizontal cut span, not nominal width"
+                    );
+                }
+                assert_eq!(preview.pick_element([4500.0, 0.0], 0.01).unwrap().id, "b.f1.L0.B0");
+            } else {
+                assert!(windows.is_empty(), "a tangent or noncrossing profile must not remove a full-width hole at sill {sill}");
+                assert!(!preview.element_segments.iter().any(|e| e.id == "b.f1.L0.B0"));
+            }
+            assert_eq!(
+                preview.pick_element([4160.0, 0.0], 0.01).unwrap().id,
+                "b.f1",
+                "masonry at the nominal corner must remain pickable at sill {sill}"
+            );
+        }
+    }
 
     #[test]
     fn presentation_stairs_retain_model_detail_at_departure_and_receiving_storeys() {

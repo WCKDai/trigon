@@ -165,6 +165,14 @@ impl Ifc<'_> {
                 props.push(("SlabThickness", Val::Length(*thickness)));
                 props.push(("RailingHeight", Val::Length(first.height)));
             }
+            Some(ComponentKind::ShapedBalcony { depth, thickness, plan }) => {
+                props.push(("Depth", Val::Length(*depth)));
+                props.push(("SlabThickness", Val::Length(*thickness)));
+                props.push(("RailingHeight", Val::Length(first.height)));
+                if let Ok(value) = serde_json::to_string(plan) {
+                    props.push(("ParametricPlan", Val::Text(value)));
+                }
+            }
             _ => {}
         }
         if self.phases {

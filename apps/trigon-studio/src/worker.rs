@@ -228,6 +228,32 @@ mod tests {
     }
 
     #[test]
+    fn roof_dormer_scene_schedule_and_editable_properties_share_source_identity() {
+        use serde_json::json;
+        let mut s = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        s.doc.buildings.push(
+            trigon_model::Building::new("b", "Original dormer worker fixture", &[[0., 0.], [30000., 0.], [30000., 10000.], [0., 10000.]], 3, 3400.)
+                .unwrap(),
+        );
+        s.execute("types.install_copenhagen", json!({})).unwrap();
+        s.execute("building.set_roof",json!({"kind":"mansard","thickness_mm":220,"dormers":[{"id":"test","facade":"b.f1","u_mm":15000,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}],"covering":{"lower":{"material":"slate"},"upper":{"material":"felt"}}})).unwrap();
+        let before = s.doc.clone();
+        let prepared = run(&job(s.doc.clone(), None)).scene.unwrap().unwrap();
+        assert_eq!(prepared.schedule.totals.windows, 1);
+        for id in ["b.dormer.test.window", "b.dormer.test.front", "b.dormer.test.roof", "b.dormer.test.cheeks"] {
+            assert!(prepared.scene.elements.iter().any(|e| e.id == id));
+            assert!(prepared.properties.iter().any(|p| p["id"] == id && p["editable"] == true));
+        }
+        assert!(prepared.scene.vertices.iter().all(|v| v.is_finite()));
+        assert!(crate::schedules::resolve_row(&prepared.scene, &prepared.schedule.rows[0]).is_ok());
+        s.execute("element.set", json!({"id":"b.dormer.test.window","properties":{"height_mm":1100}})).unwrap();
+        assert_ne!(run(&job(s.doc.clone(), None)).scene.unwrap().unwrap().scene.vertices, prepared.scene.vertices);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(run(&job(s.doc, None)).scene.unwrap().unwrap().scene.vertices, prepared.scene.vertices);
+    }
+
+    #[test]
     fn drawing_picks_resolve_in_the_scene_and_drive_the_shared_undoable_edit() {
         use serde_json::json;
         use trigon_engine::{DrawingElementKind, Session};

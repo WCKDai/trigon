@@ -32,6 +32,7 @@ pub(crate) struct Set {
 #[derive(Clone)]
 enum Source {
     Site(usize),
+    Terrain,
     Facade(usize, usize),
     Placement(usize, usize, usize),
     Interior(usize, usize, usize),
@@ -41,6 +42,7 @@ enum Source {
     Cellar(usize, usize, bool),
     Slab(usize, usize, bool),
     Roof(usize),
+    Dormer(usize, usize),
     Building(usize),
 }
 
@@ -129,6 +131,7 @@ fn component_properties(ty: &trigon_model::ComponentType) -> Vec<Value> {
     let mut result = Vec::new();
     let depth = match ty.kind {
         ComponentKind::GuardRail { projection, handrail, .. } => Some((projection, if handrail { 35.0 } else { 20.0 }, 3000.0)),
+        ComponentKind::ShapedBalcony { depth, .. } => Some((depth, 400.0, 3000.0)),
         ComponentKind::Loggia { depth, .. } => Some((depth, 300.0, 4000.0)),
         _ => ty.kind.depth().map(|depth| (depth, 300.0, 3000.0)),
     };
@@ -146,8 +149,12 @@ fn component_properties(ty: &trigon_model::ComponentType) -> Vec<Value> {
     if let ComponentKind::Balcony { slab_width, .. } = &ty.kind {
         result.push(number("slab_width_mm", "Slab width (this assembly)", *slab_width, "mm", ty.width, 12000.0));
     }
-    if let ComponentKind::BalconySlab { thickness, .. } = &ty.kind {
-        result.push(number("slab_thickness_mm", "Slab thickness (this assembly)", *thickness, "mm", 60.0, 400.0));
+    if let ComponentKind::BalconySlab { thickness, .. } | ComponentKind::ShapedBalcony { thickness, .. } = &ty.kind {
+        let min = if matches!(ty.kind, ComponentKind::ShapedBalcony { .. }) { 80.0 } else { 60.0 };
+        result.push(number("slab_thickness_mm", "Slab thickness (this assembly)", *thickness, "mm", min, 400.0));
+    }
+    if let ComponentKind::ShapedBalcony { plan, .. } = &ty.kind {
+        result.push(field("balcony_plan", "Convex parametric plan", json!(plan), true));
     }
     result
 }
@@ -157,6 +164,28 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
     for model in built {
         let bi = doc.buildings.iter().position(|b| b.id == model.building_id).ok_or_else(|| invalid("built building has no document source"))?;
         let building = &doc.buildings[bi];
+        if model.terrain.is_some()
+            && let Some(t) = &doc.terrain
+        {
+            let mut terrain = record(
+                "site.terrain",
+                "terrain",
+                building,
+                (None, Status::Existing),
+                Source::Terrain,
+                vec![
+                    field("origin_mm", "Grid origin (mm)", json!(t.origin), false),
+                    field("spacing_mm", "Sample spacing (mm)", json!(t.spacing_mm), false),
+                    field("rows", "Grid rows", t.heights_mm.len(), false),
+                    field("columns", "Grid columns", t.heights_mm.first().map_or(0, Vec::len), false),
+                    field("source", "Source", json!(t.source), false),
+                ],
+                Vec::new(),
+            );
+            terrain.data["editable"] = json!(false);
+            terrain.data["reason"] = json!("Terrain is edited as a complete height grid.");
+            result.push(terrain);
+        }
         for wall in &model.walls {
             let Some(fi) = building.facades.iter().position(|f| f.id == wall.id) else {
                 result.push(record(
@@ -284,11 +313,15 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                 let u = placement.u.or_else(|| facade.bays.get(placement.bay).copied()).ok_or_else(|| invalid("placement has no bay centre"))?;
                 let floor = building.storeys.get(placement.level).ok_or_else(|| invalid("placement has no storey"))?.elevation;
                 let assembly = if owner != element.id { " (host assembly)" } else { "" };
-                let height_bounds = if matches!(ty.kind, ComponentKind::GuardRail { .. }) { [900.0, 1500.0] } else { [300.0, 4000.0] };
+                let (min_width, min_height, max_height) = match ty.kind {
+                    ComponentKind::GuardRail { .. } => (300.0, 900.0, 1500.0),
+                    ComponentKind::ShapedBalcony { .. } => (600.0, 900.0, 1500.0),
+                    _ => (300.0, 300.0, 4000.0),
+                };
                 let handle_depth = if let ComponentKind::GuardRail { projection, .. } = ty.kind { -projection } else { 120.0 };
                 let mut properties = vec![
-                    number("width_mm", format!("Width{assembly}"), width, "mm", 300.0, 6000.0),
-                    number("height_mm", format!("Height{assembly}"), height, "mm", height_bounds[0], height_bounds[1]),
+                    number("width_mm", format!("Width{assembly}"), width, "mm", min_width, 6000.0),
+                    number("height_mm", format!("Height{assembly}"), height, "mm", min_height, max_height),
                     number("sill_mm", format!("Sill / base above floor{assembly}"), sill, "mm", -floor, 3000.0),
                     number("u_mm", format!("Centre along facade{assembly}"), u, "mm", 0.0, wall.frame.length),
                     choice(
@@ -308,7 +341,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                         wall.frame.point(u + width / 2.0, handle_depth, floor + sill + height / 2.0),
                         [wall.frame.t[0], wall.frame.t[1], 0.0],
                         width,
-                        [300.0, 6000.0],
+                        [min_width, 6000.0],
                         2.0,
                     ),
                     handle(
@@ -317,7 +350,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                         wall.frame.point(u, handle_depth, floor + sill + height),
                         [0.0, 0.0, 1.0],
                         height,
-                        height_bounds,
+                        [min_height, max_height],
                         1.0,
                     ),
                     handle("sill_mm", "Sill / base", wall.frame.point(u, handle_depth, floor + sill), [0.0, 0.0, 1.0], sill, [-floor, 3000.0], 1.0),
@@ -482,6 +515,38 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
         }
         if let Some(roof) = &model.roof {
             result.push(roof_record(building, bi, &roof.id, None)?);
+            if let trigon_model::Roof::Mansard { parameters } = &building.roof {
+                for (di, d) in roof.dormers.iter().enumerate() {
+                    let Some(spec) = parameters.dormers.get(di) else { continue };
+                    let properties = vec![
+                        number("width_mm", "Dormer window width", spec.width_mm, "mm", 300.0, 3000.0),
+                        number("height_mm", "Dormer window height", spec.height_mm, "mm", 300.0, 2200.0),
+                        number("u_mm", "Centre along host facade", spec.u_mm, "mm", 0.0, 1e8),
+                        number("setback_mm", "Front setback from wall", spec.setback_mm, "mm", 100.0, 1500.0),
+                        number("cheek_mm", "Side cheek thickness", spec.cheek_mm, "mm", 50.0, 200.0),
+                        number("head_mm", "Head above window", spec.head_mm, "mm", 50.0, 400.0),
+                        number("sill_clearance_mm", "Sill above host roof at rear lining", spec.sill_clearance_mm, "mm", 20.0, 300.0),
+                        number("roof_pitch_deg", "Shed roof pitch", spec.roof_pitch_deg, "deg", 0.0, 15.0),
+                        number("roof_thickness_mm", "Shed roof normal thickness", spec.roof_thickness_mm, "mm", 20.0, 200.0),
+                        field("window_type", "Window family", spec.window_type.clone(), true),
+                        field("source_scope", "Edit scope", "This parametric roof dormer", false),
+                    ];
+                    for id in [d.front.id.clone(), format!("{}.roof", d.id), format!("{}.cheeks", d.id)]
+                        .into_iter()
+                        .chain(d.front.openings.iter().map(|o| o.fill.id.clone()))
+                    {
+                        result.push(record(
+                            &id,
+                            "roof dormer",
+                            building,
+                            (None, Status::Existing),
+                            Source::Dormer(bi, di),
+                            properties.clone(),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
         }
         for (ri, room) in building.rooms.iter().enumerate() {
             for &level in &room.levels {
@@ -540,8 +605,12 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
     let mut properties = vec![choice(
         "roof_kind",
         "Roof kind",
-        if matches!(building.roof, trigon_model::roof::Roof::Flat) { "flat" } else { "pitched" },
-        json!(["flat", "pitched"]),
+        match building.roof {
+            trigon_model::Roof::Flat => "flat",
+            trigon_model::Roof::Pitched { .. } => "pitched",
+            trigon_model::Roof::Mansard { .. } => "mansard",
+        },
+        json!(["flat", "pitched", "mansard"]),
     )];
     match &building.roof {
         trigon_model::roof::Roof::Flat => {
@@ -557,6 +626,21 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("gutters", "Gutters", *gutters, true),
                 field("gables", "Gable facade IDs", json!(gables), true),
                 field("drainage", "Optional drainage detail / explicit downpipes", json!(drainage), true),
+            ]);
+        }
+        trigon_model::Roof::Mansard { parameters: p } => {
+            properties.extend([
+                number("lower_pitch_deg", "Lower roof pitch", p.lower_pitch_deg, "deg", 40.0, 80.0),
+                number("upper_pitch_deg", "Upper roof pitch", p.upper_pitch_deg, "deg", 5.0, 45.0),
+                number("break_run_mm", "Horizontal run to slope break", p.break_run_mm, "mm", 200.0, 10000.0),
+                number("overhang_mm", "Eave overhang", p.overhang_mm, "mm", 0.0, 2000.0),
+                number("verge_mm", "Verge overhang", p.verge_mm, "mm", 0.0, 1500.0),
+                number("thickness_mm", "Roof build-up normal to each slope", p.thickness_mm, "mm", 0.0, 1000.0),
+                number("straighten_mm", "Eave straightening", p.straighten_mm, "mm", 0.0, 10000.0),
+                field("gutters", "Half-round gutters", p.gutters, true),
+                field("gables", "Gable facade IDs", json!(p.gables), true),
+                field("dormers", "Parametric roof dormers", json!(p.dormers), true),
+                field("covering", "Lower/upper roof covering", json!(p.covering), true),
             ]);
         }
     }
@@ -711,6 +795,7 @@ fn ensure_definition_id(doc: &mut Document, bi: usize, index: usize, kind: &str)
 fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Value>, selected_id: &str) -> Result<String> {
     match *source {
         Source::Site(index) => crate::site::apply(doc, index, properties),
+        Source::Terrain => Err(invalid("terrain is edited as a complete height grid")),
         Source::Facade(bi, fi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
             let edge = b.facades.get(fi).ok_or_else(|| invalid("missing facade"))?.edge;
@@ -756,7 +841,9 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             let placement = facade.placements.get(pi).ok_or_else(|| invalid("missing placement"))?;
             let id = format!("placement:{}:{pi}", facade.id);
             let original_type = doc.component(&placement.type_id)?.clone();
-            let custom = properties.keys().any(|k| matches!(k.as_str(), "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm"));
+            let custom = properties
+                .keys()
+                .any(|k| matches!(k.as_str(), "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" | "balcony_plan"));
             if custom && properties.contains_key("type") {
                 return Err(invalid("change the component type separately from its assembly parameters"));
             }
@@ -770,6 +857,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             ComponentKind::Balcony { depth, .. }
                             | ComponentKind::BalconySlab { depth, .. }
                             | ComponentKind::SteelBalcony { depth, .. }
+                            | ComponentKind::ShapedBalcony { depth, .. }
                             | ComponentKind::Loggia { depth, .. }
                             | ComponentKind::GuardRail { projection: depth, .. },
                         ) => *depth = n()?,
@@ -780,7 +868,13 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             | ComponentKind::Loggia { rail_height, .. },
                         ) => *rail_height = n()?,
                         ("slab_width_mm", ComponentKind::Balcony { slab_width, .. }) => *slab_width = n()?,
-                        ("slab_thickness_mm", ComponentKind::BalconySlab { thickness, .. }) => *thickness = n()?,
+                        ("slab_thickness_mm", ComponentKind::BalconySlab { thickness, .. } | ComponentKind::ShapedBalcony { thickness, .. }) => {
+                            *thickness = n()?
+                        }
+                        ("balcony_plan", ComponentKind::ShapedBalcony { plan, .. }) => {
+                            *plan = serde_json::from_value(value.clone()).map_err(|_| invalid("balcony_plan requires a typed convex balcony plan"))?
+                        }
+                        ("balcony_plan", _) => return Err(invalid("balcony_plan requires a shaped balcony")),
                         _ => {}
                     }
                 }
@@ -810,7 +904,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "sill_mm" => p.sill = Some(numeric(key, value)?),
                         "u_mm" => p.u = Some(numeric(key, value)?),
                         "type" => p.type_id = text(key, value)?,
-                        "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" => {}
+                        "depth_mm" | "rail_height_mm" | "slab_width_mm" | "slab_thickness_mm" | "balcony_plan" => {}
                         _ => return Err(invalid("unknown placement property")),
                     }
                 }
@@ -965,12 +1059,34 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             b.ground_floor = checked("ground floor elevation", b.storeys.get(b.ground_level).map_or(b.ground_floor, |s| s.elevation), 0.0, 300000.0)?;
             Ok(selected_id.to_string())
         }
+        Source::Dormer(bi, di) => {
+            let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing dormer building"))?;
+            let trigon_model::Roof::Mansard { parameters } = &mut b.roof else { return Err(invalid("dormers require a mansard roof")) };
+            let d = parameters.dormers.get_mut(di).ok_or_else(|| invalid("missing roof dormer"))?;
+            for (key, value) in properties {
+                match key.as_str() {
+                    "width_mm" => d.width_mm = numeric(key, value)?,
+                    "height_mm" => d.height_mm = numeric(key, value)?,
+                    "u_mm" => d.u_mm = numeric(key, value)?,
+                    "setback_mm" => d.setback_mm = numeric(key, value)?,
+                    "cheek_mm" => d.cheek_mm = numeric(key, value)?,
+                    "head_mm" => d.head_mm = numeric(key, value)?,
+                    "sill_clearance_mm" => d.sill_clearance_mm = numeric(key, value)?,
+                    "roof_pitch_deg" => d.roof_pitch_deg = numeric(key, value)?,
+                    "roof_thickness_mm" => d.roof_thickness_mm = numeric(key, value)?,
+                    "window_type" => d.window_type = text(key, value)?,
+                    _ => return Err(invalid("unknown roof dormer property")),
+                }
+            }
+            d.validate()?;
+            Ok(selected_id.to_string())
+        }
         Source::Roof(bi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
             if let Some(kind) = properties.get("roof_kind") {
                 match kind.as_str() {
                     Some("flat") => b.roof = trigon_model::roof::Roof::Flat,
-                    Some("pitched") if matches!(b.roof, trigon_model::roof::Roof::Flat) => {
+                    Some("pitched") if !matches!(b.roof, trigon_model::roof::Roof::Pitched { .. }) => {
                         b.roof = trigon_model::roof::Roof::Pitched {
                             pitch_deg: 35.0,
                             gables: Vec::new(),
@@ -983,6 +1099,10 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         }
                     }
                     Some("pitched") => {}
+                    Some("mansard") if !matches!(b.roof, trigon_model::Roof::Mansard { .. }) => {
+                        b.roof = trigon_model::Roof::Mansard { parameters: trigon_model::roof::Mansard::default() };
+                    }
+                    Some("mansard") => {}
                     _ => return Err(invalid("unknown roof kind")),
                 }
             }
@@ -1023,6 +1143,31 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "gutters" => *gutters = boolean(key, value)?,
                         "drainage" => *drainage = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("drainage: {e}")))?,
                         _ => return Err(invalid("unknown roof property")),
+                    },
+                    trigon_model::Roof::Mansard { parameters: p } => match key.as_str() {
+                        "covering" => {
+                            p.covering =
+                                serde_json::from_value(value.clone()).map_err(|_| invalid("covering requires typed lower and upper roof surfaces"))?
+                        }
+                        "lower_pitch_deg" => p.lower_pitch_deg = numeric(key, value)?,
+                        "upper_pitch_deg" => p.upper_pitch_deg = numeric(key, value)?,
+                        "break_run_mm" => p.break_run_mm = numeric(key, value)?,
+                        "straighten_mm" => p.straighten_mm = numeric(key, value)?,
+                        "overhang_mm" => p.overhang_mm = numeric(key, value)?,
+                        "verge_mm" => p.verge_mm = numeric(key, value)?,
+                        "thickness_mm" => p.thickness_mm = numeric(key, value)?,
+                        "gutters" => p.gutters = boolean(key, value)?,
+                        "dormers" => {
+                            p.dormers = serde_json::from_value(value.clone()).map_err(|_| invalid("dormers requires typed dormer parameters"))?
+                        }
+                        "gables" => {
+                            let ids: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| invalid("gables must be facade IDs"))?;
+                            if ids.len() > 200 {
+                                return Err(invalid("at most 200 gables"));
+                            }
+                            p.gables = ids;
+                        }
+                        _ => return Err(invalid("unknown mansard roof property")),
                     },
                 }
             }

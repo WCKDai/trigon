@@ -37,7 +37,7 @@ pub struct OpeningScheduleRow {
     pub name: String,
     pub width_mm: f64,
     pub height_mm: f64,
-    /// Rectangular outer-lining area, as IFC base quantities. None for facade-hole dimensions.
+    /// Outer-lining profile area, as IFC base quantities. None for facade-hole dimensions.
     pub area_m2: Option<f64>,
     pub quantity_basis: OpeningQuantityBasis,
     pub status: String,
@@ -106,7 +106,8 @@ fn row(doc: &Document, building: &Built, host: &str, external: bool, fill: &Buil
         name: fill.name.clone(),
         width_mm,
         height_mm,
-        area_m2: (!loggia).then_some(width_mm * height_mm / 1e6),
+        area_m2: (!loggia)
+            .then(|| doc.component(&fill.type_id).map_or(width_mm * height_mm, |t| trigon_model::profile::area(&t.kind, width_mm, height_mm)) / 1e6),
         quantity_basis: if loggia { OpeningQuantityBasis::FacadeOpening } else { OpeningQuantityBasis::OuterLining },
         status: fill.status.name().into(),
         external,
@@ -118,7 +119,7 @@ fn row(doc: &Document, building: &Built, host: &str, external: bool, fill: &Buil
 pub fn opening_schedule_from_built(doc: &Document, buildings: &[Built]) -> Result<OpeningSchedule> {
     let mut schedule = OpeningSchedule::default();
     for building in buildings {
-        for wall in &building.walls {
+        for wall in building.exterior_walls() {
             for opening in &wall.openings {
                 schedule.rows.push(row(doc, building, &wall.id, true, &opening.fill)?);
             }

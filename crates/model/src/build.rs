@@ -11,6 +11,8 @@ use crate::mesh::{Material, Mesh};
 use crate::walls::{Span, WallSegment};
 use crate::{ModelError, Result};
 
+mod balcony;
+mod dormer;
 mod opening;
 
 /// Window and door frames sit this far behind the outer wall face, mm.
@@ -171,6 +173,8 @@ pub struct BuiltOpening {
     pub id: String,
     pub level: usize,
     pub rect: Rect,
+    /// Actual convex outline for shaped openings; empty retains the legacy rectangle path.
+    pub profile: Vec<[f64; 2]>,
     /// The window or door filling the opening.
     pub fill: BuiltElement,
     /// Railings and balcony slabs that belong to the opening.
@@ -258,6 +262,9 @@ pub struct BuiltRoof {
     pub cover: Mesh,
     /// Vertical gable triangles above gable walls.
     pub gables: Mesh,
+    /// Opt-in compound roofs retain each gable's explicit host finish for display/export.
+    pub gable_parts: Vec<(Material, Mesh)>,
+    pub covering: Vec<(Material, Mesh)>,
     /// Gutters along the eaves.
     pub gutters: Mesh,
     /// Explicit detail assemblies, empty for legacy roofs.
@@ -265,6 +272,24 @@ pub struct BuiltRoof {
     pub eaves: f64,
     pub ridge: f64,
     pub pitch_deg: f64,
+    /// Multiple slopes/mitres require their actual shell in exchange, not one-plane extrusion.
+    pub compound: bool,
+    pub dormers: Vec<BuiltDormer>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltDormer {
+    pub id: String,
+    pub front: BuiltWall,
+    pub cheeks: Mesh,
+    pub roof: Mesh,
+}
+
+impl Built {
+    /// Facade walls and roof-dormer fronts share the same opening/export contracts.
+    pub fn exterior_walls(&self) -> impl Iterator<Item = &BuiltWall> {
+        self.walls.iter().chain(self.roof.iter().flat_map(|r| r.dormers.iter().map(|d| &d.front)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +303,8 @@ pub struct Built {
     pub roof: Option<BuiltRoof>,
     pub interior: Vec<BuiltInterior>,
     pub stairs: Vec<BuiltStair>,
+    /// Site terrain is carried once, on the first building, for shared display/exchange.
+    pub terrain: Option<Mesh>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,7 +339,14 @@ pub fn build_cut(doc: &Document, view: View, cut: Option<f64>) -> Result<Vec<Bui
         crate::checked("cut height", z, -50_000.0, 500_000.0)?;
     }
     crate::site::validate(doc)?;
-    doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect()
+    let mut built: Vec<_> = doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect::<Result<_>>()?;
+    if let Some(terrain) = &doc.terrain {
+        let first = built.first_mut().ok_or_else(|| ModelError::Invalid("terrain needs a building site".into()))?;
+        let mesh = terrain.mesh(&doc.buildings)?;
+        let mesh = if let Some(z) = cut { mesh.below(z) } else { mesh };
+        first.terrain = (!mesh.is_empty()).then_some(mesh);
+    }
+    Ok(built)
 }
 
 fn clip_element(mut e: BuiltElement, cut: Option<f64>) -> BuiltElement {
@@ -417,7 +451,7 @@ impl Resolved {
 /// Underside of an attachment below its storey's floor, mm.
 fn attachment_drop(kind: &ComponentKind) -> f64 {
     match kind {
-        ComponentKind::BalconySlab { thickness, .. } => *thickness,
+        ComponentKind::BalconySlab { thickness, .. } | ComponentKind::ShapedBalcony { thickness, .. } => *thickness,
         ComponentKind::SteelBalcony { .. } => STEEL_FRAME,
         _ => 0.0,
     }
@@ -630,10 +664,29 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         let cellars: Vec<_> = cellars.into_iter().filter(|(_, c, _, _)| !above(c.floor)).collect();
         holes.extend(cellars.iter().map(|(_, _, _, r)| *r));
         let unbuildable = || ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id));
-        let mesh = crate::walls::skin(&fr, &spans, &holes).ok_or_else(unbuildable)?;
+        let shaped = resolved.iter().any(|(r, _)| {
+            matches!(
+                r.ty.kind,
+                ComponentKind::HistoricWindow { shape: crate::component::WindowShape::Segmental { .. } | crate::component::WindowShape::Round, .. }
+            )
+        });
+        let profiles: Vec<_> = resolved
+            .iter()
+            .map(|(r, _)| crate::profile::opening(&r.ty.kind, r.rect))
+            .chain(cellars.iter().map(|(_, _, _, r)| crate::profile::outline(&crate::component::WindowShape::Rectangular, *r)))
+            .collect();
+        let mesh = if shaped { crate::walls::skin_profiles(&fr, &spans, &profiles) } else { crate::walls::skin(&fr, &spans, &holes) }
+            .ok_or_else(unbuildable)?;
         let segments = spans
             .iter()
-            .map(|s| crate::walls::segment(&fr, &format!("{}.L{}", f.id, s.level), s, &holes).ok_or_else(unbuildable))
+            .map(|s| {
+                if shaped {
+                    crate::walls::segment_profiles(&fr, &format!("{}.L{}", f.id, s.level), s, &profiles)
+                } else {
+                    crate::walls::segment(&fr, &format!("{}.L{}", f.id, s.level), s, &holes)
+                }
+                .ok_or_else(unbuildable)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let elevation_of = |r: &Resolved| b.storeys.get(r.placement.level).map_or(0.0, |s| s.elevation);
@@ -656,14 +709,11 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 o
             })
             .collect();
-        let mut attachments: Vec<BuiltElement> = shown
-            .iter()
-            .filter(|(r, _)| !r.is_opening())
-            .flat_map(|(r, status)| {
-                let id = format!("{}.L{}.B{}.balcony", f.id, r.placement.level, r.placement.bay);
-                attachment(&fr, &id, r, elevation_of(r), *status).into_iter().map(|e| clip_element(e, cut)).collect::<Vec<_>>()
-            })
-            .collect();
+        let mut attachments = Vec::new();
+        for (r, status) in shown.iter().filter(|(r, _)| !r.is_opening()) {
+            let id = format!("{}.L{}.B{}.balcony", f.id, r.placement.level, r.placement.bay);
+            attachments.extend(attachment(&fr, &id, r, elevation_of(r), *status)?.into_iter().map(|e| clip_element(e, cut)));
+        }
         let mut openings: Vec<BuiltOpening> = openings;
         for (id, c, level, rect) in &cellars {
             let at = Fill {
@@ -684,6 +734,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 status: Status::Existing,
             };
             openings.push(BuiltOpening {
+                profile: Vec::new(),
                 id: format!("{id}.opening"),
                 level: *level,
                 rect: *rect,
@@ -695,7 +746,17 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         }
         let plinth = match (&b.plinth, &plinth_line) {
             (Some(p), Some(line)) => {
-                let m = facing_piece(&fr, f, (a, e), line, p.projection.max(1.0), (-PLINTH_FOOT, p.height), &holes).ok_or_else(unbuildable)?;
+                let m = facing_piece(
+                    &fr,
+                    f,
+                    (a, e),
+                    line,
+                    p.projection.max(1.0),
+                    (-PLINTH_FOOT, p.height),
+                    &holes,
+                    shaped.then_some(profiles.as_slice()),
+                )
+                .ok_or_else(unbuildable)?;
                 match cut {
                     Some(z) => m.below(z),
                     None => m,
@@ -714,7 +775,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 if !(z1 - z0 >= 10.0) || above(z0) {
                     continue;
                 }
-                trim.append(&facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes).ok_or_else(unbuildable)?);
+                trim.append(
+                    &facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes, shaped.then_some(profiles.as_slice()))
+                        .ok_or_else(unbuildable)?,
+                );
             }
         }
         walls.push(BuiltWall {
@@ -820,7 +884,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             });
             None
         }
-        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage } => {
+        crate::roof::Roof::Pitched { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. }
+        | crate::roof::Roof::Mansard {
+            parameters: crate::roof::Mansard { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. },
+        } => {
             let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
@@ -844,28 +911,70 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
-            let mut r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            let (mut r, pitch_deg, compound) = match &b.roof {
+                crate::Roof::Pitched { pitch_deg, .. } => (crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?, *pitch_deg, false),
+                crate::Roof::Mansard { parameters } => (crate::roof::mansard(&outline, h, &edges, parameters)?, parameters.lower_pitch_deg, true),
+                crate::Roof::Flat => return Err(ModelError::Invalid("a sloping roof configuration is required".into())),
+            };
             let mut drain_parts = Vec::new();
-            if let Some(d) = drainage {
+            if let crate::Roof::Pitched { drainage: Some(d), .. } = &b.roof {
                 if !gutters {
                     return Err(ModelError::Invalid("detailed drainage requires gutters".into()));
                 }
                 let out = inner_ring_by(&outline, |k| if edges.contains(&k) { -*verge_mm } else { -*overhang_mm });
-                drain_parts = crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, *pitch_deg, &edges, d)?;
+                drain_parts = crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, pitch_deg, &edges, d)?;
                 r.gutters = Mesh::default();
                 for part in &drain_parts {
                     r.gutters.append(&part.mesh);
                 }
             }
+            let dormers = if let crate::Roof::Mansard { parameters } = &b.roof {
+                dormer::build(doc, b, &mut r.cover, &parameters.dormers)?
+            } else {
+                Vec::new()
+            };
+            let mut gable_parts = std::collections::BTreeMap::<Material, Mesh>::new();
+            if compound {
+                for tri in &r.gables.triangles {
+                    let points = tri.map(|i| r.gables.positions.get(i as usize).copied().unwrap_or_default());
+                    let wall = walls
+                        .iter()
+                        .find(|w| {
+                            points.iter().all(|p| {
+                                let d = [p[0] - w.frame.origin[0], p[1] - w.frame.origin[1]];
+                                let along = d[0] * w.frame.t[0] + d[1] * w.frame.t[1];
+                                (d[0] * w.frame.n[0] + d[1] * w.frame.n[1]).abs() < 0.01 && along >= -0.01 && along <= w.frame.length + 0.01
+                            })
+                        })
+                        .ok_or_else(|| ModelError::Invalid("mansard gable has no matching host facade".into()))?;
+                    let mesh = gable_parts.entry(wall.finish).or_default();
+                    let base = mesh.positions.len() as u32;
+                    mesh.positions.extend(points);
+                    mesh.triangles.push([base, base + 1, base + 2]);
+                }
+            }
+            let covering = if let crate::Roof::Mansard { parameters } = &b.roof {
+                match &parameters.covering {
+                    Some(spec) => crate::roof::covering(&r.cover, parameters.lower_pitch_deg, parameters.upper_pitch_deg, spec)?,
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let ridge = covering.iter().flat_map(|(_, m)| m.positions.iter().map(|p| p[2])).fold(r.ridge, f64::max);
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
                 cover: r.cover,
                 gables: r.gables,
+                gable_parts: gable_parts.into_iter().collect(),
+                covering,
                 gutters: r.gutters,
                 drainage: drain_parts,
                 eaves: h,
-                ridge: r.ridge,
-                pitch_deg: *pitch_deg,
+                ridge,
+                pitch_deg,
+                compound,
+                dormers,
             })
         }
     };
@@ -910,7 +1019,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             stairs.push(BuiltStair { id: format!("{id}.L{level}"), level, kind: st.kind, winding: st.winders.is_some(), mesh, railing });
         }
     }
-    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
+    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs, terrain: None })
 }
 
 /// The plinth runs this far below the terrain, mm.
@@ -927,6 +1036,7 @@ fn facing_piece(
     projection: f64,
     (z0, z1): (f64, f64),
     holes: &[Rect],
+    profiles: Option<&[Vec<[f64; 2]>]>,
 ) -> Option<Mesh> {
     let n = line.len();
     let (s, t) = (*line.get(f.edge)?, *line.get((f.edge + 1) % n)?);
@@ -936,7 +1046,12 @@ fn facing_piece(
     let shift = along(fr.origin);
     let holes: Vec<Rect> = holes.iter().map(|r| Rect { u0: r.u0 + shift, u1: r.u1 + shift, ..*r }).collect();
     let span = Span { level: 0, thickness: projection, z0, z1, in0: along(a), in1: along(e), qs: a, qe: e };
-    crate::walls::segment(&face, &format!("{}.facing", f.id), &span, &holes).map(|seg| seg.mesh)
+    if let Some(profiles) = profiles {
+        let profiles: Vec<_> = profiles.iter().map(|poly| poly.iter().map(|p| [p[0] + shift, p[1]]).collect()).collect();
+        crate::walls::segment_profiles(&face, &format!("{}.facing", f.id), &span, &profiles).map(|seg| seg.mesh)
+    } else {
+        crate::walls::segment(&face, &format!("{}.facing", f.id), &span, &holes).map(|seg| seg.mesh)
+    }
 }
 
 /// Cellar door height, mm.
@@ -1014,7 +1129,7 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
             parts: opening::interior(&fr, rect, d).finish(),
             status: Status::Existing,
         };
-        doors.push(BuiltOpening { id: door_id, level, rect, fill, attached: Vec::new(), status: Status::Existing });
+        doors.push(BuiltOpening { id: door_id, level, rect, profile: Vec::new(), fill, attached: Vec::new(), status: Status::Existing });
     }
     let holes: Vec<Rect> = doors.iter().map(|o| o.rect).collect();
     let mesh = crate::walls::segment(&fr, id, &span, &holes).map_or_else(|| prism(&j.outline, z0, height), |s| s.mesh);
@@ -1208,17 +1323,31 @@ fn opening_joint(mut door: Rect, mut window: Rect, side: Side) -> (Rect, Rect) {
 /// Frame, sashes or leaves and glazing for a window or door in `rect`.
 fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> Vec<(Material, Mesh)> {
     let Rect { u0, u1, v0, v1 } = rect;
-    let w = (REVEAL, REVEAL + FRAME_DEPTH);
+    // The family reveal is measured from the exterior wall face. A thin host cannot
+    // accommodate the usual 120 mm reveal plus the 70 mm frame: seat its rear at
+    // the inner wall face instead of leaving the assembly floating behind the wall.
+    let reveal = REVEAL.min((at.wall - FRAME_DEPTH).max(0.0));
+    let w = (reveal, reveal + FRAME_DEPTH);
     let mut detail = opening::Parts::default();
     let mut parts = Vec::new();
     match kind {
+        ComponentKind::HistoricWindow { shape, lights, top_light, panes_across, panes_down, muntins, muntin_width_mm, operable } => {
+            detail =
+                opening::historic_window(fr, rect, w, shape, *lights, *top_light, *panes_across, *panes_down, *muntin_width_mm, *muntins, *operable);
+            if !matches!(shape, crate::component::WindowShape::Round) {
+                detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
+            }
+        }
+        ComponentKind::PanelDoor { leaves, panel_columns, panel_rows, glazed_rows } => {
+            detail = opening::panel_door(fr, rect, w, *leaves, *panel_columns, *panel_rows, *glazed_rows);
+        }
         ComponentKind::Window { lights, top_light } => {
             detail = opening::window(fr, rect, w, *lights, *top_light, true, false);
-            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
+            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
         }
         ComponentKind::FixedWindow => {
             detail = opening::window(fr, rect, w, 1, 0.0, false, false);
-            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
+            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, reveal);
         }
         ComponentKind::EntranceDoor => {
             let gate = u1 - u0 > 2000.0;
@@ -1234,10 +1363,10 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             detail = opening::door(fr, dr, w, 1, true, 0.0, *door_side == Side::Right);
             let ws = v0 + window_sill;
             if ws > v0 {
-                parts.push((at.finish, fbox(fr, (wr.u0, wr.u1), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
+                parts.push((at.finish, fbox(fr, (wr.u0, wr.u1), (0.0, w.1), (v0, ws))));
             }
             detail.append(opening::window(fr, Rect { v0: ws, ..wr }, w, *lights, 0.0, true, *door_side == Side::Left));
-            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, REVEAL));
+            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, reveal));
         }
         ComponentKind::Loggia { depth, rail_height, door_width, door_side } => {
             // Set back behind the facade: brick returns, a soffit, and the back wall with its
@@ -1270,7 +1399,10 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             }
             parts.push((Material::SteelWhite, rail));
         }
-        ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } | ComponentKind::GuardRail { .. } => return Vec::new(),
+        ComponentKind::BalconySlab { .. }
+        | ComponentKind::SteelBalcony { .. }
+        | ComponentKind::GuardRail { .. }
+        | ComponentKind::ShapedBalcony { .. } => return Vec::new(),
     }
     parts.extend(detail.finish());
     parts
@@ -1338,7 +1470,8 @@ fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: S
         }
         _ => {}
     }
-    BuiltOpening { id: format!("{id}.opening"), level, rect: r.rect, fill, attached, status }
+    let profile = if matches!(ty.kind, ComponentKind::HistoricWindow { .. }) { crate::profile::opening(&ty.kind, r.rect) } else { Vec::new() };
+    BuiltOpening { id: format!("{id}.opening"), level, rect: r.rect, profile, fill, attached, status }
 }
 
 /// A straight rod between two facade points `(u, w, v)` with a square section `r` mm wide.
@@ -1407,7 +1540,7 @@ fn styled_rail(fr: &FacadeFrame, from: (f64, f64), to: (f64, f64), z0: f64, heig
 }
 
 /// An attachment hung on the wall without an opening: balcony parts or an independent guard.
-fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> Vec<BuiltElement> {
+fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> Result<Vec<BuiltElement>> {
     let ty = &r.ty;
     let level = r.placement.level;
     let Rect { u0, u1, .. } = r.rect;
@@ -1423,7 +1556,7 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
         parts,
         status,
     };
-    match ty.kind {
+    Ok(match ty.kind {
         ComponentKind::GuardRail { projection, railing, finish, handrail } => {
             let metal = match finish {
                 Finish::Galvanised => Material::Steel,
@@ -1449,6 +1582,13 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
                 ));
             }
             vec![mk("rail", &ty.name, ElementClass::Railing, parts)]
+        }
+        ComponentKind::ShapedBalcony { depth, thickness, ref plan } => {
+            let (slab, rail) = balcony::meshes(fr, (u0 + u1) / 2.0, ty.width, depth, thickness, ty.height, deck_top, plan)?;
+            vec![
+                mk("slab", &ty.name, ElementClass::BalconySlab, vec![(Material::Slab, slab)]),
+                mk("rail", &format!("{} rail", ty.name), ElementClass::Railing, vec![(Material::Railing, rail)]),
+            ]
         }
         ComponentKind::BalconySlab { depth, thickness } => {
             let slab = fbox(fr, (u0, u1), (-depth, 0.0), (deck_top - thickness, deck_top));
@@ -1508,7 +1648,7 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
             ]
         }
         _ => Vec::new(),
-    }
+    })
 }
 
 fn element(id: &str, suffix: &str, name: &str, class: ElementClass, ty: &ComponentType, level: usize, mesh: Mesh, status: Status) -> BuiltElement {

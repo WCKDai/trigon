@@ -33,6 +33,7 @@ pub const CONCRETE: Mat = mat("Beton", "concrete", [0.72, 0.72, 0.70]);
 pub const TILES: Mat = mat("Tegltag på lægter", "clay", [0.62, 0.27, 0.18]);
 pub const RAFTERS: Mat = mat("Spær og undertag", "wood", [0.70, 0.55, 0.36]);
 pub const FELT: Mat = mat("Tagpap", "bitumen", [0.16, 0.16, 0.17]);
+pub const SLATE: Mat = mat("Slate roofing, illustrative family", "stone", [0.18, 0.20, 0.22]);
 pub const FRAME: Mat = mat("Træ, malet hvid", "wood", [0.95, 0.95, 0.93]);
 pub const GLASS: Mat = Mat { name: "Glas", category: "glass", rgb: [0.55, 0.70, 0.80], transparency: 0.6 };
 pub const DOOR: Mat = mat("Træ, dørblad", "wood", [0.42, 0.26, 0.16]);
@@ -48,6 +49,7 @@ pub const RENDER: Mat = mat("Facadepuds", "plaster", [0.91, 0.90, 0.87]);
 pub const BRICK_RED: Mat = mat("Tegl, røde sten", "brick", [0.62, 0.25, 0.17]);
 pub const BRICK_YELLOW: Mat = mat("Tegl, gule sten", "brick", [0.78, 0.68, 0.47]);
 pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
+pub const GROUND: Mat = mat("Terrain surface", "ground", [0.65, 0.67, 0.62]);
 /// Spaces: a translucent volume, no material.
 pub const SPACE: Mat = Mat { name: "Rum", category: "space", rgb: [0.55, 0.75, 0.95], transparency: 0.75 };
 
@@ -78,6 +80,9 @@ pub fn of(m: Material) -> Mat {
         Material::Foliage => mat("Tree crown", "vegetation", [0.19, 0.32, 0.10]),
         Material::Soil => mat("Planter soil", "soil", [0.20, 0.14, 0.08]),
         Material::Planter => mat("Planter shell", "concrete", [0.30, 0.31, 0.28]),
+        Material::Ground => GROUND,
+        Material::Slate => SLATE,
+        Material::Felt => FELT,
     }
 }
 
@@ -219,6 +224,15 @@ pub fn flat_roof(t: f64) -> BuildUp {
 pub fn pitched_roof(t: f64) -> BuildUp {
     let layers = if t > 80.0 { vec![layer(RAFTERS, t - 50.0, "LoadBearing"), layer(TILES, 50.0, "Finish")] } else { vec![layer(TILES, t, "Finish")] };
     BuildUp { name: format!("Tag, tegl på spær {}", mm(t)), layers, predefined: "ROOF" }
+}
+
+/// Original timber-front family build-up; illustrative, never inferred from a photograph.
+pub fn dormer_front(t: f64) -> BuildUp {
+    BuildUp {
+        name: format!("Dormer front, illustrative timber family {}", mm(t)),
+        layers: sandwich(t, (FRAME, 15.0), STUDS, Some((PLASTER, 15.0))),
+        predefined: "ELEMENTEDWALL",
+    }
 }
 
 /// A property value.

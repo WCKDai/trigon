@@ -35,6 +35,10 @@ The project stores imported parametric definitions locally. To refresh an extern
 library, import it again with replacement. Reopening the project does not need the library file,
 an online account, or an external model asset.
 
+`types.define` also validates complete hosted geometry before committing a shared type edit,
+including roof dormer consumers. A type that would turn a dormer window into a door, for
+example, is rejected without changing the project or its Undo history.
+
 ## File contract
 
 ```json

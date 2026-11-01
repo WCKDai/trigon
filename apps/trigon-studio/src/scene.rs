@@ -423,10 +423,20 @@ impl Scene {
         };
         let mut levels = Vec::new();
         for building in built {
+            if let Some(terrain) = &building.terrain {
+                b.add(
+                    "site.terrain",
+                    "terrain",
+                    None,
+                    vec![("units", "site-local mm; site datum".into())],
+                    false,
+                    &[Part { mesh: terrain, rgba: Material::Ground.rgba(), material: Material::Ground }],
+                );
+            }
             if levels.is_empty() {
                 levels = building.storeys.iter().map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }).collect();
             }
-            for w in &building.walls {
+            for w in building.exterior_walls() {
                 let first = b.elements.len();
                 let length = w.frame.length;
                 b.add(
@@ -488,18 +498,36 @@ impl Scene {
                 );
             }
             if let Some(r) = &building.roof {
+                let mut parts = vec![
+                    Part { mesh: &r.cover, rgba: Material::Roof.rgba(), material: Material::Roof },
+                    Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
+                ];
+                if r.gable_parts.is_empty() {
+                    parts.insert(1, Part { mesh: &r.gables, rgba: Material::Wall.rgba(), material: Material::Wall });
+                } else {
+                    parts.extend(r.gable_parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
+                }
+                parts.extend(r.covering.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
                 b.add(
                     &r.id,
                     "roof",
                     None,
                     vec![("eaves", mm(r.eaves)), ("ridge", mm(r.ridge)), ("pitch", format!("{:.1}°", r.pitch_deg))],
                     true,
-                    &[
-                        Part { mesh: &r.cover, rgba: Material::Roof.rgba(), material: Material::Roof },
-                        Part { mesh: &r.gables, rgba: Material::Wall.rgba(), material: Material::Wall },
-                        Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
-                    ],
+                    &parts,
                 );
+                for d in &r.dormers {
+                    for (suffix, kind, mesh) in [("roof", "dormer roof", &d.roof), ("cheeks", "dormer cheeks", &d.cheeks)] {
+                        b.add(
+                            &format!("{}.{suffix}", d.id),
+                            kind,
+                            None,
+                            Vec::new(),
+                            true,
+                            &[Part { mesh, rgba: Material::Steel.rgba(), material: Material::Steel }],
+                        );
+                    }
+                }
             }
             for iw in &building.interior {
                 let len = (iw.outline[1][0] - iw.outline[0][0]).hypot(iw.outline[1][1] - iw.outline[0][1]);
@@ -949,6 +977,26 @@ mod tests {
         let mut doc = Document::default();
         doc.buildings.push(Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
         doc
+    }
+
+    #[test]
+    fn terrain_uses_the_shared_source_mesh_in_the_headless_scene() {
+        let mut d = doc();
+        d.terrain = Some(trigon_model::terrain::Terrain {
+            origin: [-5000., -5000.],
+            spacing_mm: [20000., 20000.],
+            heights_mm: vec![vec![0., 100.], vec![200., 300.]],
+            source: None,
+            attribution: None,
+        });
+        let built = build(&d).unwrap();
+        let scene = Scene::from_built(&built, false);
+        let element = &scene.elements[scene.find_unique("site.terrain").unwrap()];
+        assert_eq!(element.kind, "terrain");
+        assert!(!element.ranges.is_empty());
+        assert_eq!(scene.elements.iter().filter(|e| e.id == "site.terrain").count(), 1);
+        let without = Scene::from_built(&build(&doc()).unwrap(), false);
+        assert_eq!(scene.elements.len(), without.elements.len() + 1);
     }
 
     #[test]

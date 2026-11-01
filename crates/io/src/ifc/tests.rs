@@ -18,6 +18,41 @@ fn count(text: &str, entity: &str) -> usize {
 }
 
 #[test]
+fn custom_balcony_plan_json_uses_unbounded_ifc_text_without_losing_parameters() {
+    let points = trigon_model::balcony::Plan::Bowed { return_fraction: 0.35 }
+        .outline(3000.0, 1500.0)
+        .unwrap()
+        .into_iter()
+        .map(|p| [p[0] / 3000.0, p[1] / 1500.0])
+        .collect();
+    let plan = trigon_model::balcony::Plan::Polygon { points };
+    plan.outline(3000.0, 1500.0).unwrap();
+    let encoded = serde_json::to_string(&plan).unwrap();
+    assert!(encoded.chars().count() > 255, "valid custom plans can exceed IfcLabel's bound");
+    let mut doc = Document::default();
+    let mut building =
+        trigon_model::Building::new("b", "Custom balcony fixture", &[[0., 0.], [9000., 0.], [9000., 6000.], [0., 6000.]], 1, 3000.).unwrap();
+    building.facades[0].bays = vec![4500.0];
+    building.facades[0].placements = serde_json::from_value(serde_json::json!([{"level":0,"bay":0,"type":"custom"}])).unwrap();
+    doc.buildings.push(building);
+    doc.types.push(trigon_model::ComponentType {
+        id: "custom".into(),
+        name: "Custom convex balcony".into(),
+        width: 3000.0,
+        height: 1100.0,
+        sill: 0.0,
+        kind: trigon_model::ComponentKind::ShapedBalcony { depth: 1500.0, thickness: 180.0, plan: plan.clone() },
+    });
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "custom.ifc", "2026-01-01T00:00:00");
+    let property = text.lines().find(|line| line.contains("IFCPROPERTYSINGLEVALUE('ParametricPlan'")).unwrap();
+    let expected = format!("IFCTEXT({})", string(&encoded));
+    assert!(property.contains(&expected), "full parametric JSON must use IfcText: {property}");
+    let restored: trigon_model::balcony::Plan = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(restored, plan);
+}
+
+#[test]
 fn painted_balcony_metal_is_classified_as_steel_instead_of_timber() {
     let mut doc = sample::document().unwrap();
     for ty in &mut doc.types {

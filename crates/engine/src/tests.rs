@@ -35,6 +35,12 @@ impl Provider for Canned {
     fn heights(&self, _: &[[f64; 2]]) -> trigon_data::Result<Heights> {
         Ok(Heights { terrain: 12.0, median: 15.2, top: 17.9, eaves: 15.0, samples: 1800, evidence: ev("dhm:test") })
     }
+    fn terrain(&self, origin: [f64; 2], spacing: [f64; 2], columns: u32, rows: u32) -> trigon_data::Result<Vec<Vec<f64>>> {
+        assert!((origin[0] - (721989.65 - 20.0)).abs() < 1e-6);
+        assert!((origin[1] - (6178579.47 - 10.0)).abs() < 1e-6);
+        assert_eq!(spacing, [20.0, 10.0]);
+        Ok((0..rows).map(|row| (0..columns).map(|col| 12.0 + f64::from(col) * 0.1 + f64::from(row) * 0.2).collect()).collect())
+    }
     fn photos(&self, _: [f64; 2]) -> trigon_data::Result<Vec<Photo>> {
         Ok(vec![Photo {
             id: "p-north".into(),
@@ -1943,4 +1949,30 @@ fn each_site_family_add_replace_delete_and_properties_preserve_exact_sources() {
         assert!(s.undo());
         assert_eq!(s.doc, before);
     }
+}
+
+#[test]
+fn dtm_terrain_converts_map_samples_to_the_local_datum_and_undo_is_exact() {
+    let mut s = session();
+    let before = s.doc.clone();
+    s.execute("site.sample_terrain", json!({"origin":[-20000,-10000],"spacing_mm":[20000,10000],"columns":3,"rows":3})).unwrap();
+    let t = s.doc.terrain.as_ref().unwrap();
+    assert_eq!(t.origin, [-20000., -10000.]);
+    assert_eq!(t.source.as_deref(), Some("dhm:dhm_terraen"));
+    for row in 0..3 {
+        for col in 0..3 {
+            assert!((t.heights_mm[row][col] - (col as f64 * 100. + row as f64 * 200.)).abs() < 1e-6);
+        }
+    }
+    let built = trigon_model::build(&s.doc).unwrap();
+    assert!(built[0].terrain.is_some());
+    let ifc = trigon_io::ifc::write(&s.doc, &built, "terrain.ifc", "2026-01-01T00:00:00Z");
+    assert!(ifc.contains("IFCGEOGRAPHICELEMENT") && ifc.contains(".TERRAIN."));
+    for read in [trigon_ifcread::read_ifc_lite(&ifc).unwrap(), trigon_ifcread::read_bimifc(&ifc).unwrap()] {
+        assert!(read.failures.is_empty());
+        let actual = read.elements.iter().find(|e| e.global_id == trigon_io::ifc::guid("trigon:site.terrain")).unwrap();
+        assert!(trigon_ifcread::bounds_deviation(built[0].terrain.as_ref().unwrap().bounds().unwrap(), actual.mesh.bounds().unwrap()) < 0.01);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
 }

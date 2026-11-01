@@ -101,15 +101,35 @@ impl Ifc<'_> {
         let thickness = pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness());
         let up = catalog::pitched_roof((thickness * 10.0).round() / 10.0);
         let placed = self.w.place(Some(fl.at(top)), fl.at(top).frame);
-        let kind = if r.gables.is_empty() { ".HIP_ROOF." } else { ".GABLE_ROOF." };
+        let kind = if r.compound {
+            ".MANSARD_ROOF."
+        } else if r.gables.is_empty() {
+            ".HIP_ROOF."
+        } else {
+            ".GABLE_ROOF."
+        };
+        // Mitred slope breaks have different top/soffit boundaries. Export the real shell,
+        // rather than reconstructing it as unrelated plane extrusions with overlaps or gaps.
+        let shape = if r.compound {
+            self.w
+                .faceset(&r.cover, &placed.frame)
+                .and_then(|item| {
+                    self.cat.paint(&mut self.w, item, catalog::TILES);
+                    self.shape("Tessellation", &[item], None, catalog::L_ROOF)
+                })
+                .map_or_else(|| "$".into(), |id| format!("#{id}"))
+        } else {
+            "$".into()
+        };
         let roof = self.w.add(format!(
-            "IFCROOF({},$,{},$,$,#{},$,{},{kind})",
+            "IFCROOF({},$,{},$,$,#{},{shape},{},{kind})",
             gid(&r.id),
             string(&format!("Tag {:.0}°", r.pitch_deg)),
             placed.id,
             string(&r.id)
         ));
-        self.common("Pset_RoofCommon", roof, &up.name, None, vec![("IsExternal", Val::Bool(true))]);
+        let reference = if r.compound { "Original mansard shell - illustrative build-up; covering is separate" } else { &up.name };
+        self.common("Pset_RoofCommon", roof, reference, None, vec![("IsExternal", Val::Bool(true))]);
         fl.contain(top, roof);
         let mut planes = Vec::new();
         for piece in &pieces {
@@ -150,6 +170,50 @@ impl Ifc<'_> {
                 self.w.add(format!("IFCPIPESEGMENT({},$,{name},$,$,#{},#{shape},{},{kind})", gid(&key), lp.id, string(&key), name = string(name)));
             self.made_of(id, catalog::ZINC);
             fl.contain(top, id);
+        }
+        for (material, mesh) in &r.covering {
+            let key = format!("{}.covering.{}", r.id, material.name());
+            let frame = fl.at(top).frame;
+            let lp = self.w.place(Some(fl.at(top)), frame);
+            let Some(item) = self.w.faceset(mesh, &frame) else { continue };
+            let mat = catalog::of(*material);
+            self.cat.paint(&mut self.w, item, mat);
+            let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
+            let id = self.w.add(format!(
+                "IFCCOVERING({},$,{},$,$,#{},#{shape},{},.ROOFING.)",
+                gid(&key),
+                string(&format!("{} - original family defaults", material.name())),
+                lp.id,
+                string(&key)
+            ));
+            self.made_of(id, mat);
+            fl.contain(top, id);
+        }
+        for d in &r.dormers {
+            for (suffix, mesh) in [("roof", &d.roof), ("cheeks", &d.cheeks)] {
+                let key = format!("{}.{suffix}", d.id);
+                let frame = fl.at(top).frame;
+                let lp = self.w.place(Some(fl.at(top)), frame);
+                let Some(item) = self.w.faceset(mesh, &frame) else { continue };
+                self.cat.paint(&mut self.w, item, catalog::ZINC);
+                let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
+                let id = if suffix == "roof" {
+                    self.w.add(format!(
+                        "IFCROOF({},$,'Dormer shed roof - family default',$,$,#{},#{shape},{},.SHED_ROOF.)",
+                        gid(&key),
+                        lp.id,
+                        string(&key)
+                    ))
+                } else {
+                    self.w.add(format!(
+                        "IFCCOVERING({},$,'Dormer cheek cladding - family default',$,$,#{},#{shape},{},.CLADDING.)",
+                        gid(&key),
+                        lp.id,
+                        string(&key)
+                    ))
+                };
+                fl.contain(top, id);
+            }
         }
     }
 

@@ -22,6 +22,8 @@ pub struct ModelGroup {
 pub struct Document {
     pub format: String,
     pub site: Option<Site>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain: Option<crate::terrain::Terrain>,
     pub buildings: Vec<Building>,
     /// The component library (parametric families with their parameters set).
     pub types: Vec<ComponentType>,
@@ -200,6 +202,7 @@ impl Default for Document {
         Self {
             format: FORMAT.to_string(),
             site: None,
+            terrain: None,
             buildings: Vec::new(),
             types: default_types(),
             site_objects: Vec::new(),
@@ -855,7 +858,7 @@ impl Building {
     pub fn ceiling_thickness(&self, level: usize) -> f64 {
         if level + 1 < self.storeys.len() {
             self.floor_thickness(level + 1)
-        } else if matches!(self.roof, crate::roof::Roof::Pitched { .. }) {
+        } else if !matches!(self.roof, crate::roof::Roof::Flat) {
             self.attic_thickness()
         } else {
             200.0

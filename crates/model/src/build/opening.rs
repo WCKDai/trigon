@@ -10,6 +10,9 @@
 use super::{FacadeFrame, Rect, dividers, fbox};
 use crate::{Material, Mesh};
 
+mod historic;
+pub(super) use historic::window as historic_window;
+
 #[derive(Default)]
 pub(super) struct Parts {
     pub frame: Mesh,
@@ -304,6 +307,66 @@ fn leaf(parts: &mut Parts, fr: &FacadeFrame, r: Rect, w: (f64, f64), glazed: boo
 /// Door surround with a rebate, separated closed leaves, 15 mm threshold, seated panels,
 /// hinges and levers. `mirror` reflects the complete unit, including the active leaf.
 pub(super) fn door(fr: &FacadeFrame, r: Rect, w: (f64, f64), leaves: u32, glazed: bool, top: f64, mirror: bool) -> Parts {
+    door_layout(fr, r, w, leaves, glazed, top, mirror, None)
+}
+
+pub(super) fn panel_door(fr: &FacadeFrame, r: Rect, w: (f64, f64), leaves: u32, columns: u32, rows: u32, glazed_rows: u32) -> Parts {
+    door_layout(fr, r, w, leaves, false, 0.0, false, Some((columns, rows, glazed_rows)))
+}
+
+fn panel_leaf(
+    parts: &mut Parts,
+    fr: &FacadeFrame,
+    r: Rect,
+    w: (f64, f64),
+    columns: u32,
+    rows: u32,
+    glazed_rows: u32,
+    hinge_left: bool,
+    handle: bool,
+) {
+    let stile = 90.0_f64.min((r.u1 - r.u0) / (4.0 * f64::from(columns) + 2.0)).min((r.v1 - r.v0) / (4.0 * f64::from(rows) + 2.0));
+    parts.panel.append(&ring(fr, r, &[(w.0, 0.0, stile), (w.1, 0.0, stile)], true));
+    let clear = inset(r, stile);
+    let rail = stile * 0.65;
+    let xs: Vec<_> = (0..=columns).map(|i| clear.u0 + (clear.u1 - clear.u0) * f64::from(i) / f64::from(columns)).collect();
+    let zs: Vec<_> = (0..=rows).map(|i| clear.v0 + (clear.v1 - clear.v0) * f64::from(i) / f64::from(rows)).collect();
+    for &x in xs.iter().skip(1).take(columns.saturating_sub(1) as usize) {
+        parts.panel.append(&fbox(fr, (x - rail / 2.0, x + rail / 2.0), w, (clear.v0 - 0.5, clear.v1 + 0.5)));
+    }
+    for &z in zs.iter().skip(1).take(rows.saturating_sub(1) as usize) {
+        for (i, x) in xs.windows(2).enumerate() {
+            parts.panel.append(&fbox(
+                fr,
+                (x[0] + if i > 0 { rail / 2.0 - 0.5 } else { -0.5 }, x[1] - if i + 1 < columns as usize { rail / 2.0 - 0.5 } else { -0.5 }),
+                w,
+                (z - rail / 2.0, z + rail / 2.0),
+            ));
+        }
+    }
+    for (i, x) in xs.windows(2).enumerate() {
+        for (j, z) in zs.windows(2).enumerate() {
+            let aperture = Rect {
+                u0: x[0] + if i > 0 { rail / 2.0 } else { 0.0 },
+                u1: x[1] - if i + 1 < columns as usize { rail / 2.0 } else { 0.0 },
+                v0: z[0] + if j > 0 { rail / 2.0 } else { 0.0 },
+                v1: z[1] - if j + 1 < rows as usize { rail / 2.0 } else { 0.0 },
+            };
+            if j >= rows.saturating_sub(glazed_rows) as usize {
+                let mut bead = Parts::default();
+                glazed_ring(&mut bead, fr, inset(aperture, -0.5), (w.0 + 2.0, w.1 - 2.0), 12.0_f64.min(small(aperture) / 10.0));
+                parts.panel.append(&bead.frame);
+                parts.glass.append(&bead.glass);
+                parts.seal.append(&bead.seal);
+            } else {
+                parts.panel.append(&panel(fr, aperture, w));
+            }
+        }
+    }
+    hardware(parts, fr, r, w, stile, hinge_left, true, handle);
+}
+
+fn door_layout(fr: &FacadeFrame, r: Rect, w: (f64, f64), leaves: u32, glazed: bool, top: f64, mirror: bool, grid: Option<(u32, u32, u32)>) -> Parts {
     let mut parts = Parts::default();
     let leaves = leaves.clamp(1, 4);
     let fw = 60.0_f64.min((r.u1 - r.u0) / (4.0 * f64::from(leaves) + 2.0)).min((r.v1 - r.v0) / 8.0);
@@ -331,7 +394,11 @@ pub(super) fn door(fr: &FacadeFrame, r: Rect, w: (f64, f64), leaves: u32, glazed
         let r = inset(Rect { u0: pair[0], u1: pair[1], ..clear }, 2.0_f64.min(small(clear) / (f64::from(leaves) * 30.0)));
         let hinge_left = if leaves == 1 { !mirror } else { index * 2 < leaves as usize };
         let active = if mirror { index == 0 } else { index + 1 == leaves as usize };
-        leaf(&mut parts, fr, r, (w.0 + 8.0, w.1 - 12.0), glazed, hinge_left, active);
+        if let Some((columns, rows, glazed_rows)) = grid {
+            panel_leaf(&mut parts, fr, r, (w.0 + 8.0, w.1 - 12.0), columns, rows, glazed_rows, hinge_left, active);
+        } else {
+            leaf(&mut parts, fr, r, (w.0 + 8.0, w.1 - 12.0), glazed, hinge_left, active);
+        }
     }
     parts
 }
@@ -435,6 +502,49 @@ mod tests {
                 let threshold = &parts.iter().find(|(material, _)| *material == Material::Sill).expect("door needs a threshold").1;
                 let (lo, hi) = threshold.bounds().unwrap();
                 assert!(lo[2] >= 0.0 && hi[2] <= 20.0, "threshold must not obstruct the clear opening");
+            }
+        }
+    }
+
+    #[test]
+    fn opening_mounts_fit_the_host_wall_without_moving_the_nominal_rectangle() {
+        use crate::component::{Muntins, WindowShape};
+        let r = Rect { u0: 100.0, u1: 2000.0, v0: 0.0, v1: 2300.0 };
+        for wall in [100.0, 150.0, 190.0, 360.0, 1500.0] {
+            for kind in [
+                ComponentKind::Window { lights: 2, top_light: 350.0 },
+                ComponentKind::FixedWindow,
+                ComponentKind::EntranceDoor,
+                ComponentKind::FrenchDoor { leaves: 2 },
+                ComponentKind::PanelDoor { leaves: 2, panel_columns: 2, panel_rows: 3, glazed_rows: 1 },
+                ComponentKind::HistoricWindow {
+                    shape: WindowShape::Segmental { rise_mm: 250.0 },
+                    lights: 2,
+                    top_light: 350.0,
+                    panes_across: 2,
+                    panes_down: 2,
+                    muntins: Muntins::TrueDivided,
+                    muntin_width_mm: 24.0,
+                    operable: true,
+                },
+                ComponentKind::DoorWindow { door_width: 850.0, door_side: Side::Left, window_sill: 800.0, lights: 2 },
+                ComponentKind::DoorWindow { door_width: 850.0, door_side: Side::Right, window_sill: 800.0, lights: 2 },
+            ] {
+                let parts = fill_parts(&facade(), r, &kind, Fill { wall, finish: Material::Wall, floor: 0.0, ceiling: 3000.0 });
+                let frame = &parts.iter().find(|(m, _)| *m == Material::Frame).unwrap().1;
+                let (lo, hi) = frame.bounds().unwrap();
+                let reveal = REVEAL.min(wall - FRAME_DEPTH);
+                assert_eq!((lo[1], hi[1]), (reveal, reveal + FRAME_DEPTH), "{wall} mm host, {kind:?}");
+                assert_eq!((lo[0], hi[0], lo[2], hi[2]), (r.u0, r.u1, r.v0, r.v1), "nominal opening must remain unchanged");
+                for (material, mesh) in parts {
+                    sound(&mesh);
+                    let (lo, hi) = mesh.bounds().unwrap();
+                    match material {
+                        Material::Sill => assert!(hi[1] <= wall, "sill/threshold must seat in its host"),
+                        Material::Steel => assert!(lo[1] >= reveal - 30.0 && hi[1] <= reveal + FRAME_DEPTH + 30.0, "hardware stays attached"),
+                        _ => assert!(lo[1] >= 0.0 && hi[1] <= wall, "{kind:?} {material:?} is outside {wall} mm host: {lo:?}, {hi:?}"),
+                    }
+                }
             }
         }
     }
@@ -619,6 +729,136 @@ mod tests {
         let kind = ComponentKind::Loggia { depth: 1400.0, rail_height: 1000.0, door_width: 500.0, door_side: Side::Left };
         for (_, mesh) in fill(Rect { u0: 0.0, u1: 300.0, v0: 0.0, v1: 300.0 }, &kind) {
             sound(&mesh);
+        }
+    }
+
+    #[test]
+    fn historic_families_stay_sound_at_supported_dimension_extremes() {
+        use crate::component::{Muntins, WindowShape};
+        for (width, height) in [(300.0, 300.0), (300.0, 4000.0), (6000.0, 300.0), (6000.0, 4000.0)] {
+            for shape in [
+                WindowShape::Rectangular,
+                WindowShape::Segmental { rise_mm: 20.0 },
+                WindowShape::Segmental { rise_mm: (width / 2.0_f64).min(height * 0.45) },
+            ] {
+                for mode in [Muntins::Applied, Muntins::TrueDivided] {
+                    let kind = ComponentKind::HistoricWindow {
+                        shape: shape.clone(),
+                        lights: 4,
+                        top_light: height / 2.0,
+                        panes_across: 3,
+                        panes_down: 4,
+                        muntins: mode,
+                        muntin_width_mm: 60.0,
+                        operable: true,
+                    };
+                    for (material, mesh) in fill(Rect { u0: 0.0, u1: width, v0: 0.0, v1: height }, &kind) {
+                        assert!(std::panic::catch_unwind(|| sound(&mesh)).is_ok(), "{width} × {height}, {kind:?}, {material:?}");
+                    }
+                }
+            }
+            for (_, mesh) in fill(
+                Rect { u0: 0.0, u1: width, v0: 0.0, v1: height },
+                &ComponentKind::PanelDoor { leaves: 2, panel_columns: 3, panel_rows: 6, glazed_rows: 3 },
+            ) {
+                sound(&mesh);
+            }
+        }
+        for size in [300.0, 4000.0] {
+            let kind = ComponentKind::HistoricWindow {
+                shape: WindowShape::Round,
+                lights: 1,
+                top_light: 0.0,
+                panes_across: 6,
+                panes_down: 8,
+                muntins: Muntins::TrueDivided,
+                muntin_width_mm: 60.0,
+                operable: false,
+            };
+            for (_, mesh) in fill(Rect { u0: 0.0, u1: size, v0: 0.0, v1: size }, &kind) {
+                sound(&mesh);
+            }
+        }
+    }
+
+    #[test]
+    fn historic_muntins_distinguish_real_panes_from_applied_bars() {
+        use crate::component::{Muntins, WindowShape};
+        let r = Rect { u0: 0.0, u1: 1200.0, v0: 0.0, v1: 1400.0 };
+        for mode in [Muntins::Applied, Muntins::TrueDivided] {
+            let kind = ComponentKind::HistoricWindow {
+                shape: WindowShape::Rectangular,
+                lights: 1,
+                top_light: 0.0,
+                panes_across: 2,
+                panes_down: 2,
+                muntins: mode,
+                muntin_width_mm: 22.0,
+                operable: false,
+            };
+            let parts = fill(r, &kind);
+            let glass = &parts.iter().find(|(m, _)| *m == Material::Glass).unwrap().1;
+            assert_eq!(covers(glass, [600.0, 700.0]), mode == Muntins::Applied, "applied bars retain one pane; true bars divide glazing");
+            for (_, mesh) in &parts {
+                sound(mesh);
+            }
+        }
+    }
+
+    #[test]
+    fn round_and_segmental_voids_are_real_and_preserve_nominal_extents() {
+        use crate::component::{Muntins, WindowShape};
+        for shape in [WindowShape::Round, WindowShape::Segmental { rise_mm: 220.0 }] {
+            let mut doc = Document::default();
+            let kind = ComponentKind::HistoricWindow {
+                shape,
+                lights: 1,
+                top_light: 0.0,
+                panes_across: 1,
+                panes_down: 1,
+                muntins: Muntins::TrueDivided,
+                muntin_width_mm: 22.0,
+                operable: false,
+            };
+            doc.types.push(ComponentType {
+                id: "shape".into(),
+                name: "Original shaped fixture".into(),
+                width: 1200.0,
+                height: 1200.0,
+                sill: 1000.0,
+                kind,
+            });
+            let mut b = Building::new("b", "Profile fixture", &[[0.0, 0.0], [6000.0, 0.0], [6000.0, 6000.0], [0.0, 6000.0]], 2, 3000.0).unwrap();
+            b.plinth = Some(crate::doc::Plinth { height: 2200.0, projection: 20.0 });
+            b.facades[0].bands.push(crate::doc::Band { levels: vec![0], bottom: 2000.0, top: 2200.0, projection: 40.0 });
+            b.facades[0].bays = vec![3000.0];
+            b.facades[0].placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":0,"type":"shape"})).unwrap());
+            doc.buildings.push(b);
+            let built = build(&doc).unwrap();
+            let wall = &built[0].walls[0];
+            let opening = &wall.openings[0];
+            assert_eq!(opening.rect, Rect { u0: 2400.0, u1: 3600.0, v0: 1000.0, v1: 2200.0 });
+            assert!(covers(&wall.mesh, [2420.0, 2180.0]), "masonry remains outside the curved head");
+            assert!(!covers(&wall.mesh, [3000.0, 1600.0]), "the centre is an actual wall void");
+            for finish in [&wall.plinth, &wall.trim] {
+                assert!(covers(finish, [2420.0, 2180.0]), "facing retains material outside the curved head");
+                assert!(!covers(finish, [3000.0, 2100.0]), "facing must not obstruct the curved light");
+            }
+            for (_, mesh) in &opening.fill.parts {
+                sound(mesh);
+            }
+            let volume = |m: &Mesh| {
+                m.triangles
+                    .iter()
+                    .map(|t| {
+                        let [a, b, c] = t.map(|i| m.positions[i as usize]);
+                        (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+                    })
+                    .sum::<f64>()
+            };
+            let expected = wall.segments.iter().map(|s| crate::doc::polygon_area(&s.plan) * (s.z1 - s.z0)).sum::<f64>()
+                - crate::doc::polygon_area(&opening.profile) * 400.0;
+            assert!((volume(&wall.mesh) - expected).abs() < expected * 1e-6, "curved wall volume {} vs {expected}", volume(&wall.mesh));
         }
     }
 }

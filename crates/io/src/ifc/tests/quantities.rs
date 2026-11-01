@@ -132,7 +132,14 @@ fn verify_quantities(document: &Document, built: &[Built], text: &str) -> BTreeM
             let (name, value, kind) = match quantity.attributes[0] {
                 "'Height'" => ("Height", fill.height, "IFCQUANTITYLENGTH"),
                 "'Width'" => ("Width", fill.width, "IFCQUANTITYLENGTH"),
-                "'Area'" => ("Area", fill.width * fill.height / 1_000_000.0, "IFCQUANTITYAREA"),
+                "'Area'" => (
+                    "Area",
+                    document
+                        .component(&fill.type_id)
+                        .map_or(fill.width * fill.height, |ty| trigon_model::profile::area(&ty.kind, fill.width, fill.height))
+                        / 1_000_000.0,
+                    "IFCQUANTITYAREA",
+                ),
                 other => panic!("unsupported fill quantity {other}"),
             };
             assert_eq!(quantity.kind, kind);
@@ -262,4 +269,64 @@ fn fill_base_quantities_follow_phase_filters_without_orphans() {
     assert!(exported_counts.len() >= 3, "the fixture exercises different visible sets");
     let empty = Document::default();
     assert!(verify_quantities(&empty, &[], &export(&empty, &[])).is_empty());
+}
+
+#[test]
+fn curved_void_axes_and_wall_quantities_match_the_real_profiles() {
+    let mut doc = Document::default();
+    doc.types.extend(trigon_model::component::copenhagen_types());
+    let mut b =
+        trigon_model::Building::new("b", "Original curved-void fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3500.).unwrap();
+    b.facades[0].bays = vec![2500., 5500., 8500.];
+    for (bay, ty) in ["dk.window.segmental", "dk.window.arched-fixed", "dk.window.round"].iter().enumerate() {
+        b.facades[0].placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":bay,"type":ty})).unwrap());
+    }
+    doc.buildings.push(b);
+    let built = trigon_model::build(&doc).unwrap();
+    let text = export(&doc, &built);
+    verify_quantities(&doc, &built, &text);
+    let records = entities(&text);
+    let vector =
+        |id| attributes(records[&id].attributes[0].trim_matches(['(', ')'])).into_iter().map(|x| x.parse::<f64>().unwrap()).collect::<Vec<_>>();
+    for opening in &built[0].walls[0].openings {
+        let product = records.values().find(|e| e.kind == "IFCOPENINGELEMENT" && e.attributes[0] == gid(&opening.id)).unwrap();
+        let product_shape = &records[&reference(product.attributes[6])];
+        let shape = &records[&references(product_shape.attributes[2])[0]];
+        let solid = &records[&references(shape.attributes[3])[0]];
+        assert_eq!(solid.kind, "IFCEXTRUDEDAREASOLID");
+        let position = &records[&reference(solid.attributes[1])];
+        let origin = vector(reference(position.attributes[0]));
+        let z = vector(reference(position.attributes[1]));
+        let x = vector(reference(position.attributes[2]));
+        let y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+        let profile = &records[&reference(solid.attributes[0])];
+        assert_eq!(profile.kind, "IFCARBITRARYCLOSEDPROFILEDEF");
+        let line = &records[&reference(profile.attributes[2])];
+        let heights: Vec<_> = references(line.attributes[0])
+            .into_iter()
+            .map(|id| {
+                let p = vector(id);
+                origin[2] + x[2] * p[0] + y[2] * p[1]
+            })
+            .collect();
+        let lo = heights.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = heights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(lo.abs() < 1e-6 && (hi - opening.fill.height).abs() < 1e-6, "void {} must rise from its bottom, got {lo}..{hi}", opening.id);
+    }
+    for wall in &built[0].walls {
+        for seg in &wall.segments {
+            let mesh_volume = seg
+                .mesh
+                .triangles
+                .iter()
+                .map(|t| {
+                    let [a, b, c] = t.map(|i| seg.mesh.positions[i as usize]);
+                    (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+                })
+                .sum::<f64>();
+            let quantity = crate::ifc::walls::net_volume(wall, seg, trigon_model::doc::polygon_area(&seg.plan));
+            // The wall boolean uses a quantised 2D overlay; 1 mm³ is the existing wall-volume test tolerance.
+            assert!((mesh_volume - quantity).abs() < 1.0, "curved-void wall quantity {quantity} vs mesh {mesh_volume}");
+        }
+    }
 }

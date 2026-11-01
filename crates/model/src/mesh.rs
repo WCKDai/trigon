@@ -43,10 +43,16 @@ pub enum Material {
     SteelWhite,
     /// Dark elastomer glazing seals, distinct from painted steel railings.
     Gasket,
+    /// Neutral outdoor ground; actual paving/soil composition is project information.
+    Ground,
+    /// Original slate/shingle roof presentation material.
+    Slate,
+    /// Bituminous roofing felt (tagpap).
+    Felt,
 }
 
 impl Material {
-    pub const ALL: [Material; 26] = [
+    pub const ALL: [Material; 29] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -73,6 +79,9 @@ impl Material {
         Material::Planter,
         Material::SteelWhite,
         Material::Gasket,
+        Material::Ground,
+        Material::Slate,
+        Material::Felt,
     ];
 
     pub fn name(self) -> &'static str {
@@ -103,6 +112,9 @@ impl Material {
             Material::Planter => "planter",
             Material::SteelWhite => "steel_white",
             Material::Gasket => "gasket",
+            Material::Ground => "ground",
+            Material::Slate => "slate",
+            Material::Felt => "felt",
         }
     }
 
@@ -135,6 +147,9 @@ impl Material {
             Material::Planter => [0.30, 0.31, 0.28, 1.0],
             Material::SteelWhite => Material::Frame.rgba(),
             Material::Gasket => Material::Railing.rgba(),
+            Material::Ground => [0.38, 0.40, 0.35, 1.0],
+            Material::Slate => [0.12, 0.14, 0.16, 1.0],
+            Material::Felt => [0.065, 0.07, 0.075, 1.0],
         }
     }
 
@@ -273,6 +288,43 @@ impl Mesh {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn appended_terrain_and_roof_materials_preserve_the_published_material_prefix() {
+        // Published pre-integration inventory from immutable revision 5ff5d3a.
+        let legacy = [
+            "wall",
+            "slab",
+            "roof",
+            "frame",
+            "glass",
+            "door",
+            "sill",
+            "railing",
+            "reference",
+            "steel",
+            "deck",
+            "demolished",
+            "plinth",
+            "plaster",
+            "render",
+            "brick_red",
+            "brick_yellow",
+            "paving",
+            "gravel",
+            "grass",
+            "bark",
+            "foliage",
+            "soil",
+            "planter",
+            "steel_white",
+            "gasket",
+        ];
+        assert_eq!(super::Material::ALL[..26].iter().map(|m| m.name()).collect::<Vec<_>>(), legacy);
+        for (index, material) in super::Material::ALL.iter().enumerate() {
+            assert_eq!(*material as usize, index, "GPU/export material indices must agree with the shared table");
+        }
+    }
+
     use super::*;
 
     #[test]
