@@ -43,6 +43,9 @@ pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) 
     let mut x = Ifc::new(doc);
     let project = x.project();
     let site = x.site(project);
+    for terrain in built.iter().filter_map(|b| b.terrain.as_ref()) {
+        x.terrain(terrain, site);
+    }
     let mut buildings = Vec::new();
     for b in built {
         buildings.push(x.building(b, site));
@@ -105,6 +108,21 @@ impl Floors {
 }
 
 impl<'a> Ifc<'a> {
+    fn terrain(&mut self, mesh: &Mesh, site: (usize, Placed)) {
+        let placed = self.w.place(Some(site.1), Frame::at([0.; 3]));
+        let Some(item) = self.w.faceset(mesh, &placed.frame) else { return };
+        self.cat.paint(&mut self.w, item, catalog::GROUND);
+        let Some(shape) = self.shape("Tessellation", &[item], None, "L-Terrain") else { return };
+        let id = self.w.add(format!(
+            "IFCGEOGRAPHICELEMENT({},$,'Terrain surface',$,$,#{},#{shape},'site.terrain',.TERRAIN.)",
+            gid("site.terrain"),
+            placed.id
+        ));
+        self.w.add(format!("IFCRELCONTAINEDINSPATIALSTRUCTURE({},$,$,$,(#{id}),#{})", gid("site.terrain.contains"), site.0));
+        self.common("Pset_GeographicElementCommon", id, "Terrain surface", None, vec![("IsExternal", catalog::Val::Bool(true))]);
+        self.made_of(id, catalog::GROUND);
+    }
+
     fn new(doc: &'a Document) -> Self {
         let mut w = W::default();
         let wcs = w.axis2([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);

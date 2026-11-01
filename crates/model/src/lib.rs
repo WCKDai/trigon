@@ -16,6 +16,7 @@ pub mod mesh;
 pub mod profile;
 pub mod roof;
 pub mod stair;
+pub mod terrain;
 pub mod wall_cleanup;
 pub mod walls;
 

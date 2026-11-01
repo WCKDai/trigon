@@ -504,6 +504,9 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
     };
     let kind_of = |e: &BuiltElement| doc.component(&e.type_id).ok().map(|t| t.kind.clone());
     for b in built {
+        if let Some(terrain) = &b.terrain {
+            out.push(("site.terrain".into(), terrain.clone()));
+        }
         for w in &b.walls {
             for seg in &w.segments {
                 out.push((seg.id.clone(), seg.mesh.clone()));

@@ -278,6 +278,8 @@ pub struct Built {
     pub roof: Option<BuiltRoof>,
     pub interior: Vec<BuiltInterior>,
     pub stairs: Vec<BuiltStair>,
+    /// Site terrain is carried once, on the first building, for shared display/exchange.
+    pub terrain: Option<Mesh>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,7 +313,14 @@ pub fn build_cut(doc: &Document, view: View, cut: Option<f64>) -> Result<Vec<Bui
     if let Some(z) = cut {
         crate::checked("cut height", z, -50_000.0, 500_000.0)?;
     }
-    doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect()
+    let mut built: Vec<_> = doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect::<Result<_>>()?;
+    if let Some(terrain) = &doc.terrain {
+        let first = built.first_mut().ok_or_else(|| ModelError::Invalid("terrain needs a building site".into()))?;
+        let mesh = terrain.mesh(&doc.buildings)?;
+        let mesh = if let Some(z) = cut { mesh.below(z) } else { mesh };
+        first.terrain = (!mesh.is_empty()).then_some(mesh);
+    }
+    Ok(built)
 }
 
 fn clip_element(mut e: BuiltElement, cut: Option<f64>) -> BuiltElement {
@@ -927,7 +936,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             stairs.push(BuiltStair { id: format!("{id}.L{level}"), level, kind: st.kind, winding: st.winders.is_some(), mesh, railing });
         }
     }
-    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs })
+    Ok(Built { building_id: b.id.clone(), name: b.name.clone(), storeys: b.storeys.clone(), walls, slabs, roof, interior, stairs, terrain: None })
 }
 
 /// The plinth runs this far below the terrain, mm.

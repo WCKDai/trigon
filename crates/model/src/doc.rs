@@ -22,6 +22,8 @@ pub struct ModelGroup {
 pub struct Document {
     pub format: String,
     pub site: Option<Site>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terrain: Option<crate::terrain::Terrain>,
     pub buildings: Vec<Building>,
     /// The component library (parametric families with their parameters set).
     pub types: Vec<ComponentType>,
@@ -197,6 +199,7 @@ impl Default for Document {
         Self {
             format: FORMAT.to_string(),
             site: None,
+            terrain: None,
             buildings: Vec::new(),
             types: default_types(),
             groups: Vec::new(),

@@ -44,6 +44,22 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "site.set_terrain",
+        summary: "Set/remove a parametric ground height grid in site-local mm. Buildings trim the surface, keeping ground out of floors. Bounded, validated, atomic and undoable; unmeasured flat ground is a presentation assumption.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::terrain::Set>,
+        run: |s, v| crate::terrain::set(s, parse("site.set_terrain", v)?),
+    },
+    CommandSpec {
+        id: "site.sample_terrain",
+        summary: "Sample a bounded ground grid from Danmarks Højdemodel DTM using configured Dataforsyningen access. Converts DVR90 metres to site-local mm, records source attribution, rejects missing data. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::terrain::Sample>,
+        run: |s, v| crate::terrain::sample(s, parse("site.sample_terrain", v)?),
+    },
+    CommandSpec {
         id: "element.get",
         summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
         mutates: false,

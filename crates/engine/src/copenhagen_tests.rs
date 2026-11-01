@@ -76,3 +76,21 @@ fn curved_family_exchange_quantities_and_exact_edit_undo_agree() {
         assert_eq!(s.doc, before);
     }
 }
+
+#[test]
+fn terrain_is_an_explicit_atomic_undoable_source_and_portable_mesh() {
+    let mut s = session();
+    let before = s.doc.clone();
+    s.execute("site.set_terrain", json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[65000,30000],"heights_mm":[[0,100],[200,300]]}})).unwrap();
+    let bytes = trigon_io::glb::write(&build(&s.doc).unwrap(), &[]);
+    assert!(bytes.windows(b"site.terrain".len()).any(|w| w == b"site.terrain"));
+    let valid = s.doc.clone();
+    assert!(s.execute("site.set_terrain", json!({})).is_err());
+    assert_eq!(s.doc, valid);
+    for heights in [json!([]), json!([[0, 0]]), json!([[0, 0], [0]]), json!([[0, 0], [0, 1e300]])] {
+        assert!(s.execute("site.set_terrain", json!({"terrain":{"origin":[0,0],"spacing_mm":[1000,1000],"heights_mm":heights}})).is_err());
+        assert_eq!(s.doc, valid);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}

@@ -46,6 +46,7 @@ pub const RENDER: Mat = mat("Facadepuds", "plaster", [0.91, 0.90, 0.87]);
 pub const BRICK_RED: Mat = mat("Tegl, røde sten", "brick", [0.62, 0.25, 0.17]);
 pub const BRICK_YELLOW: Mat = mat("Tegl, gule sten", "brick", [0.78, 0.68, 0.47]);
 pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
+pub const GROUND: Mat = mat("Terrain surface", "ground", [0.65, 0.67, 0.62]);
 /// Spaces: a translucent volume, no material.
 pub const SPACE: Mat = Mat { name: "Rum", category: "space", rgb: [0.55, 0.75, 0.95], transparency: 0.75 };
 
@@ -67,6 +68,7 @@ pub fn of(m: Material) -> Mat {
         Material::Render => RENDER,
         Material::BrickRed => BRICK_RED,
         Material::BrickYellow => BRICK_YELLOW,
+        Material::Ground => GROUND,
     }
 }
 

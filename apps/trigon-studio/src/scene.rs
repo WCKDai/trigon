@@ -321,6 +321,16 @@ impl Scene {
         };
         let mut levels = Vec::new();
         for building in built {
+            if let Some(terrain) = &building.terrain {
+                b.add(
+                    "site.terrain",
+                    "terrain",
+                    None,
+                    vec![("units", "site-local mm; site datum".into())],
+                    false,
+                    &[Part { mesh: terrain, rgba: Material::Ground.rgba(), material: Material::Ground }],
+                );
+            }
             if levels.is_empty() {
                 levels = building.storeys.iter().map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }).collect();
             }
@@ -709,6 +719,26 @@ mod tests {
         let mut doc = Document::default();
         doc.buildings.push(Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
         doc
+    }
+
+    #[test]
+    fn terrain_uses_the_shared_source_mesh_in_the_headless_scene() {
+        let mut d = doc();
+        d.terrain = Some(trigon_model::terrain::Terrain {
+            origin: [-5000., -5000.],
+            spacing_mm: [20000., 20000.],
+            heights_mm: vec![vec![0., 100.], vec![200., 300.]],
+            source: None,
+            attribution: None,
+        });
+        let built = build(&d).unwrap();
+        let scene = Scene::from_built(&built, false);
+        let element = &scene.elements[scene.find_unique("site.terrain").unwrap()];
+        assert_eq!(element.kind, "terrain");
+        assert!(!element.ranges.is_empty());
+        assert_eq!(scene.elements.iter().filter(|e| e.id == "site.terrain").count(), 1);
+        let without = Scene::from_built(&build(&doc()).unwrap(), false);
+        assert_eq!(scene.elements.len(), without.elements.len() + 1);
     }
 
     #[test]

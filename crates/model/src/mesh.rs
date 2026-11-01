@@ -31,10 +31,12 @@ pub enum Material {
     BrickRed,
     /// Yellow facing brick, explicitly assigned rather than changing a building's default brick.
     BrickYellow,
+    /// Neutral outdoor ground; actual paving/soil composition is project information.
+    Ground,
 }
 
 impl Material {
-    pub const ALL: [Material; 17] = [
+    pub const ALL: [Material; 18] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -52,6 +54,7 @@ impl Material {
         Material::Render,
         Material::BrickRed,
         Material::BrickYellow,
+        Material::Ground,
     ];
 
     pub fn name(self) -> &'static str {
@@ -73,6 +76,7 @@ impl Material {
             Material::Render => "render",
             Material::BrickRed => "brick_red",
             Material::BrickYellow => "brick_yellow",
+            Material::Ground => "ground",
         }
     }
 
@@ -96,6 +100,7 @@ impl Material {
             Material::Render => [0.90, 0.90, 0.88, 1.0],
             Material::BrickRed => [0.55, 0.22, 0.14, 1.0],
             Material::BrickYellow => [0.57, 0.43, 0.22, 1.0],
+            Material::Ground => [0.38, 0.40, 0.35, 1.0],
         }
     }
 

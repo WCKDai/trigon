@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (i, ty) in trigon_model::component::copenhagen_types().iter().enumerate() {
         s.execute("facade.place", json!({"facade":"b.f1","type":ty.id,"levels":[0],"bays":[i]}))?;
     }
+    s.execute("site.set_terrain",json!({"terrain":{"origin":[-8000,-8000],"spacing_mm":[58000,24000],"heights_mm":[[0,0],[0,0]],"source":"illustrative:flat-ground","attribution":"Original public-safe presentation assumption"}}))?;
     s.execute("view.define", json!({"id":"street","name":"Original family gallery","kind":{"view":"facade","facade":"b.f1"}}))?;
     for ext in ["png", "svg", "dxf"] {
         s.execute("view.export", json!({"id":"street","path":directory.join(format!("gallery.{ext}"))}))?;

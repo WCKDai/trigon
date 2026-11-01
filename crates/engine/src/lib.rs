@@ -27,6 +27,7 @@ mod schedule_export;
 mod schedules;
 mod section;
 mod sheet;
+mod terrain;
 mod time;
 mod views;
 
