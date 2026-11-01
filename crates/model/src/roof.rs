@@ -12,6 +12,68 @@ use crate::{ModelError, Result};
 mod mansard;
 pub use mansard::{Mansard, build as mansard};
 
+/// Original shed dormer source parameters, relative to a straight mansard facade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Dormer {
+    pub id: String,
+    pub facade: String,
+    pub u_mm: f64,
+    pub window_type: String,
+    pub width_mm: f64,
+    pub height_mm: f64,
+    #[serde(default = "dormer_setback")]
+    pub setback_mm: f64,
+    #[serde(default = "dormer_cheek")]
+    pub cheek_mm: f64,
+    #[serde(default = "dormer_head")]
+    pub head_mm: f64,
+    #[serde(default = "dormer_clearance")]
+    pub sill_clearance_mm: f64,
+    #[serde(default = "dormer_pitch")]
+    pub roof_pitch_deg: f64,
+    #[serde(default = "dormer_thickness")]
+    pub roof_thickness_mm: f64,
+}
+fn dormer_setback() -> f64 {
+    200.0
+}
+fn dormer_cheek() -> f64 {
+    100.0
+}
+fn dormer_head() -> f64 {
+    150.0
+}
+fn dormer_clearance() -> f64 {
+    80.0
+}
+fn dormer_pitch() -> f64 {
+    6.0
+}
+fn dormer_thickness() -> f64 {
+    65.0
+}
+
+impl Dormer {
+    pub fn validate(&self) -> Result<()> {
+        for (label, text) in [("dormer id", &self.id), ("dormer facade", &self.facade), ("dormer window type", &self.window_type)] {
+            if text.is_empty() || text.len() > 128 || text.chars().any(char::is_control) {
+                return Err(ModelError::Invalid(format!("{label} needs 1–128 bytes without control characters")));
+            }
+        }
+        crate::checked("dormer centre", self.u_mm, 0.0, 1e8)?;
+        crate::checked("dormer window width", self.width_mm, 300.0, 3000.0)?;
+        crate::checked("dormer window height", self.height_mm, 300.0, 2200.0)?;
+        crate::checked("dormer setback", self.setback_mm, 100.0, 1500.0)?;
+        crate::checked("dormer cheek", self.cheek_mm, 50.0, 200.0)?;
+        crate::checked("dormer head", self.head_mm, 50.0, 400.0)?;
+        crate::checked("dormer sill clearance", self.sill_clearance_mm, 20.0, 300.0)?;
+        crate::checked("dormer roof pitch", self.roof_pitch_deg, 0.0, 15.0)?;
+        crate::checked("dormer roof thickness", self.roof_thickness_mm, 20.0, 200.0)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Roof {

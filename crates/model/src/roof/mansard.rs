@@ -27,6 +27,8 @@ pub struct Mansard {
     pub thickness_mm: f64,
     #[serde(default)]
     pub gutters: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dormers: Vec<super::Dormer>,
 }
 
 fn lower() -> f64 {
@@ -51,6 +53,7 @@ impl Default for Mansard {
             verge_mm: 0.0,
             thickness_mm: 0.0,
             gutters: false,
+            dormers: Vec::new(),
         }
     }
 }
@@ -120,6 +123,12 @@ pub fn build(outline: &[[f64; 2]], eaves: f64, gables: &[usize], p: &Mansard) ->
     checked("mansard upper pitch", p.upper_pitch_deg, 5.0, 45.0)?;
     checked("mansard break run", p.break_run_mm, 200.0, 10000.0)?;
     checked("mansard straightening", p.straighten_mm, 0.0, 10000.0)?;
+    if p.dormers.len() > 16 {
+        return Err(ModelError::Invalid("at most 16 dormers per mansard roof".into()));
+    }
+    for dormer in &p.dormers {
+        dormer.validate()?;
+    }
     if p.lower_pitch_deg < p.upper_pitch_deg + 5.0 {
         return Err(ModelError::Invalid("mansard lower pitch must exceed upper pitch by at least 5°".into()));
     }

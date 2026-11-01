@@ -119,7 +119,7 @@ fn row(doc: &Document, building: &Built, host: &str, external: bool, fill: &Buil
 pub fn opening_schedule_from_built(doc: &Document, buildings: &[Built]) -> Result<OpeningSchedule> {
     let mut schedule = OpeningSchedule::default();
     for building in buildings {
-        for wall in &building.walls {
+        for wall in building.exterior_walls() {
             for opening in &wall.openings {
                 schedule.rows.push(row(doc, building, &wall.id, true, &opening.fill)?);
             }

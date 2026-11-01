@@ -159,6 +159,32 @@ impl Ifc<'_> {
             self.made_of(id, catalog::ZINC);
             fl.contain(top, id);
         }
+        for d in &r.dormers {
+            for (suffix, mesh) in [("roof", &d.roof), ("cheeks", &d.cheeks)] {
+                let key = format!("{}.{suffix}", d.id);
+                let frame = fl.at(top).frame;
+                let lp = self.w.place(Some(fl.at(top)), frame);
+                let Some(item) = self.w.faceset(mesh, &frame) else { continue };
+                self.cat.paint(&mut self.w, item, catalog::ZINC);
+                let Some(shape) = self.shape("Tessellation", &[item], None, catalog::L_ROOF) else { continue };
+                let id = if suffix == "roof" {
+                    self.w.add(format!(
+                        "IFCROOF({},$,'Dormer shed roof - family default',$,$,#{},#{shape},{},.SHED_ROOF.)",
+                        gid(&key),
+                        lp.id,
+                        string(&key)
+                    ))
+                } else {
+                    self.w.add(format!(
+                        "IFCCOVERING({},$,'Dormer cheek cladding - family default',$,$,#{},#{shape},{},.CLADDING.)",
+                        gid(&key),
+                        lp.id,
+                        string(&key)
+                    ))
+                };
+                fl.contain(top, id);
+            }
+        }
     }
 
     /// A roof plane: its underside outline in its own plane, extruded along its rise to the top

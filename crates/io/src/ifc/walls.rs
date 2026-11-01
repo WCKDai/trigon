@@ -30,10 +30,11 @@ impl Ifc<'_> {
     /// Every wall of a building and the connections between them. Returns the facade pieces.
     pub(super) fn walls<'b>(&mut self, b: &'b Built, bd: Option<&Building>, fl: &mut Floors) -> Vec<Piece<'b>> {
         let mut pieces = Vec::new();
-        for wall in &b.walls {
+        for wall in b.exterior_walls() {
+            let dormer = b.roof.iter().any(|r| r.dormers.iter().any(|d| d.front.id == wall.id));
             let edge = bd.and_then(|bd| bd.facade(&wall.id).ok()).map(|f| f.edge);
             for seg in &wall.segments {
-                if let Some((id, placed)) = self.facade_piece(wall, seg, fl) {
+                if let Some((id, placed)) = self.facade_piece(wall, seg, fl, dormer) {
                     pieces.push(Piece { wall: wall.id.clone(), edge, seg, id, placed });
                 }
             }
@@ -55,7 +56,7 @@ impl Ifc<'_> {
         pieces
     }
 
-    fn facade_piece(&mut self, wall: &BuiltWall, seg: &WallSegment, fl: &mut Floors) -> Option<(usize, Placed)> {
+    fn facade_piece(&mut self, wall: &BuiltWall, seg: &WallSegment, fl: &mut Floors, dormer: bool) -> Option<(usize, Placed)> {
         let fr = wall.frame;
         // x along the outer face (the reference line), y into the building.
         let frame = Frame::plan([fr.origin[0], fr.origin[1], seg.z0], fr.t)?;
@@ -71,7 +72,7 @@ impl Ifc<'_> {
         if ring.len() < 3 || !(area(&ring) > 1.0) || !(h > 1.0) {
             return None;
         }
-        let up = catalog::facade(t, wall.kind == FacadeKind::Party, wall.finish);
+        let up = if dormer { catalog::dormer_front(t) } else { catalog::facade(t, wall.kind == FacadeKind::Party, wall.finish) };
         let placed = self.w.place(Some(fl.at(seg.level)), frame);
         let axis = self.w.polyline(&[[0.0, 0.0], [len, 0.0]], false);
         let solid = self.extruded(&ring, &[], h, up.face());

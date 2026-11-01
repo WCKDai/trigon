@@ -212,6 +212,15 @@ pub fn pitched_roof(t: f64) -> BuildUp {
     BuildUp { name: format!("Tag, tegl på spær {}", mm(t)), layers, predefined: "ROOF" }
 }
 
+/// Original timber-front family build-up; illustrative, never inferred from a photograph.
+pub fn dormer_front(t: f64) -> BuildUp {
+    BuildUp {
+        name: format!("Dormer front, illustrative timber family {}", mm(t)),
+        layers: sandwich(t, (FRAME, 15.0), STUDS, Some((PLASTER, 15.0))),
+        predefined: "ELEMENTEDWALL",
+    }
+}
+
 /// A property value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {

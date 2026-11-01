@@ -187,7 +187,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
         if let Some(terrain) = &b.terrain {
             add(&mut w, "site.terrain", &[(Material::Ground, terrain)]);
         }
-        for wall in &b.walls {
+        for wall in b.exterior_walls() {
             add(&mut w, &wall.id, &[(wall.finish, &wall.mesh), (Material::Plinth, &wall.plinth), (Material::Render, &wall.trim)]);
             let elements = wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments);
             for e in elements {
@@ -204,6 +204,10 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
         }
         if let Some(r) = &b.roof {
             add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables), (Material::Steel, &r.gutters)]);
+            for d in &r.dormers {
+                add(&mut w, &format!("{}.roof", d.id), &[(Material::Steel, &d.roof)]);
+                add(&mut w, &format!("{}.cheeks", d.id), &[(Material::Steel, &d.cheeks)]);
+            }
         }
         for iw in &b.interior {
             add(&mut w, &iw.id, &[(Material::Plaster, &iw.mesh)]);

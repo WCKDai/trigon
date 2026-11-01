@@ -507,7 +507,7 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
         if let Some(terrain) = &b.terrain {
             out.push(("site.terrain".into(), terrain.clone()));
         }
-        for w in &b.walls {
+        for w in b.exterior_walls() {
             for seg in &w.segments {
                 out.push((seg.id.clone(), seg.mesh.clone()));
             }
@@ -539,6 +539,10 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
             out.extend(gutters(r));
+            for d in &r.dormers {
+                out.push((format!("{}.roof", d.id), d.roof.clone()));
+                out.push((format!("{}.cheeks", d.id), d.cheeks.clone()));
+            }
         }
         for iw in &b.interior {
             out.push((iw.id.clone(), iw.mesh.clone()));
@@ -546,7 +550,7 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((d.fill.id.clone(), merged(&d.fill.parts)));
             }
         }
-        for w in &b.walls {
+        for w in b.exterior_walls() {
             out.push((format!("{}.plinth", w.id), w.plinth.clone()));
             out.push((format!("{}.trim", w.id), w.trim.clone()));
         }

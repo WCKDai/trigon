@@ -11,6 +11,30 @@ fn session() -> Session {
 }
 
 #[test]
+fn mansard_dormers_cut_real_roof_voids_and_keep_shared_edits_atomic() {
+    let mut s = session();
+    s.execute("types.install_copenhagen", json!({})).unwrap();
+    let params = json!({"kind":"mansard","thickness_mm":220,"overhang_mm":250,"dormers":[{"id":"street-1","facade":"b.f1","u_mm":10500,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}]});
+    s.execute("building.set_roof", params).unwrap();
+    let before = s.doc.clone();
+    let original = build(&s.doc).unwrap();
+    let schedule = s.execute("schedule.openings", json!({})).unwrap();
+    assert_eq!(schedule["totals"]["windows"], 1);
+    let record = s.execute("element.get", json!({"id":"b.dormer.street-1.window"})).unwrap();
+    assert_eq!(record["editable"], true);
+    s.execute("element.set", json!({"id":"b.dormer.street-1.window","properties":{"width_mm":1200}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), original);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    for bad in
+        [json!({"id":"b.dormer.street-1.window","properties":{"width_mm":1e300}}), json!({"id":"b.dormer.street-1.window","properties":{"u_mm":100}})]
+    {
+        assert!(s.execute("element.set", bad).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
 fn shaped_balcony_is_a_separate_undoable_attachment_with_a_portable_outline() {
     let mut s = session();
     s.execute("facade.set_bays", json!({"facade":"b.f1","count":8})).unwrap();

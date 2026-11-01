@@ -334,7 +334,7 @@ impl Scene {
             if levels.is_empty() {
                 levels = building.storeys.iter().map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }).collect();
             }
-            for w in &building.walls {
+            for w in building.exterior_walls() {
                 let first = b.elements.len();
                 let length = w.frame.length;
                 b.add(
@@ -408,6 +408,18 @@ impl Scene {
                         Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
                     ],
                 );
+                for d in &r.dormers {
+                    for (suffix, kind, mesh) in [("roof", "dormer roof", &d.roof), ("cheeks", "dormer cheeks", &d.cheeks)] {
+                        b.add(
+                            &format!("{}.{suffix}", d.id),
+                            kind,
+                            None,
+                            Vec::new(),
+                            true,
+                            &[Part { mesh, rgba: Material::Steel.rgba(), material: Material::Steel }],
+                        );
+                    }
+                }
             }
             for iw in &building.interior {
                 let len = (iw.outline[1][0] - iw.outline[0][0]).hypot(iw.outline[1][1] - iw.outline[0][1]);

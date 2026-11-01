@@ -46,7 +46,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             {"levels":[4],"bottom":3220,"top":3400,"projection":180}
         ]}),
     )?;
-    s.execute("building.set_roof",json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gables":["b.f3"],"gutters":true}))?;
+    let mut dormers = Vec::new();
+    for (facade, indices) in [("b.f2", vec![1, 2, 3, 4, 5, 6]), ("b.f4", vec![1, 3, 5])] {
+        let bays = s.doc.buildings[0].facade(facade)?.bays.clone();
+        for bay in indices {
+            let u = bays.get(bay).ok_or("dormer bay is absent")?;
+            dormers.push(
+                json!({"id":format!("{facade}-{bay}"),"facade":facade,"u_mm":u,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}),
+            );
+        }
+    }
+    s.execute("building.set_roof",json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gables":["b.f3"],"gutters":true,"dormers":dormers}))?;
     s.execute(
         "site.set_terrain",
         json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[50000,32000],"heights_mm":[[0,0],[0,0]],"source":"illustrative:flat-ground"}}),

@@ -12,6 +12,7 @@ use crate::walls::{Span, WallSegment};
 use crate::{ModelError, Result};
 
 mod balcony;
+mod dormer;
 mod opening;
 
 /// Window and door frames sit this far behind the outer wall face, mm.
@@ -268,6 +269,22 @@ pub struct BuiltRoof {
     pub pitch_deg: f64,
     /// Multiple slopes/mitres require their actual shell in exchange, not one-plane extrusion.
     pub compound: bool,
+    pub dormers: Vec<BuiltDormer>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltDormer {
+    pub id: String,
+    pub front: BuiltWall,
+    pub cheeks: Mesh,
+    pub roof: Mesh,
+}
+
+impl Built {
+    /// Facade walls and roof-dormer fronts share the same opening/export contracts.
+    pub fn exterior_walls(&self) -> impl Iterator<Item = &BuiltWall> {
+        self.walls.iter().chain(self.roof.iter().flat_map(|r| r.dormers.iter().map(|d| &d.front)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -886,10 +903,15 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
-            let (r, pitch_deg, compound) = match &b.roof {
+            let (mut r, pitch_deg, compound) = match &b.roof {
                 crate::Roof::Pitched { pitch_deg, .. } => (crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?, *pitch_deg, false),
                 crate::Roof::Mansard { parameters } => (crate::roof::mansard(&outline, h, &edges, parameters)?, parameters.lower_pitch_deg, true),
                 crate::Roof::Flat => return Err(ModelError::Invalid("a sloping roof configuration is required".into())),
+            };
+            let dormers = if let crate::Roof::Mansard { parameters } = &b.roof {
+                dormer::build(doc, b, &mut r.cover, &parameters.dormers)?
+            } else {
+                Vec::new()
             };
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
@@ -900,6 +922,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 ridge: r.ridge,
                 pitch_deg,
                 compound,
+                dormers,
             })
         }
     };

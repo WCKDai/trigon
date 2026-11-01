@@ -1986,6 +1986,8 @@ struct SetRoof {
     upper_pitch_deg: Option<f64>,
     /// Mansard underside break, horizontal inward run from the exterior wall (default 1300 mm).
     break_run_mm: Option<f64>,
+    /// Shed dormers with coordinated roof voids, on one straight mansard face each.
+    dormers: Option<Vec<trigon_model::roof::Dormer>>,
     /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
     ridge: Option<f64>,
     /// Facades that end in a gable.
@@ -2365,7 +2367,7 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
 fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
-    if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some()) {
+    if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.dormers.is_some()) {
         return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg and break_run_mm require kind mansard".into()).into());
     }
     let b = s.doc.building_mut(p.building.as_deref())?;
@@ -2415,6 +2417,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     verge_mm: p.verge_mm.unwrap_or(0.0),
                     thickness_mm: p.thickness_mm.unwrap_or(0.0),
                     gutters: p.gutters.unwrap_or(false),
+                    dormers: p.dormers.unwrap_or_default(),
                 },
             }
         }

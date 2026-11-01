@@ -198,7 +198,7 @@ impl<'a> Ifc<'a> {
         let bd = doc.buildings.iter().find(|x| x.id == b.building_id);
 
         let pieces = self.walls(b, bd, &mut fl);
-        for wall in &b.walls {
+        for wall in b.exterior_walls() {
             let mine: Vec<&walls::Piece> = pieces.iter().filter(|p| p.wall == wall.id).collect();
             self.openings(wall, &mine, &mut fl);
             self.wall_balconies(wall, &mut fl);

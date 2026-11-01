@@ -41,6 +41,7 @@ enum Source {
     Cellar(usize, usize, bool),
     Slab(usize, usize, bool),
     Roof(usize),
+    Dormer(usize, usize),
     Building(usize),
 }
 
@@ -488,6 +489,38 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
         }
         if let Some(roof) = &model.roof {
             result.push(roof_record(building, bi, &roof.id, None)?);
+            if let trigon_model::Roof::Mansard { parameters } = &building.roof {
+                for (di, d) in roof.dormers.iter().enumerate() {
+                    let Some(spec) = parameters.dormers.get(di) else { continue };
+                    let properties = vec![
+                        number("width_mm", "Dormer window width", spec.width_mm, "mm", 300.0, 3000.0),
+                        number("height_mm", "Dormer window height", spec.height_mm, "mm", 300.0, 2200.0),
+                        number("u_mm", "Centre along host facade", spec.u_mm, "mm", 0.0, 1e8),
+                        number("setback_mm", "Front setback from wall", spec.setback_mm, "mm", 100.0, 1500.0),
+                        number("cheek_mm", "Side cheek thickness", spec.cheek_mm, "mm", 50.0, 200.0),
+                        number("head_mm", "Head above window", spec.head_mm, "mm", 50.0, 400.0),
+                        number("sill_clearance_mm", "Sill above host roof at rear lining", spec.sill_clearance_mm, "mm", 20.0, 300.0),
+                        number("roof_pitch_deg", "Shed roof pitch", spec.roof_pitch_deg, "deg", 0.0, 15.0),
+                        number("roof_thickness_mm", "Shed roof normal thickness", spec.roof_thickness_mm, "mm", 20.0, 200.0),
+                        field("window_type", "Window family", spec.window_type.clone(), true),
+                        field("source_scope", "Edit scope", "This parametric roof dormer", false),
+                    ];
+                    for id in [d.front.id.clone(), format!("{}.roof", d.id), format!("{}.cheeks", d.id)]
+                        .into_iter()
+                        .chain(d.front.openings.iter().map(|o| o.fill.id.clone()))
+                    {
+                        result.push(record(
+                            &id,
+                            "roof dormer",
+                            building,
+                            (None, Status::Existing),
+                            Source::Dormer(bi, di),
+                            properties.clone(),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
         }
         for (ri, room) in building.rooms.iter().enumerate() {
             for &level in &room.levels {
@@ -578,6 +611,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 number("straighten_mm", "Eave straightening", p.straighten_mm, "mm", 0.0, 10000.0),
                 field("gutters", "Half-round gutters", p.gutters, true),
                 field("gables", "Gable facade IDs", json!(p.gables), true),
+                field("dormers", "Parametric roof dormers", json!(p.dormers), true),
             ]);
         }
     }
@@ -992,6 +1026,28 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             b.ground_floor = checked("ground floor elevation", b.storeys.get(b.ground_level).map_or(b.ground_floor, |s| s.elevation), 0.0, 300000.0)?;
             Ok(selected_id.to_string())
         }
+        Source::Dormer(bi, di) => {
+            let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing dormer building"))?;
+            let trigon_model::Roof::Mansard { parameters } = &mut b.roof else { return Err(invalid("dormers require a mansard roof")) };
+            let d = parameters.dormers.get_mut(di).ok_or_else(|| invalid("missing roof dormer"))?;
+            for (key, value) in properties {
+                match key.as_str() {
+                    "width_mm" => d.width_mm = numeric(key, value)?,
+                    "height_mm" => d.height_mm = numeric(key, value)?,
+                    "u_mm" => d.u_mm = numeric(key, value)?,
+                    "setback_mm" => d.setback_mm = numeric(key, value)?,
+                    "cheek_mm" => d.cheek_mm = numeric(key, value)?,
+                    "head_mm" => d.head_mm = numeric(key, value)?,
+                    "sill_clearance_mm" => d.sill_clearance_mm = numeric(key, value)?,
+                    "roof_pitch_deg" => d.roof_pitch_deg = numeric(key, value)?,
+                    "roof_thickness_mm" => d.roof_thickness_mm = numeric(key, value)?,
+                    "window_type" => d.window_type = text(key, value)?,
+                    _ => return Err(invalid("unknown roof dormer property")),
+                }
+            }
+            d.validate()?;
+            Ok(selected_id.to_string())
+        }
         Source::Roof(bi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
             if let Some(kind) = properties.get("roof_kind") {
@@ -1055,6 +1111,9 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "verge_mm" => p.verge_mm = numeric(key, value)?,
                         "thickness_mm" => p.thickness_mm = numeric(key, value)?,
                         "gutters" => p.gutters = boolean(key, value)?,
+                        "dormers" => {
+                            p.dormers = serde_json::from_value(value.clone()).map_err(|_| invalid("dormers requires typed dormer parameters"))?
+                        }
                         "gables" => {
                             let ids: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| invalid("gables must be facade IDs"))?;
                             if ids.len() > 200 {
