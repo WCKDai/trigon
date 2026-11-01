@@ -9,6 +9,20 @@ Presentation plans retain the model's stair treads, landing outlines and directi
 the same source stair, including rounded turns and winders; drawing a plan does not change its
 geometry. A pale background replaces the former dotted shaft-only presentation.
 
+Saved plan templates can enable live room tags with `room_labels: "area"` or `"name_and_area"`
+through `view.configure` (also in Studio's view-template panel). Tags use the selected storey's
+room definitions, so a name or polygon edit updates the name and calculated square metres.
+Text stays 2.5 mm high on paper. A conservative lettering box must fit the room clearance and
+visible crop, clear of visible stair symbols; a long name falls back to area alone, and a crowded area tag is omitted. Blank
+names display only their area. Explicit view ranges show tags only when the cut crosses that
+room's storey volume. Clicking a tag's room area picks its exact source room.
+
+The default is `"hidden"`, omitted from serialized templates, preserving existing view output.
+The public Rust `DrawingTemplate` adds `room_labels` and the `RoomLabels` enum; exhaustive
+consumers/struct literals need updating. Older strict readers need a separate saved copy with
+the optional room-label setting removed before opening a feature-bearing project. Tags use
+explicit room polygons; they do not establish apartment boundaries or survey accuracy.
+
 ```json
 {"command":"view.define","params":{"id":"ground","name":"Ground floor","kind":{"view":"plan","level":0}}}
 {"command":"annotation.define","params":{"id":"wall-note","view":"ground","size_mm":2.5,"kind":{"annotation":"text","at":[1000,2000],"text":"Existing brickwork"}}}

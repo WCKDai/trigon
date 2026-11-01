@@ -128,11 +128,13 @@ fn cellar_id(building: &Building, index: usize) -> Option<String> {
 fn component_properties(ty: &trigon_model::ComponentType) -> Vec<Value> {
     let mut result = Vec::new();
     let depth = match ty.kind {
-        ComponentKind::Loggia { depth, .. } => Some((depth, 4000.0)),
-        _ => ty.kind.depth().map(|depth| (depth, 3000.0)),
+        ComponentKind::GuardRail { projection, handrail, .. } => Some((projection, if handrail { 35.0 } else { 20.0 }, 3000.0)),
+        ComponentKind::Loggia { depth, .. } => Some((depth, 300.0, 4000.0)),
+        _ => ty.kind.depth().map(|depth| (depth, 300.0, 3000.0)),
     };
-    if let Some((depth, max)) = depth {
-        result.push(number("depth_mm", "Depth (this assembly)", depth, "mm", 300.0, max));
+    if let Some((depth, min, max)) = depth {
+        let label = if matches!(ty.kind, ComponentKind::GuardRail { .. }) { "Projection to guard centreline" } else { "Depth (this assembly)" };
+        result.push(number("depth_mm", label, depth, "mm", min, max));
     }
     match &ty.kind {
         ComponentKind::FrenchBalcony { rail_height, .. } | ComponentKind::Balcony { rail_height, .. } | ComponentKind::Loggia { rail_height, .. } => {
@@ -282,9 +284,11 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                 let u = placement.u.or_else(|| facade.bays.get(placement.bay).copied()).ok_or_else(|| invalid("placement has no bay centre"))?;
                 let floor = building.storeys.get(placement.level).ok_or_else(|| invalid("placement has no storey"))?.elevation;
                 let assembly = if owner != element.id { " (host assembly)" } else { "" };
+                let height_bounds = if matches!(ty.kind, ComponentKind::GuardRail { .. }) { [900.0, 1500.0] } else { [300.0, 4000.0] };
+                let handle_depth = if let ComponentKind::GuardRail { projection, .. } = ty.kind { -projection } else { 120.0 };
                 let mut properties = vec![
                     number("width_mm", format!("Width{assembly}"), width, "mm", 300.0, 6000.0),
-                    number("height_mm", format!("Height{assembly}"), height, "mm", 300.0, 4000.0),
+                    number("height_mm", format!("Height{assembly}"), height, "mm", height_bounds[0], height_bounds[1]),
                     number("sill_mm", format!("Sill / base above floor{assembly}"), sill, "mm", -floor, 3000.0),
                     number("u_mm", format!("Centre along facade{assembly}"), u, "mm", 0.0, wall.frame.length),
                     choice(
@@ -297,28 +301,47 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                     field("source_scope", "Edit scope", "This facade assembly only; component-specific changes create a private type variant", false),
                 ];
                 properties.extend(component_properties(ty));
-                let handles = vec![
+                let mut handles = vec![
                     handle(
                         "width_mm",
                         "Width",
-                        wall.frame.point(u + width / 2.0, 120.0, floor + sill + height / 2.0),
+                        wall.frame.point(u + width / 2.0, handle_depth, floor + sill + height / 2.0),
                         [wall.frame.t[0], wall.frame.t[1], 0.0],
                         width,
                         [300.0, 6000.0],
                         2.0,
                     ),
-                    handle("height_mm", "Height", wall.frame.point(u, 120.0, floor + sill + height), [0.0, 0.0, 1.0], height, [300.0, 4000.0], 1.0),
-                    handle("sill_mm", "Sill / base", wall.frame.point(u, 120.0, floor + sill), [0.0, 0.0, 1.0], sill, [-floor, 3000.0], 1.0),
+                    handle(
+                        "height_mm",
+                        "Height",
+                        wall.frame.point(u, handle_depth, floor + sill + height),
+                        [0.0, 0.0, 1.0],
+                        height,
+                        height_bounds,
+                        1.0,
+                    ),
+                    handle("sill_mm", "Sill / base", wall.frame.point(u, handle_depth, floor + sill), [0.0, 0.0, 1.0], sill, [-floor, 3000.0], 1.0),
                     handle(
                         "u_mm",
                         "Along facade",
-                        wall.frame.point(u, 120.0, floor + sill + height / 2.0),
+                        wall.frame.point(u, handle_depth, floor + sill + height / 2.0),
                         [wall.frame.t[0], wall.frame.t[1], 0.0],
                         u,
                         [0.0, wall.frame.length],
                         1.0,
                     ),
                 ];
+                if let ComponentKind::GuardRail { projection, handrail, .. } = ty.kind {
+                    handles.push(handle(
+                        "depth_mm",
+                        "Guard projection",
+                        wall.frame.point(u, -projection, floor + sill + height / 2.0),
+                        [wall.frame.n[0], wall.frame.n[1], 0.0],
+                        projection,
+                        [if handrail { 35.0 } else { 20.0 }, 3000.0],
+                        1.0,
+                    ));
+                }
                 result.push(record(
                     &element.id,
                     element_kind(element),
@@ -747,7 +770,8 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             ComponentKind::Balcony { depth, .. }
                             | ComponentKind::BalconySlab { depth, .. }
                             | ComponentKind::SteelBalcony { depth, .. }
-                            | ComponentKind::Loggia { depth, .. },
+                            | ComponentKind::Loggia { depth, .. }
+                            | ComponentKind::GuardRail { projection: depth, .. },
                         ) => *depth = n()?,
                         (
                             "rail_height_mm",
@@ -1078,6 +1102,139 @@ mod tests {
 
     fn update(s: &mut Session, id: &str, properties: Value) -> String {
         s.execute("element.set", json!({"id":id,"properties":properties})).unwrap()["targets"][0].as_str().unwrap().to_string()
+    }
+
+    fn guard_session() -> Session {
+        let mut s = session();
+        s.doc.buildings[0].facades[0].placements.retain(|p| p.type_id.starts_with("window."));
+        s.execute(
+            "types.define",
+            json!({
+                "id":"guard.flat","name":"Independent flat-bar guard","width":1500,"height":1100,"sill":0,
+                "kind":{"family":"guard_rail","projection":150,"railing":"norrebro","finish":"galvanised","handrail":false}
+            }),
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn standalone_guards_preserve_openings_and_walls_and_are_owned_by_the_actual_railing() {
+        let mut s = guard_session();
+        let initial = trigon_model::build(&s.doc).unwrap();
+        for (bay, width) in [(0, 1500), (2, 1800)] {
+            s.execute("facade.place", json!({"facade":"b.f1","type":"guard.flat","levels":[0],"bays":[bay],"width":width})).unwrap();
+        }
+        let built = trigon_model::build(&s.doc).unwrap();
+        let wall = &built[0].walls[0];
+        assert_eq!(wall.mesh, initial[0].walls[0].mesh, "an independent guard never cuts the wall");
+        assert_eq!(wall.openings, initial[0].walls[0].openings, "a guard must coexist with its separate window without creating a fill");
+        assert_eq!(wall.attachments.len(), 2);
+        assert!(wall.attachments.iter().all(|e| e.class == ElementClass::Railing));
+        assert_eq!(wall.attachments[0].id, "b.f1.L0.B0.balcony.rail");
+        let drawing = crate::plan_drawing(&s.doc, 0, View::latest(&s.doc)).unwrap();
+        for element in &wall.attachments {
+            let segments: Vec<_> = drawing.element_segments.iter().filter(|line| line.id == element.id).collect();
+            assert!(!segments.is_empty(), "{} has no plan ownership", element.id);
+            let line = segments
+                .iter()
+                .max_by(|a, b| (a.segment[0][0] - a.segment[1][0]).abs().total_cmp(&(b.segment[0][0] - b.segment[1][0]).abs()))
+                .unwrap();
+            let [a, b] = line.segment;
+            let point = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+            assert_eq!(drawing.pick_element(point, 0.1).unwrap().id, element.id);
+            assert_eq!(descriptor(&mut s, &element.id)["kind"], "railing");
+        }
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), built, "guard geometry is deterministic");
+    }
+
+    #[test]
+    fn guard_type_changes_preserve_overrides_and_instance_handles_edit_once_with_exact_undo() {
+        let mut s = guard_session();
+        s.execute("facade.place", json!({"facade":"b.f1","type":"guard.flat","levels":[0],"bays":[0]})).unwrap();
+        s.execute("facade.place", json!({"facade":"b.f1","type":"guard.flat","levels":[0],"bays":[2],"width":1800})).unwrap();
+        let before = s.doc.clone();
+        let initial = trigon_model::build(&s.doc).unwrap();
+        let mut ty = serde_json::to_value(s.doc.component("guard.flat").unwrap()).unwrap();
+        ty["width"] = json!(1700);
+        ty["kind"]["finish"] = json!("white");
+        s.execute("types.define", ty).unwrap();
+        let built = trigon_model::build(&s.doc).unwrap();
+        let guards = &built[0].walls[0].attachments;
+        assert_eq!([guards[0].width, guards[1].width], [1700.0, 1800.0]);
+        assert!(guards.iter().all(|e| e.parts.iter().any(|(m, _)| *m == trigon_model::Material::SteelWhite)));
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), initial);
+
+        let id = "b.f1.L0.B0.balcony.rail";
+        let data = descriptor(&mut s, id);
+        let handles = data["handles"].as_array().unwrap();
+        let projection = handles.iter().find(|h| h["key"] == "depth_mm").unwrap();
+        assert_eq!(projection["direction"], json!([0.0, -1.0, 0.0]));
+        assert_eq!(projection["position_mm"], json!([5000.0, -150.0, 550.0]));
+        assert_eq!(projection["min"], 20.0);
+        let height = handles.iter().find(|h| h["key"] == "height_mm").unwrap();
+        assert_eq!((height["min"].clone(), height["max"].clone()), (json!(900.0), json!(1500.0)));
+        assert_eq!(update(&mut s, id, json!({"depth_mm":300,"height_mm":1200,"width_mm":1600})), id);
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        let edited = trigon_model::build(&s.doc).unwrap();
+        let neighbour = "b.f1.L0.B2.balcony.rail";
+        assert_eq!(
+            edited[0].walls[0].attachments.iter().find(|e| e.id == neighbour),
+            initial[0].walls[0].attachments.iter().find(|e| e.id == neighbour)
+        );
+        assert_eq!(property(&descriptor(&mut s, id), "depth_mm"), 300.0);
+        assert_eq!(property(&descriptor(&mut s, id), "height_mm"), 1200.0);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), initial);
+    }
+
+    #[test]
+    fn guards_reject_invalid_type_or_instance_parameters_without_document_or_history_changes() {
+        let mut s = guard_session();
+        s.execute("facade.place", json!({"facade":"b.f1","type":"guard.flat","levels":[0],"bays":[0]})).unwrap();
+        let before = s.doc.clone();
+        let history = s.undo.len();
+        for (key, value) in [("width", json!(299)), ("height", json!(899)), ("height", json!(1501)), ("sill", json!(-1)), ("height", json!(f64::NAN))]
+        {
+            let mut ty = serde_json::to_value(s.doc.component("guard.flat").unwrap()).unwrap();
+            ty[key] = value;
+            assert!(s.execute("types.define", ty).is_err());
+            assert_eq!(s.doc, before);
+        }
+        for (handrail, projection) in [(false, 19.0), (true, 34.0), (false, 3001.0), (false, f64::MAX), (false, f64::NEG_INFINITY)] {
+            let mut ty = serde_json::to_value(s.doc.component("guard.flat").unwrap()).unwrap();
+            ty["kind"]["handrail"] = json!(handrail);
+            ty["kind"]["projection"] = json!(projection);
+            assert!(s.execute("types.define", ty).is_err());
+            assert_eq!(s.doc, before);
+        }
+        for properties in [json!({"depth_mm":19}), json!({"height_mm":1501}), json!({"width_mm":f64::MAX}), json!({"u_mm":0})] {
+            assert!(s.execute("element.set", json!({"id":"b.f1.L0.B0.balcony.rail","properties":properties})).is_err());
+            assert_eq!(s.doc, before);
+            assert_eq!(s.undo.len(), history);
+        }
+    }
+
+    #[test]
+    fn guard_occurrence_ids_support_copy_alignment_and_storey_copy_with_exact_undo() {
+        let mut s = guard_session();
+        s.execute("facade.place", json!({"facade":"b.f1","type":"guard.flat","levels":[0],"bays":[0]})).unwrap();
+        let before = s.doc.clone();
+        let copied = s.execute("edit.copy", json!({"targets":["b.f1.L0.B0.balcony.rail"],"delta":[3000,0,0]})).unwrap();
+        let copy_id = copied["targets"][0].as_str().unwrap();
+        s.execute("edit.align", json!({"targets":[copy_id],"axis":"u","coordinate":9000,"anchor":"center"})).unwrap();
+        let upper = s.execute("edit.copy_to_levels", json!({"targets":[copy_id],"levels":[1]})).unwrap();
+        assert_eq!(upper["targets"].as_array().unwrap().len(), 1);
+        assert_eq!(s.doc.buildings[0].facades[0].placements.iter().filter(|p| p.type_id == "guard.flat").count(), 3);
+        trigon_model::build(&s.doc).unwrap();
+        for _ in 0..3 {
+            s.execute("edit.undo", json!({})).unwrap();
+        }
+        assert_eq!(s.doc, before);
     }
 
     #[test]

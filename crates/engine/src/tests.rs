@@ -363,6 +363,144 @@ fn editing_one_storey_preserves_the_other_instances_and_undo() {
 }
 
 #[test]
+fn wall_alignment_makes_axes_collinear_preserving_length_doors_other_storeys_and_exact_undo() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"reference","levels":[0,1],"a":[-4000,1000],"b":[-2000,1000],"thickness":200},
+            {"id":"target","levels":[0,1],"a":[-4000,50],"b":[-2000,75],"thickness":120,"doors":[{"at":650,"width":700}]}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let target = before.buildings[0].interior_walls.iter().find(|w| w.id == "target").unwrap();
+    let length = (target.b[0] - target.a[0]).hypot(target.b[1] - target.a[1]);
+    let out = s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":"reference.L1"})).unwrap();
+    assert_eq!(out["targets"].as_array().unwrap().len(), 1);
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.iter().find(|w| w.id == "reference"), before.buildings[0].interior_walls.iter().find(|w| w.id == "reference"));
+    let ground = walls.iter().find(|w| w.id == "target").unwrap();
+    assert_eq!(ground.levels, [0]);
+    assert_eq!((ground.a, ground.b), (target.a, target.b));
+    let aligned = walls.iter().find(|w| w.id != "reference" && w.levels == [1]).unwrap();
+    assert_eq!((aligned.a[1], aligned.b[1]), (1000.0, 1000.0));
+    assert!(((aligned.b[0] - aligned.a[0]).hypot(aligned.b[1] - aligned.a[1]) - length).abs() < 1e-9);
+    assert_eq!(aligned.doors, target.doors);
+    assert_eq!(aligned.thickness, target.thickness);
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    trigon_model::build(&s.doc).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn wall_alignment_matches_diagonal_faces_including_reversed_source_directions() {
+    for theta in [0.0_f64, 0.61, 1.27] {
+        for reversed in [false, true] {
+            let mut s = session();
+            let t = [theta.cos(), theta.sin()];
+            let n = [-t[1], t[0]];
+            let origin = [-3000., 0.];
+            let at = |along: f64, across: f64| [origin[0] + t[0] * along + n[0] * across, origin[1] + t[1] * along + n[1] * across];
+            let (mut a, mut b) = (at(100., 40.), at(1800., 70.));
+            if reversed {
+                std::mem::swap(&mut a, &mut b);
+            }
+            s.execute(
+                "interior.add_walls",
+                json!({"walls":[
+                    {"id":"reference","levels":[0],"a":origin,"b":at(2000.,0.),"thickness":200},
+                    {"id":"target","levels":[0],"a":a,"b":b,"thickness":100}
+                ]}),
+            )
+            .unwrap();
+            let before = s.doc.clone();
+            s.execute("edit.align_walls", json!({"targets":["target.L0"],"reference":"reference.L0","reference_face":"left","target_face":"right"}))
+                .unwrap();
+            let w = s.doc.buildings[0].interior_walls.iter().find(|w| w.id == "target").unwrap();
+            let direction = if reversed { -1.0 } else { 1.0 };
+            for p in [w.a, w.b] {
+                let face = [p[0] - direction * n[0] * 50., p[1] - direction * n[1] * 50.];
+                let offset = (face[0] - origin[0]) * n[0] + (face[1] - origin[1]) * n[1];
+                assert!((offset - 100.).abs() < 1e-8, "diagonal/reversed faces must be on the same exact line");
+            }
+            let original_length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            assert!(((w.b[0] - w.a[0]).hypot(w.b[1] - w.a[1]) - original_length).abs() < 1e-8);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.doc, before);
+        }
+    }
+}
+
+#[test]
+fn wall_alignment_rejects_mixed_targets_self_reference_and_nonparallel_walls_atomically() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"reference","levels":[0,1],"a":[-4000,1000],"b":[-2000,1000],"thickness":200},
+            {"id":"target","levels":[0,1],"a":[-4000,50],"b":[-2000,75],"thickness":120},
+            {"id":"perpendicular","levels":[0],"a":[-3000,0],"b":[-3000,2000],"thickness":120}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let facade = before.buildings[0].facades[0].id.clone();
+    s.execute("facade.set_bays", json!({"facade":facade,"count":2})).unwrap();
+    s.execute("facade.place", json!({"facade":facade,"type":"window.casement.2","levels":[0],"bays":[0]})).unwrap();
+    let before = s.doc.clone();
+    let history = s.undo.len();
+    for params in [
+        json!({"targets":["target.L0","perpendicular.L0"],"reference":"reference.L0"}),
+        json!({"targets":["target.L0",format!("{facade}.L0.B0")],"reference":"reference.L0"}),
+        json!({"targets":["reference.L1"],"reference":"wall:reference"}),
+        json!({"targets":["wall:target"],"reference":"reference.L1","target_face":"invalid"}),
+        json!({"targets":["wall:target"],"reference":format!("{facade}.L0.B0")}),
+        json!({"targets":[],"reference":"reference.L0"}),
+        json!({"targets":["target.L0"],"reference":"reference.L0","angle":f64::MAX}),
+    ] {
+        assert!(s.execute("edit.align_walls", params).is_err());
+        assert_eq!(s.doc, before);
+        assert_eq!(s.undo.len(), history);
+    }
+}
+
+#[test]
+fn wall_cleanup_preserves_hosted_door_centres_and_definitions_with_atomic_exact_undo() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"door-a","levels":[0],"a":[-4000,0],"b":[-2000,0],"thickness":100,"doors":[{"at":800,"width":700}]},
+            {"id":"door-b","levels":[0],"a":[-1950,0],"b":[0,0],"thickness":100,"doors":[{"at":800,"width":700}]},
+            {"id":"cross","levels":[0],"a":[-4080,-1000],"b":[-4080,1000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    let after = s.doc.clone();
+    assert_eq!(after.buildings[0].interior_walls.iter().map(|w| w.doors.len()).sum::<usize>(), 2);
+    for old in before.buildings[0].interior_walls.iter().filter(|w| !w.doors.is_empty()) {
+        let new = after.buildings[0].interior_walls.iter().find(|w| w.id == old.id).unwrap();
+        assert_eq!(old.doors.len(), new.doors.len());
+        for (a, b) in old.doors.iter().zip(&new.doors) {
+            assert!((old.a[0] + a.at - new.a[0] - b.at).abs() < 1e-7);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+        }
+    }
+    s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    assert_eq!(s.doc.buildings, after.buildings);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert!(s.execute("interior.regularize", json!({"axes_deg":[0.],"tolerance_mm":-1})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
 fn editing_copies_arrays_aligns_to_a_line_and_copies_over_storeys() {
     let mut s = session();
     editing_wall(&mut s, &[0]);

@@ -39,10 +39,14 @@ pub enum Material {
     Foliage,
     Soil,
     Planter,
+    /// Painted white metal, distinct from white timber window/door frames.
+    SteelWhite,
+    /// Dark elastomer glazing seals, distinct from painted steel railings.
+    Gasket,
 }
 
 impl Material {
-    pub const ALL: [Material; 24] = [
+    pub const ALL: [Material; 26] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -67,6 +71,8 @@ impl Material {
         Material::Foliage,
         Material::Soil,
         Material::Planter,
+        Material::SteelWhite,
+        Material::Gasket,
     ];
 
     pub fn name(self) -> &'static str {
@@ -95,6 +101,8 @@ impl Material {
             Material::Foliage => "foliage",
             Material::Soil => "soil",
             Material::Planter => "planter",
+            Material::SteelWhite => "steel_white",
+            Material::Gasket => "gasket",
         }
     }
 
@@ -125,6 +133,8 @@ impl Material {
             Material::Foliage => [0.19, 0.32, 0.10, 1.0],
             Material::Soil => [0.20, 0.14, 0.08, 1.0],
             Material::Planter => [0.30, 0.31, 0.28, 1.0],
+            Material::SteelWhite => Material::Frame.rgba(),
+            Material::Gasket => Material::Railing.rgba(),
         }
     }
 

@@ -23,7 +23,7 @@ const NEW: [u8; 3] = [40, 150, 30];
 const DEMOLISHED: [u8; 3] = [220, 30, 30];
 
 /// Choose a point with wall clearance inside a room, including concave room polygons.
-fn room_label_point(poly: &[[f64; 2]]) -> Option<[f64; 2]> {
+pub(crate) fn room_label_anchor(poly: &[[f64; 2]]) -> Option<([f64; 2], f64)> {
     let first = *poly.first()?;
     let (lo, hi) = poly.iter().fold((first[1], first[1]), |(a, b), p| (a.min(p[1]), b.max(p[1])));
     let mut best: Option<([f64; 2], f64)> = None;
@@ -52,7 +52,7 @@ fn room_label_point(poly: &[[f64; 2]]) -> Option<[f64; 2]> {
             }
         }
     }
-    best.map(|(p, _)| p)
+    best
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,6 +326,41 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     .iter()
                     .find(|element| element.class == trigon_model::ElementClass::Railing)
                     .map(|element| Element::new(&element.id, DrawingElementKind::Railing));
+                if let ComponentKind::GuardRail { projection, railing, handrail, .. } = r.ty.kind {
+                    let half = if handrail { 35.0 } else { 20.0 };
+                    let inset = if railing == trigon_model::component::Railing::Osterbro { 0.0 } else { 20.0 };
+                    let outline = [
+                        pt(fr, u0, -projection - half),
+                        pt(fr, u1, -projection - half),
+                        pt(fr, u1, -projection + half),
+                        pt(fr, u0, -projection + half),
+                    ];
+                    let start = prims.len();
+                    for k in 0..4 {
+                        prims.push(Prim::Line { a: outline[k], b: outline[(k + 1) % 4], color, width: 14.0, dashed: status == Status::Demolished });
+                    }
+                    for u in [u0 + inset + 20.0, u1 - inset - 20.0] {
+                        prims.push(Prim::Line {
+                            a: pt(fr, u, -projection + 20.0),
+                            b: pt(fr, u, 0.0),
+                            color,
+                            width: 14.0,
+                            dashed: status == Status::Demolished,
+                        });
+                    }
+                    if let Some(rail) = rail {
+                        for index in start..prims.len() {
+                            elements.insert(index, rail.clone());
+                        }
+                        prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
+                            id: rail.id,
+                            kind: DrawingElementKind::Railing,
+                            rings: vec![outline.to_vec()],
+                            depth_plane: None,
+                        }));
+                    }
+                    continue;
+                }
                 let mut rail_indices = Vec::new();
                 if let Some(element) = &owner {
                     prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
@@ -586,7 +621,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             if presentation {
                 continue;
             }
-            let Some(c) = room_label_point(&r.polygon) else { continue };
+            let Some((c, _)) = room_label_anchor(&r.polygon) else { continue };
             let area = trigon_model::doc::polygon_area(&r.polygon) / 1e6;
             if r.name.is_empty() {
                 prims.push(Prim::Text { at: c, text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None });
@@ -1301,7 +1336,8 @@ mod tests {
     #[test]
     fn concave_room_label_stays_inside_and_away_from_walls() {
         let p = [[0., 0.], [6000., 0.], [6000., 1500.], [1500., 1500.], [1500., 6000.], [0., 6000.]];
-        let at = room_label_point(&p).unwrap();
+        let (at, clearance) = room_label_anchor(&p).unwrap();
+        assert!(clearance > 500.0);
         assert!(crate::drawings::inside(&p, at));
         assert!(at[0] > 500. && at[1] > 500.);
         assert!(at[0] < 1000. || at[1] < 1000.);

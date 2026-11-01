@@ -307,6 +307,14 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| crate::edit::align(s, parse("edit.align", v)?),
     },
     CommandSpec {
+        id: "edit.align_walls",
+        summary: "Make nearly parallel interior walls exactly collinear, or align their left/right faces to a picked reference wall. Preserves length, door distances and unselected storeys. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::AlignWalls>,
+        run: |s, v| crate::edit::align_walls(s, parse("edit.align_walls", v)?),
+    },
+    CommandSpec {
         id: "edit.delete",
         summary: "Delete selected source elements or just the picked storey instances, preserving their other storeys. This removes them from every phase; use facade.demolish for phased demolition. Atomic and undoable.",
         mutates: true,

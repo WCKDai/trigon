@@ -506,8 +506,9 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
                 }));
             }
         } else if rect.u0 < 0.0 || rect.u1 > frame.length {
+            let attachment = if matches!(ty_eff.kind, ComponentKind::GuardRail { .. }) { "guard" } else { "balcony" };
             return Err(ModelError::Invalid(format!(
-                "{slot}: the {} mm balcony at {c:.0} mm runs past the facade ends (0 to {:.0} mm)",
+                "{slot}: the {} mm {attachment} at {c:.0} mm runs past the facade ends (0 to {:.0} mm)",
                 ty_eff.width, frame.length
             )));
         }
@@ -517,14 +518,15 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
             return Err(ModelError::Invalid(format!("{slot}: the {slab_width} mm balcony slab runs past the facade end")));
         }
         // Only things that stand at the same time can collide: openings with openings,
-        // balconies with balconies.
+        // attachments with attachments.
         let together = |o: &Resolved| o.lifetime.0 < lifetime.1 && lifetime.0 < o.lifetime.1 && o.is_opening() == opening;
         let gap = if opening { GAP } else { 0.0 };
         if let Some(other) = out.iter().find(|o| together(o) && o.rect.overlaps(&rect, gap)) {
             let what = if opening {
                 format!("the opening at level {} bay {} (keep {GAP} mm between openings)", other.placement.level, other.placement.bay)
             } else {
-                format!("the balcony at level {} bay {}", other.placement.level, other.placement.bay)
+                let attachment = if matches!(other.ty.kind, ComponentKind::GuardRail { .. }) { "guard" } else { "balcony" };
+                format!("the {attachment} at level {} bay {}", other.placement.level, other.placement.bay)
             };
             return Err(ModelError::Invalid(format!("{slot}: overlaps {what}")));
         }
@@ -1266,9 +1268,9 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             for u in [u0 + 15.0, u1 - 45.0] {
                 rail.append(&fbox(fr, (u, u + 30.0), (wr - 15.0, wr + 15.0), (v0, top)));
             }
-            parts.push((Material::Frame, rail));
+            parts.push((Material::SteelWhite, rail));
         }
-        ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
+        ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } | ComponentKind::GuardRail { .. } => return Vec::new(),
     }
     parts.extend(detail.finish());
     parts
@@ -1404,7 +1406,7 @@ fn styled_rail(fr: &FacadeFrame, from: (f64, f64), to: (f64, f64), z0: f64, heig
     m
 }
 
-/// A balcony hung on the wall without an opening: slab and railing elements.
+/// An attachment hung on the wall without an opening: balcony parts or an independent guard.
 fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: Status) -> Vec<BuiltElement> {
     let ty = &r.ty;
     let level = r.placement.level;
@@ -1422,6 +1424,32 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
         status,
     };
     match ty.kind {
+        ComponentKind::GuardRail { projection, railing, finish, handrail } => {
+            let metal = match finish {
+                Finish::Galvanised => Material::Steel,
+                Finish::White => Material::SteelWhite,
+                Finish::Anthracite => Material::Railing,
+            };
+            let metal_height = ty.height - if handrail { 40.0 } else { 0.0 };
+            // Inset flat rails; the rail-free style instead ends at its outer post faces.
+            let inset = if railing == Railing::Osterbro { 0.0 } else { 20.0 };
+            let mut guard = styled_rail(fr, (u0 + inset, -projection), (u1 - inset, -projection), deck_top, metal_height, railing);
+            // Parametric presentation brackets and wall plates; no structural capacity is inferred.
+            for u in [u0 + inset + 20.0, u1 - inset - 20.0] {
+                for z in [deck_top + 150.0, deck_top + metal_height - 150.0] {
+                    guard.append(&fbox(fr, (u - 20.0, u + 20.0), (-projection, 0.0), (z, z + 20.0)));
+                    guard.append(&fbox(fr, (u - 20.0, u + 20.0), (-8.0, 0.0), (z - 20.0, z + 40.0)));
+                }
+            }
+            let mut parts = vec![(metal, guard)];
+            if handrail {
+                parts.push((
+                    Material::Deck,
+                    fbox(fr, (u0, u1), (-projection - 35.0, -projection + 35.0), (deck_top + metal_height, deck_top + ty.height)),
+                ));
+            }
+            vec![mk("rail", &ty.name, ElementClass::Railing, parts)]
+        }
         ComponentKind::BalconySlab { depth, thickness } => {
             let slab = fbox(fr, (u0, u1), (-depth, 0.0), (deck_top - thickness, deck_top));
             let mut rail = rail_run(fr, (u0 + 40.0, -depth + 40.0), (u1 - 40.0, -depth + 40.0), deck_top, ty.height);
@@ -1435,7 +1463,7 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
         ComponentKind::SteelBalcony { depth, railing, finish, deck, handrail, screens, tie_rods } => {
             let metal = match finish {
                 Finish::Galvanised => Material::Steel,
-                Finish::White => Material::Frame,
+                Finish::White => Material::SteelWhite,
                 Finish::Anthracite => Material::Railing,
             };
             let deck_material = if deck == Deck::FibreConcrete { Material::Slab } else { Material::Deck };
@@ -1798,6 +1826,51 @@ mod tests {
         assert!((lo[2] - (6000.0 - 160.0)).abs() < 1.0 && (hi[2] - 7010.0).abs() < 1.0, "{lo:?} {hi:?}");
         // No hole in the wall for an attachment.
         assert!(b[0].walls[0].openings.is_empty());
+    }
+
+    #[test]
+    fn independent_guard_styles_retain_nominal_width_overall_height_and_wall_clearance() {
+        assert!(!crate::component::default_types().iter().any(|ty| matches!(ty.kind, ComponentKind::GuardRail { .. })));
+        for railing in [Railing::Frederiksberg, Railing::Norrebro, Railing::Vesterbro, Railing::Osterbro] {
+            for handrail in [false, true] {
+                for (width, height, projection) in [(300.0, 900.0, if handrail { 35.0 } else { 20.0 }), (6000.0, 1500.0, 3000.0)] {
+                    let mut doc = doc_with_block();
+                    doc.buildings[0].facades[0].placements.clear();
+                    let ty = ComponentType {
+                        id: "guard".into(),
+                        name: "Guard".into(),
+                        width,
+                        height,
+                        sill: 200.0,
+                        kind: ComponentKind::GuardRail { projection, railing, finish: Finish::White, handrail },
+                    };
+                    ty.validate().unwrap();
+                    doc.types.push(ty.clone());
+                    put(&mut doc, 1, 2, "guard", None, None);
+                    let built = build(&doc).unwrap();
+                    let wall = &built[0].walls[0];
+                    assert!(wall.openings.is_empty());
+                    assert_eq!(wall.attachments.len(), 1);
+                    let guard = &wall.attachments[0];
+                    assert_eq!(guard.class, ElementClass::Railing);
+                    assert_eq!(guard.parts[0].0, Material::SteelWhite);
+                    let mut combined = Mesh::default();
+                    for (_, mesh) in &guard.parts {
+                        combined.append(mesh);
+                    }
+                    let (lo, hi) = combined.bounds().unwrap();
+                    let expected_front = -projection - if handrail { 35.0 } else { 20.0 };
+                    assert!((hi[0] - lo[0] - width).abs() < 1e-8, "{railing:?}/{handrail}: width {lo:?} {hi:?}");
+                    assert_eq!((lo[1], hi[1]), (expected_front, 0.0));
+                    assert_eq!((lo[2], hi[2]), (3200.0, 3200.0 + height));
+                    for projection in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 3001.0] {
+                        let invalid =
+                            ComponentType { kind: ComponentKind::GuardRail { projection, railing, finish: Finish::White, handrail }, ..ty.clone() };
+                        assert!(invalid.validate().is_err());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

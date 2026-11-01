@@ -62,6 +62,10 @@ Metadata endpoints alone are canonicalized to 0.00000001 mm (and positive zero),
 deduplicated. This removes sub-ULP projection/merge ordering noise without altering any exported
 path or existing snap segment. Nearest-hit calculations use these canonical metadata endpoints.
 
+Projected collinear boundaries choose their exact line frames in sorted welded-edge order.
+Random hash iteration therefore cannot move an exported coordinate across a rounding boundary;
+this does not change the existing mesh welding or metadata precision.
+
 The attribution checks accommodate existing mesh welding (0.1 mm in projected 3D provenance,
 0.5 mm for chained/unioned drawing boundaries); returned segments follow the drawn path within
 the 0.00000001 mm metadata precision. These are not cursor hit tolerances. No model bounding box, image recognition, hidden mesh edge or projected opening void is

@@ -35,8 +35,7 @@ impl Parts {
             (Material::Frame, self.frame),
             (Material::Glass, self.glass),
             (Material::Door, self.panel),
-            // Existing dark/metal materials keep exports and old material contracts compatible.
-            (Material::Railing, self.seal),
+            (Material::Gasket, self.seal),
             (Material::Steel, self.hardware),
             (Material::Sill, self.sill),
         ]

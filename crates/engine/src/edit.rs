@@ -90,6 +90,39 @@ pub(crate) struct Align {
     pub anchor: Anchor,
 }
 
+#[derive(Clone, Copy, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WallFace {
+    #[default]
+    Center,
+    /// Left of the wall's source A-to-B direction.
+    Left,
+    /// Right of the wall's source A-to-B direction.
+    Right,
+}
+
+impl WallFace {
+    fn sign(self) -> f64 {
+        match self {
+            Self::Center => 0.0,
+            Self::Left => 1.0,
+            Self::Right => -1.0,
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AlignWalls {
+    pub targets: Vec<String>,
+    /// One interior wall or displayed storey occurrence. It remains unchanged.
+    pub reference: String,
+    #[serde(default)]
+    pub reference_face: WallFace,
+    #[serde(default)]
+    pub target_face: WallFace,
+}
+
 fn invalid(message: impl Into<String>) -> crate::EngineError {
     ModelError::Invalid(message.into()).into()
 }
@@ -749,6 +782,64 @@ fn anchor_value((lo, hi): (f64, f64), anchor: Anchor) -> f64 {
         Anchor::Center => (lo + hi) / 2.0,
         Anchor::End => hi,
     }
+}
+
+/// Align nearly parallel walls rigidly, retaining door distances from A and run lengths.
+/// Unlike bounding-box alignment, both endpoints end on the same reference line/face.
+pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
+    let entries = selected(&s.doc, &p.targets)?;
+    let mut references = selected(&s.doc, std::slice::from_ref(&p.reference))?;
+    if references.len() != 1 {
+        return Err(invalid("wall alignment needs one reference wall"));
+    }
+    let reference = references.pop().ok_or_else(|| invalid("missing reference wall"))?;
+    let Item::Wall(wall) = &reference.item else { return Err(invalid("the alignment reference must be an interior wall")) };
+    for value in wall.a.into_iter().chain(wall.b) {
+        checked("reference coordinate", value, -1e8, 1e8)?;
+    }
+    checked("reference thickness", wall.thickness, 40.0, 1000.0)?;
+    let length = checked("reference wall length", (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]), 100.0, 200_000.0)?;
+    let t = [(wall.b[0] - wall.a[0]) / length, (wall.b[1] - wall.a[1]) / length];
+    let normal = [-t[1], t[0]];
+    let reference_offset = wall.a[0] * normal[0] + wall.a[1] * normal[1] + p.reference_face.sign() * wall.thickness / 2.0;
+    let mut changes = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let Item::Wall(wall) = &entry.item else { return Err(invalid("wall alignment targets must all be interior walls")) };
+        if entry.building == reference.building
+            && entry.original.id() == reference.original.id()
+            && wall.levels.iter().any(|level| reference.item.levels().contains(level))
+        {
+            return Err(invalid("the reference wall cannot also be a target on the same storey"));
+        }
+        for value in wall.a.into_iter().chain(wall.b) {
+            checked("target coordinate", value, -1e8, 1e8)?;
+        }
+        checked("target thickness", wall.thickness, 40.0, 1000.0)?;
+        let length = checked("target wall length", (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]), 100.0, 200_000.0)?;
+        let dot = ((wall.b[0] - wall.a[0]) * t[0] + (wall.b[1] - wall.a[1]) * t[1]) / length;
+        if dot.abs() < 15.0_f64.to_radians().cos() {
+            return Err(invalid("wall alignment needs directions within 15 degrees; use the wall properties to change other angles"));
+        }
+        let direction = if dot < 0.0 { -1.0 } else { 1.0 };
+        let target_offset = reference_offset - p.target_face.sign() * direction * wall.thickness / 2.0;
+        let mid = [(wall.a[0] + wall.b[0]) / 2.0, (wall.a[1] + wall.b[1]) / 2.0];
+        let shift = target_offset - mid[0] * normal[0] - mid[1] * normal[1];
+        let mid = [mid[0] + normal[0] * shift, mid[1] + normal[1] * shift];
+        let mut aligned = wall.clone();
+        for k in 0..2 {
+            aligned.a[k] = checked("aligned wall endpoint", mid[k] - direction * t[k] * length / 2.0, -1e8, 1e8)?;
+            aligned.b[k] = checked("aligned wall endpoint", mid[k] + direction * t[k] * length / 2.0, -1e8, 1e8)?;
+        }
+        changes.push(Item::Wall(aligned));
+    }
+    let mut ids = Vec::with_capacity(entries.len());
+    for (entry, item) in entries.iter().zip(changes) {
+        let shared = remove(&mut s.doc, entry)?;
+        let next = put(&mut s.doc, entry, item, shared, false, false)?;
+        remap_groups(&mut s.doc, entry, &next, shared);
+        ids.push(next);
+    }
+    finish(s, ids)
 }
 
 pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {

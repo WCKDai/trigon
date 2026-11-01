@@ -199,6 +199,27 @@ impl Properties {
                         if ui.add(egui::TextEdit::singleline(&mut text).char_limit(512)).changed() {
                             *value = json!(text);
                         }
+                    } else if matches!(key, "a" | "b")
+                        && let Some(mut point) = value.as_array().filter(|p| p.len() == 2).and_then(|p| Some([p[0].as_f64()?, p[1].as_f64()?]))
+                        && point.iter().all(|n| n.is_finite())
+                    {
+                        let mut edited = false;
+                        for (axis, coordinate) in ["X", "Y"].into_iter().zip(&mut point) {
+                            ui.horizontal(|ui| {
+                                ui.label(axis);
+                                // DragValue parses its text on blur. Keep the round-trip value,
+                                // so merely focusing a coordinate cannot round the wall axis.
+                                let drag = egui::DragValue::new(coordinate)
+                                    .speed(1.0)
+                                    .range(-1e8..=1e8)
+                                    .suffix(" mm")
+                                    .custom_formatter(|number, _| number.to_string());
+                                edited |= ui.add(drag).changed();
+                            });
+                        }
+                        if edited && point.iter().all(|n| n.is_finite()) {
+                            *value = json!(point);
+                        }
                     } else {
                         let text = self.complex.entry(key.into()).or_default();
                         ui.add(egui::TextEdit::multiline(text).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY));
@@ -545,5 +566,79 @@ mod tests {
         assert!(!properties.gizmo.active());
         properties.finish(3, vec![descriptor.clone(), descriptor]);
         assert_eq!(properties.descriptor("wall").unwrap()["editable"], false);
+    }
+
+    #[test]
+    fn point_properties_keep_unedited_precision_and_commit_only_the_changed_axis() {
+        let start = [1234.567890123456, 6789.123456789012];
+        let end = [9876.543210987654, 4321.987654321098];
+        let descriptor = json!({"id":"wall","editable":true,"properties":[
+            {"key":"a","label":"Axis start","value":start,"editable":true},
+            {"key":"b","label":"Axis end","value":end,"editable":true}
+        ],"handles":[]});
+        let mut properties = Properties::default();
+        properties.finish(1, vec![descriptor]);
+        let ctx = egui::Context::default();
+        let mut frame = 0;
+        let edits = std::cell::RefCell::new(Vec::new());
+        let mut draw = |events| {
+            frame += 1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420., 700.))),
+                    time: Some(frame as f64 * 0.03),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    if let Some(edit) = properties.ui(ui, "wall", None) {
+                        edits.borrow_mut().push(edit);
+                    }
+                },
+            );
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some((text.galley.job.text.clone(), text.visual_bounding_rect().center())),
+                    _ => None,
+                })
+                .collect();
+            output.textures_delta.clear();
+            text
+        };
+        let text = draw(vec![]);
+        assert_eq!(text.iter().filter(|(text, _)| text == "X").count(), 2);
+        assert_eq!(text.iter().filter(|(text, _)| text == "Y").count(), 2);
+        let field = text
+            .iter()
+            .find(|(text, _)| text == &start[0].to_string())
+            .unwrap_or_else(|| panic!("a numeric X field replaces the raw JSON point; painted: {text:?}"))
+            .1;
+        let apply = text.iter().find(|(text, _)| text == "Apply model properties").unwrap().1;
+        let click = |at: egui::Pos2| crate::control::parse_input("ui.click", &json!({"x":at.x,"y":at.y})).unwrap();
+        for event in click(field) {
+            draw(vec![event]);
+        }
+        // Enter and blur without typing must retain the original floating-point coordinates.
+        for event in crate::control::parse_input("ui.key", &json!({"key":"Enter"})).unwrap() {
+            draw(vec![event]);
+        }
+        for event in click(apply) {
+            draw(vec![event]);
+        }
+        assert!(edits.borrow().is_empty(), "focusing a coordinate is not an endpoint edit");
+        for event in click(field) {
+            draw(vec![event]);
+        }
+        draw(vec![egui::Event::Text("1250.25".into())]);
+        for event in crate::control::parse_input("ui.key", &json!({"key":"Enter"})).unwrap() {
+            draw(vec![event]);
+        }
+        for event in click(apply) {
+            draw(vec![event]);
+        }
+        assert_eq!(*edits.borrow(), vec![Edit { id: "wall".into(), properties: json!({"a":[1250.25,start[1]]}) }]);
+        assert_eq!(properties.values["b"], json!(end));
     }
 }

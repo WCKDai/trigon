@@ -977,6 +977,28 @@ impl StudioApp {
         None
     }
 
+    fn authoring_controls(&mut self, ui: &mut egui::Ui, selected: Option<&crate::scene::Element>) {
+        let run =
+            ui.add_enabled_ui(self.edit_block_reason().is_none(), |ui| self.authoring.ui(ui, &self.session.doc, selected, self.plan_level)).inner;
+        if let Some(run) = run
+            && self.edit_block_reason().is_none()
+        {
+            match self.run(Who::Owner, run.command, run.params) {
+                Ok(value) => {
+                    if let Some(targets) = value.get("targets").and_then(Value::as_array) {
+                        let ids = targets.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                        self.pending_selection = ids.first().map(|s| s.to_string());
+                        if !self.authoring.targets.is_empty() {
+                            self.authoring.targets = ids.join("\n");
+                        }
+                    }
+                    self.status = Some((format!("{} completed", run.command), false));
+                }
+                Err(error) => self.status = Some((error, true)),
+            }
+        }
+    }
+
     fn selection_panel(&mut self, ui: &mut egui::Ui) {
         if self.authoring.tab == Tab::Drawings {
             if self.mode == Mode::Drawing {
@@ -994,6 +1016,11 @@ impl StudioApp {
         let blocked = self.edit_block_reason();
         if let Some(reason) = blocked {
             ui.label(egui::RichText::new(reason).color(theme::ACCENT));
+        }
+        let controls_first = self.authoring.command_controls_first();
+        if controls_first {
+            self.authoring_controls(ui, selected.as_ref());
+            ui.separator();
         }
         if self.authoring.tab != Tab::Families
             && let Some(element) = &selected
@@ -1020,23 +1047,8 @@ impl StudioApp {
             });
             ui.separator();
         }
-        let run = ui.add_enabled_ui(blocked.is_none(), |ui| self.authoring.ui(ui, &self.session.doc, selected.as_ref(), self.plan_level)).inner;
-        if let Some(run) = run
-            && self.edit_block_reason().is_none()
-        {
-            match self.run(Who::Owner, run.command, run.params) {
-                Ok(value) => {
-                    if let Some(targets) = value.get("targets").and_then(Value::as_array) {
-                        let ids = targets.iter().filter_map(Value::as_str).collect::<Vec<_>>();
-                        self.pending_selection = ids.first().map(|s| s.to_string());
-                        if !self.authoring.targets.is_empty() {
-                            self.authoring.targets = ids.join("\n");
-                        }
-                    }
-                    self.status = Some((format!("{} completed", run.command), false));
-                }
-                Err(error) => self.status = Some((error, true)),
-            }
+        if !controls_first {
+            self.authoring_controls(ui, selected.as_ref());
         }
         ui.add_space(6.0);
         ui.separator();
@@ -1322,7 +1334,11 @@ impl StudioApp {
     }
 
     pub(crate) fn projected_handles(&self, rect: egui::Rect) -> Vec<ProjectedHandle> {
-        if self.authoring.tab == Tab::Drawings || self.authoring.tab == Tab::Families || self.edit_block_reason().is_some() {
+        if self.authoring.tab == Tab::Drawings
+            || self.authoring.tab == Tab::Families
+            || self.authoring.wall_alignment_active()
+            || self.edit_block_reason().is_some()
+        {
             return Vec::new();
         }
         let Some(element) = self.selection.and_then(|index| self.scene.elements.get(index)) else { return Vec::new() };

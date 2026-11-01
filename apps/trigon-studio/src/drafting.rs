@@ -6,8 +6,8 @@ use serde_json::json;
 use trigon_engine::SnapOptions;
 use trigon_model::Document;
 use trigon_model::annotation::{
-    Annotation, AnnotationKind, DrawingTemplate, DrawingViewKind, FontFamily, LinePattern, LineStyle, LineWeightProfile, PlanRange, TextStyle,
-    ViewSizing,
+    Annotation, AnnotationKind, DrawingTemplate, DrawingViewKind, FontFamily, LinePattern, LineStyle, LineWeightProfile, PlanRange, RoomLabels,
+    TextStyle, ViewSizing,
 };
 
 use crate::{authoring::Run, theme};
@@ -669,6 +669,20 @@ impl Drafting {
                 }
             }
             if matches!(view.kind, DrawingViewKind::Plan { .. }) {
+                egui::ComboBox::from_id_salt("room-labels")
+                    .selected_text(match self.template.room_labels {
+                        RoomLabels::Hidden => "Room tags · hidden",
+                        RoomLabels::Area => "Room tags · areas",
+                        RoomLabels::NameAndArea => "Room tags · names and areas",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (mode, label) in
+                            [(RoomLabels::Hidden, "Hidden"), (RoomLabels::Area, "Areas"), (RoomLabels::NameAndArea, "Names and areas")]
+                        {
+                            ui.selectable_value(&mut self.template.room_labels, mode, label);
+                        }
+                    });
+                ui.weak("Live room definitions · 2.5 mm paper text, fitted inside rooms and the visible crop.");
                 let mut ranged = self.template.range.is_some();
                 if ui.checkbox(&mut ranged, "Explicit floor-plan view range").changed() {
                     self.template.range = if ranged { Some(PlanRange::default()) } else { None };

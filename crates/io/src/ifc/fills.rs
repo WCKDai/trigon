@@ -4,10 +4,10 @@
 
 use trigon_model::build::{BuiltElement, BuiltWall, Status};
 use trigon_model::component::Side;
-use trigon_model::{ComponentKind, ElementClass, FacadeFrame};
+use trigon_model::{ComponentKind, ElementClass, FacadeFrame, Material};
 
 use super::catalog::{self, Qty, Val};
-use super::part21::{Frame, Placed, gid, real, string};
+use super::part21::{Frame, Placed, gid, real, refs, string};
 use super::walls::Piece;
 use super::{Floors, Ifc};
 
@@ -101,10 +101,12 @@ impl Ifc<'_> {
     /// A window or door in `frame`, placed relative to its opening.
     pub(super) fn fill(&mut self, e: &BuiltElement, opening: Placed, frame: Frame, external: bool, fl: &mut Floors) -> usize {
         let placed = self.w.place(Some(opening), frame);
-        let items = self.tessellated(&e.parts, &frame);
+        let material_items = self.tessellated_parts(&e.parts, &frame);
+        let items: Vec<_> = material_items.iter().map(|(_, item)| *item).collect();
         let door = e.class == ElementClass::Door;
         let layer = if door { catalog::L_DOOR } else { catalog::L_WINDOW };
-        let shape = self.shape("Tessellation", &items, None, layer).map_or("$".to_string(), |s| format!("#{s}"));
+        let definition = self.shape("Tessellation", &items, None, layer);
+        let shape = definition.map_or("$".to_string(), |s| format!("#{s}"));
         let ty = self.doc.component(&e.type_id).ok();
         let kind = ty.map(|t| &t.kind);
         let (g, name, tag) = (gid(&e.id), string(&e.name), string(&e.id));
@@ -116,6 +118,9 @@ impl Ifc<'_> {
             let part = kind.map_or(".NOTDEFINED.", window_partitioning);
             self.w.add(format!("IFCWINDOW({g},$,{name},$,$,#{},{shape},{tag},{h},{wd},.WINDOW.,{part},$)", placed.id))
         };
+        if let Some(definition) = definition {
+            self.opening_materials(id, definition, &material_items);
+        }
         // The type: the component type, or for doors Trigon makes itself (interior doors) one by name.
         let reference = ty.map_or(e.name.as_str(), |t| t.name.as_str());
         let tg = gid(&format!("type:{}", e.type_id));
@@ -145,6 +150,37 @@ impl Ifc<'_> {
         }
         fl.contain(e.level, id);
         id
+    }
+
+    /// IFC4 constituents and matching named shape aspects identify the actual material parts.
+    /// Fractions remain unset: these presentation meshes do not establish composition quantities.
+    fn opening_materials(&mut self, object: usize, definition: usize, items: &[(Material, usize)]) {
+        let mut groups = std::collections::BTreeMap::<Material, Vec<usize>>::new();
+        for &(material, item) in items {
+            groups.entry(material).or_default().push(item);
+        }
+        let mut constituents = Vec::new();
+        for (material, items) in groups {
+            let role = match material {
+                Material::Frame => "Framing",
+                Material::Glass => "Glazing",
+                Material::Door => "Panel",
+                Material::Gasket => "Gasket",
+                Material::Steel => "Hardware",
+                Material::SteelWhite => "Guard",
+                Material::Sill => "Sill",
+                Material::Render => "Lining",
+                _ => material.name(),
+            };
+            let mat = self.cat.material(&mut self.w, catalog::of(material));
+            constituents.push(self.w.add(format!("IFCMATERIALCONSTITUENT({},$,#{mat},$,$)", string(role))));
+            let rep = self.w.add(format!("IFCSHAPEREPRESENTATION(#{},'Body','Tessellation',({}))", self.cat.context, refs(&items)));
+            self.w.add(format!("IFCSHAPEASPECT((#{rep}),{},$,.T.,#{definition})", string(role)));
+        }
+        if !constituents.is_empty() {
+            let set = self.w.add(format!("IFCMATERIALCONSTITUENTSET('Opening materials',$,({}))", refs(&constituents)));
+            self.cat.associate(&format!("fill-materials:{object}"), set, object);
+        }
     }
 
     /// A railing on its own (a French balcony's rail), contained in its storey.
