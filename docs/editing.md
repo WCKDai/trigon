@@ -37,6 +37,8 @@ source definition once in a batch.
   typing coordinates, then aligns the next picked wall through this same command.
   Active Align, Copy, To levels and Delete controls appear above model parameters in the
   Properties panel, so long parameter forms cannot bury the command's fields or Apply button.
+  Wall line / face mode hides model drag handles while picking, so a reference handle cannot
+  intercept a nearby target. Other editing modes retain their existing handles.
 - `edit.delete`: `{"targets":["partition.L1"]}` removes that storey instance and preserves the
   definition on its other storeys. Deletion removes source data in every phase; use
   `facade.demolish` for demolition in a particular phase.
@@ -51,6 +53,12 @@ a wall axis snaps or its start extends to a junction, each door centre is projec
 axis and its distance from the new start is updated; clear widths and heights stay unchanged.
 This preserves the opening's position instead of shifting it with a changed start point.
 Derived room boundaries still need an explicit refresh after cleanup.
+
+For a native picking regression, open a drawing, capture the reference in Wall line / face mode,
+and run `python3 tools/check_studio_drawing_pick.py --help`. The check needs an explicit review
+session's control directory, drawing ID, drawing-plane point and expected element ID. It compares
+the read-only exact drawing query with the native canvas selection and saves its evidence to the
+specified output folder. It never discovers the owner's default Studio session.
 
 A batch is limited to 256 targets. Arrays have at most 100 copies and 5,000 new definitions;
 facades have at most 200 bay axes. An offset component is limited to 100,000 mm. Plan elements

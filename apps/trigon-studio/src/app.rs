@@ -1334,7 +1334,11 @@ impl StudioApp {
     }
 
     pub(crate) fn projected_handles(&self, rect: egui::Rect) -> Vec<ProjectedHandle> {
-        if self.authoring.tab == Tab::Drawings || self.authoring.tab == Tab::Families || self.edit_block_reason().is_some() {
+        if self.authoring.tab == Tab::Drawings
+            || self.authoring.tab == Tab::Families
+            || self.authoring.wall_alignment_active()
+            || self.edit_block_reason().is_some()
+        {
             return Vec::new();
         }
         let Some(element) = self.selection.and_then(|index| self.scene.elements.get(index)) else { return Vec::new() };

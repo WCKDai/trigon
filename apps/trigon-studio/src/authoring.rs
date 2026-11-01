@@ -248,6 +248,10 @@ impl Authoring {
         self.tab != Tab::Families && self.tool != Tool::Move
     }
 
+    pub(crate) fn wall_alignment_active(&self) -> bool {
+        self.tool == Tool::Align && self.align_mode == 3
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, doc: &Document, current: Option<&Element>, level: usize) -> Option<Run> {
         if self.tab == Tab::Families {
             return self.family_editor(ui, doc, level);
