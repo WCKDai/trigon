@@ -44,6 +44,14 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "export.fbx",
+        summary: "Export binary FBX through an optional locally installed Blender, for Lumion and rendering tools. Pure Rust model geometry passes through GLB; an isolated public-API converter embeds textures and verifies source IDs, triangle counts, UVs and vertices within 0.1 mm on re-import before atomic file replacement. No account or GUI required. TRIGON_BLENDER selects an operator-configured executable.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::fbx::Export>,
+        run: |s, v| crate::fbx::export(s, parse("export.fbx", v)?),
+    },
+    CommandSpec {
         id: "site.set_terrain",
         summary: "Set/remove a parametric ground height grid in site-local mm. Buildings trim the surface, keeping ground out of floors. Bounded, validated, atomic and undoable; unmeasured flat ground is a presentation assumption.",
         mutates: true,

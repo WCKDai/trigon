@@ -94,3 +94,20 @@ fn terrain_is_an_explicit_atomic_undoable_source_and_portable_mesh() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(s.doc, before);
 }
+
+#[test]
+fn fbx_export_is_read_only_and_refuses_document_supplied_executables() {
+    let mut s = session();
+    let before = s.doc.clone();
+    let spec = commands().iter().find(|c| c.id == "export.fbx").unwrap();
+    assert!(!spec.mutates && !spec.journaled);
+    for bad in [
+        json!({"path":"wrong.txt"}),
+        json!({"path":"out/never.fbx","blender":"/untrusted/program"}),
+        json!({"path":"out/never.fbx","filter":"invalid"}),
+    ] {
+        let error = s.execute("export.fbx", bad).unwrap_err();
+        assert!(!matches!(error, crate::EngineError::Internal(_)));
+        assert_eq!(s.doc, before);
+    }
+}

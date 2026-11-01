@@ -180,7 +180,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             return;
         }
         meshes.push(json!({"name": name, "primitives": prims}));
-        nodes.push(json!({"name": name, "mesh": meshes.len() - 1}));
+        nodes.push(json!({"name": name, "mesh": meshes.len() - 1,"extras":{"trigon_id":name}}));
     };
 
     for b in built {

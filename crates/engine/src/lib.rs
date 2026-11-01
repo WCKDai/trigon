@@ -20,6 +20,7 @@ mod edit;
 mod elements;
 mod elevation;
 mod facade_image;
+mod fbx;
 mod plan;
 mod plan_output;
 mod rooms;
