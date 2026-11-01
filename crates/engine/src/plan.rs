@@ -63,6 +63,11 @@ enum Surface {
 }
 
 enum Prim {
+    /// Independent site footprints, displayed only in the ground plan.
+    Site {
+        pts: Vec<[f64; 2]>,
+        fill: [u8; 3],
+    },
     /// Semantic filled areas; never emitted as graphical ink by either writer.
     PickRegion(crate::views::DrawingElementRegion),
     Poly {
@@ -151,6 +156,25 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
     let mut prims = Vec::new();
     let mut elements = BTreeMap::new();
     let mut title = String::new();
+    if level == doc.buildings.first().map_or(0, |b| b.ground_level) {
+        let mut site = trigon_model::site::build(doc, view, None)?;
+        // Areas under furniture and canopies. The outlines here are the actual parametric
+        // footprints, so selection never invents an opening or a building identity.
+        site.sort_by_key(|o| if o.class == trigon_model::site::SiteClass::Ground { 0 } else { 1 });
+        for o in site {
+            let material = if o.class == trigon_model::site::SiteClass::Tree {
+                trigon_model::Material::Foliage
+            } else {
+                o.parts.first().map_or(trigon_model::Material::Paving, |p| p.0)
+            };
+            let rgba = material.rgba();
+            let material_colour =
+                [((rgba[0].sqrt() * 190.) + 40.) as u8, ((rgba[1].sqrt() * 190.) + 40.) as u8, ((rgba[2].sqrt() * 190.) + 40.) as u8];
+            let color = if presentation && o.status != Status::Demolished { material_colour } else { status_color(o.status, material_colour) };
+            elements.insert(prims.len(), Element::new(&o.id, DrawingElementKind::Site));
+            prims.push(Prim::Site { pts: o.footprint, fill: color });
+        }
+    }
     let built = build_view(doc, view)?;
     for b in &built {
         let storey = b.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("level {level} doesn't exist")))?;
@@ -607,8 +631,8 @@ impl Frame {
     }
 }
 
-fn frame_for(doc: &Document, mm: f64, rot_deg: f64) -> Result<Frame> {
-    let pts: Vec<[f64; 2]> = doc.buildings.iter().flat_map(|b| b.footprint.iter().copied()).collect();
+fn frame_for(doc: &Document, mm: f64, rot_deg: f64, level: usize, view: View) -> Result<Frame> {
+    let pts = plan_extents(doc, level, view)?;
     let first = *pts.first().ok_or_else(|| ModelError::NotFound("no building yet".into()))?;
     let (lo, hi) = pts.iter().fold((first, first), |(lo, hi), p| ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])]));
     let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
@@ -732,10 +756,23 @@ impl Label {
     }
 }
 
+fn plan_extents(doc: &Document, level: usize, view: View) -> Result<Vec<[f64; 2]>> {
+    let mut points: Vec<_> = doc.buildings.iter().flat_map(|b| b.footprint.iter().copied()).collect();
+    if level == doc.buildings.first().map_or(0, |b| b.ground_level) {
+        for o in trigon_model::site::build(doc, view, None)? {
+            points.extend(o.footprint);
+        }
+    }
+    Ok(points)
+}
+
 /// A composed landscape sheet. Its crop and rotation affect the viewport only, never the model.
-fn sheet_frame(doc: &Document, region: Option<&[[f64; 2]]>, rotation: f64) -> Result<Frame> {
+fn sheet_frame(doc: &Document, region: Option<&[[f64; 2]]>, rotation: f64, level: usize, view: View) -> Result<Frame> {
     trigon_model::checked("rotate_deg", rotation, -360.0, 360.0)?;
-    let points: Vec<_> = region.map(region_corners).unwrap_or_else(|| doc.buildings.iter().flat_map(|b| b.footprint.iter().copied()).collect());
+    let points = match region {
+        Some(r) => region_corners(r),
+        None => plan_extents(doc, level, view)?,
+    };
     if points.len() < 2 || points.len() > 10_000 || points.iter().flatten().any(|x| !x.is_finite() || x.abs() > 1e8) {
         return Err(ModelError::Invalid("sheet region needs 2 to 10000 finite site points".into()).into());
     }
@@ -805,7 +842,7 @@ struct PlanSheet {
 
 fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<PlanSheet> {
     let (prims, _, elements) = scene(doc, level, view, true)?;
-    let f = sheet_frame(doc, region, rotation)?;
+    let f = sheet_frame(doc, region, rotation, level, view)?;
     let vp = Viewport { x0: f.x0, y1: f.y1, mm: f.mm };
     let floor = doc.buildings.first().and_then(|b| b.storeys.get(level)).map(|s| s.name.clone()).unwrap_or_default();
     let project = doc.buildings.first().map(|b| b.name.clone()).unwrap_or_default();
@@ -827,6 +864,27 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         [70.0, 130.0, 1460.0, 670.0]
     };
     let mut sc = Scene::new(vp.scale());
+    for (index, p) in prims.iter().enumerate() {
+        if let Prim::Site { pts, fill } = p {
+            let points: Vec<_> = pts.iter().map(|p| f.rot(*p)).collect();
+            sc.polygon(
+                Layer::Ground,
+                vec![points.clone()],
+                Some(Fill::Solid(*fill)),
+                Some(Stroke { pen: 0.18, colour: [80, 85, 75], dashed: false }),
+            );
+            if let Some(element) = elements.get(&index) {
+                let sources: Vec<_> = (0..points.len()).map(|i| element.segment([points[i], points[(i + 1) % points.len()]])).collect();
+                sc.attribute_last(&sources);
+                sc.element_regions.push(crate::views::DrawingElementRegion {
+                    id: element.id.clone(),
+                    kind: element.kind,
+                    rings: vec![points],
+                    depth_plane: None,
+                });
+            }
+        }
+    }
     // Union each family before stroking: no rectangles' internal seams or doubled junction edges.
     for surface in [Surface::Stair, Surface::Interior, Surface::Exterior] {
         let polys: Vec<_> = prims
@@ -873,7 +931,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                     ..region.clone()
                 });
             }
-            Prim::Poly { .. } => {}
+            Prim::Poly { .. } | Prim::Site { .. } => {}
             Prim::StairLine { a, b, width, dashed } => {
                 let pen = if *width >= 14.0 { 0.18 } else { 0.13 };
                 sc.line(Layer::Stair, f.rot(*a), f.rot(*b), Stroke { pen, colour: [0x33; 3], dashed: *dashed });
@@ -1027,7 +1085,7 @@ fn svg(prims: &[Prim], f: &Frame, background: Option<&[u8]>, title: &str) -> Res
     for p in prims {
         match p {
             Prim::PickRegion(_) => {}
-            Prim::Poly { pts, fill, .. } => {
+            Prim::Poly { pts, fill, .. } | Prim::Site { pts, fill } => {
                 let d: Vec<String> = pts.iter().map(|p| f.px(*p)).map(|q| format!("{:.1},{:.1}", q[0], q[1])).collect();
                 let _ = writeln!(out, r#"<polygon points="{}" fill="{}"/>"#, d.join(" "), hex(*fill));
             }
@@ -1096,7 +1154,7 @@ pub(crate) fn render(
             }
         }
     }
-    let f = frame_for(&s.doc, mm, rot_deg)?;
+    let f = frame_for(&s.doc, mm, rot_deg, level, view)?;
     let (rgb, used) = if show_scan { underlay(s, &f, level, drawing)? } else { (vec![255u8; (f.w * f.h * 3) as usize], None) };
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_string();
     match ext.as_str() {
@@ -1156,7 +1214,7 @@ mod tests {
             for level in [0, 1] {
                 for rotation in [0.0, 27.5] {
                     let sheet = sheet_scene(&doc, level, View::latest(&doc), rotation, None, "").unwrap();
-                    let frame = sheet_frame(&doc, None, rotation).unwrap();
+                    let frame = sheet_frame(&doc, None, rotation, level, View::latest(&doc)).unwrap();
                     let paths: Vec<_> = sheet
                         .scene
                         .items
@@ -1203,7 +1261,7 @@ mod tests {
         assert_eq!(visible_stairs(&b, 1).len(), 1);
         let mut doc = Document::default();
         doc.buildings.push(b);
-        let frame = sheet_frame(&doc, Some(&[[0., 0.], [10000., 10000.]]), 45.).unwrap();
+        let frame = sheet_frame(&doc, Some(&[[0., 0.], [10000., 10000.]]), 45., 0, View::latest(&doc)).unwrap();
         assert!(frame.mm.is_finite());
         for p in [[0., 0.], [10000., 0.], [10000., 10000.], [0., 10000.]] {
             let q = frame.px(p);

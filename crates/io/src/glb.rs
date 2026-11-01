@@ -138,9 +138,15 @@ fn masonry_mesh(source: &Mesh, material: Material) -> MasonryMesh {
 
 /// Writes every built building, plus named reference meshes (linked models), as one GLB scene.
 pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
+    write_with_site(built, &[], references)
+}
+
+/// Includes separately built site geometry, preserving source parameters in node extras.
+pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObject], references: &[(String, Mesh)]) -> Vec<u8> {
     let mut w = Writer { bin: Vec::new(), views: Vec::new(), accessors: Vec::new() };
     let mut materials: Vec<Value> = Material::ALL
         .iter()
+        .filter(|m| !site.is_empty() || (**m as usize) < 17)
         .map(|m| {
             let c = m.rgba();
             let mut v = json!({
@@ -213,8 +219,18 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             add(&mut w, &st.id, &[(Material::Sill, &st.mesh), (Material::Railing, &st.railing)]);
         }
     }
+    for o in site {
+        let demolished = o.status == trigon_model::build::Status::Demolished;
+        let parts: Vec<_> = o.parts.iter().map(|(m, mesh)| (if demolished { Material::Demolished } else { *m }, mesh)).collect();
+        add(&mut w, &o.id, &parts);
+    }
     for (name, mesh) in references {
         add(&mut w, name, &[(Material::Reference, mesh)]);
+    }
+    for o in site {
+        if let Some(node) = nodes.iter_mut().find(|n| n["name"] == o.id) {
+            node["extras"] = json!({"trigon_source":o.source,"phase_status":o.status.name(),"exchange_classification":format!("Trigon {} (presentation geometry)",o.class.name())});
+        }
     }
     let (mut images, mut textures) = (Vec::new(), Vec::new());
     for material in masonry {

@@ -260,6 +260,8 @@ pub struct BuiltRoof {
     pub gables: Mesh,
     /// Gutters along the eaves.
     pub gutters: Mesh,
+    /// Explicit detail assemblies, empty for legacy roofs.
+    pub drainage: Vec<crate::roof::drainage::DrainPart>,
     pub eaves: f64,
     pub ridge: f64,
     pub pitch_deg: f64,
@@ -309,6 +311,7 @@ pub fn build_cut(doc: &Document, view: View, cut: Option<f64>) -> Result<Vec<Bui
     if let Some(z) = cut {
         crate::checked("cut height", z, -50_000.0, 500_000.0)?;
     }
+    crate::site::validate(doc)?;
     doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect()
 }
 
@@ -815,7 +818,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             });
             None
         }
-        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters } => {
+        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage } => {
             let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
@@ -839,12 +842,25 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
-            let r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            let mut r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            let mut drain_parts = Vec::new();
+            if let Some(d) = drainage {
+                if !gutters {
+                    return Err(ModelError::Invalid("detailed drainage requires gutters".into()));
+                }
+                let out = inner_ring_by(&outline, |k| if edges.contains(&k) { -*verge_mm } else { -*overhang_mm });
+                drain_parts = crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, *pitch_deg, &edges, d)?;
+                r.gutters = Mesh::default();
+                for part in &drain_parts {
+                    r.gutters.append(&part.mesh);
+                }
+            }
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
                 cover: r.cover,
                 gables: r.gables,
                 gutters: r.gutters,
+                drainage: drain_parts,
                 eaves: h,
                 ridge: r.ridge,
                 pitch_deg: *pitch_deg,

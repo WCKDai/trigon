@@ -21,6 +21,7 @@ mod catalog;
 mod fills;
 mod part21;
 pub mod sample;
+mod site;
 mod slabs;
 mod spaces;
 mod split;
@@ -40,9 +41,15 @@ pub use split::model_shapes;
 
 /// Writes the document's buildings as IFC4. `timestamp` is ISO 8601 (for FILE_NAME).
 pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) -> String {
+    write_with_site(doc, built, &[], file_name, timestamp)
+}
+
+/// Writes building geometry and separately built site sources in the caller's exact phase view.
+pub fn write_with_site(doc: &Document, built: &[Built], objects: &[trigon_model::site::BuiltSiteObject], file_name: &str, timestamp: &str) -> String {
     let mut x = Ifc::new(doc);
     let project = x.project();
     let site = x.site(project);
+    x.site_objects(objects, site);
     let mut buildings = Vec::new();
     for b in built {
         buildings.push(x.building(b, site));

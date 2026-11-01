@@ -170,6 +170,8 @@ pub enum DrawingElementKind {
     Railing,
     Roof,
     Slab,
+    /// Ground-plan site geometry (not building openings or rooms).
+    Site,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]

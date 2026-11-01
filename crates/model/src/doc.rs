@@ -25,6 +25,9 @@ pub struct Document {
     pub buildings: Vec<Building>,
     /// The component library (parametric families with their parameters set).
     pub types: Vec<ComponentType>,
+    /// Independent courtyard/site sources; omitted in old and empty documents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub site_objects: Vec<crate::site::SiteObject>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ModelGroup>,
     /// Saved plan, facade and section drawing frames.
@@ -199,6 +202,7 @@ impl Default for Document {
             site: None,
             buildings: Vec::new(),
             types: default_types(),
+            site_objects: Vec::new(),
             groups: Vec::new(),
             views: Vec::new(),
             annotations: Vec::new(),

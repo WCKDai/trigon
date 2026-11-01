@@ -69,6 +69,8 @@ pub struct Scene {
     pub tri_element: Vec<u32>,
     pub bounds: Option<([f32; 3], [f32; 3])>,
     pub levels: Vec<Level>,
+    /// Site additions inherit the exact display policy selected by from_built.
+    phases: bool,
 }
 
 /// A part of an element: its mesh and colour.
@@ -208,7 +210,7 @@ impl Builder {
         }
     }
 
-    fn finish(mut self, levels: Vec<Level>) -> Scene {
+    fn finish(mut self, levels: Vec<Level>, phases: bool) -> Scene {
         let opaque = (self.opaque.len() / VERTEX_FLOATS) as u32;
         for (e, (o, c)) in self.elements.iter_mut().zip(self.raw) {
             e.ranges = o.into_iter().chain(c.into_iter().map(|r| r.start + opaque..r.end + opaque)).collect();
@@ -218,7 +220,7 @@ impl Builder {
         vertices.extend_from_slice(&self.clear);
         let mut tri_element = self.opaque_tris;
         tri_element.extend_from_slice(&self.clear_tris);
-        Scene { origin: self.origin, vertices, opaque, edges: self.edges, elements: self.elements, tri_element, bounds, levels }
+        Scene { origin: self.origin, vertices, opaque, edges: self.edges, elements: self.elements, tri_element, bounds, levels, phases }
     }
 }
 
@@ -450,7 +452,59 @@ impl Scene {
                 );
             }
         }
-        b.finish(levels)
+        b.finish(levels, phases)
+    }
+
+    /// Add independent site geometry without changing the building-scene API or source IDs.
+    pub fn with_site(mut self, site: &[trigon_model::site::BuiltSiteObject]) -> Self {
+        if site.is_empty() {
+            return self;
+        }
+        let phases = self.phases;
+        let opaque = self.opaque;
+        let clear = self.vertices.split_off(opaque as usize * VERTEX_FLOATS);
+        let clear_tris = self.tri_element.split_off(opaque as usize / 3);
+        let raw = self
+            .elements
+            .iter()
+            .map(|e| {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                for r in &e.ranges {
+                    if r.end <= opaque {
+                        a.push(r.clone());
+                    } else {
+                        b.push(r.start - opaque..r.end - opaque);
+                    }
+                }
+                (a, b)
+            })
+            .collect();
+        let (lo, hi) = self.bounds.unwrap_or(([f32::MAX; 3], [f32::MIN; 3]));
+        let mut builder = Builder {
+            origin: self.origin,
+            opaque: self.vertices,
+            clear,
+            opaque_tris: self.tri_element,
+            clear_tris,
+            edges: self.edges,
+            elements: self.elements,
+            raw,
+            lo,
+            hi,
+        };
+        for o in site {
+            let parts: Vec<_> = o.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, o.status, phases), material: *m }).collect();
+            builder.add(
+                &o.id,
+                o.class.name(),
+                None,
+                vec![("name", o.name.clone()), ("intent", format!("{:?}", o.intent).to_lowercase()), ("phase status", o.status.name().into())],
+                false,
+                &parts,
+            );
+        }
+        builder.finish(self.levels, phases)
     }
 
     /// Rooms are semantic spaces, not opaque boxes. Invisible floor polygons let a room be
@@ -882,5 +936,53 @@ mod tests {
         assert!(s.overlay(&[usize::MAX], [1.0; 4], [0.0; 3]).is_empty());
         let moved = s.overlay(&[0], [1.0; 4], [1.0, 2.0, 3.0]);
         assert_eq!([moved[0] - o[0], moved[1] - o[1], moved[2] - o[2]], [1.0, 2.0, 3.0]);
+    }
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::*;
+    #[test]
+    fn independent_site_meshes_are_pickable_and_keep_existing_opaque_and_glass_ranges() {
+        let source: trigon_model::Document = serde_json::from_str(include_str!("../../../crates/model/tests/fixtures/courtyard.trigon")).unwrap();
+        let site = trigon_model::site::build(&source, trigon_model::build::View::latest(&source), None).unwrap();
+        let mut doc = trigon_model::Document::default();
+        let mut building = trigon_model::Building::new("b1", "Synthetic", &[[0., 0.], [9000., 0.], [9000., 8000.], [0., 8000.]], 2, 3000.).unwrap();
+        building.facades[0].bays = vec![4500.];
+        building.facades[0].placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":0,"type":"window.fixed"})).unwrap());
+        doc.buildings.push(building);
+        let base = Scene::from_built(&trigon_model::build(&doc).unwrap(), false);
+        assert!(base.opaque < (base.vertices.len() / VERTEX_FLOATS) as u32);
+        let joined = base.clone().with_site(&site);
+        assert_eq!(joined.origin, base.origin);
+        assert_eq!(&joined.vertices[..base.opaque as usize * VERTEX_FLOATS], &base.vertices[..base.opaque as usize * VERTEX_FLOATS]);
+        assert_eq!(&joined.vertices[joined.opaque as usize * VERTEX_FLOATS..], &base.vertices[base.opaque as usize * VERTEX_FLOATS..]);
+        for e in &base.elements {
+            let after = &joined.elements[joined.find_unique(&e.id).unwrap()];
+            assert_eq!(e.fingerprint, after.fingerprint);
+        }
+        for e in &joined.elements {
+            for r in &e.ranges {
+                assert!(r.end as usize <= joined.vertices.len() / VERTEX_FLOATS);
+            }
+        }
+        for phases in [false, true] {
+            let view = Scene::from_built(&[], phases).with_site(&site);
+            let tree = &view.elements[view.find_unique("site.tree").unwrap()];
+            let offset = tree.ranges[0].start as usize * VERTEX_FLOATS;
+            let color = &view.vertices[offset + 6..offset + 10];
+            if phases {
+                assert_ne!(color, Material::Bark.rgba());
+            } else {
+                assert_eq!(color, Material::Bark.rgba());
+            }
+        }
+        for scene in [joined, Scene::default().with_site(&site)] {
+            let ray =
+                [(-5000. - scene.origin[0]) as f32 / 1000., (-4000. - scene.origin[1]) as f32 / 1000., (10000. - scene.origin[2]) as f32 / 1000.];
+            let hit = scene.pick(ray, [0., 0., -1.], None).unwrap();
+            assert_eq!(scene.elements[hit].id, "site.tree");
+            assert_eq!(scene.elements[hit].level, None);
+        }
     }
 }
