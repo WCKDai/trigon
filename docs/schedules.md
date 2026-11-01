@@ -35,8 +35,9 @@ quotes or newlines are quoted; formula-like textual cells receive a leading apos
 retains the exact original strings. Invalid queries cannot replace an existing file, and
 exporting does not change the document or its history.
 
-For `outer_lining`, area is width × height / 1,000,000 m², matching the IFC window/door base
-quantities. This is the complete rectangular unit, including a compound door/window, rather
+For `outer_lining`, rectangular-family area is width × height / 1,000,000 m², matching the IFC
+window/door base quantities. Shaped families use their actual opening-profile area, including
+arched and round windows. This measures the complete unit, including a compound door/window, rather
 than clear passage or glazing area. Loggias retain their facade-hole width and height with
 `quantity_basis: "facade_opening"` and `area_m2: null`; they do not add a misleading lining area.
 Their `kind` follows the existing built model (currently a door). Totals count windows, doors

@@ -13,7 +13,7 @@ Source property editing is documented in [coordinated authoring](coordinated-aut
 
 - `id: String`: an existing built semantic element ID.
 - `kind: DrawingElementKind`: `Opening`, `InteriorWall`, `FacadeWall`, `Room`, `Stair`,
-  `Balcony`, `Railing`, `Roof` or `Slab` (snake_case JSON).
+  `Balcony`, `Railing`, `Roof`, `Slab` or `Site` (snake_case JSON).
 - `segment: [[f64; 2]; 2]`: the owned portion of an actual visible stroked drawing path.
 
 `preview.pick_element(point, tolerance_mm)` returns `Option<DrawingElementHit>`. A hit has `id`,
@@ -121,9 +121,10 @@ red/dashed demolished symbols under `all`/`demolition`. Facades and sections cur
 demolished fill meshes even under those filters, and picking omits them too. Existing host
 walls and non-phased interior elements follow the generator's existing behavior.
 
-Only facade walls, interior walls, windows and doors are attributed. Roofs, slabs, stairs,
-balconies/railings, room labels, generated dimensions, hatching, ground/level marks and saved
-annotations are not semantic targets. Annotation picking remains a separate UI concern. Raw
+Facade walls, interior walls, openings, rooms, stairs, balconies, railings, roofs, slabs and
+ground-plan site objects are attributed. Room labels, generated dimensions, hatching,
+ground/level marks and saved annotations are not semantic targets. Annotation picking remains
+a separate UI concern. Raw
 registered archive-image plans are not semantic targets; use generated presentation drawings.
 The engine does not add SVG attributes or metadata to exported SVG/DXF/PNG/PDF files.
 

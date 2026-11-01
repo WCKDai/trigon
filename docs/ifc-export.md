@@ -77,7 +77,7 @@ Why these choices:
 
 ### Window and door base quantities
 
-Rectangular window and door occurrences carry `Qto_WindowBaseQuantities` or
+Window and door occurrences carry `Qto_WindowBaseQuantities` or
 `Qto_DoorBaseQuantities` through `IfcRelDefinesByProperties`, including interior and cellar
 doors. The existing types, common property sets, opening/fill relationships, placements and
 geometry are unchanged. Quantities follow the exported phase view, not all placements in the
@@ -93,7 +93,9 @@ the pre-existing product GlobalIds are unchanged by this increment.
   `OverallHeight` and `OverallWidth`. IFC4 ADD2 TC1 defines these quantities as the total outer
   height and width of the lining, only for rectangular windows or doors; they are not clear
   passage dimensions or separately measured construction-opening dimensions.
-- `Area` is an `IfcQuantityArea` in m²: `width × height / 1_000_000`. It is the rectangular area
+- `Area` is an `IfcQuantityArea` in m². Rectangular families use `width × height / 1_000_000`;
+  shaped families use the actual opening-profile area, which is smaller than the bounding
+  rectangle for arched and round windows. For rectangular families it is the area
   enclosed by the outer lining, not glazing area, exposed frame-material area, mesh surface area,
   or the area of an individual storey's opening void when a window spans floors. A compound
   door/window is measured as the modeled unit, not just its door leaf.

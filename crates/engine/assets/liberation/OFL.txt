@@ -1,4 +1,4 @@
-Liberation Sans (crates/sketch/fonts/LiberationSans-Regular.ttf)
+Liberation Sans, Serif and Mono 2.1.5 (crates/engine/assets/liberation/*.ttf)
 
 Digitized data copyright (c) 2010 Google Corporation with Reserved Font Arimo, Tinos and Cousine.
 Copyright (c) 2012 Red Hat, Inc. with Reserved Font Name Liberation.
@@ -36,7 +36,7 @@ copyright statement(s).
 as distributed by the Copyright Holder(s).
 
 "Modified Version" refers to any derivative made by adding to, deleting,
-or substituting ? in part or in whole ?
+or substituting – in part or in whole –
 any of the components of the Original Version, by changing formats or
 by porting the Font Software to a new environment.
 
