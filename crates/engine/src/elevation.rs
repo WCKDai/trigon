@@ -154,6 +154,8 @@ pub(crate) fn scene(
                 fs,
                 text: format!("Ca. {depth:.0} × {width:.0}"),
                 balcony: true,
+                source: None,
+                clearance: None,
             });
             ticks.push((px(c - width / 2.0, r.rect.v0 - 330.0), px(c + width / 2.0, r.rect.v0 - 330.0)));
         }
@@ -189,14 +191,14 @@ pub(crate) fn scene(
             (ahead, _) => ahead.is_some(),
         };
         let text = if front { format!("TV {} TH", e.number) } else { format!("TH {} TV", e.number) };
-        labels.push(Label { at: px(u, top + 900.0), alt: None, deg: 0.0, fs: 18.0, text, balcony: false });
+        labels.push(Label { at: px(u, top + 900.0), alt: None, deg: 0.0, fs: 18.0, text, balcony: false, source: None, clearance: None });
     }
     let mut placed: Vec<Label> = Vec::new();
     for l in labels {
         let fits = |l: &Label| !placed.iter().any(|q| q.overlaps(l));
         if fits(&l) {
             placed.push(l);
-        } else if let Some(at) = l.alt.filter(|at| fits(&Label { at: *at, alt: None, text: l.text.clone(), ..l })) {
+        } else if let Some(at) = l.alt.filter(|at| fits(&Label { at: *at, alt: None, text: l.text.clone(), ..l.clone() })) {
             placed.push(Label { at, alt: None, ..l });
         }
     }

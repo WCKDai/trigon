@@ -106,6 +106,43 @@ pub(crate) fn prepare(sheet: &mut Sheet, template: &DrawingTemplate, annotation_
     sheet.metrics["mm_per_px"] = json!(sheet.vp.mm);
 }
 
+/// Keep generated dimension text clear using the final physical scale and actual glyph ink.
+/// Legacy unconfigured exports retain their layout; configured sheets use paper-mm clearance.
+pub(crate) fn paper_clearances(sheet: &mut Sheet) -> Result<()> {
+    let labels: Vec<_> = sheet
+        .scene
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Text(t) if t.clearance.is_some() => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    if labels.is_empty() {
+        return Ok(());
+    }
+    let bounds = crate::plan_output::text_ink_bounds(&labels)?;
+    let mut bounds = bounds.into_iter();
+    for item in &mut sheet.scene.items {
+        let Item::Text(text) = item else { continue };
+        let Some(guide) = &text.clearance else { continue };
+        let Some(b) = bounds.next().flatten() else { continue };
+        let (sin, cos) = text.deg.to_radians().sin_cos();
+        let near = [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
+            .into_iter()
+            .map(|[x, y]| (x * cos - y * sin) * guide.outward[0] + (x * sin + y * cos) * guide.outward[1])
+            .fold(f64::INFINITY, f64::min);
+        // 0.5 mm visible air, half the dimension pen, and the text's white outline.
+        let required = 0.5 + 0.13 / 2.0 + 2.0 * MM_PER_PX - near;
+        let current = ((text.at[0] - guide.anchor[0]) * guide.outward[0] + (text.at[1] - guide.anchor[1]) * guide.outward[1]) / sheet.scene.scale;
+        let shift = (required - current).max(0.0) * sheet.scene.scale;
+        for (coordinate, direction) in text.at.iter_mut().zip(guide.outward) {
+            *coordinate += direction * shift;
+        }
+    }
+    Ok(())
+}
+
 /// Crop geometry as well as the SVG viewport, so DXF and exact picking agree with the sheet.
 pub(crate) fn finish(sheet: &mut Sheet, template: &DrawingTemplate) {
     if let Some(crop) = template.crop {
@@ -361,6 +398,46 @@ mod room_label_tests {
             assert!(s.execute("view.configure", params).is_err());
             assert_eq!(s.doc, before);
             assert_eq!(s.undo.len(), history);
+        }
+    }
+}
+
+#[cfg(test)]
+mod precision_clearance_tests {
+    use super::*;
+    use trigon_model::build::View;
+
+    #[test]
+    fn fixed_plan_balcony_lettering_clears_dimension_line_at_paper_scale() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        let mut b = trigon_model::Building::new("b", "Balcony clearance", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 2, 3000.).unwrap();
+        b.facades[0].bays = vec![6000.];
+        let facade = b.facades[0].id.clone();
+        s.doc.buildings.push(b);
+        s.execute("facade.place", json!({"facade":facade,"type":"balcony.cantilever","levels":[0],"bays":[0]})).unwrap();
+        s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+        for scale in [100., 200., 500.] {
+            s.execute(
+                "view.configure",
+                json!({"id":"p","template":{"name":"Physical scale","sizing":{"mode":"fixed","denominator":scale,"centre":[6000,2500]}}}),
+            )
+            .unwrap();
+            let sheet = crate::views::sheet(&s.doc, "p", View::latest(&s.doc)).unwrap();
+            let text = sheet
+                .scene
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Text(t) if t.text.starts_with("Ca. ") => Some(t),
+                    _ => None,
+                })
+                .expect("balcony label");
+            let bounds = crate::plan_output::text_ink_bounds(std::slice::from_ref(text)).unwrap()[0].unwrap();
+            // First facade faces south: the dimension is 300 mm outside a 1300 mm slab.
+            let dim_y = -s.doc.component("balcony.cantilever").unwrap().kind.depth().unwrap() - 300.;
+            let top = text.at[1] + bounds[3] * scale;
+            let ink_gap = (dim_y - top) / scale;
+            assert!(ink_gap >= 0.49, "scale 1:{scale}: ink clearance {ink_gap} paper mm");
         }
     }
 }

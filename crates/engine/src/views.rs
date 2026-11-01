@@ -140,6 +140,7 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
             }
         }
         crate::view_config::prepare(&mut sheet, template, bounds);
+        crate::view_config::paper_clearances(&mut sheet)?;
         crate::view_config::room_labels(&mut sheet, doc, view, template);
     }
     let mut regions = Scene::new(sheet.scene.scale);

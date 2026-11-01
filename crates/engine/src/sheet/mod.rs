@@ -295,6 +295,13 @@ pub(crate) enum Halo {
     Box,
 }
 
+/// A generated label's known dimension line. Transient layout data, never serialized.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TextClearance {
+    pub(crate) anchor: [f64; 2],
+    pub(crate) outward: [f64; 2],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Text {
     pub(crate) layer: Layer,
@@ -310,6 +317,9 @@ pub(crate) struct Text {
     pub(crate) colour: Rgb,
     pub(crate) halo: Halo,
     pub(crate) style: trigon_model::annotation::TextStyle,
+    /// Stable source/role for read-only diagnostics, not SVG attributes or document data.
+    pub(crate) source: Option<String>,
+    pub(crate) clearance: Option<TextClearance>,
 }
 
 impl Text {
@@ -325,6 +335,8 @@ impl Text {
             colour: LETTERING,
             halo: Halo::None,
             style: Default::default(),
+            source: None,
+            clearance: None,
         }
     }
 }

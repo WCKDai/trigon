@@ -27,3 +27,15 @@ Source association correctness does not establish physical accuracy. Distinct st
 adjacent departures may intentionally overlap. A scan-based relocation needs registration,
 source evidence and an explicit reviewed correction; an apparent double symbol is not enough
 to delete a staircase.
+
+## Physical drawing scale
+
+Configured plan views place generated balcony size lettering using glyph ink from the same
+bundled fonts and SVG shaping used by Studio, PNG and PDF. The lettering retains at least
+0.5 paper mm of visible clearance beyond its dimension pen and white outline at the final
+view scale. A scale change therefore cannot compress that clearance to a fraction of a model
+millimetre. Unconfigured legacy export layouts retain their existing fingerprints.
+
+Font measurements are paper millimetres and include actual style and anchoring; wide and
+narrow letters are not interchangeable. DXF consumers may substitute fonts, so these exact
+ink measurements describe Trigon's shared SVG renderer.

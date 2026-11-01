@@ -447,6 +447,9 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 if status != Status::Demolished {
                     let label_at = pt(fr, (u0 + u1) / 2.0, -depth - 450.0);
                     let out = pt(fr, (u0 + u1) / 2.0, -depth - 1450.0);
+                    if let Some(element) = &owner {
+                        elements.insert(prims.len(), element.clone());
+                    }
                     prims.push(Prim::Text {
                         at: label_at,
                         text: format!("Ca. {:.0} x {:.0}", depth, slab_width),
@@ -796,6 +799,8 @@ pub(crate) struct Label {
     pub(crate) fs: f64,
     pub(crate) text: String,
     pub(crate) balcony: bool,
+    pub(crate) source: Option<String>,
+    pub(crate) clearance: Option<crate::sheet::TextClearance>,
 }
 
 impl Label {
@@ -1034,7 +1039,32 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                     let l = (q[0] - p[0]).hypot(q[1] - p[1]);
                     (l > 1e-6).then(|| [p[0] + (q[0] - p[0]) / l * fs * 1.7, p[1] + (q[1] - p[1]) / l * fs * 1.7])
                 });
-                labels.push(Label { at: p, alt, deg, fs, text: text.replace(" x ", " × "), balcony: text.starts_with("Ca. ") });
+                let clearance = away
+                    .filter(|d| {
+                        let anchor = [at[0] - d[0] * 150.0, at[1] - d[1] * 150.0];
+                        text.starts_with("Ca. ")
+                            && prims.iter().any(|p| {
+                                matches!(p,
+                        Prim::Line { a,b,width,.. } if *width == 10.0 &&
+                        ((a[0]+b[0])/2.0-anchor[0]).hypot((a[1]+b[1])/2.0-anchor[1]) < 1e-4)
+                            })
+                    })
+                    .map(|d| {
+                        let anchor = f.rot([at[0] - d[0] * 150.0, at[1] - d[1] * 150.0]);
+                        let start = f.rot(*at);
+                        let end = f.rot([at[0] + d[0], at[1] + d[1]]);
+                        crate::sheet::TextClearance { anchor, outward: [end[0] - start[0], end[1] - start[1]] }
+                    });
+                labels.push(Label {
+                    at: p,
+                    alt,
+                    deg,
+                    fs,
+                    text: text.replace(" x ", " × "),
+                    balcony: text.starts_with("Ca. "),
+                    source: elements.get(&index).map(|e| format!("element:{}:size", e.id)),
+                    clearance,
+                });
             }
         }
     }
@@ -1065,6 +1095,8 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         let mut t = Text::new(Layer::Annotation, vp.at(l.at), l.text.clone(), l.fs * MM_PER_PX);
         t.deg = -l.deg;
         t.halo = Halo::Outline;
+        t.source = l.source.clone();
+        t.clearance = l.clearance.clone();
         sc.text(t);
     }
     let note = crowded.then(|| format!("Altaner: {}", sizes.iter().map(|(t, n)| format!("{n} stk. {t}")).collect::<Vec<_>>().join(", ")));
@@ -1408,7 +1440,16 @@ mod tests {
 
     #[test]
     fn labels_collide_as_rotated_boxes() {
-        let label = |at: [f64; 2], deg: f64| Label { at, alt: None, deg, fs: 14.0, text: "Ca. 1300 × 2700".into(), balcony: true };
+        let label = |at: [f64; 2], deg: f64| Label {
+            at,
+            alt: None,
+            deg,
+            fs: 14.0,
+            text: "Ca. 1300 × 2700".into(),
+            balcony: true,
+            source: None,
+            clearance: None,
+        };
         // Side by side 80 px apart: the 15-character labels overlap; 140 px apart they don't.
         assert!(label([100., 100.], 0.).overlaps(&label([180., 100.], 0.)));
         assert!(!label([100., 100.], 0.).overlaps(&label([240., 100.], 0.)));
