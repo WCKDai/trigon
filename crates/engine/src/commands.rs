@@ -263,7 +263,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "annotation.define",
-        summary: "Create or replace text, an aligned measured dimension, a leader/tag or a vertical level mark in a saved view. Positions/offsets are drawing mm; size_mm is paper mm. Atomic and undoable.",
+        summary: "Create or replace text, an aligned measured dimension, a leader/tag, a vertical level mark, a manual drafting line or a filled region in a saved view. Positions/offsets are drawing mm; size_mm and line widths are paper mm. Atomic and undoable.",
         mutates: true,
         journaled: true,
         schema: schema::<trigon_model::annotation::Annotation>,

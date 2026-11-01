@@ -194,7 +194,7 @@ impl Schedules {
                 ui.label(format!("{} excluded from area", totals.area_excluded));
                 ui.weak(format!("/ {} in phase view", schedule.totals.instances));
             });
-            ui.weak("Area = outer lining width × height. Facade openings (loggias) have no lining area. Dimensions in mm.");
+            ui.weak("Area = outer lining width × height for rectangular families; shaped families use opening-profile area. Facade openings (loggias) have no lining area. Dimensions in mm.");
         });
         if filtered.rows.is_empty() {
             ui.add_space(12.0);

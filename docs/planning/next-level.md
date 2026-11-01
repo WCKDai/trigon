@@ -42,8 +42,8 @@ These are acceptance targets, not a claim that the full workflow is implemented.
 drawing milestone covers annotation authoring and snapping. Direct 2D model selection and IFC
 window/door quantities are implemented in separate follow-up increments ([#17](https://github.com/WCKDai/trigon/pull/17),
 [#18](https://github.com/WCKDai/trigon/pull/18)), with local verification and an offline workflow
-fixture. Those branches remain under review; native interaction and representative commercial
-import checks remain open. The next increment connects those quantities to local schedules.
+fixture. Both are integrated; native interaction and representative commercial import checks
+remain open. Local opening schedules now build on those quantities.
 
 Open-source libraries, ML weights, datasets and component assets each need a source, an exact
 version and a checked redistribution licence. Reuse follows the clean-room rules in `AGENTS.md`;
@@ -101,6 +101,7 @@ is undoable.
   view on the laptop.
 - **Parallel agents per independent workstream** in isolated worktrees, with explicit file ownership
   and exclusive build-cache leases. Semantic picking and IFC quantities have been integrated
-  sequentially; schedules are the current follow-up. Add reviewers when a concrete diff is ready.
+  sequentially; local opening schedules now use those quantities. Native interaction and
+  representative commercial imports remain open. Add reviewers when a concrete diff is ready.
 - **Representative import checks** of `examples/sample-building.ifc` in Revit, Archicad and
   Vectorworks, with the application version, element categories, quantities and geometry recorded.
