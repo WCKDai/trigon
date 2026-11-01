@@ -523,6 +523,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                         number("width_mm", "Dormer window width", spec.width_mm, "mm", 300.0, 3000.0),
                         number("height_mm", "Dormer window height", spec.height_mm, "mm", 300.0, 2200.0),
                         number("u_mm", "Centre along host facade", spec.u_mm, "mm", 0.0, 1e8),
+                        number("yaw_deg", "Rotation about +Z from source facade", spec.yaw_deg, "deg", -45.0, 45.0),
                         number("setback_mm", "Front setback from wall", spec.setback_mm, "mm", 100.0, 1500.0),
                         number("cheek_mm", "Side cheek thickness", spec.cheek_mm, "mm", 50.0, 200.0),
                         number("head_mm", "Head above window", spec.head_mm, "mm", 50.0, 400.0),
@@ -1087,6 +1088,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                     "width_mm" => d.width_mm = numeric(key, value)?,
                     "height_mm" => d.height_mm = numeric(key, value)?,
                     "u_mm" => d.u_mm = numeric(key, value)?,
+                    "yaw_deg" => d.yaw_deg = numeric(key, value)?,
                     "setback_mm" => d.setback_mm = numeric(key, value)?,
                     "cheek_mm" => d.cheek_mm = numeric(key, value)?,
                     "head_mm" => d.head_mm = numeric(key, value)?,
@@ -1548,6 +1550,44 @@ mod tests {
         assert_eq!(s.doc, before);
         assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
         assert_eq!(s.doc, after);
+    }
+
+    #[test]
+    fn dormer_yaw_property_preserves_anchor_and_exact_undo() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Skew host property fixture",
+            "footprint":[[0,0],[12000,0],[24000,-1000],[24000,11000],[0,11000]],"storeys":3,"storey_height_mm":3400}),
+        )
+        .unwrap();
+        let yaw = -(1000.0_f64 / 24000.0).atan().to_degrees();
+        // Both orientations lie within the unchanged host-plane numerical tolerance.
+        s.execute(
+            "building.set_roof",
+            json!({"building":"b","kind":"pitched","pitch_deg":46,"thickness_mm":220,"overhang_mm":250,
+            "dormers":[{"id":"skew","facade":"b.f1","u_mm":6000,"yaw_deg":yaw+1e-8,
+                "window_type":"window.casement.2","width_mm":1100,"height_mm":1100}]}),
+        )
+        .unwrap();
+        let id = "b.dormer.skew.window";
+        assert_eq!(property(&descriptor(&mut s, id), "yaw_deg"), yaw + 1e-8);
+        let before = serde_json::to_vec(&s.doc).unwrap();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        assert!(s.execute("element.set", json!({"id":id,"properties":{"yaw_deg":46}})).is_err());
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), before);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+        assert_eq!(update(&mut s, id, json!({"yaw_deg":yaw})), id);
+        let value = descriptor(&mut s, id);
+        assert_eq!(property(&value, "yaw_deg"), yaw);
+        assert_eq!(property(&value, "u_mm"), 6000.0);
+        let after = serde_json::to_vec(&s.doc).unwrap();
+        let reopened: Document = serde_json::from_slice(&after).unwrap();
+        assert_eq!(trigon_model::build(&reopened).unwrap(), trigon_model::build(&s.doc).unwrap());
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), after);
     }
 
     #[test]
