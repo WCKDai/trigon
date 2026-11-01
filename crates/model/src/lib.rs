@@ -13,6 +13,7 @@ pub mod doors;
 pub mod footprint;
 pub mod joins;
 pub mod mesh;
+pub mod profile;
 pub mod roof;
 pub mod stair;
 pub mod wall_cleanup;

@@ -199,7 +199,9 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     prims.push(Prim::Line { a: pt(fr, hinge, d * 0.5), b: pt(fr, other, d * 0.5), color, width: 45.0, dashed: false });
                 };
                 match kind {
-                    Some(ComponentKind::Window { .. } | ComponentKind::FixedWindow) => window(&mut prims, u0, u1),
+                    Some(ComponentKind::Window { .. } | ComponentKind::HistoricWindow { .. } | ComponentKind::FixedWindow) => {
+                        window(&mut prims, u0, u1)
+                    }
                     Some(ComponentKind::Loggia { depth, door_width, door_side, .. }) => {
                         // Open to the cut: brick returns, the glazing set back, a rail across the parapet.
                         let back = depth.max(d + 300.0);

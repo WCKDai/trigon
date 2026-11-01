@@ -295,7 +295,14 @@ fn opening_area(wall: &BuiltWall, seg: &WallSegment) -> f64 {
     seg.openings
         .iter()
         .filter_map(|&k| wall.openings.get(k))
-        .map(|o| (o.rect.u1 - o.rect.u0).max(0.0) * (o.rect.v1.min(seg.z1) - o.rect.v0.max(seg.z0)).max(0.0))
+        .map(|o| {
+            if o.profile.is_empty() {
+                (o.rect.u1 - o.rect.u0).max(0.0) * (o.rect.v1.min(seg.z1) - o.rect.v0.max(seg.z0)).max(0.0)
+            } else {
+                let rect = trigon_model::Rect { v0: seg.z0, v1: seg.z1, ..o.rect };
+                trigon_model::doc::polygon_area(&trigon_model::profile::clip(&o.profile, rect))
+            }
+        })
         .sum()
 }
 

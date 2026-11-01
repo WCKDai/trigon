@@ -34,6 +34,34 @@ pub enum ComponentKind {
     },
     /// Fixed glazing, no sash.
     FixedWindow,
+    /// Original, parametric traditional joinery. The opening follows the declared profile;
+    /// muntins are either real glazing divisions or explicitly applied presentation bars.
+    HistoricWindow {
+        #[serde(default)]
+        shape: WindowShape,
+        #[serde(default = "one")]
+        lights: u32,
+        #[serde(default)]
+        top_light: f64,
+        #[serde(default = "one")]
+        panes_across: u32,
+        #[serde(default = "one")]
+        panes_down: u32,
+        #[serde(default)]
+        muntins: Muntins,
+        #[serde(default = "muntin_width")]
+        muntin_width_mm: f64,
+        #[serde(default = "yes")]
+        operable: bool,
+    },
+    /// Fyldningsdør: a parameterised grid of recessed panels; the upper rows may be glazed.
+    PanelDoor {
+        leaves: u32,
+        panel_columns: u32,
+        panel_rows: u32,
+        #[serde(default)]
+        glazed_rows: u32,
+    },
     /// Solid entrance door.
     EntranceDoor,
     /// Glazed door with `leaves` leaves opening onto nothing (ground floor, or into a balcony).
@@ -75,6 +103,35 @@ pub enum ComponentKind {
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+fn one() -> u32 {
+    1
+}
+fn yes() -> bool {
+    true
+}
+fn muntin_width() -> f64 {
+    22.0
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WindowShape {
+    #[default]
+    Rectangular,
+    /// Circular segment over vertical jambs. Rise is measured from spring line to crown.
+    Segmental { rise_mm: f64 },
+    /// A circular fixed light; nominal width and height must be equal.
+    Round,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Muntins {
+    #[default]
+    TrueDivided,
+    Applied,
 }
 
 /// Left or right, seen from outside.
@@ -131,6 +188,7 @@ impl ComponentKind {
         matches!(
             self,
             Self::EntranceDoor
+                | Self::PanelDoor { .. }
                 | Self::FrenchDoor { .. }
                 | Self::FrenchBalcony { .. }
                 | Self::Balcony { .. }
@@ -161,6 +219,39 @@ impl ComponentType {
         checked("height", self.height, 300.0, 4000.0)?;
         checked("sill", self.sill, 0.0, 3000.0)?;
         match &self.kind {
+            ComponentKind::HistoricWindow { shape, lights, top_light, panes_across, panes_down, muntin_width_mm, operable, .. } => {
+                if !(1..=4).contains(lights)
+                    || !(1..=6).contains(panes_across)
+                    || !(1..=8).contains(panes_down)
+                    || u64::from(*lights) * u64::from(*panes_across) * u64::from(*panes_down) * if *top_light > 0.0 { 2 } else { 1 } > 96
+                {
+                    return Err(crate::ModelError::Invalid("historic window: 1–4 lights, 1–6 pane columns, 1–8 pane rows, at most 96 panes".into()));
+                }
+                checked("top_light", *top_light, 0.0, self.height / 2.0)?;
+                checked("muntin_width_mm", *muntin_width_mm, 8.0, 60.0)?;
+                match shape {
+                    WindowShape::Rectangular => {}
+                    WindowShape::Segmental { rise_mm } => {
+                        checked("arch rise", *rise_mm, 20.0, (self.width / 2.0).min(self.height * 0.45))?;
+                    }
+                    WindowShape::Round => {
+                        if (self.width - self.height).abs() > 1e-6 || *operable || *lights != 1 || *top_light != 0.0 {
+                            return Err(crate::ModelError::Invalid(
+                                "round windows require equal width/height, one fixed light and no top_light".into(),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ComponentKind::PanelDoor { leaves, panel_columns, panel_rows, glazed_rows } => {
+                if !(1..=2).contains(leaves) || !(1..=3).contains(panel_columns) || !(1..=6).contains(panel_rows) || *glazed_rows > *panel_rows {
+                    return Err(crate::ModelError::Invalid(
+                        "panel door: 1–2 leaves, 1–3 panel columns, 1–6 panel rows; glazed_rows cannot exceed panel_rows".into(),
+                    ));
+                }
+                Ok(())
+            }
             ComponentKind::Window { lights, .. } if *lights == 0 || *lights > 8 => {
                 Err(crate::ModelError::Invalid(format!("lights must be 1 to 8 (got {lights})")))
             }
@@ -248,6 +339,104 @@ pub fn default_types() -> Vec<ComponentType> {
     ]
 }
 
+/// Original configurable style templates, installed explicitly so old projects and their
+/// default libraries remain unchanged. Dimensions are family defaults, not surveyed data.
+pub fn copenhagen_types() -> Vec<ComponentType> {
+    let window = |id: &str, name: &str, width, height, shape, lights, top_light, panes_across, panes_down, muntins, operable| ComponentType {
+        id: format!("dk.window.{id}"),
+        name: name.into(),
+        width,
+        height,
+        sill: 850.0,
+        kind: ComponentKind::HistoricWindow { shape, lights, top_light, panes_across, panes_down, muntins, muntin_width_mm: 22.0, operable },
+    };
+    let mut types = vec![
+        window("dannebrog", "Dannebrog – four casements", 1200.0, 1900.0, WindowShape::Rectangular, 2, 450.0, 1, 1, Muntins::TrueDivided, true),
+        window("crosspost", "Krydspost – balanced cross", 1400.0, 1900.0, WindowShape::Rectangular, 2, 700.0, 1, 1, Muntins::TrueDivided, true),
+        window(
+            "three-light",
+            "Three-light Copenhagen casement",
+            1800.0,
+            1900.0,
+            WindowShape::Rectangular,
+            3,
+            450.0,
+            1,
+            1,
+            Muntins::TrueDivided,
+            true,
+        ),
+        window(
+            "small-panes",
+            "Småsprosset – true divided glazing",
+            1100.0,
+            1700.0,
+            WindowShape::Rectangular,
+            2,
+            0.0,
+            1,
+            3,
+            Muntins::TrueDivided,
+            true,
+        ),
+        window(
+            "applied-bars",
+            "Pyntesprosser – explicitly applied bars",
+            1100.0,
+            1700.0,
+            WindowShape::Rectangular,
+            2,
+            0.0,
+            1,
+            3,
+            Muntins::Applied,
+            true,
+        ),
+        window(
+            "segmental",
+            "Segmentbuet Dannebrog",
+            1200.0,
+            2000.0,
+            WindowShape::Segmental { rise_mm: 180.0 },
+            2,
+            450.0,
+            1,
+            1,
+            Muntins::TrueDivided,
+            true,
+        ),
+        window(
+            "arched-fixed",
+            "Arched fixed light",
+            1000.0,
+            1800.0,
+            WindowShape::Segmental { rise_mm: 450.0 },
+            1,
+            0.0,
+            1,
+            1,
+            Muntins::TrueDivided,
+            false,
+        ),
+        window("round", "Round oculus – fixed", 700.0, 700.0, WindowShape::Round, 1, 0.0, 2, 2, Muntins::TrueDivided, false),
+    ];
+    for (id, name, width, height, leaves, columns, rows, glazed_rows) in [
+        ("six-panel", "Six-panel entrance", 1100.0, 2350.0, 1, 2, 3, 0),
+        ("glazed-panel", "Glazed-panel entrance", 1100.0, 2350.0, 1, 2, 3, 1),
+        ("double-panel", "Double Copenhagen entrance", 1600.0, 2500.0, 2, 1, 3, 1),
+    ] {
+        types.push(ComponentType {
+            id: format!("dk.door.{id}"),
+            name: name.into(),
+            width,
+            height,
+            sill: 0.0,
+            kind: ComponentKind::PanelDoor { leaves, panel_columns: columns, panel_rows: rows, glazed_rows },
+        });
+    }
+    types
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +454,31 @@ mod tests {
         for w in [f64::NAN, f64::INFINITY, -1.0, 1e9] {
             t.width = w;
             assert!(t.validate().is_err(), "width {w}");
+        }
+    }
+
+    #[test]
+    fn historic_family_parameters_round_trip_without_rewriting_old_families() {
+        for kind in [
+            serde_json::json!({"family":"historic_window","shape":{"kind":"segmental","rise_mm":180},"lights":2,"top_light":450,"panes_across":1,"panes_down":2,"muntins":"true_divided","muntin_width_mm":22,"operable":true}),
+            serde_json::json!({"family":"historic_window","shape":{"kind":"round"},"lights":1,"operable":false}),
+            serde_json::json!({"family":"panel_door","leaves":2,"panel_columns":2,"panel_rows":3,"glazed_rows":1}),
+        ] {
+            let parsed: ComponentKind = serde_json::from_value(kind).unwrap();
+            let round_trip: ComponentKind = serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+            assert_eq!(parsed, round_trip);
+        }
+        let old: ComponentKind = serde_json::from_str(r#"{"family":"window","lights":2}"#).unwrap();
+        assert_eq!(serde_json::to_value(old).unwrap(), serde_json::json!({"family":"window","lights":2}));
+    }
+
+    #[test]
+    fn copenhagen_templates_are_valid_and_have_distinct_ids() {
+        let types = copenhagen_types();
+        let ids: std::collections::BTreeSet<_> = types.iter().map(|t| &t.id).collect();
+        assert_eq!(ids.len(), types.len());
+        for t in types {
+            t.validate().unwrap();
         }
     }
 }

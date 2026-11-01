@@ -69,7 +69,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "schedule.openings",
-        summary: "List actual built windows and doors with semantic IDs, building/host/storey/type, phase status and dimensions. Areas are rectangular outer-lining m2; loggia facade-hole areas are excluded. Optional building, levels and phase/filter. Read-only and deterministic; does not change history.",
+        summary: "List actual built windows and doors with semantic IDs, building/host/storey/type, phase status and dimensions. Areas are outer-lining profile m2 (width × height for rectangular families); loggia facade-hole areas are excluded. Optional building, levels and phase/filter. Read-only and deterministic; does not change history.",
         mutates: false,
         journaled: false,
         schema: schema::<crate::schedules::OpeningScheduleRequest>,
@@ -741,6 +741,33 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| {
             parse::<NoParams>("types.list", v)?;
             Ok(serde_json::to_value(&s.doc.types).unwrap_or(Value::Null))
+        },
+    },
+    CommandSpec {
+        id: "types.install_copenhagen",
+        summary: "Install original parametric Danish Dannebrog, crosspost, segmental/round, true/applied muntin and panel-door families. Explicit style defaults, not surveyed or certified products. Existing definitions are never overwritten. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("types.install_copenhagen", v)?;
+            let mut installed = Vec::new();
+            for ty in trigon_model::component::copenhagen_types() {
+                ty.validate()?;
+                if let Some(existing) = s.doc.types.iter().find(|t| t.id == ty.id) {
+                    if existing != &ty {
+                        return Err(ModelError::Invalid(format!(
+                            "type {} already has different parameters; rename it or install in a new document",
+                            ty.id
+                        ))
+                        .into());
+                    }
+                } else {
+                    installed.push(ty.id.clone());
+                    s.doc.types.push(ty);
+                }
+            }
+            Ok(json!({"installed":installed,"family_defaults":true}))
         },
     },
     CommandSpec {

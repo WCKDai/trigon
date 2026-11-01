@@ -171,6 +171,8 @@ pub struct BuiltOpening {
     pub id: String,
     pub level: usize,
     pub rect: Rect,
+    /// Actual convex outline for shaped openings; empty retains the legacy rectangle path.
+    pub profile: Vec<[f64; 2]>,
     /// The window or door filling the opening.
     pub fill: BuiltElement,
     /// Railings and balcony slabs that belong to the opening.
@@ -625,10 +627,29 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         let cellars: Vec<_> = cellars.into_iter().filter(|(_, c, _, _)| !above(c.floor)).collect();
         holes.extend(cellars.iter().map(|(_, _, _, r)| *r));
         let unbuildable = || ModelError::Invalid(format!("facade {}: the wall faces could not be triangulated", f.id));
-        let mesh = crate::walls::skin(&fr, &spans, &holes).ok_or_else(unbuildable)?;
+        let shaped = resolved.iter().any(|(r, _)| {
+            matches!(
+                r.ty.kind,
+                ComponentKind::HistoricWindow { shape: crate::component::WindowShape::Segmental { .. } | crate::component::WindowShape::Round, .. }
+            )
+        });
+        let profiles: Vec<_> = resolved
+            .iter()
+            .map(|(r, _)| crate::profile::opening(&r.ty.kind, r.rect))
+            .chain(cellars.iter().map(|(_, _, _, r)| crate::profile::outline(&crate::component::WindowShape::Rectangular, *r)))
+            .collect();
+        let mesh = if shaped { crate::walls::skin_profiles(&fr, &spans, &profiles) } else { crate::walls::skin(&fr, &spans, &holes) }
+            .ok_or_else(unbuildable)?;
         let segments = spans
             .iter()
-            .map(|s| crate::walls::segment(&fr, &format!("{}.L{}", f.id, s.level), s, &holes).ok_or_else(unbuildable))
+            .map(|s| {
+                if shaped {
+                    crate::walls::segment_profiles(&fr, &format!("{}.L{}", f.id, s.level), s, &profiles)
+                } else {
+                    crate::walls::segment(&fr, &format!("{}.L{}", f.id, s.level), s, &holes)
+                }
+                .ok_or_else(unbuildable)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let elevation_of = |r: &Resolved| b.storeys.get(r.placement.level).map_or(0.0, |s| s.elevation);
@@ -679,6 +700,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 status: Status::Existing,
             };
             openings.push(BuiltOpening {
+                profile: Vec::new(),
                 id: format!("{id}.opening"),
                 level: *level,
                 rect: *rect,
@@ -690,7 +712,17 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         }
         let plinth = match (&b.plinth, &plinth_line) {
             (Some(p), Some(line)) => {
-                let m = facing_piece(&fr, f, (a, e), line, p.projection.max(1.0), (-PLINTH_FOOT, p.height), &holes).ok_or_else(unbuildable)?;
+                let m = facing_piece(
+                    &fr,
+                    f,
+                    (a, e),
+                    line,
+                    p.projection.max(1.0),
+                    (-PLINTH_FOOT, p.height),
+                    &holes,
+                    shaped.then_some(profiles.as_slice()),
+                )
+                .ok_or_else(unbuildable)?;
                 match cut {
                     Some(z) => m.below(z),
                     None => m,
@@ -709,7 +741,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 if !(z1 - z0 >= 10.0) || above(z0) {
                     continue;
                 }
-                trim.append(&facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes).ok_or_else(unbuildable)?);
+                trim.append(
+                    &facing_piece(&fr, f, (a, e), &line, projection, (z0, top_at(z1)), &holes, shaped.then_some(profiles.as_slice()))
+                        .ok_or_else(unbuildable)?,
+                );
             }
         }
         walls.push(BuiltWall {
@@ -909,6 +944,7 @@ fn facing_piece(
     projection: f64,
     (z0, z1): (f64, f64),
     holes: &[Rect],
+    profiles: Option<&[Vec<[f64; 2]>]>,
 ) -> Option<Mesh> {
     let n = line.len();
     let (s, t) = (*line.get(f.edge)?, *line.get((f.edge + 1) % n)?);
@@ -918,7 +954,12 @@ fn facing_piece(
     let shift = along(fr.origin);
     let holes: Vec<Rect> = holes.iter().map(|r| Rect { u0: r.u0 + shift, u1: r.u1 + shift, ..*r }).collect();
     let span = Span { level: 0, thickness: projection, z0, z1, in0: along(a), in1: along(e), qs: a, qe: e };
-    crate::walls::segment(&face, &format!("{}.facing", f.id), &span, &holes).map(|seg| seg.mesh)
+    if let Some(profiles) = profiles {
+        let profiles: Vec<_> = profiles.iter().map(|poly| poly.iter().map(|p| [p[0] + shift, p[1]]).collect()).collect();
+        crate::walls::segment_profiles(&face, &format!("{}.facing", f.id), &span, &profiles).map(|seg| seg.mesh)
+    } else {
+        crate::walls::segment(&face, &format!("{}.facing", f.id), &span, &holes).map(|seg| seg.mesh)
+    }
 }
 
 /// Cellar door height, mm.
@@ -996,7 +1037,7 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
             parts: opening::interior(&fr, rect, d).finish(),
             status: Status::Existing,
         };
-        doors.push(BuiltOpening { id: door_id, level, rect, fill, attached: Vec::new(), status: Status::Existing });
+        doors.push(BuiltOpening { id: door_id, level, rect, profile: Vec::new(), fill, attached: Vec::new(), status: Status::Existing });
     }
     let holes: Vec<Rect> = doors.iter().map(|o| o.rect).collect();
     let mesh = crate::walls::segment(&fr, id, &span, &holes).map_or_else(|| prism(&j.outline, z0, height), |s| s.mesh);
@@ -1194,6 +1235,16 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
     let mut detail = opening::Parts::default();
     let mut parts = Vec::new();
     match kind {
+        ComponentKind::HistoricWindow { shape, lights, top_light, panes_across, panes_down, muntins, muntin_width_mm, operable } => {
+            detail =
+                opening::historic_window(fr, rect, w, shape, *lights, *top_light, *panes_across, *panes_down, *muntin_width_mm, *muntins, *operable);
+            if !matches!(shape, crate::component::WindowShape::Round) {
+                detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
+            }
+        }
+        ComponentKind::PanelDoor { leaves, panel_columns, panel_rows, glazed_rows } => {
+            detail = opening::panel_door(fr, rect, w, *leaves, *panel_columns, *panel_rows, *glazed_rows);
+        }
         ComponentKind::Window { lights, top_light } => {
             detail = opening::window(fr, rect, w, *lights, *top_light, true, false);
             detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
@@ -1320,7 +1371,8 @@ fn component(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: S
         }
         _ => {}
     }
-    BuiltOpening { id: format!("{id}.opening"), level, rect: r.rect, fill, attached, status }
+    let profile = if matches!(ty.kind, ComponentKind::HistoricWindow { .. }) { crate::profile::opening(&ty.kind, r.rect) } else { Vec::new() };
+    BuiltOpening { id: format!("{id}.opening"), level, rect: r.rect, profile, fill, attached, status }
 }
 
 /// A straight rod between two facade points `(u, w, v)` with a square section `r` mm wide.

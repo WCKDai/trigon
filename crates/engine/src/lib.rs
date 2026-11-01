@@ -13,6 +13,8 @@ use trigon_model::{Document, ModelError};
 
 mod annotation_style;
 mod commands;
+#[cfg(test)]
+mod copenhagen_tests;
 mod drawings;
 mod edit;
 mod elements;
