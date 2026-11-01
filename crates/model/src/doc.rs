@@ -876,6 +876,12 @@ impl Building {
     fn fit_schedule(&mut self) {
         let count = self.storeys.len();
         self.floor_thicknesses.truncate(count);
+        for facade in &mut self.facades {
+            for band in &mut facade.bands {
+                band.levels.retain(|level| *level < count);
+            }
+            facade.bands.retain(|band| !band.levels.is_empty());
+        }
         for schedule in std::iter::once(&mut self.wall_schedule).chain(self.facades.iter_mut().map(|f| &mut f.wall_schedule)) {
             if let Some(&top) = schedule.last() {
                 schedule.resize(count, top);

@@ -495,7 +495,7 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "building.set_storeys",
         summary: "Set the number of storeys, the floor-to-floor height and the ground floor's level above the terrain (mm). \
-                  Placements above the new top storey are removed.",
+                  Placements and facade-band occurrences above the new top storey are removed.",
         mutates: true,
         journaled: true,
         schema: schema::<SetStoreys>,
@@ -513,7 +513,7 @@ static COMMANDS: &[CommandSpec] = &[
         id: "building.set_levels",
         summary: "Set the storeys from explicit floor levels (mm above the site's terrain, rising) and the top of the last storey \
                   (eaves or attic floor), for storeys of different heights read from a section drawing. `source` records where \
-                  the levels came from as evidence. Placements above the new top storey are removed.",
+                  the levels came from as evidence. Placements and facade-band occurrences above the new top storey are removed.",
         mutates: true,
         journaled: true,
         schema: schema::<SetLevels>,

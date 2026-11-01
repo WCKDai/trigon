@@ -99,6 +99,36 @@ fn session() -> Session {
 }
 
 #[test]
+fn reducing_storeys_prunes_facade_band_levels_and_undo_restores_them() {
+    for (command, params) in
+        [("building.set_storeys", json!({"count":2,"height":3000})), ("building.set_levels", json!({"floors":[0,3000],"top":6000}))]
+    {
+        let mut s = session();
+        let facade = s.doc.buildings[0].facades[0].id.clone();
+        s.execute(
+            "element.set",
+            json!({"id":facade,"properties":{"bands":[
+                {"levels":[0,1,4],"bottom":2000,"top":2200,"projection":30,"finish":"yellow_brick"},
+                {"levels":[4],"bottom":2500,"top":2700,"projection":40}
+            ]}}),
+        )
+        .unwrap();
+        let before = serde_json::to_vec(&s.doc).unwrap();
+        s.execute(command, params).unwrap();
+        let bands = &s.doc.buildings[0].facades[0].bands;
+        assert_eq!(bands.len(), 1, "bands with no remaining occurrences must be removed");
+        assert_eq!(bands[0].levels, vec![0, 1]);
+        assert_eq!(bands[0].finish, Some(trigon_model::doc::WallFinish::YellowBrick));
+        trigon_model::build(&s.doc).unwrap();
+        let after = serde_json::to_vec(&s.doc).unwrap();
+        assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), before);
+        assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), after);
+    }
+}
+
+#[test]
 fn clearing_stair_walls_preserves_the_other_storeys() {
     let mut s = session();
     s.execute(
