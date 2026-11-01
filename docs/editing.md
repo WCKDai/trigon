@@ -47,6 +47,13 @@ Successful edits return `targets`: the handles of the moved or created definitio
 Use those handles for subsequent edits because splitting a definition creates a new id.
 `edit.undo` restores a whole batch; `edit.redo` reapplies it.
 
+In Studio's Properties, interior-wall axes and shared facade footprint corners have separate
+X and Y fields in millimetres. Click to type an exact coordinate or drag to adjust it. The
+fields retain full numeric precision: focusing a coordinate and leaving it unchanged cannot
+round the wall's position. Apply submits only edited properties through `element.set`;
+unchanged coordinates keep their original values. Polygon boundaries retain their advanced
+coordinate editor. The shown edit scope still decides which storeys or shared corners move.
+
 `interior.regularize` cleans traced walls against explicit building-grid angles. Walls with
 explicit doors retain their source identities and are never merged into another host. When
 a wall axis snaps or its start extends to a junction, each door centre is projected onto that
