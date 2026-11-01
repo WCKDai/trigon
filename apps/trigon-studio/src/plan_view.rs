@@ -314,6 +314,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pointer_drag_pans_the_live_canvas_without_changing_its_zoom() {
+        let ctx = egui::Context::default();
+        let mut view = PlanView::new(ctx.clone());
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900"><path d="M10 10L1500 800" stroke="black"/></svg>"#;
+        view.set_tree(1, Arc::new(trigon_engine::parse_svg(svg).unwrap()));
+        let mut frame = 0;
+        let mut draw = |view: &mut PlanView, events| {
+            frame += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                time: Some(f64::from(frame) * 0.05),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                view.ui(ui, false);
+            });
+            output.textures_delta.clear();
+        };
+        draw(&mut view, Vec::new());
+        let before = view.centre;
+        let zoom = view.zoom;
+        let events = crate::control::parse_input("ui.drag", &serde_json::json!({"from":[600,400],"to":[640,420],"steps":8})).unwrap();
+        for event in events {
+            draw(&mut view, vec![event]);
+        }
+        assert!(view.centre[0] < before[0] - 20.0 / zoom, "a real drag must move the drawing centre");
+        assert_eq!(view.zoom, zoom);
+    }
+
+    #[test]
     fn alignment_remains_in_drawing_mm_after_pan_and_zoom_and_alt_bypasses_it() {
         let mut view = PlanView::new(egui::Context::default());
         view.geometry = Some(DrawingPreview {
