@@ -564,10 +564,14 @@ mod picking_tests {
     #[test]
     fn drawing_outputs_retain_baseline_bytes() {
         let session = session();
+        // Opening-detail baseline (#27): stepped sashes, separated panes, recessed door
+        // panels, hardware and sloped sills intentionally change facade/section paths.
+        // The plan remains identical. Keep exact exports and legacy segment extraction
+        // locked together; semantic ownership and picking invariants below are unchanged.
         for (id, expected) in [
             ("plan", [10244507659954298824, 11109581394211914227]),
-            ("facade", [12304697737480228178, 7625715272030178447]),
-            ("section", [13566637633045740336, 3463606591175843950]),
+            ("facade", [7252864978991160264, 12503913643375835528]),
+            ("section", [18028250061707514544, 14549507134392012572]),
         ] {
             let sheet = sheet(&session.doc, id, View::latest(&session.doc)).unwrap();
             let dxf = crate::sheet::dxf::write(
@@ -634,7 +638,8 @@ mod picking_tests {
         let phase = View::latest(&session.doc);
         let facade = drawing_view(&session.doc, "facade", phase).unwrap();
         let bays = &session.doc.buildings[0].facades[0].bays;
-        assert_pick(&facade, [bays[0], 850.0], "b.f1.L0.B0", DrawingElementKind::Opening);
+        // The sloped sill falls outward below 850; pick the visible frame rebate at 850 + 46.
+        assert_pick(&facade, [bays[0], 896.0], "b.f1.L0.B0", DrawingElementKind::Opening);
         assert_pick(&facade, [bays[2], 2300.0], "b.f1", DrawingElementKind::FacadeWall);
         assert_pick(&facade, [bays[2], 2240.0], "b.f1.L0.B2", DrawingElementKind::Opening);
         assert_pick(&facade, [0.0, 3000.0], "b.f1", DrawingElementKind::FacadeWall);
@@ -789,7 +794,7 @@ mod picking_tests {
                 assert_eq!(has("b.f1.L0.B0"), old_visible, "{id}, {phase}, {filter:?}");
                 assert_eq!(has("b.f1.L0.B1"), new_visible, "{id}, {phase}, {filter:?}");
             }
-            let old = session.execute("view.pick", json!({"id":id,"point":[session.doc.buildings[0].facades[0].bays[0],if id == "plan" {140.0} else {850.0}],"tolerance_mm":1,"phase":"existing"})).unwrap();
+            let old = session.execute("view.pick", json!({"id":id,"point":[session.doc.buildings[0].facades[0].bays[0],if id == "plan" {140.0} else {896.0}],"tolerance_mm":1,"phase":"existing"})).unwrap();
             assert_eq!(old["hit"]["id"], "b.f1.L0.B0");
         }
     }
