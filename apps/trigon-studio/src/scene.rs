@@ -5,8 +5,8 @@
 //! Coordinates are metres relative to [`Scene::origin`] (site mm), so f32 keeps sub-millimetre
 //! precision; Z is up as in the model.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
@@ -234,7 +234,8 @@ fn normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 
 /// The edges worth drawing: borders (one face) and creases (faces meeting at more than
 /// `crease_deg`, either winding), never the diagonals of a triangulated flat face. Vertices are
-/// welded on a fine grid first, since the model's meshes repeat corners per face.
+/// welded on a fine grid first, since the model's meshes repeat corners per face. Collinear
+/// unmatched sides are split at their endpoints, so T junctions do not expose flat-face seams.
 pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg: f64) -> Vec<([f64; 3], [f64; 3])> {
     let mut weld: HashMap<[i64; 3], u32> = HashMap::new();
     let mut points: Vec<[f64; 3]> = Vec::new();
@@ -276,6 +277,7 @@ pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg:
     sides.sort_unstable();
     let cos = crease_deg.to_radians().cos();
     let mut out = Vec::new();
+    let mut borders = Vec::new();
     let mut i = 0;
     while i < sides.len() {
         let (p, q, f0) = sides[i];
@@ -284,7 +286,10 @@ pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg:
             j += 1;
         }
         let keep = match j - i {
-            1 => true,
+            1 => {
+                borders.push((p, q, f0));
+                false
+            }
             2 => {
                 let (n0, n1) = (faces[f0 as usize], faces[sides[i + 1].2 as usize]);
                 (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).abs() < cos
@@ -295,6 +300,101 @@ pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg:
             out.push((points[p as usize], points[q as usize]));
         }
         i = j;
+    }
+    out.extend(border_edges(&points, &faces, &borders, cos));
+    out
+}
+
+/// Resolve only unmatched sides; the usual shared-edge path above remains unchanged. A coarse
+/// line key finds candidates, followed by a strict collinearity check. Sweeping endpoint events
+/// compares the adjacent face normals on each interval without scanning every edge pair.
+fn border_edges(points: &[[f64; 3]], faces: &[[f64; 3]], borders: &[(u32, u32, u32)], cos: f64) -> Vec<([f64; 3], [f64; 3])> {
+    let mut out = Vec::new();
+    let Some(origin) = points.first() else { return out };
+    let mut lines: BTreeMap<[i64; 5], Vec<(u32, u32, u32)>> = BTreeMap::new();
+    for &(p, q, face) in borders {
+        let (a, b) = (points[p as usize], points[q as usize]);
+        let delta: [f64; 3] = std::array::from_fn(|axis| b[axis] - a[axis]);
+        let axis = (0..3).max_by(|&a, &b| delta[a].abs().total_cmp(&delta[b].abs())).unwrap_or(0);
+        let other = [(axis + 1) % 3, (axis + 2) % 3];
+        let slope = other.map(|k| delta[k] / delta[axis]);
+        let offset: [f64; 2] = std::array::from_fn(|k| a[other[k]] - origin[other[k]] - slope[k] * (a[axis] - origin[axis]));
+        if delta[axis].abs() <= 1e-9 || !slope.iter().chain(&offset).all(|v| v.is_finite()) {
+            out.push((a, b));
+            continue;
+        }
+        let key = [
+            axis as i64,
+            (slope[0] * 1e8).round() as i64,
+            (slope[1] * 1e8).round() as i64,
+            (offset[0] * 1e3).round() as i64,
+            (offset[1] * 1e3).round() as i64,
+        ];
+        lines.entry(key).or_default().push((p, q, face));
+    }
+    for (key, group) in lines {
+        let Some(&(p, q, _)) = group.first() else { continue };
+        let axis = key[0] as usize;
+        let (a, b) = (points[p as usize], points[q as usize]);
+        let collinear = |p: [f64; 3]| {
+            (0..3).filter(|&k| k != axis).all(|k| {
+                let predicted = a[k] + (b[k] - a[k]) / (b[axis] - a[axis]) * (p[axis] - a[axis]);
+                (predicted - p[k]).abs() <= 1e-6
+            })
+        };
+        if group.len() == 1 || group.iter().any(|&(p, q, _)| !collinear(points[p as usize]) || !collinear(points[q as usize])) {
+            out.extend(group.iter().map(|&(p, q, _)| (points[p as usize], points[q as usize])));
+            continue;
+        }
+        let mut events = Vec::with_capacity(group.len() * 2);
+        for (index, &(p, q, _)) in group.iter().enumerate() {
+            let (lo, hi) = if points[p as usize][axis] <= points[q as usize][axis] { (p, q) } else { (q, p) };
+            events.push((points[lo as usize][axis], lo, index, true));
+            events.push((points[hi as usize][axis], hi, index, false));
+        }
+        events.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let mut active: BTreeSet<usize> = BTreeSet::new();
+        let mut previous = None;
+        let mut run: Option<(u32, u32)> = None;
+        let mut i = 0;
+        while i < events.len() {
+            let (coordinate, point, _, _) = events[i];
+            if let Some(from) = previous {
+                let keep = match active.len() {
+                    0 => false,
+                    2 => match (active.first(), active.last()) {
+                        (Some(&first), Some(&last)) => {
+                            let (n0, n1) = (faces[group[first].2 as usize], faces[group[last].2 as usize]);
+                            (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).abs() < cos
+                        }
+                        _ => false,
+                    },
+                    _ => true,
+                };
+                if keep {
+                    if let Some((_, end)) = &mut run {
+                        *end = point;
+                    } else {
+                        run = Some((from, point));
+                    }
+                } else if let Some((p, q)) = run.take() {
+                    out.push((points[p as usize], points[q as usize]));
+                }
+            }
+            while i < events.len() && (events[i].0 - coordinate).abs() <= 1e-7 {
+                let (_, _, edge, start) = events[i];
+                if start {
+                    active.insert(edge);
+                } else {
+                    active.remove(&edge);
+                }
+                i += 1;
+            }
+            previous = Some(point);
+        }
+        if let Some((p, q)) = run {
+            out.push((points[p as usize], points[q as usize]));
+        }
     }
     out
 }
@@ -738,6 +838,92 @@ mod tests {
         // The second triangle turned over: still coplanar, still no diagonal.
         m.triangles[1] = [m.triangles[1][0], m.triangles[1][2], m.triangles[1][1]];
         assert_eq!(feature_edges(&m.positions, &m.triangles, CREASE_DEG).len(), 4);
+    }
+
+    #[test]
+    fn coplanar_t_junctions_do_not_draw_internal_seams_even_rotated_or_reversed() {
+        for (angle, offset) in [
+            (0_f64, [0.; 3]),
+            (17.950685409018618_f64.to_radians(), [1e6, -2e6, 3000.]),
+            (57.34404001940922_f64.to_radians(), [1e6, -2e6, 3000.]),
+            (31_f64.to_radians(), [1e6, -2e6, 3000.]),
+            (45_f64.to_radians(), [1e6, -2e6, 3000.]),
+        ] {
+            let (s, c) = angle.sin_cos();
+            let at = |[x, y]: [f64; 2]| [offset[0] + c * x - s * y, offset[1] + s * x + c * y, offset[2] + x * 0.2 + y * 0.1];
+            let mut m = Mesh::default();
+            for [x0, y0, x1, y1] in [[0., 0., 4000., 2000.], [0., 2000., 2000., 4000.], [2000., 2000., 4000., 4000.]] {
+                m.quad(at([x0, y0]), at([x1, y0]), at([x1, y1]), at([x0, y1]));
+            }
+            for triangle in m.triangles.iter_mut().step_by(2) {
+                triangle.swap(1, 2);
+            }
+            let edges = feature_edges(&m.positions, &m.triangles, CREASE_DEG);
+            let xy = |p: [f64; 3]| [c * (p[0] - offset[0]) + s * (p[1] - offset[1]), -s * (p[0] - offset[0]) + c * (p[1] - offset[1])];
+            for &(a, b) in &edges {
+                let (a, b) = (xy(a), xy(b));
+                assert!(
+                    (0..2).any(|axis| [0., 4000.].iter().any(|v| (a[axis] - v).abs() < 1e-6 && (b[axis] - v).abs() < 1e-6)),
+                    "a triangulation seam crosses the flat face: {a:?} to {b:?}"
+                );
+            }
+            let distance = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            let expected = 2. * distance(at([0., 0.]), at([4000., 0.])) + 2. * distance(at([0., 0.]), at([0., 4000.]));
+            let perimeter: f64 = edges.iter().map(|&(a, b)| distance(a, b)).sum();
+            assert!((perimeter - expected).abs() < 1e-6, "the visible outer border remains complete");
+        }
+    }
+
+    #[test]
+    fn aligned_window_sills_keep_reveal_edges_without_lines_across_solid_brickwork() {
+        let mut d = doc();
+        let facade = &mut d.buildings[0].facades[0];
+        facade.bays = vec![1500., 4500., 7500.];
+        for bay in 0..3 {
+            facade.placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":bay,"type":"window.casement.2"})).unwrap());
+        }
+        let built = build(&d).unwrap();
+        let mesh = &built[0].walls[0].mesh;
+        let sill_edges: Vec<_> = feature_edges(&mesh.positions, &mesh.triangles, CREASE_DEG)
+            .into_iter()
+            .filter(|(a, b)| [a, b].iter().all(|p| p[1].abs() < 1e-6 && (p[2] - 850.).abs() < 1e-6))
+            .collect();
+        for &(a, b) in &sill_edges {
+            let (lo, hi) = (a[0].min(b[0]), a[0].max(b[0]));
+            assert!(
+                [1500., 4500., 7500.].iter().any(|centre| lo >= centre - 600. - 1e-6 && hi <= centre + 600. + 1e-6),
+                "a false sill seam crosses the brickwork: {a:?} to {b:?}"
+            );
+        }
+        let length: f64 = sill_edges.iter().map(|(a, b)| (b[0] - a[0]).abs()).sum();
+        assert!((length - 3600.).abs() < 1e-6, "all three real sill/reveal creases must remain");
+    }
+
+    #[test]
+    fn a_t_junction_on_a_real_fold_keeps_one_complete_crease() {
+        let mut m = Mesh::default();
+        m.quad([0., 0., 0.], [4000., 0., 0.], [4000., 2000., 0.], [0., 2000., 0.]);
+        for [x0, x1] in [[0., 2000.], [2000., 4000.]] {
+            m.quad([x0, 2000., 0.], [x1, 2000., 0.], [x1, 2000., 2000.], [x0, 2000., 2000.]);
+        }
+        let edges = feature_edges(&m.positions, &m.triangles, CREASE_DEG);
+        let crease: f64 = edges
+            .iter()
+            .filter(|(a, b)| [a, b].iter().all(|p| (p[1] - 2000.).abs() < 1e-6 && p[2].abs() < 1e-6))
+            .map(|(a, b)| (a[0] - b[0]).abs())
+            .sum();
+        assert!((crease - 4000.).abs() < 1e-6, "the sharp fold stays visible without duplicate outlines");
+    }
+
+    #[test]
+    fn collinear_borders_never_fill_a_real_gap() {
+        let mut m = Mesh::default();
+        for [x0, x1] in [[0., 1000.], [1500., 2500.]] {
+            m.quad([x0, 0., 0.], [x1, 0., 0.], [x1, 1000., 0.], [x0, 1000., 0.]);
+        }
+        let edges = feature_edges(&m.positions, &m.triangles, CREASE_DEG);
+        assert_eq!(edges.len(), 8);
+        assert!(edges.iter().all(|(a, b)| !(a[0].min(b[0]) < 1250. && a[0].max(b[0]) > 1250.)));
     }
 
     #[test]

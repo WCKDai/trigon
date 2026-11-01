@@ -32,3 +32,27 @@ without changing zoom. Native interaction and frame pacing still need a visible 
 Projection chooses boundary-line frames in stable welded-edge order. This avoids hash-seed ULP
 variation crossing an SVG rounding boundary. The legacy public SVG/DXF fingerprints remain
 unchanged; do not relax byte comparisons when a larger model reveals an ordering defect.
+
+## Studio 3D outlines
+
+Studio resolves collinear unmatched triangle sides as intervals before classifying borders and
+creases. This prevents long triangulation edges along aligned window sills from drawing lines
+across flat brickwork. Real reveals and sharp folds stay visible; gaps remain empty. The repair
+only changes the viewport's outline data, with no change to model triangles, materials, picking
+ownership or exported geometry. A coarse candidate key is followed by a strict collinearity
+check; uncertain candidates retain their original borders.
+
+The CPU scene profile reuses Studio's scene builder without opening a window:
+
+```sh
+cargo run --release --locked -p trigon-studio --example scene-edge-profile
+cargo run --release --locked -p trigon-studio --example scene-edge-profile -- path/to/local-project.trigon 9
+```
+
+The default is a synthetic 160-window building. It builds the model once, warms the scene builder
+once, then records every scene preparation sample, median and p95. A same-toolchain signature
+covers face vertices, pick ownership, element identities and fingerprints, excluding the changed
+outlines. Freeze baseline and candidate executables, finish other builds and interleave their
+runs on the same input before comparing results. Geometry generation, room/site append, GPU
+upload and native frame pacing are outside this measurement; a native render remains necessary
+to check the visible result.
