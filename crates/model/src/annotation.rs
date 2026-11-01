@@ -86,6 +86,24 @@ pub struct DrawingTemplate {
     pub crop: Option<[f64; 4]>,
     /// Plan only, relative to the selected storey floor. None retains legacy plan symbols.
     pub range: Option<PlanRange>,
+    /// Live labels from the selected floor's room definitions; hidden preserves old drawings.
+    #[serde(default, skip_serializing_if = "RoomLabels::is_hidden")]
+    pub room_labels: RoomLabels,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomLabels {
+    #[default]
+    Hidden,
+    Area,
+    NameAndArea,
+}
+
+impl RoomLabels {
+    fn is_hidden(&self) -> bool {
+        *self == Self::Hidden
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -122,7 +140,14 @@ impl Default for PlanRange {
 }
 impl Default for DrawingTemplate {
     fn default() -> Self {
-        Self { name: "Custom".into(), line_weights: Default::default(), sizing: Default::default(), crop: None, range: None }
+        Self {
+            name: "Custom".into(),
+            line_weights: Default::default(),
+            sizing: Default::default(),
+            crop: None,
+            range: None,
+            room_labels: Default::default(),
+        }
     }
 }
 impl PlanRange {
@@ -329,6 +354,9 @@ impl DrawingView {
             template.validate()?;
             if template.range.is_some() && !matches!(self.kind, DrawingViewKind::Plan { .. }) {
                 return Err(ModelError::Invalid("floor-relative view ranges belong to plan views".into()));
+            }
+            if template.room_labels != RoomLabels::Hidden && !matches!(self.kind, DrawingViewKind::Plan { .. }) {
+                return Err(ModelError::Invalid("room labels belong to plan views".into()));
             }
         }
         if self.name.len() > 200 {

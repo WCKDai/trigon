@@ -23,7 +23,7 @@ const NEW: [u8; 3] = [40, 150, 30];
 const DEMOLISHED: [u8; 3] = [220, 30, 30];
 
 /// Choose a point with wall clearance inside a room, including concave room polygons.
-fn room_label_point(poly: &[[f64; 2]]) -> Option<[f64; 2]> {
+pub(crate) fn room_label_anchor(poly: &[[f64; 2]]) -> Option<([f64; 2], f64)> {
     let first = *poly.first()?;
     let (lo, hi) = poly.iter().fold((first[1], first[1]), |(a, b), p| (a.min(p[1]), b.max(p[1])));
     let mut best: Option<([f64; 2], f64)> = None;
@@ -52,7 +52,7 @@ fn room_label_point(poly: &[[f64; 2]]) -> Option<[f64; 2]> {
             }
         }
     }
-    best.map(|(p, _)| p)
+    best
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -621,7 +621,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             if presentation {
                 continue;
             }
-            let Some(c) = room_label_point(&r.polygon) else { continue };
+            let Some((c, _)) = room_label_anchor(&r.polygon) else { continue };
             let area = trigon_model::doc::polygon_area(&r.polygon) / 1e6;
             if r.name.is_empty() {
                 prims.push(Prim::Text { at: c, text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None });
@@ -1336,7 +1336,8 @@ mod tests {
     #[test]
     fn concave_room_label_stays_inside_and_away_from_walls() {
         let p = [[0., 0.], [6000., 0.], [6000., 1500.], [1500., 1500.], [1500., 6000.], [0., 6000.]];
-        let at = room_label_point(&p).unwrap();
+        let (at, clearance) = room_label_anchor(&p).unwrap();
+        assert!(clearance > 500.0);
         assert!(crate::drawings::inside(&p, at));
         assert!(at[0] > 500. && at[1] > 500.);
         assert!(at[0] < 1000. || at[1] < 1000.);
