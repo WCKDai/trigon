@@ -349,7 +349,7 @@ impl StudioApp {
         if self.phase >= phases {
             self.phase = self.session.doc.active_index();
         }
-        let levels = self.session.doc.buildings.first().map_or(0, |b| b.storeys.len());
+        let levels = self.levels().len();
         if self.level.is_some_and(|l| l >= levels) {
             self.level = None;
         }
@@ -686,8 +686,14 @@ impl StudioApp {
         }
     }
 
-    fn levels(&self) -> Vec<String> {
-        self.session.doc.buildings.first().map(|b| b.storeys.iter().map(|s| s.name.clone()).collect()).unwrap_or_default()
+    pub(crate) fn levels(&self) -> Vec<String> {
+        let doc = &self.session.doc;
+        let count = if doc.buildings.iter().any(|b| b.attic_level().is_some()) {
+            doc.buildings.iter().map(|b| b.storeys.len()).max().unwrap_or(0)
+        } else {
+            doc.buildings.first().map_or(0, |b| b.storeys.len())
+        };
+        (0..count).filter_map(|level| doc.level_label(level)).collect()
     }
 
     fn app_bar(&mut self, ui: &mut egui::Ui) {

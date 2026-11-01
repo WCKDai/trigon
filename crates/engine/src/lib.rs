@@ -13,6 +13,7 @@ use trigon_model::{Document, ModelError};
 
 mod alignment;
 mod annotation_style;
+mod attic;
 pub use alignment::{AlignedSnap, AlignmentOptions, snap_drawing_aligned};
 mod commands;
 #[cfg(test)]
@@ -105,10 +106,18 @@ impl Session {
         let params = if params.is_null() { Value::Object(Default::default()) } else { params };
         let before = spec.mutates.then(|| self.doc.clone());
         let outcome = catch_unwind(AssertUnwindSafe(|| (spec.run)(self, &params)));
-        let result = match outcome {
+        let mut result = match outcome {
             Ok(r) => r,
             Err(_) => Err(EngineError::Internal(id.to_string())),
         };
+        // Some source-authoring commands need no geometry build. They must still preserve
+        // the opt-in roof-level contract before their changes enter history.
+        if result.is_ok()
+            && spec.mutates
+            && let Err(error) = self.doc.buildings.iter().try_for_each(|b| b.validate_attic())
+        {
+            result = Err(error.into());
+        }
         match (&result, before) {
             (Err(_), Some(before)) => self.doc = before,
             (Ok(_), Some(before)) if spec.journaled => {

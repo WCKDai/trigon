@@ -922,11 +922,26 @@ struct PlanSheet {
 }
 
 fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<PlanSheet> {
+    if doc.buildings.iter().any(|b| b.attic_level() == Some(level)) {
+        if rotation != 0.0 || region.is_some() {
+            return Err(ModelError::Invalid(
+                "roof floor plans use actual mesh cuts; use a saved plan view/template for crops; rotation is unsupported".into(),
+            )
+            .into());
+        }
+        let sheet = crate::plan_range::sheet(doc, level, view, Default::default())?;
+        let caption = if caption.is_empty() { sheet.project.clone() } else { caption.into() };
+        let note = Some(match sheet.note {
+            Some(note) => format!("{note} · Roof-clipped interiors and habitable areas unsupported"),
+            None => "Roof-clipped interiors and habitable areas unsupported".into(),
+        });
+        return Ok(PlanSheet { scene: sheet.scene, vp: sheet.vp, clip: sheet.clip, floor: sheet.title, project: sheet.project, caption, note });
+    }
     let (prims, _, elements) = scene(doc, level, view, true)?;
     let f = sheet_frame(doc, region, rotation, level, view)?;
     let vp = Viewport { x0: f.x0, y1: f.y1, mm: f.mm };
     let source = doc.buildings.iter().find(|b| b.storeys.get(level).is_some());
-    let floor = source.and_then(|b| b.storeys.get(level)).map(|s| s.name.clone()).unwrap_or_default();
+    let floor = doc.level_label(level).unwrap_or_default();
     let project = source.map(|b| b.name.clone()).unwrap_or_default();
     let caption = if caption.is_empty() { project.clone() } else { caption.to_string() };
     let clip = if let Some(region) = region {
@@ -1246,6 +1261,12 @@ pub(crate) fn render(
 ) -> Result<Value> {
     let mm = trigon_model::checked("mm_per_px", mm, 5.0, 200.0)?;
     let rot_deg = trigon_model::checked("rotate_deg", rot_deg, -360.0, 360.0)?;
+    if s.doc.buildings.iter().any(|b| b.attic_level() == Some(level)) {
+        return Err(ModelError::Invalid(
+            "roof floor plans need actual roof cuts; use plan.sheet or a saved ranged plan, without a scan overlay".into(),
+        )
+        .into());
+    }
     let (mut prims, title, _) = scene(&s.doc, level, view, false)?;
     if show_scan {
         // Check views: the model in colour so it stands apart from the scan's greys.

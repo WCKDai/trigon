@@ -529,6 +529,19 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
             Rect { u0: c - ty_eff.width / 2.0, u1: c + ty_eff.width / 2.0, v0: deck - attachment_drop(&ty_eff.kind), v1: deck + ty_eff.height }
         };
         if opening {
+            if b.attic_level() == Some(p.level) && rect.v0 < storey.elevation {
+                return Err(ModelError::Invalid(format!(
+                    "{slot}: roof-level facade openings must stay above their floor; host crossing stairwell windows on the full storey explicitly"
+                )));
+            }
+            if b.attic_level().is_some_and(|l| p.level.checked_add(1) == Some(l)) && !p.spans_storeys {
+                let ceiling = storey.elevation + storey.height - b.attic_thickness();
+                if rect.v1 > ceiling {
+                    return Err(ModelError::Invalid(format!(
+                        "{slot}: the roof floor slab would collide with the opening; its underside is {ceiling} mm"
+                    )));
+                }
+            }
             if rect.u0 < lo || rect.u1 > hi {
                 return Err(ModelError::Invalid(format!(
                     "{slot}: {} mm wide at {c:.0} mm doesn't fit the wall ({lo:.0} to {hi:.0} mm along the facade)",
@@ -578,6 +591,7 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
 }
 
 fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) -> Result<Built> {
+    b.validate_attic()?;
     if b.floor_thicknesses.len() > b.storeys.len() {
         return Err(ModelError::Invalid("floor thicknesses must refer to existing storeys".into()));
     }
@@ -886,7 +900,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         };
         let (inner, holes) = slab_shape(&inner, holes)?;
         slabs.push(BuiltSlab {
-            id: format!("{}.slab.L{i}", b.id),
+            id: if s.roof_level { format!("{}.attic", b.id) } else { format!("{}.slab.L{i}", b.id) },
             kind: SlabKind::Floor,
             level: i,
             mesh: prism_with_holes(&inner, &holes, z0, thickness),
@@ -918,18 +932,20 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         | crate::roof::Roof::Mansard {
             parameters: crate::roof::Mansard { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. },
         } => {
-            let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
-            // The attic floor closes the top storey; the roof rises from the eaves above it.
-            slabs.push(BuiltSlab {
-                id: format!("{}.attic", b.id),
-                kind: SlabKind::Floor,
-                level: top_level,
-                mesh: prism_with_holes(&top_inner, &holes, h - b.attic_thickness(), b.attic_thickness()),
-                polygon: top_inner,
-                z_bottom: h - b.attic_thickness(),
-                thickness: b.attic_thickness(),
-                holes,
-            });
+            if b.attic_level().is_none() {
+                let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
+                // The attic floor closes the top storey; the roof rises from the eaves above it.
+                slabs.push(BuiltSlab {
+                    id: format!("{}.attic", b.id),
+                    kind: SlabKind::Floor,
+                    level: top_level,
+                    mesh: prism_with_holes(&top_inner, &holes, h - b.attic_thickness(), b.attic_thickness()),
+                    polygon: top_inner,
+                    z_bottom: h - b.attic_thickness(),
+                    thickness: b.attic_thickness(),
+                    holes,
+                });
+            }
             let selected = match &b.roof {
                 crate::Roof::Pitched { eave_facades, .. } => eave_facades.as_deref(),
                 _ => None,
