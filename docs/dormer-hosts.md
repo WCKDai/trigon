@@ -41,6 +41,40 @@ Oriented cheeks must retain positive height through the full rear underlap. The 
 host build-up and shed thickness can prevent this even after the basic 50 mm host check;
 feedback reports the rear height in mm. The zero-yaw path retains its legacy behavior.
 
+## Quantitative rejection feedback
+
+End-clearance errors retain the stem `dormer runs too close to a facade end` and identify
+the dormer source ID and facade. They report the requested `u_mm`, the full `projected along
+span`, the `permitted end range` and separate nonnegative start/end shortfalls, all in mm
+along the **original source facade**. The permitted range is `[100, facade length - 100]`.
+`centre end limits` subtract the current envelope's offsets from that range; a lower limit
+above its upper limit means that envelope cannot fit. These are end-clearance constraints
+for this envelope, not a search for a valid station or a promise that another host passes.
+For example, a synthetic 1400 mm window with 100 mm cheeks and 50 mm roof overhang has a
+zero-yaw half-envelope of 850 mm. Its minimum centre for the 100 mm end guard is 950 mm;
+a requested centre of 937.5 mm projects to `[87.5, 1787.5]` mm and is short by 12.5 mm.
+
+Hip/slope-break errors retain the stem
+`dormer crosses a hip or slope break; reduce its width, height or setback`, followed by
+the dormer ID, source facade, failing sampled `(u, w)` in mm and `surface=top` or
+`surface=underside`. These coordinates use the **dormer's chosen frame**, including explicit
+yaw: `u` follows its rotated tangent, its wall-line anchor remains at `u_mm`, and `w` runs
+inward from that anchor. The reported expected and found `z` are site-local heights in mm
+(Z up); `found-expected` is signed. Expected height extends the corresponding plane sampled
+at the front reference `(u_mm, setback_mm + 100)`. An absolute residual above the unchanged
+0.01 mm tolerance rejects the host. If a sample has no intersecting host surface, the
+existing `dormer is outside a continuous, thick host roof face` stem instead identifies the
+same sample and surface and explicitly reports that no height is available.
+
+Feedback describes the first failing existing guard sample. It adds no samples, nearest-edge
+search or inferred dimensions; the existing 3 along × 4 depth × 2 surface checks remain
+bounded and unchanged. The printed values are rounded to six decimal places; validation
+uses the original unrounded values and tolerances. Text is diagnostic, not a structured
+numeric API. Command schemas/defaults, JSON error envelopes and CLI exit codes are unchanged.
+Rejected preview/edit commands do not change source, geometry, journal, Undo or retained Redo.
+No feedback automatically moves, rotates or resizes a dormer. A host requiring multiple
+planes needs a separate reviewed modelling design or better roof evidence, not relaxed guards.
+
 For nonzero yaw, front-wall polygon-overlay output is reconciled to its known source
 corner and opening vertices within the unchanged `1e-6` mm numerical epsilon. This
 keeps overlay faces, exact caps and reveals joined at fractional host elevations; the
