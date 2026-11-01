@@ -453,6 +453,66 @@ impl Scene {
         b.finish(levels)
     }
 
+    /// Rooms are semantic spaces, not opaque boxes. Invisible floor polygons let a room be
+    /// picked in a cut view; only its selection overlay colours the space.
+    pub fn with_rooms(mut self, doc: &trigon_model::Document) -> Self {
+        for building in &doc.buildings {
+            for (room_index, room) in building.rooms.iter().enumerate() {
+                for level in &room.levels {
+                    let Some(storey) = building.storeys.get(*level) else { continue };
+                    let mut mesh = Mesh::default();
+                    if !mesh.polygon(&room.polygon, &[], |p| [p[0], p[1], storey.elevation + 0.5]) {
+                        continue;
+                    }
+                    let index = self.elements.len() as u32;
+                    let start = self.vertices.len() / VERTEX_FLOATS;
+                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    let mut fingerprint = DefaultHasher::new();
+                    room.name.hash(&mut fingerprint);
+                    for triangle in &mesh.triangles {
+                        let [Some(a), Some(b), Some(c)] = triangle.map(|i| mesh.positions.get(i as usize)) else { continue };
+                        for source in [a, b, c] {
+                            let position = std::array::from_fn::<_, 3, _>(|axis| ((source[axis] - self.origin[axis]) / 1000.0) as f32);
+                            self.vertices.extend_from_slice(&position);
+                            self.vertices.extend_from_slice(&[0.0, 0.0, 1.0]);
+                            self.vertices.extend_from_slice(&[0.0; 7]);
+                            for axis in 0..3 {
+                                source[axis].to_bits().hash(&mut fingerprint);
+                                lo[axis] = lo[axis].min(position[axis]);
+                                hi[axis] = hi[axis].max(position[axis]);
+                            }
+                        }
+                        self.tri_element.push(index);
+                    }
+                    let end = self.vertices.len() / VERTEX_FLOATS;
+                    if start == end {
+                        continue;
+                    }
+                    let id = trigon_engine::room_element_id(building, room_index, *level);
+                    self.elements.push(Element {
+                        id,
+                        kind: "room",
+                        level: Some(*level),
+                        props: vec![
+                            ("building", building.id.clone()),
+                            ("name", room.name.clone()),
+                            ("area", format!("{:.2} m²", polygon_area(&room.polygon) / 1e6)),
+                        ],
+                        ranges: std::iter::once(start as u32..end as u32).collect(),
+                        fingerprint: fingerprint.finish(),
+                        host: false,
+                        bounds: Some((lo, hi)),
+                        facing: None,
+                    });
+                    self.bounds = Some(self.bounds.map_or((lo, hi), |(a, b)| {
+                        (std::array::from_fn(|axis| a[axis].min(lo[axis])), std::array::from_fn(|axis| b[axis].max(hi[axis])))
+                    }));
+                }
+            }
+        }
+        self
+    }
+
     pub fn triangle_count(&self) -> usize {
         self.tri_element.len()
     }
@@ -649,6 +709,37 @@ mod tests {
         let mut doc = Document::default();
         doc.buildings.push(Building::new("b1", "T", &[[0.0, 0.0], [9000.0, 0.0], [9000.0, 8000.0], [0.0, 8000.0]], 2, 3000.0).unwrap());
         doc
+    }
+
+    #[test]
+    fn rooms_are_pickable_floor_spaces_without_idle_edges_or_opaque_boxes() {
+        let mut d = doc();
+        d.buildings[0].rooms.push(trigon_model::doc::Room {
+            id: "living".into(),
+            levels: vec![0],
+            name: "Living".into(),
+            polygon: vec![[1000.0, 1000.0], [5000.0, 1000.0], [5000.0, 5000.0], [1000.0, 5000.0]],
+        });
+        let built = build(&d).unwrap();
+        let plain = Scene::from_built(&built, false);
+        let edges = plain.edges.clone();
+        let opaque = plain.opaque;
+        let scene = plain.with_rooms(&d);
+        let room = scene.find_unique("living.space.L0").unwrap();
+        assert_eq!(scene.edges, edges);
+        assert_eq!(scene.opaque, opaque);
+        let local = |p: [f64; 3]| std::array::from_fn(|axis| ((p[axis] - scene.origin[axis]) / 1000.0) as f32);
+        assert_eq!(scene.pick(local([2000.0, 2000.0, 1000.0]), [0.0, 0.0, -1.0], scene.clip_z(0)), Some(room));
+        for range in &scene.elements[room].ranges {
+            assert!(
+                scene.vertices[range.start as usize * VERTEX_FLOATS..range.end as usize * VERTEX_FLOATS]
+                    .as_chunks::<VERTEX_FLOATS>()
+                    .0
+                    .iter()
+                    .all(|v| v[9] == 0.0)
+            );
+        }
+        assert!(!scene.overlay(&[room], [1.0, 0.4, 0.0, 0.4], [0.0; 3]).is_empty());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use trigon_model::annotation::{self, Annotation, AnnotationKind, DrawingView, Dr
 use trigon_model::build::View;
 use trigon_model::{Document, ModelError};
 
-use crate::sheet::{Anchor, Fill, Halo, Item, Layer, Scene, Sheet, Stroke, Text, level_text};
+use crate::sheet::{Item, Scene, Sheet};
 use crate::{Result, Session};
 
 #[derive(Deserialize, JsonSchema)]
@@ -113,7 +113,13 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
         DrawingViewKind::Section { from, to, flip, depth_mm } => crate::section::scene(doc, [*from, *to], *flip, *depth_mm, phase, &view.name, "")?,
     };
     sheet.title = view.name.clone();
-    for a in doc.annotations.iter().filter(|a| a.view == id) {
+    let mut regions = Scene::new(sheet.scene.scale);
+    for a in doc.annotations.iter().filter(|a| a.view == id && matches!(a.kind, AnnotationKind::Region { .. })) {
+        draw(&mut regions, a);
+    }
+    regions.items.append(&mut sheet.scene.items);
+    sheet.scene.items = regions.items;
+    for a in doc.annotations.iter().filter(|a| a.view == id && !matches!(a.kind, AnnotationKind::Region { .. })) {
         draw(&mut sheet.scene, a);
     }
     sheet.metrics["view"] = json!(id);
@@ -121,77 +127,7 @@ pub(crate) fn sheet(doc: &Document, id: &str, phase: View) -> Result<Sheet> {
     Ok(sheet)
 }
 
-fn lettering(scene: &mut Scene, at: [f64; 2], value: &str, size: f64, rotation: f64) {
-    let mut t = Text::new(Layer::Annotation, at, value, size);
-    t.anchor = Anchor::Start;
-    t.middle = false;
-    t.deg = rotation;
-    t.halo = Halo::Outline;
-    scene.text(t);
-}
-
-fn draw(scene: &mut Scene, a: &Annotation) {
-    let s = scene.scale;
-    let pen = Stroke::new(0.18);
-    match &a.kind {
-        AnnotationKind::Text { at, text, rotation_deg } => lettering(scene, *at, text, a.size_mm, *rotation_deg),
-        AnnotationKind::Dimension { from, to, offset_mm } => {
-            let length = (to[0] - from[0]).hypot(to[1] - from[1]);
-            let d = [(to[0] - from[0]) / length, (to[1] - from[1]) / length];
-            let n = [-d[1], d[0]];
-            let shift = |p: [f64; 2], u: f64, v: f64| [p[0] + d[0] * u + n[0] * v, p[1] + d[1] * u + n[1] * v];
-            let sign = if *offset_mm < 0.0 { -1.0 } else { 1.0 };
-            let (a0, b0) = (shift(*from, 0.0, *offset_mm), shift(*to, 0.0, *offset_mm));
-            for (p, q) in [(*from, a0), (*to, b0)] {
-                scene.line(Layer::Annotation, shift(p, 0.0, sign * 0.8 * s), shift(q, 0.0, sign * 1.5 * s), pen);
-                scene.line(Layer::Annotation, shift(q, -1.2 * s, -1.2 * s), shift(q, 1.2 * s, 1.2 * s), pen);
-            }
-            scene.line(Layer::Annotation, a0, b0, pen);
-            let value = if (length - length.round()).abs() < 0.05 { format!("{length:.0}") } else { format!("{length:.1}") };
-            let mut t = Text::new(Layer::Annotation, shift([(a0[0] + b0[0]) / 2.0, (a0[1] + b0[1]) / 2.0], 0.0, 1.0 * s), value, a.size_mm);
-            let angle = d[1].atan2(d[0]).to_degrees();
-            t.deg = if angle > 90.0 {
-                angle - 180.0
-            } else if angle < -90.0 {
-                angle + 180.0
-            } else {
-                angle
-            };
-            t.middle = false;
-            t.halo = Halo::Box;
-            scene.text(t);
-        }
-        AnnotationKind::Leader { tip, elbow, at, text } => {
-            scene.polyline(Layer::Annotation, vec![*tip, *elbow, *at], pen);
-            let length = (elbow[0] - tip[0]).hypot(elbow[1] - tip[1]);
-            let d = [(elbow[0] - tip[0]) / length, (elbow[1] - tip[1]) / length];
-            let size = (2.8 * s).min(length * 0.6);
-            scene.polygon(
-                Layer::Annotation,
-                vec![vec![
-                    *tip,
-                    [tip[0] + d[0] * size - d[1] * size * 0.3, tip[1] + d[1] * size + d[0] * size * 0.3],
-                    [tip[0] + d[0] * size + d[1] * size * 0.3, tip[1] + d[1] * size - d[0] * size * 0.3],
-                ]],
-                Some(Fill::Solid(crate::sheet::INK)),
-                None,
-            );
-            lettering(scene, [at[0] + s, at[1] + s], text, a.size_mm, 0.0);
-        }
-        AnnotationKind::Level { at, datum_mm, label } => {
-            scene.polygon(
-                Layer::Annotation,
-                vec![vec![*at, [at[0] + 1.3 * s, at[1] + 2.2 * s], [at[0] - 1.3 * s, at[1] + 2.2 * s]]],
-                Some(Fill::Solid(crate::sheet::INK)),
-                None,
-            );
-            scene.line(Layer::Annotation, [at[0] - 3.0 * s, at[1]], [at[0] + 12.0 * s, at[1]], pen);
-            let value = level_text(at[1] - datum_mm);
-            let text = if label.is_empty() { value } else { format!("{value} {label}") };
-            lettering(scene, [at[0] + 2.2 * s, at[1] + 1.0 * s], &text, a.size_mm, 0.0);
-        }
-    }
-}
+use crate::annotation_style::draw;
 
 /// The exact drawing-plane mm ↔ 1600 × 900 sheet-pixel mapping, shared with Studio.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
@@ -218,6 +154,8 @@ pub struct DrawingPreview {
     /// Visible path segments in drawing-plane mm, for precise endpoint/midpoint/intersection snaps.
     pub segments: Vec<[[f64; 2]; 2]>,
     pub element_segments: Vec<DrawingElementSegment>,
+    /// Filled semantic areas, used only after no visible boundary stroke is within tolerance.
+    pub element_regions: Vec<DrawingElementRegion>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -226,6 +164,22 @@ pub enum DrawingElementKind {
     Opening,
     InteriorWall,
     FacadeWall,
+    Room,
+    Stair,
+    Balcony,
+    Railing,
+    Roof,
+    Slab,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct DrawingElementRegion {
+    pub id: String,
+    pub kind: DrawingElementKind,
+    /// Drawing-plane mm; even-odd rings allow holes. This metadata does not change graphics.
+    pub rings: Vec<Vec<[f64; 2]>>,
+    /// Orthographic depth = c + gx*x + gy*y. None for plan-only semantic areas.
+    pub depth_plane: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -251,7 +205,8 @@ impl DrawingPreview {
         {
             return None;
         }
-        self.element_segments
+        let boundary = self
+            .element_segments
             .iter()
             .filter_map(|element| {
                 let [start, end] = element.segment;
@@ -275,7 +230,44 @@ impl DrawingPreview {
                     .then(left.id.cmp(&right.id))
                     .then(left.point[0].total_cmp(&right.point[0]))
                     .then(left.point[1].total_cmp(&right.point[1]))
+            });
+        if boundary.is_some() {
+            return boundary;
+        }
+        self.element_regions
+            .iter()
+            .filter(|region| {
+                !region.id.is_empty()
+                    && !region.rings.is_empty()
+                    && region.rings.len() <= 1024
+                    && region
+                        .rings
+                        .iter()
+                        .all(|ring| (3..=10_000).contains(&ring.len()) && ring.iter().flatten().all(|value| value.is_finite() && value.abs() <= 1e8))
+                    && region
+                        .depth_plane
+                        .is_none_or(|plane| plane.iter().all(|v| v.is_finite()) && (plane[0] + plane[1] * point[0] + plane[2] * point[1]).is_finite())
+                    && region.rings.iter().filter(|ring| crate::drawings::inside(ring, point)).count() % 2 == 1
             })
+            .min_by(|left, right| {
+                let area = |region: &DrawingElementRegion| {
+                    region
+                        .rings
+                        .iter()
+                        .map(|ring| {
+                            ring.iter().zip(ring.iter().cycle().skip(1)).take(ring.len()).map(|(a, b)| a[0] * b[1] - b[0] * a[1]).sum::<f64>().abs()
+                        })
+                        .sum::<f64>()
+                };
+                let depth =
+                    |region: &DrawingElementRegion| region.depth_plane.map_or(0.0, |plane| plane[0] + plane[1] * point[0] + plane[2] * point[1]);
+                depth(left)
+                    .total_cmp(&depth(right))
+                    .then(area(left).total_cmp(&area(right)))
+                    .then(left.kind.cmp(&right.kind))
+                    .then(left.id.cmp(&right.id))
+            })
+            .map(|region| DrawingElementHit { id: region.id.clone(), kind: region.kind, point, distance_mm: 0.0 })
     }
 }
 
@@ -326,11 +318,21 @@ fn preview(sheet: Sheet) -> DrawingPreview {
         })
     });
     element_segments.dedup();
+    let clip = vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+    let element_regions = sheet
+        .scene
+        .element_regions
+        .iter()
+        .flat_map(|region| {
+            crate::sheet::cut::intersect_rings(&region.rings, &clip).into_iter().map(|rings| DrawingElementRegion { rings, ..region.clone() })
+        })
+        .collect();
     DrawingPreview {
         svg: sheet.svg(),
         transform: DrawingTransform { x0: sheet.vp.x0, y1: sheet.vp.y1, mm_per_px: sheet.vp.mm },
         segments,
         element_segments,
+        element_regions,
     }
 }
 
@@ -351,6 +353,7 @@ mod tests {
             id: "d".into(),
             view: "v".into(),
             size_mm: 2.5,
+            style: Default::default(),
             kind: AnnotationKind::Dimension { from: [100.0, 200.0], to: [3100.0, 4200.0], offset_mm: 500.0 },
         };
         let mut small = Scene::new(50.0);
@@ -530,6 +533,7 @@ pub(crate) fn snap(doc: &Document, p: SnapRequest, view: View) -> Result<Value> 
 #[cfg(test)]
 mod picking_tests {
     use super::*;
+    use crate::sheet::{Layer, Stroke};
 
     fn session() -> Session {
         let mut session = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
@@ -620,8 +624,8 @@ mod picking_tests {
         assert_eq!(near.id, "partition.L0");
         assert_eq!(near.point, [3000.0, 3925.0]);
         assert_eq!(near.distance_mm, 5.0);
-        assert!(preview.pick_element([3000.0, 3920.0], 4.99).is_none());
-        assert!(preview.pick_element([6000.0, 6500.0], 10.0).is_none());
+        assert_pick(&preview, [3000.0, 3920.0], "b.slab.L0", DrawingElementKind::Slab);
+        assert_pick(&preview, [6000.0, 6500.0], "b.slab.L0", DrawingElementKind::Slab);
     }
 
     #[test]
@@ -643,7 +647,7 @@ mod picking_tests {
         let cut = drawing_view(&session.doc, "cut", phase).unwrap();
         assert_pick(&cut, [2000.0, 1500.0], "partition.L0", DrawingElementKind::InteriorWall);
         assert_pick(&cut, [6000.0, 2100.0], "partition.L0.D0", DrawingElementKind::Opening);
-        assert!(section.pick_element([6000.0, 4500.0], 1.0).is_none());
+        assert_pick(&section, [6000.0, 4500.0], "b.f3", DrawingElementKind::FacadeWall);
     }
 
     #[test]
@@ -661,7 +665,10 @@ mod picking_tests {
         let preview = plan_drawing(&session.doc, 0, View::latest(&session.doc)).unwrap();
         assert_pick(&preview, [4000.0, 5925.0], "left.L0", DrawingElementKind::InteriorWall);
         assert_pick(&preview, [8000.0, 5925.0], "right.L0", DrawingElementKind::InteriorWall);
-        assert!(preview.pick_element([6000.0, 6000.0], 10.0).is_none());
+        let mut boundary_only = preview.clone();
+        boundary_only.element_regions.clear();
+        assert!(boundary_only.pick_element([6000.0, 6000.0], 10.0).is_none(), "the union seam must not become a stroke");
+        assert_pick(&preview, [6000.0, 6000.0], "left.L0", DrawingElementKind::InteriorWall);
     }
 
     #[test]
@@ -671,6 +678,7 @@ mod picking_tests {
             svg: String::new(),
             transform: DrawingTransform { x0: 0.0, y1: 0.0, mm_per_px: 1.0 },
             segments: Vec::new(),
+            element_regions: Vec::new(),
             element_segments: vec![
                 DrawingElementSegment { id: "a-host".into(), kind: DrawingElementKind::FacadeWall, segment },
                 DrawingElementSegment { id: "a-interior".into(), kind: DrawingElementKind::InteriorWall, segment },
@@ -732,7 +740,11 @@ mod picking_tests {
         assert!(!spec.mutates && !spec.journaled);
         let result = session.execute("view.pick", json!({"id":"plan","point":[3000,3920],"tolerance_mm":5})).unwrap();
         assert_eq!(result, json!({"hit":{"id":"partition.L0","kind":"interior_wall","point":[3000.0,3925.0],"distance_mm":5.0}}));
-        assert_eq!(session.execute("view.pick", json!({"id":"plan","point":[6000,6500],"tolerance_mm":1})).unwrap(), json!({"hit":null}));
+        assert_eq!(
+            session.execute("view.pick", json!({"id":"plan","point":[6000,6500],"tolerance_mm":1})).unwrap(),
+            json!({"hit":{"id":"b.slab.L0","kind":"slab","point":[6000.0,6500.0],"distance_mm":0.0}})
+        );
+        assert_eq!(session.execute("view.pick", json!({"id":"plan","point":[6000,15000],"tolerance_mm":1})).unwrap(), json!({"hit":null}));
         for params in [
             json!({"id":"plan","point":[1e300,0],"tolerance_mm":5}),
             json!({"id":"plan","point":[0,1e300],"tolerance_mm":5}),
@@ -801,6 +813,7 @@ mod picking_tests {
             for _ in 0..8 {
                 let repeated = drawing_view(&session.doc, id, View::latest(&session.doc)).unwrap();
                 assert_eq!(first.element_segments, repeated.element_segments, "{id}");
+                assert!(first.element_regions == repeated.element_regions, "{id} semantic areas must be deterministic");
             }
             assert!(!first.element_segments.is_empty(), "{id}");
             for element in &first.element_segments {
@@ -837,7 +850,8 @@ mod picking_tests {
         let after = drawing_view(&session.doc, "plan", phase).unwrap();
         assert_eq!(before.element_segments, after.element_segments);
         assert!(after.segments.len() > before.segments.len());
-        assert!(after.pick_element([9000.0, 6000.0], 10.0).is_none());
+        assert_eq!(before.element_regions, after.element_regions, "annotations must not change semantic model areas");
+        assert_pick(&after, [9000.0, 6000.0], "b.slab.L0", DrawingElementKind::Slab);
         let upper = plan_drawing(&session.doc, 1, phase).unwrap();
         assert!(upper.element_segments.iter().all(|element| element.kind == DrawingElementKind::FacadeWall));
         session
@@ -874,6 +888,108 @@ mod picking_tests {
                 Some(DrawingElementHit { id: "wall".into(), kind: DrawingElementKind::FacadeWall, point: [1500.0, 2000.0], distance_mm: 5.0 })
             );
         }
+    }
+
+    #[test]
+    fn filled_picking_respects_holes_depth_and_existing_boundary_priority() {
+        let square = |lo, hi| vec![[lo, lo], [hi, lo], [hi, hi], [lo, hi]];
+        let region = |id: &str, kind, rings, depth_plane| DrawingElementRegion { id: id.into(), kind, rings, depth_plane };
+        let mut preview = DrawingPreview {
+            svg: String::new(),
+            transform: DrawingTransform { x0: 0.0, y1: 0.0, mm_per_px: 1.0 },
+            segments: vec![],
+            element_segments: vec![],
+            element_regions: vec![
+                region("floor", DrawingElementKind::Slab, vec![square(0.0, 100.0), square(40.0, 60.0)], None),
+                region("room", DrawingElementKind::Room, vec![square(10.0, 30.0)], None),
+            ],
+        };
+        assert_pick(&preview, [20.0, 20.0], "room", DrawingElementKind::Room);
+        assert_pick(&preview, [80.0, 80.0], "floor", DrawingElementKind::Slab);
+        assert!(preview.pick_element([50.0, 50.0], 0.0).is_none(), "a floor opening has no floor pick");
+        preview.element_regions.push(region("behind", DrawingElementKind::Opening, vec![square(12.0, 28.0)], Some([10.0, 0.0, 0.0])));
+        assert_pick(&preview, [20.0, 20.0], "room", DrawingElementKind::Room);
+        preview.element_regions.push(region("front", DrawingElementKind::Roof, vec![square(0.0, 100.0)], Some([-10.0, 0.0, 0.0])));
+        assert_pick(&preview, [20.0, 20.0], "front", DrawingElementKind::Roof);
+        preview.element_segments.push(DrawingElementSegment {
+            id: "visible-line".into(),
+            kind: DrawingElementKind::FacadeWall,
+            segment: [[19.0, 0.0], [19.0, 100.0]],
+        });
+        assert_pick(&preview, [20.0, 20.0], "visible-line", DrawingElementKind::FacadeWall);
+        preview.element_regions.reverse();
+        assert_pick(&preview, [20.0, 20.0], "visible-line", DrawingElementKind::FacadeWall);
+    }
+
+    #[test]
+    fn semantic_areas_follow_logical_scene_clip_before_sheet_clip() {
+        let mut scene = Scene::new(100.0);
+        scene.element_regions.push(DrawingElementRegion {
+            id: "wall".into(),
+            kind: DrawingElementKind::FacadeWall,
+            rings: vec![vec![[-100.0, -100.0], [200.0, -100.0], [200.0, 200.0], [-100.0, 200.0]]],
+            depth_plane: Some([12.0, 0.0, 0.0]),
+        });
+        scene.clip([0.0, 0.0, 100.0, f64::MAX]);
+        let preview = DrawingPreview {
+            svg: String::new(),
+            transform: DrawingTransform { x0: 0.0, y1: 0.0, mm_per_px: 1.0 },
+            segments: vec![],
+            element_segments: vec![],
+            element_regions: scene.element_regions,
+        };
+        assert_pick(&preview, [50.0, 50.0], "wall", DrawingElementKind::FacadeWall);
+        for point in [[-20.0, 50.0], [120.0, 50.0], [50.0, -20.0]] {
+            assert!(preview.pick_element(point, 0.0).is_none(), "clipped area at {point:?}");
+        }
+    }
+
+    #[test]
+    fn top_floor_plan_picks_its_floor_instead_of_the_attic_above_the_cut() {
+        let mut s = session();
+        s.execute("element.set", json!({"id":"b.roof","properties":{"roof_kind":"pitched"}})).unwrap();
+        let preview = plan_drawing(&s.doc, 1, View::latest(&s.doc)).unwrap();
+        assert_pick(&preview, [6000.0, 6500.0], "b.slab.L1", DrawingElementKind::Slab);
+        assert!(!preview.element_regions.iter().any(|r| r.id == "b.attic"));
+    }
+
+    #[test]
+    fn plan_areas_and_rail_strokes_resolve_to_actual_scene_elements() {
+        let mut s = session();
+        for (bay, ty) in [(0, "balcony.french"), (1, "balcony.cantilever")] {
+            s.execute("facade.place", json!({"facade":"b.f1","type":ty,"levels":[0],"bays":[bay]})).unwrap();
+        }
+        let b = &mut s.doc.buildings[0];
+        b.rooms =
+            serde_json::from_value(json!([{"id":"living","name":"Living","levels":[0],"polygon":[[1000,1000],[5000,1000],[5000,3500],[1000,3500]]}]))
+                .unwrap();
+        b.stairs = serde_json::from_value(
+            json!([{"id":"stair","levels":[0],"outline":[[7500,5000],[11000,5000],[11000,7000],[7500,7000]],"kind":"u_turn"}]),
+        )
+        .unwrap();
+        let phase = View::latest(&s.doc);
+        let preview = plan_drawing(&s.doc, 0, phase).unwrap();
+        assert_pick(&preview, [3000.0, 2500.0], "living.space.L0", DrawingElementKind::Room);
+        assert_pick(&preview, [9000.0, 5900.0], "stair.L0", DrawingElementKind::Stair);
+        let built = trigon_model::build::build_view(&s.doc, phase).unwrap();
+        let descriptors = crate::element_properties_from_built(&s.doc, &built, phase).unwrap();
+        for id in ["b.f1.L0.B0.rail", "b.f1.L0.B1.rail"] {
+            assert!(
+                preview.element_segments.iter().any(|segment| segment.id == id && segment.kind == DrawingElementKind::Railing),
+                "visible rail {id}"
+            );
+        }
+        assert!(preview.element_regions.iter().any(|region| region.id == "b.f1.L0.B1.slab" && region.kind == DrawingElementKind::Balcony));
+        for id in preview.element_segments.iter().map(|s| &s.id).chain(preview.element_regions.iter().map(|r| &r.id)) {
+            assert!(descriptors.iter().any(|descriptor| descriptor["id"] == *id), "picked ID {id} must resolve to a real editable occurrence");
+        }
+        s.doc.buildings[0].add_basement(-2480.0, "Basement").unwrap();
+        s.doc.buildings[0].cellar_stairs = serde_json::from_value(
+            json!([{"facade":"b.f2","from":1000,"to":6000,"width":1500,"top":1200,"bottom":4000,"floor":-2480,"door_at":5000}]),
+        )
+        .unwrap();
+        let preview = plan_drawing(&s.doc, 1, View::latest(&s.doc)).unwrap();
+        assert!(preview.element_regions.iter().any(|region| region.id == "b.f2.cellar0" && region.kind == DrawingElementKind::Stair));
     }
 }
 

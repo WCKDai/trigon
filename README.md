@@ -55,6 +55,11 @@ saved plans, elevations and sections with precise annotation picking and snappin
 [saved drawings](docs/annotations.md). See [precise editing](docs/editing.md) for
 the shared commands, coordinate conventions and current boundaries.
 
+The 3D workspace and 2D views share one model. Pick a wall, opening, stair, room, balcony, roof or
+slab to edit its source properties; dimensional markers provide drag edits with one Undo step.
+Saved annotations support font families/styles and filled regions. See
+[coordinated authoring](docs/coordinated-authoring.md) for supported edits and current limits.
+
 Studio's **Schedules** workspace and `schedule.openings` list the built windows and doors with their model IDs, storeys, types,
 dimensions, phase status and lining areas. It includes interior/cellar doors and explicitly
 excludes loggia facade-hole areas from the totals. `schedule.export` saves the inventory as

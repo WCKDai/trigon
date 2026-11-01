@@ -11,9 +11,11 @@ use trigon_data::{DataError, Provider};
 use trigon_model::doc::JournalEntry;
 use trigon_model::{Document, ModelError};
 
+mod annotation_style;
 mod commands;
 mod drawings;
 mod edit;
+mod elements;
 mod elevation;
 mod facade_image;
 mod plan;
@@ -27,6 +29,7 @@ mod time;
 mod views;
 
 pub use commands::{CommandSpec, commands};
+pub use elements::{element_properties_from_built, room_element_id};
 /// For live views (Trigon Studio): one level's presentation plan as SVG text, the drawings' SVG
 /// parser and the renderer they use, so a view rasterizes exactly what the sheets show.
 pub use plan::sheet_svg_text as plan_sheet_svg;
@@ -37,8 +40,8 @@ pub use schedules::{
     opening_schedule_from_built,
 };
 pub use views::{
-    DrawingElementHit, DrawingElementKind, DrawingElementSegment, DrawingPreview, DrawingSnap, DrawingTransform, SnapKind, SnapOptions, drawing_view,
-    plan_drawing, snap_drawing,
+    DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap, DrawingTransform, SnapKind,
+    SnapOptions, drawing_view, plan_drawing, snap_drawing,
 };
 
 #[derive(Debug, thiserror::Error)]

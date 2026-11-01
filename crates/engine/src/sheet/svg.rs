@@ -179,9 +179,19 @@ pub(crate) fn items(out: &mut String, scene: &Scene, vp: &Viewport) {
                 };
                 let baseline = if t.middle { r#" dominant-baseline="middle""# } else { "" };
                 let fill = if t.colour == LETTERING { String::new() } else { format!(r#" fill="{}""#, hex(t.colour)) };
+                let font = if t.style.is_default() {
+                    String::new()
+                } else {
+                    format!(
+                        r#" font-family="{}" font-weight="{}" font-style="{}""#,
+                        t.style.family.name(),
+                        if t.style.bold { "bold" } else { "normal" },
+                        if t.style.italic { "italic" } else { "normal" }
+                    )
+                };
                 let _ = writeln!(
                     out,
-                    r#"<text x="{:.2}" y="{:.2}" text-anchor="{anchor}"{baseline} font-size="{fs:.2}"{fill}{rotate}{halo}>{}</text>"#,
+                    r#"<text x="{:.2}" y="{:.2}" text-anchor="{anchor}"{baseline} font-size="{fs:.2}"{fill}{font}{rotate}{halo}>{}</text>"#,
                     at[0],
                     at[1],
                     escape(&t.text)

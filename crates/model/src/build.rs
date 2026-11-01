@@ -530,6 +530,12 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
 }
 
 fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) -> Result<Built> {
+    if b.floor_thicknesses.len() > b.storeys.len() {
+        return Err(ModelError::Invalid("floor thicknesses must refer to existing storeys".into()));
+    }
+    for thickness in b.floor_thicknesses.iter().copied().chain(b.attic_thickness_mm).chain(b.roof_slab_thickness_mm) {
+        crate::checked("slab thickness", thickness, 20.0, 1000.0)?;
+    }
     let above = |z: f64| cut.is_some_and(|c| z >= c - 1.0);
     let top_at = |z: f64| cut.map_or(z, |c| z.min(c));
     let h = b.height();
@@ -551,8 +557,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
     // A storey's wall runs from the underside of its floor to the underside of the next one.
     let heights: Vec<(f64, f64)> = (0..levels)
         .map(|l| {
-            let z0 = if l == 0 { zb } else { b.storeys.get(l).map_or(zb, |s| s.elevation - FLOOR_SLAB) };
-            (z0, b.storeys.get(l + 1).map_or(h, |s| s.elevation - FLOOR_SLAB))
+            let z0 = if l == 0 { zb } else { b.storeys.get(l).map_or(zb, |s| s.elevation - b.floor_thickness(l)) };
+            (z0, b.storeys.get(l + 1).map_or(h, |s| s.elevation - b.floor_thickness(l + 1)))
         })
         .collect();
     let mut walls = Vec::with_capacity(b.facades.len());
@@ -634,7 +640,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     wall: b.edge_thickness(f.edge, level),
                     finish,
                     floor: elevation_of(r),
-                    ceiling: b.storeys.get(level + 1).map_or(h, |s| s.elevation - FLOOR_SLAB),
+                    ceiling: b.storeys.get(level + 1).map_or(h, |s| s.elevation - b.floor_thickness(level + 1)),
                 };
                 let mut o = component(&fr, &id, r, elevation_of(r), *status, at);
                 if cut.is_some() {
@@ -658,7 +664,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 wall: b.edge_thickness(f.edge, *level),
                 finish,
                 floor: c.floor,
-                ceiling: b.storeys.get(level + 1).map_or(h, |s| s.elevation - FLOOR_SLAB),
+                ceiling: b.storeys.get(level + 1).map_or(h, |s| s.elevation - b.floor_thickness(level + 1)),
             };
             let fill = BuiltElement {
                 id: format!("{id}.door"),
@@ -769,7 +775,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         |level: usize| -> Result<Vec<Vec<[f64; 2]>>> { b.stairs.iter().filter(|st| st.levels.contains(&level)).map(crate::stair::opening).collect() };
     for (i, s) in b.storeys.iter().enumerate() {
         let inner = storey_inners.get(i).cloned().unwrap_or_default();
-        let z0 = s.elevation - FLOOR_SLAB;
+        let thickness = b.floor_thickness(i);
+        let z0 = s.elevation - thickness;
         if above(z0) {
             continue;
         }
@@ -782,17 +789,17 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             id: format!("{}.slab.L{i}", b.id),
             kind: SlabKind::Floor,
             level: i,
-            mesh: prism_with_holes(&inner, &holes, z0, FLOOR_SLAB),
+            mesh: prism_with_holes(&inner, &holes, z0, thickness),
             polygon: inner,
             z_bottom: z0,
-            thickness: FLOOR_SLAB,
+            thickness,
             holes,
         });
     }
     let top_level = levels.saturating_sub(1);
     let top_inner = inners.get(top_level).cloned().unwrap_or_default();
     let roof = match &b.roof {
-        _ if above(h - FLOOR_SLAB) => None,
+        _ if above(h - b.ceiling_thickness(top_level)) => None,
         crate::roof::Roof::Flat => {
             let (outline, holes) = slab_shape(&b.footprint, openings(top_level)?)?;
             slabs.push(BuiltSlab {
@@ -800,8 +807,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 kind: SlabKind::Roof,
                 level: top_level,
                 z_bottom: h,
-                thickness: ROOF_SLAB,
-                mesh: prism_with_holes(&outline, &holes, h, ROOF_SLAB),
+                thickness: b.roof_slab_thickness_mm.unwrap_or(ROOF_SLAB),
+                mesh: prism_with_holes(&outline, &holes, h, b.roof_slab_thickness_mm.unwrap_or(ROOF_SLAB)),
                 polygon: outline,
                 holes,
             });
@@ -814,10 +821,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 id: format!("{}.attic", b.id),
                 kind: SlabKind::Floor,
                 level: top_level,
-                mesh: prism_with_holes(&top_inner, &holes, h - FLOOR_SLAB, FLOOR_SLAB),
+                mesh: prism_with_holes(&top_inner, &holes, h - b.attic_thickness(), b.attic_thickness()),
                 polygon: top_inner,
-                z_bottom: h - FLOOR_SLAB,
-                thickness: FLOOR_SLAB,
+                z_bottom: h - b.attic_thickness(),
+                thickness: b.attic_thickness(),
                 holes,
             });
             let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
@@ -850,7 +857,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         if on.is_empty() || above(s.elevation) {
             continue;
         }
-        let wall_height = top_at(s.elevation + s.height - FLOOR_SLAB) - s.elevation;
+        let wall_height = top_at(s.elevation + s.height - b.ceiling_thickness(level)) - s.elevation;
         let axes: Vec<Axis> = on.iter().map(|(_, w)| Axis { a: w.a, b: w.b, thickness: w.thickness }).collect();
         let joined = crate::joins::join(&axes, storey_inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
         for ((k, iw), j) in on.iter().zip(joined) {

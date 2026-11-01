@@ -237,6 +237,16 @@ pub(crate) fn union(shapes: &[Shape]) -> Vec<Shape> {
     rings.overlay(&Vec::<Ring>::new(), OverlayRule::Subject, FillRule::NonZero)
 }
 
+/// Even-odd semantic areas intersected with a clipping polygon.
+pub(crate) fn intersect_rings(rings: &[Ring], clip: &Ring) -> Vec<Shape> {
+    let rings = finite_rings(rings);
+    let clips = finite_rings(std::slice::from_ref(clip));
+    if rings.is_empty() || clips.is_empty() {
+        return Vec::new();
+    }
+    rings.overlay(&clips, OverlayRule::Intersect, FillRule::EvenOdd)
+}
+
 /// `shapes` minus `minus`.
 pub(crate) fn difference(shapes: &[Shape], minus: &[Shape]) -> Vec<Shape> {
     let a: Vec<Ring> = finite_rings(&shapes.iter().flatten().cloned().collect::<Vec<_>>());

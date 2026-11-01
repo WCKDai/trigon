@@ -20,6 +20,7 @@ use crate::camera::Orbit;
 use crate::drafting::{Action as DrawingAction, Drafting};
 use crate::palette::Palette;
 use crate::plan_view::PlanView;
+use crate::properties::{self, Mapping, ProjectedHandle, Properties};
 use crate::render::{self, Viewport3d};
 use crate::scene::{self, Scene};
 use crate::schedules::{self, Schedules};
@@ -160,6 +161,7 @@ pub struct StudioApp {
     pub(crate) selection: Option<usize>,
     authoring: Authoring,
     schedules: Schedules,
+    properties: Properties,
     pending_selection: Option<String>,
     selection_dirty: bool,
     pub(crate) plan: PlanView,
@@ -253,6 +255,7 @@ impl StudioApp {
             selection: None,
             authoring: Authoring::default(),
             schedules: Schedules::default(),
+            properties: Properties::default(),
             pending_selection: None,
             selection_dirty: false,
             plan: PlanView::new(ctx.clone()),
@@ -317,6 +320,7 @@ impl StudioApp {
                 self.selection = None;
                 self.authoring = Authoring::default();
                 self.schedules = Schedules::default();
+                self.properties = Properties::default();
                 self.drafting = Drafting::default();
                 self.drawing.clear();
                 if self.mode == Mode::Drawing {
@@ -353,6 +357,7 @@ impl StudioApp {
         self.generation += 1;
         self.scene_wanted = self.generation;
         self.schedules.begin(self.generation);
+        self.properties.begin(self.generation);
         self.build_error = None;
         if let Some(seq) = cause {
             self.cause = Some((self.generation, seq));
@@ -410,6 +415,7 @@ impl StudioApp {
                     self.timings = Some((done.build_ms, done.scene_ms));
                     self.build_error = None;
                     self.schedules.finish(done.generation, Ok(prepared.schedule));
+                    self.properties.finish(done.generation, prepared.properties);
                     self.apply_scene(prepared.scene, done.generation);
                 }
                 Err(e) => {
@@ -417,6 +423,7 @@ impl StudioApp {
                     self.build_error = Some(e);
                     self.selection = None;
                     self.pending_selection = None;
+                    self.properties.begin(done.generation);
                     self.selection_dirty = true;
                 }
             }
@@ -844,6 +851,7 @@ impl StudioApp {
 
     /// The view settings changed: rebuild what the new view needs.
     pub(crate) fn view_changed(&mut self, phase_changed: bool) {
+        self.properties.gizmo.cancel();
         self.redraw = true;
         if !phase_changed && self.authoring.tab == Tab::Schedules {
             self.authoring.tab = Tab::Project;
@@ -932,6 +940,9 @@ impl StudioApp {
         if self.building() || (self.authoring.tab == Tab::Schedules && self.schedules.data().is_none()) {
             return Some("Wait for the current model build before editing.");
         }
+        if self.mode != Mode::ThreeD && (self.drawing_plan() || self.plan.error.is_some()) {
+            return Some("Wait for a valid drawing of the current model before editing this view.");
+        }
         let selected = self.selection.and_then(|i| self.scene.elements.get(i));
         let ambiguous = |id: &str| {
             if let Some(group) = id.strip_prefix("group:") {
@@ -944,11 +955,11 @@ impl StudioApp {
             return Some(schedules::AMBIGUOUS);
         }
         // Semantic edit commands target the document's active phase, not a historical view.
-        if (self.authoring.tab == Tab::Schedules || selected.is_some_and(|e| matches!(e.kind, "window" | "door")))
+        if (self.authoring.tab == Tab::Schedules || selected.is_some())
             && (self.phase != self.session.doc.active_index()
                 || selected.is_some_and(|e| e.props.iter().any(|(k, v)| *k == "phase status" && v == "demolished")))
         {
-            return Some("Opening edits use the active phase. Use its complete view to edit this element.");
+            return Some("Model edits use the active phase. Use its complete view to edit this element.");
         }
         None
     }
@@ -970,6 +981,31 @@ impl StudioApp {
         let blocked = self.edit_block_reason();
         if let Some(reason) = blocked {
             ui.label(egui::RichText::new(reason).color(theme::ACCENT));
+        }
+        if self.authoring.tab != Tab::Families
+            && let Some(element) = &selected
+        {
+            ui.monospace(&element.id);
+            let edit = self.properties.ui(ui, &element.id, blocked);
+            if let Some(edit) = edit {
+                self.apply_property_edit(edit);
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Show in 3D").clicked()
+                    && let Some(index) = self.selection
+                {
+                    self.level = None;
+                    self.focus(index);
+                }
+                if let Some(level) = element.level
+                    && ui.button("Show plan").clicked()
+                {
+                    self.mode = Mode::Plan;
+                    self.plan_level = level;
+                    self.view_changed(false);
+                }
+            });
+            ui.separator();
         }
         let run = ui.add_enabled_ui(blocked.is_none(), |ui| self.authoring.ui(ui, &self.session.doc, selected.as_ref(), self.plan_level)).inner;
         if let Some(run) = run
@@ -1227,6 +1263,103 @@ impl StudioApp {
         }
     }
 
+    fn apply_property_edit(&mut self, edit: properties::Edit) {
+        if self.edit_block_reason().is_some()
+            || self.selection.and_then(|index| self.scene.elements.get(index)).is_none_or(|e| e.id != edit.id)
+            || self.scene.find_unique(&edit.id) != self.selection
+            || !self.properties.descriptor(&edit.id).is_some_and(|d| d["editable"] == true)
+        {
+            self.properties.gizmo.cancel();
+            return;
+        }
+        let phase = self.session.doc.phases.get(self.phase).map(|p| p.id.clone());
+        let params = json!({"id":edit.id,"phase":phase,"filter":filter_name(self.filter),"properties":edit.properties});
+        match self.run(Who::Owner, "element.set", params) {
+            Ok(result) => {
+                self.pending_selection = result["targets"].as_array().and_then(|targets| targets.first()).and_then(Value::as_str).map(str::to_string);
+                self.status = Some(("Model properties updated".into(), false));
+            }
+            Err(error) => self.status = Some((error, true)),
+        }
+    }
+
+    fn drawing_point(&self, point: [f64; 3]) -> Option<[f64; 2]> {
+        use trigon_model::annotation::DrawingViewKind;
+        if self.mode == Mode::Plan {
+            return Some([point[0], point[1]]);
+        }
+        let view = self.session.doc.views.iter().find(|view| view.id == self.drawing)?;
+        match &view.kind {
+            DrawingViewKind::Plan { .. } => Some([point[0], point[1]]),
+            DrawingViewKind::Facade { facade } => {
+                let building = self.session.doc.buildings.iter().find(|b| b.facades.iter().any(|f| &f.id == facade))?;
+                let f = building.facade(facade).ok()?;
+                let (a, b) = building.edge(f.edge)?;
+                let frame = trigon_model::FacadeFrame::new(a, b)?;
+                Some([(point[0] - a[0]) * frame.t[0] + (point[1] - a[1]) * frame.t[1], point[2]])
+            }
+            DrawingViewKind::Section { from, to, flip, .. } => {
+                let (a, b) = if *flip { (*to, *from) } else { (*from, *to) };
+                let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+                (length > 1e-9).then(|| [((point[0] - a[0]) * (b[0] - a[0]) + (point[1] - a[1]) * (b[1] - a[1])) / length, point[2]])
+            }
+        }
+    }
+
+    pub(crate) fn projected_handles(&self, rect: egui::Rect) -> Vec<ProjectedHandle> {
+        if self.authoring.tab == Tab::Drawings || self.authoring.tab == Tab::Families || self.edit_block_reason().is_some() {
+            return Vec::new();
+        }
+        let Some(element) = self.selection.and_then(|index| self.scene.elements.get(index)) else { return Vec::new() };
+        self.properties
+            .handles(&element.id)
+            .into_iter()
+            .filter_map(|handle| {
+                let mapping = if self.mode == Mode::ThreeD {
+                    let at = std::array::from_fn(|axis| ((handle.position[axis] - self.scene.origin[axis]) / 1000.0) as f32);
+                    Mapping::Spatial { camera: self.camera, rect, at, direction: handle.direction.map(|v| v as f32) }
+                } else {
+                    let start = self.drawing_point(handle.position)?;
+                    let end = self.drawing_point(std::array::from_fn(|axis| handle.position[axis] + handle.direction[axis] * 1000.0))?;
+                    let at = self.plan.model_to_screen(rect, start)?;
+                    let to = self.plan.model_to_screen(rect, end)?;
+                    let per_mm = (to - at) / 1000.0;
+                    if per_mm.length_sq() < 1e-10 {
+                        return None;
+                    }
+                    Mapping::Drawing { at, per_mm }
+                };
+                let at = mapping.screen(0.0)?;
+                mapping.parameter(at)?;
+                Some(ProjectedHandle { handle, mapping })
+            })
+            .collect()
+    }
+
+    fn handle_hover(&self, ui: &egui::Ui, rect: egui::Rect) -> bool {
+        if self.properties.gizmo.active() {
+            return true;
+        }
+        let (hover, press) = ui.input(|i| (i.pointer.hover_pos(), i.pointer.primary_down().then(|| i.pointer.press_origin()).flatten()));
+        self.projected_handles(rect).iter().any(|handle| {
+            handle.mapping.screen(0.0).is_some_and(|at| rect.contains(at) && [hover, press].into_iter().flatten().any(|p| p.distance(at) <= 12.0))
+        })
+    }
+
+    fn model_handles_ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
+        let Some(id) = self.selection.and_then(|index| self.scene.elements.get(index)).map(|e| e.id.clone()) else {
+            self.properties.gizmo.cancel();
+            return false;
+        };
+        let handles = self.projected_handles(rect);
+        let enabled = !handles.is_empty() && self.edit_block_reason().is_none() && self.scene.find_unique(&id) == self.selection;
+        let (busy, edit) = self.properties.gizmo.ui(ui, rect, &id, self.scene_generation, &handles, enabled);
+        if let Some(edit) = edit {
+            self.apply_property_edit(edit);
+        }
+        busy
+    }
+
     fn viewport_drawing(&mut self, ui: &mut egui::Ui) {
         if self.plan_wanted == 0 {
             self.request_plan();
@@ -1235,13 +1368,16 @@ impl StudioApp {
             self.drafting.picking = None;
         }
         let picking = self.mode == Mode::Drawing && self.authoring.tab == Tab::Drawings && self.drafting.picking.is_some();
-        let response = self.plan.ui(ui, picking);
+        let handle_capture = self.viewport_rect.is_some_and(|rect| self.handle_hover(ui, rect));
+        let response = self.plan.ui(ui, picking || handle_capture);
         let rect = response.rect;
         self.viewport_rect = Some(rect);
         if self.drawing_plan() || self.plan.error.is_some() || !self.plan.ready(rect, self.ppp) {
             return;
         }
+        let handles_busy = self.model_handles_ui(ui, rect);
         if !picking
+            && !handles_busy
             && response.clicked()
             && let Some(p) = response.interact_pointer_pos()
         {
@@ -1259,7 +1395,7 @@ impl StudioApp {
                 if let Some(hit) = self.plan.pick_element(rect, p) {
                     self.authoring.targets.clear();
                     self.pending_selection = Some(hit.id.clone());
-                    self.selection = self.scene.find(&hit.id);
+                    self.selection = self.scene.find_unique(&hit.id);
                     if self.selection.is_some() {
                         self.authoring.tab = Tab::Project;
                     }
@@ -1280,6 +1416,15 @@ impl StudioApp {
                 for p in self.drafting.points() {
                     if let Some(at) = self.plan.model_to_screen(rect, *p) {
                         painter.circle_stroke(at, 4.0, egui::Stroke::new(1.5, theme::ACCENT));
+                    }
+                }
+                if self.drafting.is_region() {
+                    let points: Vec<_> = self.drafting.points().iter().filter_map(|point| self.plan.model_to_screen(rect, *point)).collect();
+                    for pair in points.windows(2) {
+                        painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, theme::ACCENT));
+                    }
+                    if !picking && let (Some(first), Some(last)) = (points.first(), points.last()) {
+                        painter.line_segment([*last, *first], egui::Stroke::new(1.5, theme::ACCENT));
                     }
                 }
             }
@@ -1331,10 +1476,11 @@ impl StudioApp {
             self.redraw = true;
         }
         let aspect = rect.width() / rect.height().max(1.0);
+        let handle_capture = self.handle_hover(ui, rect);
         // Orbit with the left button; pan with the right or middle button, or Shift.
         let shift = ui.input(|i| i.modifiers.shift);
         let d = resp.drag_delta();
-        if d != egui::Vec2::ZERO {
+        if d != egui::Vec2::ZERO && !handle_capture {
             if resp.dragged_by(egui::PointerButton::Primary) && !shift {
                 self.camera.orbit(d.x * 0.008, d.y * 0.008);
             } else {
@@ -1342,7 +1488,7 @@ impl StudioApp {
             }
             self.redraw = true;
         }
-        if resp.hovered() {
+        if resp.hovered() && !handle_capture {
             let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
             let factor = (1.0 / pinch) * (-scroll / 300.0).exp();
             if (factor - 1.0).abs() > 1e-4
@@ -1354,9 +1500,10 @@ impl StudioApp {
                 self.redraw = true;
             }
         }
-        if resp.double_clicked() {
+        if resp.double_clicked() && !handle_capture {
             self.fit();
         } else if resp.clicked()
+            && !handle_capture
             && let Some(p) = resp.interact_pointer_pos()
         {
             let ndc = [(p.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (p.y - rect.top()) / rect.height() * 2.0];
@@ -1394,6 +1541,7 @@ impl StudioApp {
             ui.ctx().request_repaint();
         }
         self.viewport_overlay(&painter, rect);
+        self.model_handles_ui(ui, rect);
     }
 
     /// Words over the view: what is building, errors, the agent at work, the change just made.
@@ -1600,6 +1748,108 @@ mod tests {
     fn window(app: &StudioApp) -> usize {
         let row = app.schedules.data().unwrap().rows.iter().find(|r| r.kind == trigon_engine::ScheduleOpeningKind::Window).unwrap();
         schedules::resolve_row(&app.scene, row).unwrap()
+    }
+
+    #[test]
+    fn viewport_pointer_drag_reserves_the_handle_and_commits_one_source_edit() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        app.selection = Some(window(&app));
+        app.focus(app.selection.unwrap());
+        let before = app.session.doc.clone();
+        let camera = app.camera.view_proj(1.0);
+        let ctx = egui::Context::default();
+        let mut frame = 0;
+        let mut draw = |app: &mut StudioApp, events: Vec<egui::Event>| {
+            frame += 1;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                time: Some(frame as f64 * 0.05),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.viewport_3d(ui));
+            output.textures_delta.clear();
+        };
+        draw(&mut app, vec![]);
+        let handle = app.projected_handles(app.viewport_rect.unwrap()).into_iter().find(|h| h.handle.key == "width_mm").unwrap();
+        let from = handle.mapping.screen(0.0).unwrap();
+        let to = handle.mapping.screen(120.0).unwrap();
+        let expected = handle.handle.value + 120.0 * handle.handle.gain;
+        let events = crate::control::parse_input("ui.drag", &json!({"from":[from.x,from.y],"to":[to.x,to.y],"steps":4})).unwrap();
+        for event in events {
+            draw(&mut app, vec![event]);
+        }
+        assert_eq!(app.camera.view_proj(1.0), camera, "a handle drag must not orbit the model");
+        assert_eq!(app.session.doc.journal.len(), before.journal.len() + 1, "release must make exactly one command");
+        complete(&mut app);
+        let selected = app.scene.elements[app.selection.unwrap()].id.clone();
+        let width = app.properties.descriptor(&selected).unwrap()["properties"].as_array().unwrap().iter().find(|p| p["key"] == "width_mm").unwrap()
+            ["value"]
+            .as_f64()
+            .unwrap();
+        assert!((width - expected).abs() < 0.1, "{width} expected {expected}");
+        app.run(Who::Owner, "edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.doc, before);
+    }
+
+    #[test]
+    fn one_property_edit_updates_the_shared_model_scene_and_plan_and_undo_restores_them() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let index = window(&app);
+        let id = app.scene.elements[index].id.clone();
+        app.selection = Some(index);
+        let original = app.session.doc.clone();
+        let bounds = app.scene.elements[index].bounds;
+        let drawing = trigon_engine::plan_drawing(&original, 0, app.view()).unwrap().svg;
+        let descriptor = app.properties.descriptor(&id).unwrap();
+        assert_eq!(descriptor["editable"], true);
+        let width = descriptor["properties"].as_array().unwrap().iter().find(|p| p["key"] == "width_mm").unwrap()["value"].as_f64().unwrap();
+        app.apply_property_edit(properties::Edit { id: id.clone(), properties: json!({"width_mm":width+200.0}) });
+        assert_eq!(app.session.doc.journal.len(), original.journal.len() + 1, "one completed edit is one command");
+        assert!(app.building());
+        assert!(app.properties.descriptor(&id).is_none());
+        complete(&mut app);
+        let selected = app.selection.unwrap();
+        assert_eq!(app.scene.elements[selected].id, id);
+        assert_ne!(app.scene.elements[selected].bounds, bounds);
+        let updated = trigon_engine::plan_drawing(&app.session.doc, 0, app.view()).unwrap().svg;
+        assert_ne!(updated, drawing);
+        app.run(Who::Owner, "edit.undo", json!({})).unwrap();
+        complete(&mut app);
+        assert_eq!(app.session.doc, original);
+        assert_eq!(trigon_engine::plan_drawing(&app.session.doc, 0, app.view()).unwrap().svg, drawing);
+        assert_eq!(app.scene.elements[app.selection.unwrap()].bounds, bounds);
+        app.run(Who::Owner, "edit.redo", json!({})).unwrap();
+        complete(&mut app);
+        assert_eq!(trigon_engine::plan_drawing(&app.session.doc, 0, app.view()).unwrap().svg, updated);
+        let before = app.session.doc.clone();
+        app.apply_property_edit(properties::Edit { id, properties: json!({"width_mm":f64::MAX}) });
+        assert_eq!(app.session.doc, before);
+        assert!(app.status.as_ref().is_some_and(|(_, error)| *error));
+    }
+
+    #[test]
+    fn historical_and_pending_views_cannot_commit_property_edits_or_offer_handles() {
+        let mut app = app(true);
+        app.authoring.tab = Tab::Project;
+        let index = window(&app);
+        let id = app.scene.elements[index].id.clone();
+        app.selection = Some(index);
+        app.request_rebuild(None);
+        let before = app.session.doc.clone();
+        app.apply_property_edit(properties::Edit { id: id.clone(), properties: json!({"width_mm":1400.0}) });
+        assert_eq!(app.session.doc, before);
+        complete(&mut app);
+        app.phase = 0;
+        app.view_changed(true);
+        complete(&mut app);
+        app.selection = Some(window(&app));
+        let selected = app.scene.elements[app.selection.unwrap()].id.clone();
+        assert!(app.projected_handles(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))).is_empty());
+        app.apply_property_edit(properties::Edit { id: selected, properties: json!({"width_mm":1400.0}) });
+        assert_eq!(app.session.doc, before);
     }
 
     #[test]

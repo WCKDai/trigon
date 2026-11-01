@@ -19,6 +19,9 @@ pub const METHODS: &[(&str, &str)] = &[
         "ui.screenshot",
         "a PNG of the viewport (`target: viewport`, default) or the whole window (`window`; `raise: true` brings it to the front first); `path` writes it, else base64",
     ),
+    ("ui.click", "click at window points `x`, `y`; optional `button`, `double` and modifiers"),
+    ("ui.drag", "primary-button drag between window points `from: [x,y]` and `to: [x,y]`; optional `steps` (1..60) and modifiers"),
+    ("ui.key", "press an egui `key`; optional command, shift, alt and ctrl modifiers"),
 ];
 
 /// Longest command id accepted.

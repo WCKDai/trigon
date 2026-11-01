@@ -63,6 +63,8 @@ enum Surface {
 }
 
 enum Prim {
+    /// Semantic filled areas; never emitted as graphical ink by either writer.
+    PickRegion(crate::views::DrawingElementRegion),
     Poly {
         pts: Vec<[f64; 2]>,
         fill: [u8; 3],
@@ -154,6 +156,18 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         let storey = b.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("level {level} doesn't exist")))?;
         title = format!("{} — {}", b.name, storey.name);
         let cut = storey.elevation + CUT;
+        for slab in
+            b.slabs.iter().filter(|slab| slab.level == level && slab.kind == trigon_model::SlabKind::Floor && slab.z_bottom + slab.thickness <= cut)
+        {
+            let mut rings = vec![slab.polygon.clone()];
+            rings.extend(slab.holes.iter().cloned());
+            prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
+                id: slab.id.clone(),
+                kind: DrawingElementKind::Slab,
+                rings,
+                depth_plane: None,
+            }));
+        }
         for w in &b.walls {
             let fr = &w.frame;
             // The facade wall as it is on this storey (thicker lower down).
@@ -229,6 +243,9 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 }
                 if french_rail {
                     for depth in [-110.0, -150.0] {
+                        if let Some(rail) = o.attached.iter().find(|element| element.class == trigon_model::ElementClass::Railing) {
+                            elements.insert(prims.len(), Element::new(&rail.id, DrawingElementKind::Railing));
+                        }
                         prims.push(Prim::Line {
                             a: pt(fr, u0 - 50.0, depth),
                             b: pt(fr, u1 + 50.0, depth),
@@ -258,16 +275,58 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let (u0, u1) = (centre - slab_width / 2.0, centre + slab_width / 2.0);
                 let color = status_color(status, LINE);
                 let corners = [pt(fr, u0, 0.0), pt(fr, u1, 0.0), pt(fr, u1, -depth), pt(fr, u0, -depth)];
+                let prefix = if r.is_opening() {
+                    format!("{}.L{}.B{}", w.id, level, r.placement.bay)
+                } else {
+                    format!("{}.L{}.B{}.balcony", w.id, level, r.placement.bay)
+                };
+                let parts: Vec<_> = w
+                    .openings
+                    .iter()
+                    .flat_map(|opening| opening.attached.iter())
+                    .chain(w.attachments.iter())
+                    .filter(|element| element.level == level && element.type_id == r.ty.id && element.id.starts_with(&format!("{prefix}.")))
+                    .collect();
+                let owner = parts.iter().copied().min_by_key(|element| if element.class == trigon_model::ElementClass::BalconySlab { 0 } else { 1 });
+                let owner = owner.map(|element| {
+                    Element::new(
+                        &element.id,
+                        if element.class == trigon_model::ElementClass::BalconySlab {
+                            DrawingElementKind::Balcony
+                        } else {
+                            DrawingElementKind::Railing
+                        },
+                    )
+                });
+                let rail = parts
+                    .iter()
+                    .find(|element| element.class == trigon_model::ElementClass::Railing)
+                    .map(|element| Element::new(&element.id, DrawingElementKind::Railing));
+                let mut rail_indices = Vec::new();
+                if let Some(element) = &owner {
+                    prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
+                        id: element.id.clone(),
+                        kind: element.kind,
+                        rings: vec![corners.to_vec()],
+                        depth_plane: None,
+                    }));
+                }
+                let detail_start = prims.len();
                 let dashed = status == Status::Demolished;
                 for k in 0..4 {
                     prims.push(Prim::Line { a: corners[k], b: corners[(k + 1) % 4], color, width: 30.0, dashed });
                 }
+                let mut detail_end = prims.len();
                 if presentation && status != Status::Demolished {
                     // The deck and perimeter rail are separate from the cut wall.
-                    for v in [70.0, depth - 70.0] {
+                    for (edge, v) in [70.0, depth - 70.0].into_iter().enumerate() {
+                        if edge == 1 {
+                            rail_indices.push(prims.len());
+                        }
                         prims.push(Prim::Line { a: pt(fr, u0 + 70.0, -v), b: pt(fr, u1 - 70.0, -v), color, width: 14.0, dashed: false });
                     }
                     for u in [u0 + 70.0, u1 - 70.0] {
+                        rail_indices.push(prims.len());
                         prims.push(Prim::Line { a: pt(fr, u, -70.0), b: pt(fr, u, -depth + 70.0), color, width: 14.0, dashed: false });
                     }
                     let boards = if matches!(r.ty.kind, ComponentKind::SteelBalcony { deck, .. } if deck != trigon_model::component::Deck::FibreConcrete)
@@ -280,6 +339,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                         let v = -depth * k as f64 / boards as f64;
                         prims.push(Prim::Line { a: pt(fr, u0 + 70.0, v), b: pt(fr, u1 - 70.0, v), color, width: 7.0, dashed: false });
                     }
+                    detail_end = prims.len();
                     let dim = -depth - 300.0;
                     prims.push(Prim::Line { a: pt(fr, u0, dim), b: pt(fr, u1, dim), color, width: 10.0, dashed: false });
                     for u in [u0, u1] {
@@ -305,6 +365,16 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                         away: Some([(out[0] - label_at[0]) / 1000.0, (out[1] - label_at[1]) / 1000.0]),
                     });
                 }
+                if let Some(owner) = owner {
+                    for index in detail_start..detail_end {
+                        elements.insert(index, owner.clone());
+                    }
+                }
+                if let Some(rail) = rail {
+                    for index in rail_indices {
+                        elements.insert(index, rail.clone());
+                    }
+                }
             }
         }
     }
@@ -313,10 +383,13 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         if level != 0 && level != b.ground_level {
             continue;
         }
-        for c in &b.cellar_stairs {
+        for (index, c) in b.cellar_stairs.iter().enumerate() {
             let Ok(f) = b.facade(&c.facade) else { continue };
             let Some((a, e)) = b.edge(f.edge) else { continue };
             let Some(fr) = trigon_model::FacadeFrame::new(a, e) else { continue };
+            let id = if c.id.is_empty() { format!("{}.cellar{index}", f.id) } else { c.id.clone() };
+            let owner = Element::new(&id, DrawingElementKind::Stair);
+            let start = prims.len();
             let (out, r) = (c.width, 150.0);
             let walls = [
                 [(c.from - r, out), (c.to + r, out), (c.to + r, out + r), (c.from - r, out + r)],
@@ -338,6 +411,11 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let u = c.bottom + (c.top - c.bottom) * i as f64 / risers as f64;
                 prims.push(Prim::Line { a: pt(&fr, u, 0.0), b: pt(&fr, u, -out), color: LINE, width: 9.0, dashed: false });
             }
+            for index in start..prims.len() {
+                elements.insert(index, owner.clone());
+            }
+            let rings = vec![vec![pt(&fr, c.from, 0.0), pt(&fr, c.to, 0.0), pt(&fr, c.to, -out), pt(&fr, c.from, -out)]];
+            prims.push(Prim::PickRegion(crate::views::DrawingElementRegion { id, kind: DrawingElementKind::Stair, rings, depth_plane: None }));
         }
     }
     // Interior: walls cut at this storey (joined to each other and to the facade), stairs with
@@ -359,13 +437,17 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
     for b in &doc.buildings {
         let visible = visible_stairs(b, level);
         for st in &visible {
+            let start = prims.len();
+            let departure = if st.levels.contains(&level) { level } else { level.saturating_sub(1) };
+            let Some(index) = b.stairs.iter().position(|source| std::ptr::eq(source, *st)) else { continue };
+            let id = if st.id.is_empty() { format!("{}.stair{index}.L{departure}", b.id) } else { format!("{}.L{departure}", st.id) };
+            let owner = Element::new(&id, DrawingElementKind::Stair);
             if presentation {
                 prims.push(Prim::Poly { pts: trigon_model::stair::opening(st)?, fill: [245, 245, 245], surface: Surface::Stair });
             }
             let line = |a, b, width, dashed| {
                 if presentation { Prim::StairLine { a, b, width, dashed } } else { Prim::Line { a, b, color: LINE, width, dashed } }
             };
-            let departure = if st.levels.contains(&level) { level } else { level.saturating_sub(1) };
             let h = b.storeys.get(departure).map_or(3000.0, |s| s.height);
             let Ok(sym) = trigon_model::stair::symbol(st, h) else { continue };
             for (a, e) in &sym.outline {
@@ -393,6 +475,15 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let dot = [w0[0] + ux * 60.0, w0[1] + uy * 60.0];
                 prims.push(line([dot[0] - 40.0, dot[1]], [dot[0] + 40.0, dot[1]], 70.0, false));
             }
+            for index in start..prims.len() {
+                elements.insert(index, owner.clone());
+            }
+            prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
+                id,
+                kind: DrawingElementKind::Stair,
+                rings: vec![trigon_model::stair::opening(st)?],
+                depth_plane: None,
+            }));
         }
         // Entrances: house number on the staircase's floor landing, the apartments' doors either side
         // ("TV" to the left and "TH" to the right as you arrive up the stairs).
@@ -458,8 +549,17 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 prims.push(Prim::Text { at, text: others.join(" "), color: LINE, size: 240.0, angle: None, away: None });
             }
         }
-        for r in &b.rooms {
-            if presentation || !r.levels.contains(&level) || r.polygon.is_empty() {
+        for (index, r) in b.rooms.iter().enumerate() {
+            if !r.levels.contains(&level) || r.polygon.is_empty() {
+                continue;
+            }
+            prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
+                id: crate::room_element_id(b, index, level),
+                kind: DrawingElementKind::Room,
+                rings: vec![r.polygon.clone()],
+                depth_plane: None,
+            }));
+            if presentation {
                 continue;
             }
             let Some(c) = room_label_point(&r.polygon) else { continue };
@@ -742,6 +842,12 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                 && *family == surface
                 && let Some(element) = elements.get(&index)
             {
+                sc.element_regions.push(crate::views::DrawingElementRegion {
+                    id: element.id.clone(),
+                    kind: element.kind,
+                    rings: vec![pts.iter().map(|p| f.rot(*p)).collect()],
+                    depth_plane: None,
+                });
                 for corner in 0..pts.len() {
                     sources.push(element.segment([f.rot(pts[corner]), f.rot(pts[(corner + 1) % pts.len()])]));
                 }
@@ -761,10 +867,19 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
     let mut labels: Vec<Label> = Vec::new();
     for (index, p) in prims.iter().enumerate() {
         match p {
+            Prim::PickRegion(region) => {
+                sc.element_regions.push(crate::views::DrawingElementRegion {
+                    rings: region.rings.iter().map(|ring| ring.iter().map(|p| f.rot(*p)).collect()).collect(),
+                    ..region.clone()
+                });
+            }
             Prim::Poly { .. } => {}
             Prim::StairLine { a, b, width, dashed } => {
                 let pen = if *width >= 14.0 { 0.18 } else { 0.13 };
                 sc.line(Layer::Stair, f.rot(*a), f.rot(*b), Stroke { pen, colour: [0x33; 3], dashed: *dashed });
+                if let Some(element) = elements.get(&index) {
+                    sc.attribute_last(&[element.segment([f.rot(*a), f.rot(*b)])]);
+                }
             }
             Prim::Line { a, b, width, dashed, color } => {
                 let colour = if *dashed || *color == DEMOLISHED { [0xbd, 0x30, 0x30] } else { [0x33, 0x33, 0x33] };
@@ -911,6 +1026,7 @@ fn svg(prims: &[Prim], f: &Frame, background: Option<&[u8]>, title: &str) -> Res
     }
     for p in prims {
         match p {
+            Prim::PickRegion(_) => {}
             Prim::Poly { pts, fill, .. } => {
                 let d: Vec<String> = pts.iter().map(|p| f.px(*p)).map(|q| format!("{:.1},{:.1}", q[0], q[1])).collect();
                 let _ = writeln!(out, r#"<polygon points="{}" fill="{}"/>"#, d.join(" "), hex(*fill));

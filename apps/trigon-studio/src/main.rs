@@ -11,6 +11,7 @@ mod control;
 mod drafting;
 mod palette;
 mod plan_view;
+mod properties;
 mod render;
 mod scene;
 mod schedules;

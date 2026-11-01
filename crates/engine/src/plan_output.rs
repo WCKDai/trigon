@@ -13,6 +13,19 @@ use crate::{EngineError, Result};
 
 const FONT: &[u8] = include_bytes!("../assets/liberation-sans/LiberationSans-Regular.ttf");
 const FONT_FAMILY: &str = "Liberation Sans";
+const ADDITIONAL_FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/liberation/LiberationSans-Bold.ttf"),
+    include_bytes!("../assets/liberation/LiberationSans-Italic.ttf"),
+    include_bytes!("../assets/liberation/LiberationSans-BoldItalic.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-Regular.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-Bold.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-Italic.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-BoldItalic.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-Regular.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-Bold.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-Italic.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-BoldItalic.ttf"),
+];
 const MAX_DIMENSION: f32 = 6000.0;
 const MAX_PIXELS: u64 = 36_000_000;
 const MAX_PAGES: usize = 100;
@@ -31,9 +44,12 @@ fn options(blocked: Arc<AtomicBool>) -> usvg::Options<'static> {
     };
     let fonts = opt.fontdb_mut();
     fonts.load_font_data(FONT.to_vec());
+    for font in ADDITIONAL_FONTS {
+        fonts.load_font_data(font.to_vec());
+    }
     fonts.set_sans_serif_family(FONT_FAMILY);
-    fonts.set_serif_family(FONT_FAMILY);
-    fonts.set_monospace_family(FONT_FAMILY);
+    fonts.set_serif_family("Liberation Serif");
+    fonts.set_monospace_family("Liberation Mono");
     opt
 }
 
@@ -138,6 +154,36 @@ mod tests {
             assert!(glyph.as_chunks::<4>().0.iter().any(|p| p[0] < 100 && p[3] == 255), "missing glyph {ch}");
             assert_ne!(glyph, pixels(&png(&text_svg("\u{fffd}")).unwrap()), "{ch} must not render as a replacement character");
         }
+    }
+
+    #[test]
+    fn bundled_family_and_face_choices_render_distinct_pixels_and_embed_real_pdf_fonts() {
+        let styled = |family: &str, weight: &str, style: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="420" height="90"><rect width="420" height="90" fill="white"/><text x="8" y="60" font-family="{family}" font-weight="{weight}" font-style="{style}" font-size="38">Køkken ffi WWW 123</text></svg>"#
+            )
+        };
+        let mut rendered = Vec::new();
+        for family in ["Liberation Sans", "Liberation Serif", "Liberation Mono"] {
+            for (weight, style) in [("normal", "normal"), ("bold", "normal"), ("normal", "italic"), ("bold", "italic")] {
+                let image = pixels(&png(&styled(family, weight, style)).unwrap());
+                assert!(image.as_chunks::<4>().0.iter().any(|pixel| pixel[0] < 100));
+                assert!(rendered.iter().all(|previous| previous != &image), "{family}/{weight}/{style} must use its real face");
+                rendered.push(image);
+            }
+        }
+        let bytes = pdf(&[styled("Liberation Serif", "bold", "italic"), styled("Liberation Mono", "normal", "normal")], [148.0, 105.0]).unwrap();
+        let document = lopdf::Document::load_mem(&bytes).unwrap();
+        let names: Vec<_> = document
+            .objects
+            .values()
+            .filter_map(|object| object.as_dict().ok())
+            .filter_map(|dictionary| dictionary.get(b"BaseFont").ok()?.as_name().ok())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains("LiberationSerif-BoldItalic")), "actual serif bold italic must be embedded: {names:?}");
+        assert!(names.iter().any(|name| name.contains("LiberationMono")), "actual mono must be embedded: {names:?}");
+        assert_eq!(document.extract_text(&[1]).unwrap().replace('\n', ""), "Køkken ffi WWW 123");
     }
 
     #[test]

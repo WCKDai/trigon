@@ -3,7 +3,6 @@
 //! room's name as the long name.
 
 use trigon_model::Building;
-use trigon_model::build::FLOOR_SLAB;
 
 use super::catalog::{self, Qty, Val};
 use super::part21::{area, ccw, clean_ring, gid, string};
@@ -16,7 +15,7 @@ impl Ifc<'_> {
             for (k, r) in bd.rooms.iter().enumerate().filter(|(_, r)| r.levels.contains(&level)) {
                 let ring = ccw(clean_ring(&r.polygon));
                 let floor = area(&ring);
-                let height = (s.height - FLOOR_SLAB).max(100.0);
+                let height = (s.height - bd.ceiling_thickness(level)).max(100.0);
                 if ring.len() < 3 || !(floor > 10_000.0) || !height.is_finite() {
                     continue;
                 }

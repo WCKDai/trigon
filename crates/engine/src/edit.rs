@@ -95,7 +95,7 @@ fn invalid(message: impl Into<String>) -> crate::EngineError {
 }
 
 #[derive(Clone, PartialEq)]
-enum Item {
+pub(crate) enum Item {
     Wall(InteriorWall),
     Stair(Stair),
     Room(Room),
@@ -297,7 +297,12 @@ fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
                 };
                 let root = original.id();
                 let all = target == root || target == &format!("{kind}:{root}");
-                let level = target.strip_prefix(&format!("{root}.L")).and_then(|s| s.parse::<usize>().ok());
+                // Only rooms accept the IFC-compatible display alias. Do not reinterpret an
+                // actual wall/stair source whose own id happens to end with ".space".
+                let level = target
+                    .strip_prefix(&format!("{root}.L"))
+                    .or_else(|| if matches!(original, Item::Room(_)) { target.strip_prefix(&format!("{root}.space.L")) } else { None })
+                    .and_then(|s| s.parse::<usize>().ok());
                 if all || level.is_some_and(|l| original.levels().contains(&l)) {
                     let mut item = original.clone();
                     if !all && let Some(l) = level {
@@ -560,6 +565,42 @@ pub(crate) fn move_elements(s: &mut Session, p: Move) -> Result<Value> {
         ids.push(next);
     }
     finish(s, ids)
+}
+
+/// Change one source/storey instance without nesting a journal entry. The outer command owns
+/// atomic validation; shared definitions split exactly as precise moves do, including groups.
+pub(crate) fn update_parameters(doc: &mut Document, target: &str, update: impl FnOnce(&mut Item) -> Result<()>) -> Result<String> {
+    let mut entries = selected(doc, &[target.to_string()])?;
+    let entry = entries.pop().ok_or_else(|| invalid("missing source selection"))?;
+    let mut item = entry.item.clone();
+    update(&mut item)?;
+    // Replacing a whole definition must keep its position: unnamed sibling definitions derive
+    // their displayed IDs from their source indices. Shared definitions stay in place when split.
+    if !matches!(item, Item::Placement(_)) && entry.original.levels().iter().all(|l| entry.item.levels().contains(l)) {
+        let b = doc.buildings.get_mut(entry.building).ok_or_else(|| invalid("missing building"))?;
+        let id = item.id().to_string();
+        let levels = item.levels();
+        match (&entry.original, item) {
+            (Item::Wall(old), Item::Wall(value)) => {
+                *b.interior_walls.iter_mut().find(|source| *source == old).ok_or_else(|| invalid("source wall changed"))? = value
+            }
+            (Item::Stair(old), Item::Stair(value)) => {
+                *b.stairs.iter_mut().find(|source| *source == old).ok_or_else(|| invalid("source stair changed"))? = value
+            }
+            (Item::Room(old), Item::Room(value)) => {
+                *b.rooms.iter_mut().find(|source| *source == old).ok_or_else(|| invalid("source room changed"))? = value
+            }
+            _ => return Err(invalid("source kind changed")),
+        }
+        let level = levels.first().copied().ok_or_else(|| invalid("missing source storey"))?;
+        let next = format!("{id}.L{level}");
+        remap_groups(doc, &entry, &next, false);
+        return Ok(next);
+    }
+    let shared = remove(doc, &entry)?;
+    let next = put(doc, &entry, item, shared, false, false)?;
+    remap_groups(doc, &entry, &next, shared);
+    Ok(next)
 }
 
 pub(crate) fn copy_elements(s: &mut Session, p: Copy) -> Result<Value> {

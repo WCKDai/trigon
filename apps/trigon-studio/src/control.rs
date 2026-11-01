@@ -88,7 +88,7 @@ fn modifiers(p: &Value) -> egui::Modifiers {
     }
 }
 
-/// `ui.click {x, y, button?, double?, shift?…}` (window points) or `ui.key {key, command?, shift?…}`:
+/// `ui.click`, `ui.drag` (window points), or `ui.key`:
 /// the egui events a real click or key press makes.
 pub fn parse_input(method: &str, p: &Value) -> Result<Vec<egui::Event>, String> {
     let m = modifiers(p);
@@ -97,6 +97,33 @@ pub fn parse_input(method: &str, p: &Value) -> Result<Vec<egui::Event>, String> 
         let key = egui::Key::from_name(name).ok_or_else(|| format!("ui.key: unknown key {}", name.chars().take(32).collect::<String>()))?;
         let ev = |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: m };
         return Ok(vec![ev(true), ev(false)]);
+    }
+    if method == "ui.drag" {
+        let point = |key: &str| -> Result<egui::Pos2, String> {
+            let values = p
+                .get(key)
+                .and_then(Value::as_array)
+                .filter(|v| v.len() == 2)
+                .ok_or_else(|| format!("ui.drag: `{key}` must be [x,y] in window points"))?;
+            let coord = |v: &Value| v.as_f64().filter(|v| v.is_finite() && (0.0..=20_000.0).contains(v)).map(|v| v as f32);
+            match (coord(&values[0]), coord(&values[1])) {
+                (Some(x), Some(y)) => Ok(egui::pos2(x, y)),
+                _ => Err(format!("ui.drag: `{key}` coordinates must be between 0 and 20000")),
+            }
+        };
+        let from = point("from")?;
+        let to = point("to")?;
+        let steps = match p.get("steps") {
+            None => 8,
+            Some(v) => v.as_u64().filter(|n| (1..=60).contains(n)).ok_or("ui.drag: `steps` must be an integer from 1 to 60")? as usize,
+        };
+        let press = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: m };
+        let mut events = vec![egui::Event::PointerMoved(from), press(from, true)];
+        for step in 1..=steps {
+            events.push(egui::Event::PointerMoved(from + (to - from) * (step as f32 / steps as f32)));
+        }
+        events.push(press(to, false));
+        return Ok(events);
     }
     let coord = |k: &str| p.get(k).and_then(Value::as_f64).filter(|v| v.is_finite() && (0.0..=20_000.0).contains(v)).map(|v| v as f32);
     let (Some(x), Some(y)) = (coord("x"), coord("y")) else {
@@ -176,8 +203,11 @@ impl StudioApp {
                 let who = Who::Agent(self.agent_name(connection));
                 self.run(who, &id, p)
             }),
-            "ui.view" => self.ui_view(&params),
-            "ui.click" | "ui.key" => parse_input(&method, &params).and_then(|events| {
+            "ui.view" => self.ui_view(&params).map(|mut view| {
+                view["window_focused"] = json!(ctx.input(|i| i.viewport().focused));
+                view
+            }),
+            "ui.click" | "ui.key" | "ui.drag" => parse_input(&method, &params).and_then(|events| {
                 if self.synthetic.len() + events.len() > 4 * MAX_SYNTHETIC {
                     return Err("busy: earlier input is still being delivered; send it again shortly".into());
                 }
@@ -197,6 +227,12 @@ impl StudioApp {
                 };
                 let path = params.get("path").and_then(Value::as_str).map(str::to_string);
                 let raise = params.get("raise").and_then(Value::as_bool).unwrap_or(false);
+                // An unfocused window can still report itself as unoccluded. Honour explicit
+                // raising in that case too; handle drags intentionally cancel without focus.
+                if raise && matches!(target, ShotTarget::Window) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 // Answered once the view shows the latest change (serve_shots).
                 self.shots.push(Shot { responder, target, path, deadline: Instant::now() + SHOT_WAIT, requested: false, raise });
                 ctx.request_repaint();
@@ -283,6 +319,10 @@ impl StudioApp {
             },
             "model_box_m": self.scene.bounds,
             "window_hidden": self.window_hidden,
+            "viewport_window_points": self.viewport_rect.map(|r|[r.left(),r.top(),r.width(),r.height()]),
+            "handles": self.viewport_rect.map(|rect|self.projected_handles(rect).into_iter().filter_map(|handle|{
+                handle.mapping.screen(0.0).filter(|point|rect.contains(*point)).map(|point|json!({"key":handle.handle.key,"label":handle.handle.label,"point":[point.x,point.y],"value_mm":handle.handle.value}))
+            }).collect::<Vec<_>>()).unwrap_or_default(),
         })
     }
 
@@ -463,6 +503,27 @@ mod tests {
             ("ui.key", json!({"key": 5})),
         ] {
             assert!(parse_input(m, &bad).is_err(), "{m} {bad}");
+        }
+    }
+
+    #[test]
+    fn drag_input_is_complete_bounded_and_releases_at_the_last_position() {
+        let events = parse_input("ui.drag", &json!({"from":[10,20],"to":[110,220],"steps":4,"shift":true})).unwrap();
+        assert_eq!(events.len(), 7);
+        assert!(matches!(events[1],egui::Event::PointerButton{pos,pressed:true,modifiers,..} if pos==egui::pos2(10.0,20.0) && modifiers.shift));
+        assert!(matches!(events[5],egui::Event::PointerMoved(pos) if pos==egui::pos2(110.0,220.0)));
+        assert!(matches!(events[6],egui::Event::PointerButton{pos,pressed:false,..} if pos==egui::pos2(110.0,220.0)));
+        assert!(parse_input("ui.drag", &json!({"from":[0,0],"to":[20000,20000],"steps":60})).unwrap().len() <= MAX_SYNTHETIC);
+        for bad in [
+            json!({}),
+            json!({"from":[0,0],"to":[1]}),
+            json!({"from":[-1,0],"to":[1,1]}),
+            json!({"from":[0,0],"to":[f64::MAX,1]}),
+            json!({"from":[0,0],"to":[1,1],"steps":0}),
+            json!({"from":[0,0],"to":[1,1],"steps":61}),
+            json!({"from":[0,0],"to":[1,1],"steps":1.5}),
+        ] {
+            assert!(parse_input("ui.drag", &bad).is_err(), "{bad}");
         }
     }
 

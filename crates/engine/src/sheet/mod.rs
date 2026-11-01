@@ -286,11 +286,23 @@ pub(crate) struct Text {
     pub(crate) middle: bool,
     pub(crate) colour: Rgb,
     pub(crate) halo: Halo,
+    pub(crate) style: trigon_model::annotation::TextStyle,
 }
 
 impl Text {
     pub(crate) fn new(layer: Layer, at: [f64; 2], text: impl Into<String>, size: f64) -> Self {
-        Text { layer, at, text: text.into(), size, deg: 0.0, anchor: Anchor::Middle, middle: true, colour: LETTERING, halo: Halo::None }
+        Text {
+            layer,
+            at,
+            text: text.into(),
+            size,
+            deg: 0.0,
+            anchor: Anchor::Middle,
+            middle: true,
+            colour: LETTERING,
+            halo: Halo::None,
+            style: Default::default(),
+        }
     }
 }
 
@@ -305,11 +317,12 @@ pub(crate) enum Item {
 pub(crate) struct Scene {
     pub(crate) scale: f64,
     pub(crate) items: Vec<Item>,
+    pub(crate) element_regions: Vec<crate::views::DrawingElementRegion>,
 }
 
 impl Scene {
     pub(crate) fn new(scale: f64) -> Self {
-        Scene { scale, items: Vec::new() }
+        Scene { scale, items: Vec::new(), element_regions: Vec::new() }
     }
 
     pub(crate) fn polygon(&mut self, layer: Layer, rings: Vec<Vec<[f64; 2]>>, fill: Option<Fill>, stroke: Option<Stroke>) {
@@ -363,6 +376,15 @@ impl Scene {
     /// Keeps what lies inside `rect` (`[x0, y0, x1, y1]`): rings are clipped as areas, polylines as
     /// lines. Texts are kept as they are.
     pub(crate) fn clip(&mut self, rect: [f64; 4]) {
+        let [x0, y0, x1, y1] = rect.map(|v| v.clamp(-1e8, 1e8));
+        let clip = vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+        self.element_regions = self
+            .element_regions
+            .iter()
+            .flat_map(|region| {
+                cut::intersect_rings(&region.rings, &clip).into_iter().map(|rings| crate::views::DrawingElementRegion { rings, ..region.clone() })
+            })
+            .collect();
         let items = std::mem::take(&mut self.items);
         for item in items {
             match item {
