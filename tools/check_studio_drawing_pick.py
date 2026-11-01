@@ -2,8 +2,9 @@
 
 Open the drawing and arrange the editing mode first. For the wall-alignment regression, capture
 a reference wall, then check a nearby target within the reference's normal drag-handle radius.
-The check runs read-only view.pick, clicks the corresponding canvas point, and compares the
-native selection. It never discovers or connects to the owner's default Studio session.
+The check runs read-only view.pick with the canvas's ten-window-point tolerance, clicks the
+corresponding point, and compares native selection. It never discovers or connects to the
+owner's default Studio session.
 """
 
 import argparse
@@ -40,12 +41,18 @@ def main():
     before = ask('ui.view', {})
     if before['drawing'] != args.drawing or before['drawing_mapping'] is None:
         parser.error('open the requested drawing and let it finish rendering first')
+    mapping = before['drawing_mapping']
+    scale = mapping['points_per_mm']
+    if not math.isfinite(scale) or scale <= 0:
+        parser.error('the native drawing mapping must have a finite positive scale')
+    # Match PlanView::tolerance_mm. A fixed model-space tolerance can select a region
+    # while the native cursor correctly chooses a nearby boundary at the current zoom.
+    tolerance_mm = min(100_000.0, 10.0 / scale)
     hit = ask('command.run', {'command': 'view.pick', 'params': {
-        'id': args.drawing, 'point': args.point, 'tolerance_mm': 1,
+        'id': args.drawing, 'point': args.point, 'tolerance_mm': tolerance_mm,
         'phase': before['phase'], 'filter': before['filter']}})['hit']
     if hit is None or hit['id'] != args.expected_id:
         raise RuntimeError('the exact drawing query does not identify the expected test element')
-    mapping = before['drawing_mapping']
     screen = [mapping['origin'][0] + args.point[0] * mapping['points_per_mm'],
               mapping['origin'][1] - args.point[1] * mapping['points_per_mm']]
     x, y, width, height = mapping['viewport']
@@ -61,6 +68,7 @@ def main():
     report = {'expected_id': args.expected_id, 'query_id': hit['id'],
               'selection_before': before['selection'], 'selection_after': after['selection'],
               'drawing_point_mm': args.point, 'window_point': screen, 'handles_before': before['handles'],
+              'native_tolerance_mm': tolerance_mm,
               'passed': after['selection'] == args.expected_id,
               'scope': 'Native selection consistency; frame pacing and GPU upload cost are not measured.'}
     (args.out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
