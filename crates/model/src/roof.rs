@@ -1,7 +1,7 @@
 //! Roofs. A pitched roof is the straight skeleton of the outline lifted at one pitch: every wall
 //! edge carries one roof face rising inward from the eaves. Gable edges (where a wing meets a
-//! neighbour, or a gable end) keep their wall: the skeleton nodes of their face are slid onto the
-//! edge, so the ridge runs out to the gable and the face turns into a vertical gable triangle.
+//! neighbour, or a gable end) keep their wall: the skeleton nodes meet that edge at the
+//! intersection of the adjoining roof planes, preserving their pitch on oblique gables too.
 
 pub mod drainage;
 
@@ -226,28 +226,77 @@ pub fn pitched(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edges: &[
     }
     let sk = skeleton(outline)?;
     let n = outline.len();
+    if sk.faces.len() != n || sk.vertices.len() < n {
+        return Err(ModelError::Invalid("roof skeleton does not match its outline".into()));
+    }
     let mut verts = sk.vertices.clone();
-    let max_depth = verts.iter().map(|v| v[2]).fold(0.0, f64::max);
     for &e in gable_edges {
-        let (Some(a), Some(b), Some(face)) = (outline.get(e), outline.get((e + 1) % n), sk.faces.get(e)) else {
+        if e >= n {
             return Err(ModelError::Invalid(format!("gable edge {e} doesn't exist")));
-        };
-        let d = [b[0] - a[0], b[1] - a[1]];
-        let l2 = d[0] * d[0] + d[1] * d[1];
-        if !(l2 > 1.0) {
-            continue;
-        }
-        for &vi in &face.vertices {
-            if vi < n {
-                continue;
-            }
-            if let Some(v) = verts.get_mut(vi) {
-                let t = (((v[0] - a[0]) * d[0] + (v[1] - a[1]) * d[1]) / l2).clamp(0.0, 1.0);
-                v[0] = a[0] + t * d[0];
-                v[1] = a[1] + t * d[1];
-            }
         }
     }
+    if !gable_edges.is_empty() {
+        let mut incident = vec![Vec::new(); verts.len()];
+        for (edge, face) in sk.faces.iter().enumerate() {
+            for &vertex in &face.vertices {
+                if let Some(edges) = incident.get_mut(vertex) {
+                    edges.push(edge);
+                }
+            }
+        }
+        let planes: Vec<_> = outline
+            .iter()
+            .zip(outline.iter().cycle().skip(1))
+            .take(n)
+            .map(|(a, b)| {
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let length = dx.hypot(dy);
+                let normal = [-dy / length, dx / length];
+                (normal, normal[0] * a[0] + normal[1] * a[1])
+            })
+            .collect();
+        for (vertex, edges) in verts.iter_mut().zip(&incident).skip(n) {
+            let gables: Vec<_> = edges.iter().copied().filter(|e| gable_edges.contains(e)).collect();
+            let Some(&gable) = gables.first() else { continue };
+            let slopes: Vec<_> = edges.iter().copied().filter(|e| !gable_edges.contains(e)).collect();
+            let Some(&slope) = slopes.first() else {
+                return Err(ModelError::Invalid("gable layout leaves no adjoining roof plane".into()));
+            };
+            let (a, c) = planes[gable];
+            let (normal, constant) = planes[slope];
+            let (b, d) = if let Some(&second) = slopes.get(1) {
+                // Equal signed distance to two eave lines defines their ridge/valley.
+                let (other, value) = planes[second];
+                ([normal[0] - other[0], normal[1] - other[1]], constant - value)
+            } else if let Some(&second) = gables.get(1) {
+                planes[second]
+            } else {
+                // A degree-two skeleton station retains its distance to the sole slope.
+                (normal, constant + vertex[2])
+            };
+            let det = a[0] * b[1] - a[1] * b[0];
+            if !det.is_finite() || det.abs() < 1e-10 {
+                return Err(ModelError::Invalid("gable layout has no stable intersection with its adjoining roof planes".into()));
+            }
+            let x = (c * b[1] - a[1] * d) / det;
+            let y = (a[0] * d - c * b[0]) / det;
+            let depth = normal[0] * x + normal[1] * y - constant;
+            if !x.is_finite() || !y.is_finite() || !depth.is_finite() || depth < -1e-6 {
+                return Err(ModelError::Invalid("gable intersection lies below its eaves".into()));
+            }
+            for &edge in edges {
+                let (normal, constant) = planes[edge];
+                let expected = if gable_edges.contains(&edge) { 0. } else { depth };
+                if (normal[0] * x + normal[1] * y - constant - expected).abs() > 1e-5 {
+                    return Err(ModelError::Invalid(
+                        "gable layout needs a different roof topology; adjoining roof planes cannot meet at one node".into(),
+                    ));
+                }
+            }
+            *vertex = [x, y, depth.max(0.)];
+        }
+    }
+    let max_depth = verts.iter().map(|v| v[2]).fold(0.0, f64::max);
     let rise = pitch_deg.to_radians().tan();
     let z = |v: &[f64; 3]| eaves + rise * v[2];
     let mut roof = PitchedRoof { max_depth, ..Default::default() };
@@ -415,6 +464,41 @@ mod tests {
         assert!(at_ends.iter().any(|x| x.abs() < 1.0) && at_ends.iter().any(|x| (x - 30000.0).abs() < 1.0), "{at_ends:?}");
         // The gable triangles stand in the end walls' planes.
         assert!(r.gables.positions.iter().all(|p| p[0].abs() < 1.0 || (p[0] - 30000.0).abs() < 1.0));
+    }
+
+    #[test]
+    fn skew_gable_ends_preserve_the_adjoining_roof_planes() {
+        // The two long eaves stay parallel; the gables are deliberately oblique.
+        // Moving a hip node perpendicular to a gable while retaining its old height
+        // takes it out of the adjoining roof planes and creates artificial creases.
+        let outline = [[0., 0.], [30000., 0.], [32000., 9000.], [-600., 9000.]];
+        let eaves = 10000.;
+        let pitch: f64 = 46.;
+        let roof = pitched(&outline, eaves, pitch, &[1, 3]).unwrap();
+        for p in &roof.cover.positions {
+            let expected = eaves + p[1].min(9000. - p[1]) * pitch.to_radians().tan();
+            assert!((p[2] - expected).abs() < 1e-6, "skew gable warped the roof at {p:?}: expected {expected}");
+        }
+        assert!((roof.ridge - (eaves + 4500. * pitch.to_radians().tan())).abs() < 1e-6);
+    }
+
+    #[test]
+    fn skew_gable_buildup_preserves_pitch_after_rotation_and_translation() {
+        let source = [[0., 0.], [30000., 0.], [32000., 9000.], [-600., 9000.]];
+        let (sin, cos) = 31_f64.to_radians().sin_cos();
+        let outline = source.map(|[x, y]| [14000. + x * cos - y * sin, -7000. + x * sin + y * cos]);
+        let eaves = 10000.;
+        let pitch = 46_f64.to_radians();
+        let buildup = Buildup { overhang: 180., verge: 80., thickness: 200., gutters: true };
+        let roof = pitched_with(&outline, eaves, pitch.to_degrees(), &[1, 3], &buildup).unwrap();
+        let lift = buildup.thickness / pitch.cos();
+        for p in &roof.cover.positions {
+            let y = -(p[0] - 14000.) * sin + (p[1] + 7000.) * cos;
+            let soffit = eaves + y.min(9000. - y) * pitch.tan();
+            assert!((p[2] - soffit).abs() < 1e-5 || (p[2] - soffit - lift).abs() < 1e-5, "built-up roof warped at {p:?}");
+        }
+        assert!((roof.ridge - (eaves + 4500. * pitch.tan() + lift)).abs() < 1e-5);
+        assert_eq!(roof, pitched_with(&outline, eaves, pitch.to_degrees(), &[3, 1], &buildup).unwrap(), "gable input order cannot change geometry");
     }
 
     #[test]

@@ -429,6 +429,31 @@ mod tests {
     }
 
     #[test]
+    fn repeated_dormers_on_a_skew_gabled_roof_keep_a_closed_continuous_host() {
+        let mut doc = Document::default();
+        let mut building = Building::new("b", "Skew gable fixture", &[[0., 0.], [30000., 0.], [32000., 9000.], [-600., 9000.]], 3, 3400.).unwrap();
+        let dormers: Vec<_> = [3000, 10000, 20000, 28000]
+            .into_iter()
+            .map(|u| serde_json::json!({"id":format!("d-{u}"),"facade":"b.f1","u_mm":u,"window_type":"window.casement.2","width_mm":1000,"height_mm":1000}))
+            .collect();
+        building.roof = serde_json::from_value(serde_json::json!({
+            "kind":"pitched","pitch_deg":46,"gables":["b.f2","b.f4"],"thickness_mm":220,"overhang_mm":180,"dormers":dormers
+        }))
+        .unwrap();
+        doc.buildings.push(building);
+        let built = crate::build(&doc).unwrap();
+        let roof = built[0].roof.as_ref().unwrap();
+        assert_eq!(roof.dormers.len(), 4);
+        closed(&roof.cover);
+        for dormer in &roof.dormers {
+            closed(&dormer.roof);
+            closed(&dormer.cheeks);
+            assert_eq!(dormer.front.openings[0].fill.width, 1000.);
+        }
+        assert_eq!(built, crate::build(&doc).unwrap());
+    }
+
+    #[test]
     fn repeated_dormers_on_opposite_faces_keep_the_host_shell_closed_and_deterministic() {
         let mut doc = Document::default();
         doc.types.extend(crate::component::copenhagen_types());
