@@ -68,6 +68,12 @@ phase-visible site footprints in the ground plan. Explicit regions retain their 
 do not enter window/door or room schedules. This is a flat site vocabulary, without surveyed
 terrain, site boundary assertions, grading, species data, collision analysis or accessibility checks.
 
+Saved ground plans with an explicit view range instead cut/project the actual site meshes within
+that height interval, retaining their source IDs for picking. Demolished site meshes form a red
+overlay in demolition/all views and do not occlude retained geometry. Editing a site's lifetime
+can hide it from the current view; the command still returns its stable source ID and supports
+exact Undo. Upper-storey ranged plans omit site objects, matching the ordinary plan convention.
+
 Positions and resulting extents must be finite, within 100 km of the site origin horizontally
 and -50–500 m vertically. Simple ground polygons require 3–256 vertices, 0.01–1,000,000 m² area,
 1 mm minimum edges and 10–1000 mm thickness. Crossing/touching edges are rejected, never cleaned

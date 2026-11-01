@@ -867,12 +867,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
     for (index, p) in prims.iter().enumerate() {
         if let Prim::Site { pts, fill } = p {
             let points: Vec<_> = pts.iter().map(|p| f.rot(*p)).collect();
-            sc.polygon(
-                Layer::Ground,
-                vec![points.clone()],
-                Some(Fill::Solid(*fill)),
-                Some(Stroke { pen: 0.18, colour: [80, 85, 75], dashed: false }),
-            );
+            sc.polygon(Layer::Ground, vec![points.clone()], Some(Fill::Solid(*fill)), Some(Stroke { colour: [80, 85, 75], ..Stroke::new(0.18) }));
             if let Some(element) = elements.get(&index) {
                 let sources: Vec<_> = (0..points.len()).map(|i| element.segment([points[i], points[(i + 1) % points.len()]])).collect();
                 sc.attribute_last(&sources);
@@ -918,7 +913,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         };
         for shape in trigon_model::footprint::union(&polys)? {
             let rings = shape.iter().map(|ring| ring.iter().map(|p| f.rot(*p)).collect()).collect();
-            sc.polygon(layer, rings, Some(fill), Some(Stroke { pen, colour: [0x33, 0x33, 0x33], dashed: false }));
+            sc.polygon(layer, rings, Some(fill), Some(Stroke { pen, colour: [0x33, 0x33, 0x33], dashed: false, ..Stroke::new(pen) }));
             sc.attribute_last(&sources);
         }
     }
@@ -934,7 +929,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
             Prim::Poly { .. } | Prim::Site { .. } => {}
             Prim::StairLine { a, b, width, dashed } => {
                 let pen = if *width >= 14.0 { 0.18 } else { 0.13 };
-                sc.line(Layer::Stair, f.rot(*a), f.rot(*b), Stroke { pen, colour: [0x33; 3], dashed: *dashed });
+                sc.line(Layer::Stair, f.rot(*a), f.rot(*b), Stroke { pen, colour: [0x33; 3], dashed: *dashed, ..Stroke::new(pen) });
                 if let Some(element) = elements.get(&index) {
                     sc.attribute_last(&[element.segment([f.rot(*a), f.rot(*b)])]);
                 }
@@ -948,7 +943,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                 } else {
                     0.13
                 };
-                sc.line(line_layer(doc, *width, *a, *b), f.rot(*a), f.rot(*b), Stroke { pen, colour, dashed: *dashed });
+                sc.line(line_layer(doc, *width, *a, *b), f.rot(*a), f.rot(*b), Stroke { pen, colour, dashed: *dashed, ..Stroke::new(pen) });
                 if let Some(element) = elements.get(&index) {
                     sc.attribute_last(&[element.segment([f.rot(*a), f.rot(*b)])]);
                 }

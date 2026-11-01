@@ -141,6 +141,7 @@ pub struct StudioApp {
     drafting: Drafting,
     pub(crate) phase: usize,
     pub(crate) filter: PhaseFilter,
+    pub(crate) phase_colors: bool,
     pub(crate) camera: Orbit,
     fit_pending: bool,
     pub(crate) render_state: Option<eframe::egui_wgpu::RenderState>,
@@ -238,6 +239,7 @@ impl StudioApp {
             drafting: Drafting::default(),
             phase: 0,
             filter: PhaseFilter::Complete,
+            phase_colors: false,
             camera: Orbit::default(),
             fit_pending: true,
             viewport: render_state.as_ref().map(|rs| Viewport3d::new(&rs.device, &rs.adapter)),
@@ -371,6 +373,7 @@ impl StudioApp {
             doc: Arc::new(self.session.doc.clone()),
             view: self.view(),
             want_scene: true,
+            phase_colors: self.phase_colors,
             drawing,
         });
     }
@@ -384,6 +387,7 @@ impl StudioApp {
             doc: Arc::new(self.session.doc.clone()),
             view: self.view(),
             want_scene: false,
+            phase_colors: self.phase_colors,
             drawing: self.drawing_request(),
         });
     }
@@ -689,8 +693,7 @@ impl StudioApp {
     fn app_bar(&mut self, ui: &mut egui::Ui) {
         let wide = ui.available_width() > 1100.0;
         ui.horizontal(|ui| {
-            theme::mark(ui, 32.0);
-            ui.label(egui::RichText::new("TRIGON").size(19.0).strong());
+            theme::wordmark(ui);
             ui.label(egui::RichText::new("STUDIO").monospace().size(12.0).color(theme::MUTED));
             ui.separator();
             let project = self.session.doc.buildings.first().map(|b| b.name.clone()).unwrap_or_else(|| "Untitled project".into());
@@ -766,7 +769,7 @@ impl StudioApp {
         ui.horizontal_wrapped(|ui| {
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(180.0));
-            let before = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone());
+            let before = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone(), self.phase_colors);
             ui.selectable_value(&mut self.mode, Mode::ThreeD, "3D");
             ui.selectable_value(&mut self.mode, Mode::Plan, "Plan");
             if ui.add_enabled(!self.session.doc.views.is_empty(), egui::Button::selectable(self.mode == Mode::Drawing, "Drawing")).clicked() {
@@ -818,6 +821,16 @@ impl StudioApp {
                     }
                 });
             }
+            if self.mode == Mode::ThreeD {
+                egui::ComboBox::from_id_salt("appearance")
+                    .selected_text(if self.phase_colors { "Phase colors" } else { "Materials" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.phase_colors, false, "Materials");
+                        ui.selectable_value(&mut self.phase_colors, true, "Phase colors");
+                    })
+                    .response
+                    .on_hover_text("Materials show actual finishes. Phase colors highlight new work. Phase visibility and status are independent.");
+            }
             if ui.button("Fit").on_hover_text("Frame the whole model (F)").clicked() {
                 self.fit();
             }
@@ -838,13 +851,13 @@ impl StudioApp {
                     ui.weak("Window & door inventory · select a row to edit in Properties");
                 }
             }
-            let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone());
+            let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone(), self.phase_colors);
             if before != after {
                 if before.5 != after.5 {
                     self.plan.fit();
                     self.drafting.picking = None;
                 }
-                self.view_changed(before.3 != after.3 || before.4 != after.4);
+                self.view_changed(before.3 != after.3 || before.4 != after.4 || before.6 != after.6);
             }
         });
     }
@@ -1101,7 +1114,9 @@ impl StudioApp {
             return;
         }
         if self.authoring.tab == Tab::Families {
-            self.authoring.library(ui, &self.session.doc);
+            if let Some(run) = self.authoring.library(ui, &self.session.doc) {
+                let _ = self.run(Who::Owner, run.command, run.params);
+            }
             return;
         }
         theme::eyebrow(ui, "PROJECT BROWSER");
@@ -1430,7 +1445,17 @@ impl StudioApp {
             }
             if let Some(p) = response.hover_pos() {
                 let snap = (!ui.input(|i| i.modifiers.alt)).then(|| self.drafting.options());
-                if let Some((point, snapped)) = self.plan.cursor(rect, p, snap) {
+                let settings = self.drafting.alignment_options(&self.session.doc, &self.drawing);
+                let alignment = (picking && self.drafting.alignment).then_some(&settings);
+                if let Some((point, aligned)) = self.plan.aligned_cursor(rect, p, snap, alignment) {
+                    let snapped = aligned.as_ref().map(|a| a.snap);
+                    if picking && let Some(aligned) = &aligned {
+                        for guide in &aligned.guides {
+                            if let (Some(a), Some(b)) = (self.plan.model_to_screen(rect, guide[0]), self.plan.model_to_screen(rect, guide[1])) {
+                                painter.line_segment([a, b], egui::Stroke::new(0.8, theme::ACCENT.gamma_multiply(0.6)));
+                            }
+                        }
+                    }
                     if picking {
                         response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
                         if let Some(at) = self.plan.model_to_screen(rect, point) {
@@ -1666,7 +1691,7 @@ impl eframe::App for StudioApp {
         egui::Panel::left("project-browser").resizable(true).default_size(235.0).min_size(180.0).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("project-scroll").show(ui, |ui| self.project_browser(ui));
         });
-        egui::Panel::right("side").resizable(true).default_size(330.0).min_size(280.0).show(ui, |ui| {
+        egui::Panel::right("side").resizable(true).default_size(350.0).min_size(300.0).show(ui, |ui| {
             egui::Panel::bottom("activity-panel").resizable(true).default_size(170.0).min_size(80.0).show(ui, |ui| {
                 if let Some(a) = self.feed.ui(ui, true, true) {
                     self.undo_redo(a);
@@ -1736,6 +1761,7 @@ mod tests {
             doc: Arc::new(app.session.doc.clone()),
             view: app.view(),
             want_scene: true,
+            phase_colors: app.phase_colors,
             drawing: None,
         })
     }
@@ -1903,6 +1929,7 @@ mod tests {
                 doc: Arc::new(app.session.doc.clone()),
                 view: app.view(),
                 want_scene: false,
+                phase_colors: app.phase_colors,
                 drawing: app.drawing_request(),
             }));
             if !pending {

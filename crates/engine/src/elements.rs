@@ -600,7 +600,9 @@ pub(crate) fn set(session: &mut Session, params: Set) -> Result<Value> {
     let descriptors = records(&candidate, &built, view)?;
     let target = if matches!(selected.source, Source::Placement(..)) && descriptors.iter().any(|r| r.data["id"] == params.id) {
         params.id
-    } else if descriptors.iter().any(|r| r.data["id"] == target) {
+    } else if descriptors.iter().any(|r| r.data["id"] == target) || matches!(selected.source, Source::Site(_)) {
+        // A site source keeps its exact ID even when a valid lifetime edit hides it in this view.
+        // site::apply has validated the complete source list before reaching this branch.
         target
     } else {
         descriptors

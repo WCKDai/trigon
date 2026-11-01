@@ -72,8 +72,19 @@ pub(crate) fn sheet(frame: &Frame<'_>, scene: &Scene, vp: &Viewport, clip: [f64;
 }
 
 fn stroke_attrs(s: &Stroke, cap: &str) -> String {
-    let dash = if s.dashed { format!(r#" stroke-dasharray="{:.2} {:.2}""#, px(2.0), px(1.0)) } else { String::new() };
-    let cap = if s.dashed { "butt" } else { cap };
+    use trigon_model::annotation::LinePattern;
+    let pattern = s.pattern();
+    let dash = match pattern {
+        LinePattern::Solid => String::new(),
+        LinePattern::Dashed => format!(r#" stroke-dasharray="{:.2} {:.2}""#, px(2.0), px(1.0)),
+        LinePattern::Dotted => format!(r#" stroke-dasharray="0 {:.2}""#, px(1.0)),
+        LinePattern::DashDot => format!(r#" stroke-dasharray="{:.2} {:.2} 0 {:.2}""#, px(2.0), px(1.0), px(1.0)),
+    };
+    let cap = match pattern {
+        LinePattern::Solid => cap,
+        LinePattern::Dashed => "butt",
+        _ => "round",
+    };
     format!(r#"stroke="{}" stroke-width="{:.3}" stroke-linecap="{cap}" stroke-linejoin="round"{dash}"#, hex(s.colour), px(s.pen))
 }
 
