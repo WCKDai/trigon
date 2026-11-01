@@ -33,6 +33,32 @@ Projection chooses boundary-line frames in stable welded-edge order. This avoids
 variation crossing an SVG rounding boundary. The legacy public SVG/DXF fingerprints remain
 unchanged; do not relax byte comparisons when a larger model reveals an ordering defect.
 
+Large mesh groups also use a spatial tree to find candidate source edges for picking ownership.
+Groups below 1,024 source edges retain the linear path. Larger groups query conservative 3D
+bounds, then run the unchanged 0.1 mm overlap predicate in original source order. This avoids
+comparing every roof-course edge with every triangle edge while retaining exact geometry and
+ownership records. Differential tests compare exact strokes, owners, planes and near-cut regions,
+the existing exporter-normalized face contours and SVG/DXF bytes with the linear reference,
+including joined sources; a separate candidate-count check guards
+against returning an entire detailed surface for a local query.
+
+The cheap overlap rejection wrapper carries an inline hint: profiling the final 2D stroke
+attribution exposed out-of-line predicate cost after projection changed. Benchmark both paths
+on existing plans, facades and sections as well as dense roofs; faster projection alone does
+not prove that complete drawing generation improved.
+
+Check a saved detailed facade against a local time budget with:
+
+```sh
+python3 tools/check_drawing_latency.py --cli target/release/trigon \
+  --doc path/to/local-project.trigon --view detailed-facade \
+  --out out/facade-latency --limit-s 30
+```
+
+This records command/input/output hashes, elapsed time, completion or timeout and logs. A timeout
+is a failed check; use a new output directory for each binary. The source and executable must
+remain unchanged. Keep this machine-dependent latency budget separate from frame-pacing claims.
+
 ## Studio 3D outlines
 
 Studio resolves collinear unmatched triangle sides as intervals before classifying borders and

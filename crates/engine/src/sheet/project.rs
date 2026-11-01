@@ -15,6 +15,11 @@ use super::cut::{self, Ring, Shape};
 use super::{Element, overlap};
 use crate::views::{DrawingElementRegion, DrawingElementSegment};
 
+mod ownership;
+use ownership::EdgeIndex;
+
+const MIN_INDEX_EDGES: usize = 1024;
+
 /// How a view looks at the model: drawing x along `t`, drawing y up (model z), depth along `d`
 /// (into the drawing, away from the viewer). `t` and `d` are horizontal unit vectors.
 #[derive(Clone, Copy, Debug)]
@@ -494,6 +499,10 @@ fn caps(shapes: &[Shape], depth: f64, occ: &mut Vec<Occluder>) {
 /// Projects `sources` seen through `look`, keeping depths in `range`; `near` says what happens
 /// at the near limit.
 pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), near: Near<'_>) -> Projection {
+    project_with_index::<true>(sources, look, range, near)
+}
+
+fn project_with_index<const INDEXED: bool>(sources: &[Source<'_>], look: &Look, range: (f64, f64), near: Near<'_>) -> Projection {
     let mut groups: Vec<usize> = sources.iter().map(|s| s.group).collect();
     groups.sort_unstable();
     groups.dedup();
@@ -561,14 +570,19 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                 }
             }
         }
-        let attribution = |start: P3, end: P3| {
-            owned_edges
-                .iter()
-                .filter_map(|(index, source)| {
-                    let element = sources.get(*index)?.element.as_ref()?;
-                    overlap([start, end], *source, 0.1).map(|segment| element.segment(segment.map(|point| [point[0], point[1]])))
-                })
-                .collect::<Vec<_>>()
+        let ownership = (INDEXED && owned_edges.len() >= MIN_INDEX_EDGES).then(|| EdgeIndex::new(&owned_edges));
+        let mut owned_candidates = Vec::new();
+        let mut attribution = |start: P3, end: P3| {
+            let exact = |(index, source): &(usize, [P3; 2])| {
+                let element = sources.get(*index)?.element.as_ref()?;
+                overlap([start, end], *source, 0.1).map(|segment| element.segment(segment.map(|point| [point[0], point[1]])))
+            };
+            if let Some(index) = &ownership {
+                index.query([start, end], &mut owned_candidates);
+                owned_candidates.iter().filter_map(|&k| owned_edges.get(k).and_then(exact)).collect::<Vec<_>>()
+            } else {
+                owned_edges.iter().filter_map(exact).collect::<Vec<_>>()
+            }
         };
         lines.extend(feature_edges(&tris, &weld.points).into_iter().map(|(start, end, class)| (start, end, class, attribution(start, end))));
         if !near_segs.is_empty() {
@@ -791,6 +805,28 @@ mod tests {
         edges.iter().map(|e| (e.b[0] - e.a[0]).hypot(e.b[1] - e.a[1])).sum()
     }
 
+    fn export_faces(projection: &Projection) -> Vec<Face> {
+        // faces() enumerates HashMap boundary segments, so a raw ring has no fixed cycle
+        // origin. Match style::fills' existing writer normalization without changing any
+        // coordinates, face order, depth, plane, class or semantic owner.
+        projection.faces.iter().map(|face| Face { rings: cut::even_odd(&face.rings).into_iter().flatten().collect(), ..face.clone() }).collect()
+    }
+
+    #[test]
+    fn linear_face_contour_cycles_normalize_to_identical_export_shapes() {
+        let mesh = cuboid([0.0, 0.0, 0.0], [1000.0, 400.0, 2000.0]);
+        let sources = [Source { mesh: &mesh, class: Class::Wall, group: 0, element: None }];
+        let baseline = project_with_index::<false>(&sources, &north(), (-1e5, 1e5), Near::Cut);
+        let expected = format!("{:?}", export_faces(&baseline));
+        let mut raw = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let p = project_with_index::<false>(&sources, &north(), (-1e5, 1e5), Near::Cut);
+            raw.insert(format!("{:?}", p.faces));
+            assert_eq!(format!("{:?}", export_faces(&p)), expected);
+        }
+        eprintln!("Linear-reference raw contour variants across 32 repetitions: {}", raw.len());
+    }
+
     #[test]
     fn a_box_shows_its_outline_and_no_diagonals() {
         let m = cuboid([0.0, 0.0, 0.0], [4000.0, 3000.0, 2000.0]);
@@ -802,6 +838,66 @@ mod tests {
         assert!((total(&p.edges) - 12_000.0).abs() < 1.0, "{}", total(&p.edges));
         assert_eq!(p.faces.len(), 2, "front and back face, back first");
         assert!(p.faces[0].depth > p.faces[1].depth);
+    }
+
+    #[test]
+    fn indexed_large_groups_preserve_full_projection_and_exact_ownership() {
+        let mut meshes = [Mesh::default(), Mesh::default()];
+        for row in 0..12 {
+            for column in 0..12 {
+                let x = f64::from(column) * 220.0;
+                let z = f64::from(row) * 180.0;
+                let depth = f64::from(row % 3) * 40.0;
+                meshes[(row + column) as usize % 2].append(&cuboid([x, depth, z], [x + 180.0, depth + 20.0, z + 130.0]));
+            }
+        }
+        // Touching coplanar pieces join into longer lines with multiple source owners.
+        meshes[0].append(&cuboid([0.0, 200.0, 3000.0], [200.0, 220.0, 3200.0]));
+        meshes[1].append(&cuboid([200.0, 200.0, 3000.0], [400.0, 220.0, 3200.0]));
+        let sources = [
+            Source { mesh: &meshes[0], class: Class::Roof, group: 0, element: Some(Element::new("roof-a", crate::DrawingElementKind::Roof)) },
+            Source { mesh: &meshes[1], class: Class::Roof, group: 0, element: Some(Element::new("roof-b", crate::DrawingElementKind::Roof)) },
+        ];
+        assert!(sources.iter().map(|s| 3 * s.mesh.triangles.len()).sum::<usize>() >= MIN_INDEX_EDGES);
+        for angle in [0.0_f64, 0.31] {
+            let look = Look { origin: [0.0; 2], t: [angle.cos(), angle.sin()], d: [-angle.sin(), angle.cos()] };
+            for near_depth in [-1000.0, 30.0] {
+                let indexed = project_with_index::<true>(&sources, &look, (near_depth, 5000.0), Near::Cut);
+                let linear = project_with_index::<false>(&sources, &look, (near_depth, 5000.0), Near::Cut);
+                assert!(!indexed.edges.is_empty());
+                assert!(indexed.edges.iter().any(|e| !e.element_segments.is_empty()));
+                // Compare every coordinate, plane, class, outline and ownership segment,
+                // including ordering and duplicate records, without flooding failure logs.
+                assert_eq!(indexed.triangles, linear.triangles);
+                assert_eq!(indexed.edges.len(), linear.edges.len());
+                assert_eq!(indexed.faces.len(), linear.faces.len());
+                for (i, (a, b)) in indexed.edges.iter().zip(&linear.edges).enumerate() {
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "edge {i}, angle {angle}, near {near_depth}");
+                }
+                for (i, (a, b)) in export_faces(&indexed).iter().zip(export_faces(&linear)).enumerate() {
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "face {i}, angle {angle}, near {near_depth}");
+                }
+                assert_eq!(format!("{:?}", indexed.element_regions), format!("{:?}", linear.element_regions));
+                let render = |p: &Projection| {
+                    let mut scene = super::super::Scene::new(100.0);
+                    super::super::style::fills(&mut scene, p);
+                    super::super::style::edges(&mut scene, p);
+                    let vp = super::super::Viewport { x0: -200.0, y1: 2400.0, mm: 2.0 };
+                    let svg = super::super::svg::sheet(
+                        &super::super::svg::Frame { title: "Ownership regression", project: "Original fixture", caption: "", footer: "", note: None },
+                        &scene,
+                        &vp,
+                        [0.0, 0.0, 1600.0, 900.0],
+                    );
+                    let dxf = super::super::dxf::write(
+                        &scene,
+                        &super::super::dxf::TitleBlock { title: "Ownership regression", project: "Original fixture", caption: "", note: None },
+                    );
+                    (svg, dxf)
+                };
+                assert_eq!(render(&indexed), render(&linear), "export bytes must remain exact");
+            }
+        }
     }
 
     #[test]

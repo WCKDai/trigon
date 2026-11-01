@@ -28,10 +28,12 @@ impl Element {
     }
 }
 
+#[inline]
 pub(crate) fn overlap<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; DIM]; 2], epsilon: f64) -> Option<[[f64; DIM]; 2]> {
     // Most ownership candidates are on unrelated parts of the drawing. Reject disjoint bounds
     // before doing the exact collinearity/interval arithmetic. Include its perpendicular
-    // tolerance and a few ULPs at the existing 1e8 mm coordinate limit.
+    // tolerance and a few ULPs at the existing 1e8 mm coordinate limit. Keep this cheap
+    // rejection inline in the many ownership-attribution loops; the exact predicate is below.
     let pad = epsilon.abs() + 1e-7;
     if (0..DIM).any(|axis| {
         drawn[0][axis].min(drawn[1][axis]) > source[0][axis].max(source[1][axis]) + pad
