@@ -181,6 +181,48 @@ fn export(document: &Document, built: &[Built]) -> String {
 }
 
 #[test]
+fn dormer_roof_and_cheeks_have_external_common_properties_and_zinc_materials() {
+    let mut document = Document::default();
+    let mut building =
+        trigon_model::Building::new("dormer", "Synthetic", &[[0., 0.], [24000., 0.], [24000., 12000.], [0., 12000.]], 1, 3000.).unwrap();
+    building.roof = serde_json::from_value(serde_json::json!({
+        "kind":"pitched","pitch_deg":46,"thickness_mm":220,"overhang_mm":180,
+        "dormers":[{"id":"test","facade":"dormer.f1","u_mm":12000,
+            "window_type":"window.casement.2","width_mm":1100,"height_mm":1200}]
+    }))
+    .unwrap();
+    document.buildings.push(building);
+    let built = trigon_model::build(&document).unwrap();
+    let text = export(&document, &built);
+    let records = entities(&text);
+    let dormers = &built[0].roof.as_ref().unwrap().dormers;
+    assert_eq!(dormers.len(), 1);
+    for (suffix, kind, pset_name) in [("roof", "IFCROOF", "'Pset_RoofCommon'"), ("cheeks", "IFCCOVERING", "'Pset_CoveringCommon'")] {
+        let guid = gid(&format!("{}.{}", dormers[0].id, suffix));
+        let (&id, product) = records.iter().find(|(_, entity)| entity.kind == kind && entity.attributes[0] == guid).unwrap();
+        assert!(product.attributes[6].starts_with('#'), "the product must retain represented geometry");
+        let materials: Vec<_> =
+            records.values().filter(|e| e.kind == "IFCRELASSOCIATESMATERIAL" && references(e.attributes[4]).contains(&id)).collect();
+        assert_eq!(materials.len(), 1, "each dormer product needs a semantic material association");
+        let material = &records[&reference(materials[0].attributes[5])];
+        assert_eq!(material.kind, "IFCMATERIAL");
+        assert_eq!(material.attributes[0], super::super::part21::string(super::super::catalog::ZINC.name));
+        let common = records
+            .values()
+            .filter(|e| e.kind == "IFCRELDEFINESBYPROPERTIES" && references(e.attributes[4]).contains(&id))
+            .map(|e| &records[&reference(e.attributes[5])])
+            .find(|e| e.kind == "IFCPROPERTYSET" && e.attributes[2] == pset_name)
+            .expect("dormer product needs its class's common property set");
+        assert!(
+            references(common.attributes[4])
+                .iter()
+                .map(|id| &records[id])
+                .any(|e| e.kind == "IFCPROPERTYSINGLEVALUE" && e.attributes[0] == "'IsExternal'" && e.attributes[2] == "IFCBOOLEAN(.T.)")
+        );
+    }
+}
+
+#[test]
 fn fill_base_quantities_use_occurrence_sizes_and_project_units() {
     let mut document = sample::document().unwrap();
     let placement = document.buildings[0].facades[3].placements.iter_mut().find(|placement| placement.type_id == "window.fixed").unwrap();

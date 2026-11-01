@@ -212,6 +212,9 @@ impl Ifc<'_> {
                         string(&key)
                     ))
                 };
+                let common = if suffix == "roof" { "Pset_RoofCommon" } else { "Pset_CoveringCommon" };
+                self.common(common, id, &key, None, vec![("IsExternal", Val::Bool(true))]);
+                self.made_of(id, catalog::ZINC);
                 fl.contain(top, id);
             }
         }
