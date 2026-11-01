@@ -515,9 +515,9 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
         }
         if let Some(roof) = &model.roof {
             result.push(roof_record(building, bi, &roof.id, None)?);
-            if let trigon_model::Roof::Mansard { parameters } = &building.roof {
+            {
                 for (di, d) in roof.dormers.iter().enumerate() {
-                    let Some(spec) = parameters.dormers.get(di) else { continue };
+                    let Some(spec) = building.roof.dormers().get(di) else { continue };
                     let properties = vec![
                         number("width_mm", "Dormer window width", spec.width_mm, "mm", 300.0, 3000.0),
                         number("height_mm", "Dormer window height", spec.height_mm, "mm", 300.0, 2200.0),
@@ -616,7 +616,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
         trigon_model::roof::Roof::Flat => {
             properties.push(number("thickness_mm", "Flat roof slab thickness", building.roof_slab_thickness_mm.unwrap_or(300.0), "mm", 20.0, 1000.0));
         }
-        trigon_model::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage } => {
+        trigon_model::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage, dormers } => {
             properties.extend([
                 number("pitch_deg", "Roof pitch", *pitch_deg, "deg", 5.0, 75.0),
                 number("overhang_mm", "Eave overhang", *overhang_mm, "mm", 0.0, 2000.0),
@@ -626,6 +626,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("gutters", "Gutters", *gutters, true),
                 field("gables", "Gable facade IDs", json!(gables), true),
                 field("drainage", "Optional drainage detail / explicit downpipes", json!(drainage), true),
+                field("dormers", "Parametric roof dormers", json!(dormers), true),
             ]);
         }
         trigon_model::Roof::Mansard { parameters: p } => {
@@ -1061,8 +1062,8 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
         }
         Source::Dormer(bi, di) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing dormer building"))?;
-            let trigon_model::Roof::Mansard { parameters } = &mut b.roof else { return Err(invalid("dormers require a mansard roof")) };
-            let d = parameters.dormers.get_mut(di).ok_or_else(|| invalid("missing roof dormer"))?;
+            let dormers = b.roof.dormers_mut().ok_or_else(|| invalid("dormers require a pitched or mansard roof"))?;
+            let d = dormers.get_mut(di).ok_or_else(|| invalid("missing roof dormer"))?;
             for (key, value) in properties {
                 match key.as_str() {
                     "width_mm" => d.width_mm = numeric(key, value)?,
@@ -1096,6 +1097,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             thickness_mm: 0.0,
                             gutters: false,
                             drainage: None,
+                            dormers: Vec::new(),
                         }
                     }
                     Some("pitched") => {}
@@ -1127,6 +1129,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         thickness_mm,
                         gutters,
                         drainage,
+                        dormers,
                     } => match key.as_str() {
                         "pitch_deg" => *pitch_deg = numeric(key, value)?,
                         "gables" => {
@@ -1142,6 +1145,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "thickness_mm" => *thickness_mm = numeric(key, value)?,
                         "gutters" => *gutters = boolean(key, value)?,
                         "drainage" => *drainage = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("drainage: {e}")))?,
+                        "dormers" => *dormers = serde_json::from_value(value.clone()).map_err(|_| invalid("dormers require typed roof instances"))?,
                         _ => return Err(invalid("unknown roof property")),
                     },
                     trigon_model::Roof::Mansard { parameters: p } => match key.as_str() {
@@ -1522,6 +1526,32 @@ mod tests {
         let target = update(&mut s, "b.f1.L0.B1.slab", json!({"type":"door.french"}));
         assert_eq!(target, "b.f1.L0.B1");
         assert_eq!(property(&descriptor(&mut s, &target), "type"), "door.french");
+    }
+
+    #[test]
+    fn pitched_dormers_are_pickable_editable_atomic_and_roundtrip_without_mansard_parameters() {
+        let mut s = session();
+        let spec = json!({"id":"test","facade":"b.f1","u_mm":10000,"window_type":"window.casement.2","width_mm":1100,"height_mm":1000});
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220,"dormers":[spec.clone()]})).unwrap();
+        let created = s.doc.clone();
+        let id = "b.dormer.test.window";
+        assert_eq!(property(&descriptor(&mut s, id), "width_mm"), 1100.0);
+        assert!(property(&descriptor(&mut s, "b.roof"), "dormers").as_array().is_some_and(|v| v.len() == 1));
+        let action = json!({"command":"element.set","params":{"id":id,"properties":{"width_mm":1250}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, created);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(property(&descriptor(&mut s, id), "width_mm"), 1250.0);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, created);
+        let reopened: Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(trigon_model::build(&reopened).unwrap(), trigon_model::build(&s.doc).unwrap());
+        let mut invalid = spec;
+        invalid["width_mm"] = json!(f64::MAX);
+        assert!(s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220,"dormers":[invalid]})).is_err());
+        assert_eq!(s.doc, created);
+        assert!(s.execute("building.set_roof", json!({"kind":"flat","dormers":[]})).is_err());
+        assert_eq!(s.doc, created);
     }
 
     #[test]

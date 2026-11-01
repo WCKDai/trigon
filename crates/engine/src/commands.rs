@@ -2146,7 +2146,7 @@ struct SetRoof {
     upper_pitch_deg: Option<f64>,
     /// Mansard underside break, horizontal inward run from the exterior wall (default 1300 mm).
     break_run_mm: Option<f64>,
-    /// Shed dormers with coordinated roof voids, on one straight mansard face each.
+    /// Shed dormers with coordinated roof voids, on one straight pitched or mansard face each.
     dormers: Option<Vec<trigon_model::roof::Dormer>>,
     /// Optional lower/upper slate or tagpap construction, with typed family dimensions.
     covering: Option<trigon_model::roof::Covering>,
@@ -2531,10 +2531,11 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
 fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
-    if p.kind != "mansard"
-        && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.dormers.is_some() || p.covering.is_some())
-    {
-        return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg, break_run_mm, dormers and covering require kind mansard".into()).into());
+    if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.covering.is_some()) {
+        return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg, break_run_mm and covering require kind mansard".into()).into());
+    }
+    if p.kind == "flat" && p.dormers.is_some() {
+        return Err(ModelError::Invalid("dormers require a pitched or mansard roof".into()).into());
     }
     let b = s.doc.building_mut(p.building.as_deref())?;
     let roof = match p.kind.as_str() {
@@ -2567,6 +2568,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,
                 gutters: p.gutters.unwrap_or(false),
                 drainage: p.drainage,
+                dormers: p.dormers.unwrap_or_default(),
             }
         }
         "mansard" => {

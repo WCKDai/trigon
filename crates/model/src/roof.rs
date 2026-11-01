@@ -16,7 +16,7 @@ pub use mansard::{Mansard, build as mansard};
 mod covering;
 pub use covering::{Covering, Surface, build as covering};
 
-/// Original shed dormer source parameters, relative to a straight mansard facade.
+/// Original shed dormer source parameters, relative to a straight sloping-roof facade.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Dormer {
@@ -111,12 +111,33 @@ pub enum Roof {
         /// Optional detailed channels and explicit downpipes. Missing keeps legacy geometry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         drainage: Option<drainage::Drainage>,
+        /// Shed dormers with real voids in one continuous thick roof face.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dormers: Vec<Dormer>,
     },
     /// Two continuous roof pitches with a shared hip/ridge skeleton and a real slope break.
     Mansard {
         #[serde(flatten)]
         parameters: Mansard,
     },
+}
+
+impl Roof {
+    pub fn dormers(&self) -> &[Dormer] {
+        match self {
+            Self::Flat => &[],
+            Self::Pitched { dormers, .. } => dormers,
+            Self::Mansard { parameters } => &parameters.dormers,
+        }
+    }
+
+    pub fn dormers_mut(&mut self) -> Option<&mut Vec<Dormer>> {
+        match self {
+            Self::Flat => None,
+            Self::Pitched { dormers, .. } => Some(dormers),
+            Self::Mansard { parameters } => Some(&mut parameters.dormers),
+        }
+    }
 }
 
 fn is_zero(v: &f64) -> bool {

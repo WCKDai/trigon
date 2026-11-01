@@ -1,4 +1,4 @@
-//! Shed dormers on a single straight mansard plane, with actual host-roof voids.
+//! Shed dormers on a single straight pitched or mansard plane, with actual host-roof voids.
 
 use super::*;
 use crate::roof::Dormer;
@@ -387,6 +387,44 @@ mod tests {
             parameters.dormers[0].u_mm = 100.;
         }
         assert!(crate::build(&doc).is_err(), "crossing the hip must be rejected");
+    }
+
+    #[test]
+    fn pitched_dormers_cut_closed_voids_and_keep_glazing_clear_without_changing_legacy_roofs() {
+        let mut doc = Document::default();
+        let mut b = Building::new("b", "Pitched roof fixture", &[[0., 0.], [30000., 0.], [30000., 10000.], [0., 10000.]], 3, 3400.).unwrap();
+        let mut source = serde_json::json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220,"overhang_mm":250});
+        b.roof = serde_json::from_value(source.clone()).unwrap();
+        assert!(serde_json::to_value(&b.roof).unwrap().get("dormers").is_none());
+        doc.buildings.push(b);
+        let before = crate::build(&doc).unwrap();
+        let original = &before[0].roof.as_ref().unwrap().cover;
+        source["dormers"] = serde_json::json!([
+            {"id":"front","facade":"b.f1","u_mm":15000,"window_type":"window.casement.2","width_mm":1100,"height_mm":1100},
+            {"id":"back","facade":"b.f3","u_mm":15000,"window_type":"window.casement.2","width_mm":1100,"height_mm":1100}
+        ]);
+        doc.buildings[0].roof = serde_json::from_value(source).unwrap();
+        let after = crate::build(&doc).unwrap();
+        let roof = after[0].roof.as_ref().unwrap();
+        assert_eq!(roof.dormers.len(), 2, "pitched roof dormers must not be silently discarded");
+        closed(&roof.cover);
+        for dormer in &roof.dormers {
+            closed(&dormer.roof);
+            closed(&dormer.cheeks);
+        }
+        let fr = FacadeFrame::new([0., 0.], [30000., 0.]).unwrap();
+        assert!(plane(original, &fr, [15000., 600.], true).is_ok());
+        assert!(plane(&roof.cover, &fr, [15000., 600.], true).is_err());
+        let window = &roof.dormers[0].front.openings[0].fill;
+        for p in &window.parts.iter().find(|(m, _)| *m == Material::Glass).unwrap().1.positions {
+            let q = local(&fr, *p);
+            assert!(q[2] > plane(original, &fr, [q[0], q[1]], true).unwrap().z(q[0], q[1]));
+        }
+        assert_eq!(after, crate::build(&doc).unwrap());
+        let mut invalid = serde_json::to_value(&doc.buildings[0].roof).unwrap();
+        invalid["dormers"][0]["u_mm"] = serde_json::json!(100.0);
+        doc.buildings[0].roof = serde_json::from_value(invalid).unwrap();
+        assert!(crate::build(&doc).is_err(), "the existing hip-clearance check also applies to pitched roofs");
     }
 
     #[test]

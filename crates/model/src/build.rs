@@ -933,11 +933,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     r.gutters.append(&part.mesh);
                 }
             }
-            let dormers = if let crate::Roof::Mansard { parameters } = &b.roof {
-                dormer::build(doc, b, &mut r.cover, &parameters.dormers)?
-            } else {
-                Vec::new()
-            };
+            let dormers = dormer::build(doc, b, &mut r.cover, b.roof.dormers())?;
             let mut gable_parts = std::collections::BTreeMap::<Material, Mesh>::new();
             if compound {
                 for tri in &r.gables.triangles {

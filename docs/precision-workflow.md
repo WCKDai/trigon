@@ -166,3 +166,15 @@ that storey; their footprints and incoming stair symbols do not expand or contam
 floor's drawing. Saved views accept a level present in any building. Physical-range plans
 anchor their absolute cut to the first building containing that level, preserving the existing
 single-building convention, and show other geometry only within the specified height range.
+
+Basement windows and doors may extend below terrain, bounded by their departure storey's
+floor. Above-ground openings retain the terrain bound, and non-opening facade attachments
+retain their existing bounds. The model does not infer the associated light well or earthworks.
+
+`building.set_roof` accepts `dormers` on ordinary pitched roofs as well as mansards. Each
+requires a continuous straight host face with at least 50 mm build-up, real roof cut-outs,
+hip/overlap clearance and a window family. The same exact dormer IDs support drawing/3D
+picking, `element.get` / `element.set`, precision previews, Undo and exchange. Empty pitched
+dormer lists are omitted in saved files, preserving legacy serialization and geometry. Feature
+files require a reader supporting pitched dormers; older readers can discard this new optional
+field. Roof coverings remain mansard-only; flat roofs reject dormer parameters explicitly.
