@@ -564,7 +564,10 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 let (dx, dy) = (w1[0] - w0[0], w1[1] - w0[1]);
                 let l = (dx * dx + dy * dy).sqrt().max(1.0);
                 let (ux, uy) = (dx / l, dy / l);
-                let tip = [w0[0] + ux * 450.0, w0[1] + uy * 450.0];
+                // A narrow quarter turn's first segment can be only 300 mm. The arrow must
+                // stop at its corner rather than continue across the next flight's treads.
+                let lead = 450.0_f64.min(l);
+                let tip = [w0[0] + ux * lead, w0[1] + uy * lead];
                 for side in [-1.0, 1.0] {
                     let base = [tip[0] - ux * 180.0 - uy * 90.0 * side, tip[1] - uy * 180.0 + ux * 90.0 * side];
                     prims.push(line(base, tip, 9.0, false));
@@ -1346,6 +1349,81 @@ mod tests {
                 "b.f1",
                 "masonry at the nominal corner must remain pickable at sill {sill}"
             );
+        }
+    }
+
+    #[test]
+    fn stair_direction_head_stays_on_the_first_walk_segment_in_both_plan_styles() {
+        for kind in ["straight", "u_turn", "double_quarter_turn"] {
+            for (angle, width) in [(0.0_f64, 600.0), (37.0, 620.0), (90.0, 1000.0)] {
+                let (sin, cos) = angle.to_radians().sin_cos();
+                let at = |run: f64, across: f64| [3500.0 + run * cos - across * sin, 3500.0 + run * sin + across * cos];
+                let length = if kind == "double_quarter_turn" { 500.0 } else { 1000.0 };
+                let stair: trigon_model::Stair = serde_json::from_value(json!({
+                    "id":"direction", "levels":[0], "kind":kind, "rounded":false,
+                    "outline":[at(0.0,0.0),at(length,0.0),at(length,width),at(0.0,width)]
+                }))
+                .unwrap();
+                let walk = trigon_model::stair::symbol(&stair, 3000.0).unwrap().walk;
+                let (start, end) = (walk[0], walk[1]);
+                let distance = (end[0] - start[0]).hypot(end[1] - start[1]);
+                let direction = [(end[0] - start[0]) / distance, (end[1] - start[1]) / distance];
+                let mut building =
+                    trigon_model::Building::new("b", "Direction fixture", &[[0., 0.], [8000., 0.], [8000., 8000.], [0., 8000.]], 2, 3000.).unwrap();
+                building.stairs.push(stair);
+                let mut doc = Document::default();
+                doc.buildings.push(building);
+                let before = doc.clone();
+                for level in [0, 1] {
+                    for presentation in [false, true] {
+                        let (prims, _, elements) = scene(&doc, level, View::latest(&doc), presentation).unwrap();
+                        let heads: Vec<_> = prims
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, p)| {
+                                if !elements.get(&index).is_some_and(|e| e.id == "direction.L0") {
+                                    return None;
+                                }
+                                match p {
+                                    Prim::Line { a, b, width, .. } | Prim::StairLine { a, b, width, .. } if *width == 9.0 => Some((*a, *b)),
+                                    _ => None,
+                                }
+                            })
+                            .rev()
+                            .take(2)
+                            .collect();
+                        assert_eq!(heads.len(), 2);
+                        let tip = heads[0].1;
+                        assert_eq!(tip, heads[1].1);
+                        for point in [tip, heads[0].0, heads[1].0] {
+                            let along = (point[0] - start[0]) * direction[0] + (point[1] - start[1]) * direction[1];
+                            assert!(
+                                along >= 0.0 && along <= distance + 1e-6,
+                                "{kind}, {angle} degrees, level {level}, presentation {presentation}: arrow extends beyond its first flight ({along} > {distance} mm)"
+                            );
+                        }
+                        let off_axis = (tip[0] - start[0]) * direction[1] - (tip[1] - start[1]) * direction[0];
+                        assert!(off_axis.abs() < 1e-6);
+                        if distance >= 450.0 {
+                            assert!(
+                                ((tip[0] - start[0]).hypot(tip[1] - start[1]) - 450.0).abs() < 1e-6,
+                                "existing full-size symbols retain their exact arrow position"
+                            );
+                        }
+                        let preview = crate::plan_drawing(&doc, level, View::latest(&doc)).unwrap();
+                        assert_eq!(preview.pick_element(tip, 0.01).unwrap().id, "direction.L0");
+                        for (base, tip) in heads {
+                            let expected = if base <= tip { [base, tip] } else { [tip, base] };
+                            assert!(
+                                preview.element_segments.iter().any(|line| line.id == "direction.L0"
+                                    && line.segment.iter().zip(expected).all(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-6)),
+                                "display/export and exact picking must share the direction head"
+                            );
+                        }
+                        assert_eq!(doc, before);
+                    }
+                }
+            }
         }
     }
 

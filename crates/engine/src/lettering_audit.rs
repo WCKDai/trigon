@@ -52,11 +52,13 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         crop = [crop[0].max(bounds[0] / scale), crop[1].max(bounds[1] / scale), crop[2].min(bounds[2] / scale), crop[3].min(bounds[3] / scale)];
     }
     let mut labels = Vec::new();
-    let mut polygons: Vec<(String, Vec<[f64; 2]>)> = Vec::new();
+    let mut polygons: Vec<(String, Option<crate::sheet::TextSource>, Vec<[f64; 2]>)> = Vec::new();
     let mut findings = Vec::new();
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
     let mut count = 0usize;
     let mut finding = |value: Value| {
         count += 1;
+        *counts.entry(value["kind"].as_str().unwrap_or("unknown").to_string()).or_default() += 1;
         if findings.len() < p.max_results {
             findings.push(value);
         }
@@ -110,15 +112,19 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         if clipped || outside_anchor {
             finding(json!({"kind":"clipped_label","key":key,"source":text.source,"anchor_outside":outside_anchor}));
         }
-        for (other, poly) in &polygons {
+        for (other, source, poly) in &polygons {
             if overlaps(&visible, poly, p.clearance_mm_paper) {
-                finding(json!({"kind":"potential_text_overlap","keys":[other,&key],"clearance_mm_paper":p.clearance_mm_paper}));
+                finding(
+                    json!({"kind":"potential_text_overlap","keys":[other,&key],"sources":[source,&text.source],"clearance_mm_paper":p.clearance_mm_paper}),
+                );
             }
         }
-        polygons.push((key, visible));
+        polygons.push((key, text.source.clone(), visible));
     }
     Ok(json!({"view":p.id,"scale":scale,"status":if count==0 {"no_findings_in_scope"} else {"needs_review"},
-        "labels":labels,"findings":findings,"total_findings":count,"truncated":count>p.max_results,
+        "labels":labels,"findings":findings,"total_findings":count,"finding_counts":counts,"truncated":count>p.max_results,
+        "inspect_commands":[{"command":"annotation.list","params":{"view":p.id}}],
+        "mutation_workflow":["precision.preview","precision.apply"],
         "clearance_mm_paper":p.clearance_mm_paper,"visible_bounds_mm":crop.map(|v|v*scale),
         "scope":"bundled SVG glyph ink and exported halos; generated labels present in the view plus saved annotations",
         "limitations":["Box intersections are potential collisions, not a pixel-level glyph collision test.","DXF consumers may substitute fonts. Suppressed generated labels and generic text/model-line clashes are not audited."]}))
@@ -169,4 +175,50 @@ fn clip_rect(mut poly: Vec<[f64; 2]>, b: [f64; 4]) -> Vec<[f64; 2]> {
         poly = clipped;
     }
     poly
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_feedback_keeps_lettering_counts_sources_and_read_only_next_steps_when_truncated() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        s.doc.buildings.push(
+            trigon_model::Building::new("b", "Lettering feedback fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.)
+                .unwrap(),
+        );
+        s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+        s.execute("view.configure", json!({"id":"p","template":{"name":"100","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}))
+            .unwrap();
+        for (id, at) in [("wide-a", [2000, 4000]), ("wide-b", [3500, 4000]), ("outside", [6000, 100000])] {
+            s.execute(
+                "annotation.define",
+                json!({"id":id,"view":"p","size_mm":2.5,"kind":{"annotation":"text","at":at,"text":"WWWWWWWW","rotation_deg":0}}),
+            )
+            .unwrap();
+        }
+        let before = s.doc.clone();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        let full = s.execute("view.audit", json!({"id":"p"})).unwrap();
+        assert_eq!(full["total_findings"], 2);
+        let limited = s.execute("view.audit", json!({"id":"p","max_results":1})).unwrap();
+        assert_eq!(limited["truncated"], true);
+        assert_eq!(limited["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["finding_counts"], json!({"clipped_label":1,"potential_text_overlap":1}));
+        assert_eq!(limited["finding_counts"], full["finding_counts"]);
+        assert_eq!(limited["findings"][0]["sources"][0]["id"], "wide-a");
+        assert_eq!(limited["findings"][0]["sources"][1]["id"], "wide-b");
+        assert_eq!(limited["clearance_mm_paper"], 0.5);
+        assert_eq!(limited["labels"], full["labels"], "bounded findings retain the shaped ink and halo evidence");
+        assert_eq!(limited["mutation_workflow"], json!(["precision.preview", "precision.apply"]));
+        assert_eq!(limited["inspect_commands"], json!([{"command":"annotation.list","params":{"view":"p"}}]));
+        for command in limited["inspect_commands"].as_array().unwrap() {
+            let id = command["command"].as_str().unwrap();
+            assert!(!crate::commands().iter().find(|c| c.id == id).unwrap().mutates);
+            assert_eq!(s.execute(id, command["params"].clone()).unwrap()["annotations"].as_array().unwrap().len(), 3);
+        }
+        assert_eq!(s.doc, before);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+    }
 }
