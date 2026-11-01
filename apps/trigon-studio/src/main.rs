@@ -9,6 +9,7 @@ mod authoring;
 mod camera;
 mod control;
 mod drafting;
+mod drawing_raster;
 mod palette;
 mod plan_view;
 mod properties;

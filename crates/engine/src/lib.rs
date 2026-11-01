@@ -11,21 +11,27 @@ use trigon_data::{DataError, Provider};
 use trigon_model::doc::JournalEntry;
 use trigon_model::{Document, ModelError};
 
+mod alignment;
 mod annotation_style;
+pub use alignment::{AlignedSnap, AlignmentOptions, snap_drawing_aligned};
 mod commands;
 mod drawings;
 mod edit;
 mod elements;
 mod elevation;
 mod facade_image;
+mod libraries;
 mod plan;
 mod plan_output;
+mod plan_range;
 mod rooms;
 mod schedule_export;
 mod schedules;
 mod section;
 mod sheet;
+mod site;
 mod time;
+mod view_config;
 mod views;
 
 pub use commands::{CommandSpec, commands};
@@ -40,8 +46,8 @@ pub use schedules::{
     opening_schedule_from_built,
 };
 pub use views::{
-    DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap, DrawingTransform, SnapKind,
-    SnapOptions, drawing_view, plan_drawing, snap_drawing,
+    DrawingDisplay, DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap,
+    DrawingTransform, SnapKind, SnapOptions, drawing_view, drawing_view_display, plan_drawing, plan_drawing_display, snap_drawing,
 };
 
 #[derive(Debug, thiserror::Error)]

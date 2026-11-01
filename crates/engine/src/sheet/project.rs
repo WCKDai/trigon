@@ -67,6 +67,8 @@ pub(crate) struct Edge {
     pub(crate) class: Class,
     /// Depth at its middle, mm.
     pub(crate) depth: f64,
+    /// Endpoint depths, used to split primary/depth plan strokes at the exact range boundary.
+    pub(crate) end_depths: [f64; 2],
     /// Against the background on one side: part of the outline.
     pub(crate) outline: bool,
     pub(crate) element_segments: Vec<DrawingElementSegment>,
@@ -645,7 +647,15 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                 .iter()
                 .filter_map(|element| overlap([p(s), p(e)], element.segment, 0.1).map(|segment| DrawingElementSegment { segment, ..element.clone() }))
                 .collect();
-            edges.push(Edge { a: p(s), b: p(e), class, depth: pa[2] + (pb[2] - pa[2]) * (s + e) / 2.0, outline, element_segments });
+            edges.push(Edge {
+                a: p(s),
+                b: p(e),
+                class,
+                depth: pa[2] + (pb[2] - pa[2]) * (s + e) / 2.0,
+                end_depths: [pa[2] + (pb[2] - pa[2]) * s, pa[2] + (pb[2] - pa[2]) * e],
+                outline,
+                element_segments,
+            });
         }
     }
     let mut faces = faces(&fill_tris, sources);

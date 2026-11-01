@@ -151,3 +151,39 @@ fn a_built_up_roof_is_one_slab_per_plane_as_thick_as_its_build_up() {
     assert_eq!(planes.len(), 4);
     assert!(planes.iter().all(|p| (p.thickness() - split::ROOF_PLANE).abs() < 1e-6));
 }
+
+#[test]
+fn explicit_drainage_reads_back_with_stable_ids_and_correct_pipe_classes() {
+    use trigon_model::roof::drainage::{Downpipe, Drainage};
+    let mut doc = sample::document().unwrap();
+    let facade = doc.buildings[0].facades[0].id.clone();
+    if let trigon_model::Roof::Pitched { drainage, gutters, .. } = &mut doc.buildings[0].roof {
+        *gutters = true;
+        *drainage = Some(Drainage {
+            downpipes: vec![Downpipe {
+                id: "rain-a".into(),
+                facade,
+                along_mm: 3000.0,
+                diameter_mm: 80.0,
+                wall_offset_mm: 100.0,
+                bottom_mm: 150.0,
+                shoe_mm: 200.0,
+            }],
+            ..Default::default()
+        });
+    }
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "drainage.ifc", "2026-01-01T00:00:00");
+    assert!(text.contains(".RIGIDSEGMENT.)"));
+    assert!(text.contains(".GUTTER.)"));
+    let shapes = model_shapes(&doc, &built);
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        assert!(read.failures.is_empty(), "{:?}", read.failures);
+        for (id, mesh) in shapes.iter().filter(|(id, _)| id.contains(".gutter") || id.contains(".downpipe.")) {
+            let guid = guid(&format!("trigon:{id}"));
+            let e = read.elements.iter().find(|e| e.global_id == guid).unwrap();
+            assert!(e.class.eq_ignore_ascii_case("IfcPipeSegment"));
+            assert!(trigon_ifcread::bounds_deviation(mesh.bounds().unwrap(), e.mesh.bounds().unwrap()) < 0.01);
+        }
+    }
+}

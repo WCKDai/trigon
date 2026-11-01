@@ -13,7 +13,7 @@ pub const METHODS: &[(&str, &str)] = &[
     ("document.summary", "the open document (document.info) with its file and unsaved state"),
     (
         "ui.view",
-        "what the owner sees: `mode` (3d, plan, drawing), `drawing` (saved view id), `level`, `phase`, `filter`, `fit`, `focus` (an element id); returns the view",
+        "what the owner sees: `mode` (3d, plan, drawing), `drawing` (saved view id), `level`, `phase`, `filter`, `appearance` (materials, phases; 3D only), `fit`, `focus` (an element id); returns the view",
     ),
     (
         "ui.screenshot",

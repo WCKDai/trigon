@@ -11,9 +11,10 @@ use crate::mesh::{Material, Mesh};
 use crate::walls::{Span, WallSegment};
 use crate::{ModelError, Result};
 
+mod opening;
+
 /// Window and door frames sit this far behind the outer wall face, mm.
 pub const REVEAL: f64 = 120.0;
-const FRAME: f64 = 60.0;
 const FRAME_DEPTH: f64 = 70.0;
 /// Wall kept between an opening and the inner face of the wall it meets at a corner, mm. An
 /// opening may come no closer than this to the corner's inner face, so it never cuts the
@@ -259,6 +260,8 @@ pub struct BuiltRoof {
     pub gables: Mesh,
     /// Gutters along the eaves.
     pub gutters: Mesh,
+    /// Explicit detail assemblies, empty for legacy roofs.
+    pub drainage: Vec<crate::roof::drainage::DrainPart>,
     pub eaves: f64,
     pub ridge: f64,
     pub pitch_deg: f64,
@@ -308,6 +311,7 @@ pub fn build_cut(doc: &Document, view: View, cut: Option<f64>) -> Result<Vec<Bui
     if let Some(z) = cut {
         crate::checked("cut height", z, -50_000.0, 500_000.0)?;
     }
+    crate::site::validate(doc)?;
     doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect()
 }
 
@@ -814,7 +818,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             });
             None
         }
-        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters } => {
+        crate::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage } => {
             let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
             // The attic floor closes the top storey; the roof rises from the eaves above it.
             slabs.push(BuiltSlab {
@@ -838,12 +842,25 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
-            let r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            let mut r = crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?;
+            let mut drain_parts = Vec::new();
+            if let Some(d) = drainage {
+                if !gutters {
+                    return Err(ModelError::Invalid("detailed drainage requires gutters".into()));
+                }
+                let out = inner_ring_by(&outline, |k| if edges.contains(&k) { -*verge_mm } else { -*overhang_mm });
+                drain_parts = crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, *pitch_deg, &edges, d)?;
+                r.gutters = Mesh::default();
+                for part in &drain_parts {
+                    r.gutters.append(&part.mesh);
+                }
+            }
             Some(BuiltRoof {
                 id: format!("{}.roof", b.id),
                 cover: r.cover,
                 gables: r.gables,
                 gutters: r.gutters,
+                drainage: drain_parts,
                 eaves: h,
                 ridge: r.ridge,
                 pitch_deg: *pitch_deg,
@@ -963,11 +980,6 @@ fn cellar_stair(fr: &FacadeFrame, id: &str, c: &crate::doc::CellarStair, level: 
     }
 }
 
-/// Door frame (karm) width, mm.
-const DOOR_FRAME: f64 = 45.0;
-/// Door leaf thickness, mm.
-const DOOR_LEAF: f64 = 40.0;
-
 /// An interior wall on one storey after joining: a closed prism with its doors cut out, a
 /// frame and a closed leaf in each door, and the plan cut with the doors left open. `None` if
 /// the wall is degenerate.
@@ -988,11 +1000,6 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
         // A wall cut lower than the door (a 3D plan cut) leaves the door open through the top.
         let top = if door.height + 50.0 > height { height + 10.0 } else { door.height };
         let rect = Rect { u0, u1, v0: z0, v1: z0 + top };
-        let (fw, leaf) = (DOOR_FRAME.min((u1 - u0) / 4.0), DOOR_LEAF.min(d / 2.0));
-        let mut frame = fbox(&fr, (u0, u0 + fw), (0.0, d), (rect.v0, rect.v1));
-        frame.append(&fbox(&fr, (u1 - fw, u1), (0.0, d), (rect.v0, rect.v1)));
-        frame.append(&fbox(&fr, (u0 + fw, u1 - fw), (0.0, d), (rect.v1 - fw, rect.v1)));
-        let panel = fbox(&fr, (u0 + fw, u1 - fw), ((d - leaf) / 2.0, (d + leaf) / 2.0), (rect.v0 + 10.0, rect.v1 - fw));
         let door_id = format!("{id}.D{k}");
         let fill = BuiltElement {
             id: door_id.clone(),
@@ -1002,7 +1009,7 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
             level,
             width: u1 - u0,
             height: rect.v1 - rect.v0,
-            parts: vec![(Material::Frame, frame), (Material::Door, panel)],
+            parts: opening::interior(&fr, rect, d).finish(),
             status: Status::Existing,
         };
         doors.push(BuiltOpening { id: door_id, level, rect, fill, attached: Vec::new(), status: Status::Existing });
@@ -1169,114 +1176,66 @@ struct Fill {
     ceiling: f64,
 }
 
-/// A door leaf in `(u0, u1) × (v0, v1)`, `w` deep: white stiles and rails, glass in the upper
-/// part over a solid bottom panel (Danish balcony and stair doors). Returns (frame, glass).
-fn door_leaf(fr: &FacadeFrame, (u0, u1): (f64, f64), (v0, v1): (f64, f64), w: (f64, f64)) -> (Mesh, Mesh) {
-    let stile = 90.0_f64.min((u1 - u0) / 4.0);
-    let panel = v0 + 0.36 * (v1 - v0);
-    let mut frame = Mesh::default();
-    frame.append(&fbox(fr, (u0, u0 + stile), w, (v0, v1)));
-    frame.append(&fbox(fr, (u1 - stile, u1), w, (v0, v1)));
-    frame.append(&fbox(fr, (u0 + stile, u1 - stile), w, (v1 - stile, v1)));
-    frame.append(&fbox(fr, (u0 + stile, u1 - stile), (w.0 + 10.0, w.1 - 10.0), (v0, panel)));
-    frame.append(&fbox(fr, (u0 + stile, u1 - stile), w, (panel, panel + stile * 0.7)));
-    let glass = fbox(fr, (u0 + stile, u1 - stile), ((w.0 + w.1) / 2.0 - 3.0, (w.0 + w.1) / 2.0 + 3.0), (panel + stile * 0.7, v1 - stile));
-    (frame, glass)
+/// Partition a composite without moving its nominal boundary. A legacy loggia can have a
+/// door_width larger than its opening; keep both generated subdivisions positive in that case.
+fn opening_split(r: Rect, width: f64, side: Side) -> (Rect, Rect) {
+    let margin = 100.0_f64.min((r.u1 - r.u0) * 0.1);
+    let width = width.clamp(margin, r.u1 - r.u0 - margin);
+    match side {
+        Side::Left => (Rect { u1: r.u0 + width, ..r }, Rect { u0: r.u0 + width, ..r }),
+        Side::Right => (Rect { u0: r.u1 - width, ..r }, Rect { u1: r.u1 - width, ..r }),
+    }
 }
 
-/// A window's frame, sash bars and glass in `(u0, u1) × (v0, v1)`, `w` deep.
-fn window_lights(fr: &FacadeFrame, (u0, u1): (f64, f64), (v0, v1): (f64, f64), w: (f64, f64), lights: u32, top_light: f64) -> (Mesh, Mesh) {
-    let mut frame = Mesh::default();
-    frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
-    frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
-    frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
-    frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v0, v0 + FRAME)));
-    for c in dividers(u0 + FRAME, u1 - FRAME, lights) {
-        frame.append(&fbox(fr, (c - FRAME / 2.0, c + FRAME / 2.0), w, (v0 + FRAME, v1 - FRAME)));
+/// A 1 mm assembly joint between the two factory frames. Keeping their exposed ends
+/// separate avoids coincident faces; the nominal subdivision and scheduled sizes stay intact.
+fn opening_joint(mut door: Rect, mut window: Rect, side: Side) -> (Rect, Rect) {
+    match side {
+        Side::Left => {
+            door.u1 -= 0.5;
+            window.u0 += 0.5;
+        }
+        Side::Right => {
+            door.u0 += 0.5;
+            window.u1 -= 0.5;
+        }
     }
-    if top_light > 0.0 && v1 - v0 > top_light + 4.0 * FRAME {
-        let t = v1 - FRAME - top_light;
-        frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (t - FRAME / 2.0, t + FRAME / 2.0)));
-    }
-    let mid = (w.0 + w.1) / 2.0;
-    let glass = fbox(fr, (u0 + FRAME, u1 - FRAME), (mid - 3.0, mid + 3.0), (v0 + FRAME, v1 - FRAME));
-    (frame, glass)
+    (door, window)
 }
 
 /// Frame, sashes or leaves and glazing for a window or door in `rect`.
 fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> Vec<(Material, Mesh)> {
     let Rect { u0, u1, v0, v1 } = rect;
     let w = (REVEAL, REVEAL + FRAME_DEPTH);
-    let mut frame = Mesh::default();
-    let mut glass = Mesh::default();
+    let mut detail = opening::Parts::default();
     let mut parts = Vec::new();
-    let sill = |parts: &mut Vec<(Material, Mesh)>, (a, b): (f64, f64), z: f64| {
-        parts.push((Material::Sill, fbox(fr, (a - 30.0, b + 30.0), (-40.0, REVEAL), (z - 40.0, z))))
-    };
     match kind {
         ComponentKind::Window { lights, top_light } => {
-            let (f, g) = window_lights(fr, (u0, u1), (v0, v1), w, *lights, *top_light);
-            frame.append(&f);
-            glass.append(&g);
-            sill(&mut parts, (u0, u1), v0);
+            detail = opening::window(fr, rect, w, *lights, *top_light, true, false);
+            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
         }
         ComponentKind::FixedWindow => {
-            let (f, g) = window_lights(fr, (u0, u1), (v0, v1), w, 1, 0.0);
-            frame.append(&f);
-            glass.append(&g);
-            sill(&mut parts, (u0, u1), v0);
-        }
-        ComponentKind::EntranceDoor if u1 - u0 > 2000.0 => {
-            // A gateway: timber gates in a frame.
-            frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
-            frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
-            frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
-            parts.push((Material::Door, fbox(fr, (u0 + FRAME, u1 - FRAME), (REVEAL + 15.0, REVEAL + 60.0), (v0, v1 - FRAME))));
+            detail = opening::window(fr, rect, w, 1, 0.0, false, false);
+            detail.sill = opening::sill(fr, (u0 - 30.0, u1 + 30.0), v0, REVEAL);
         }
         ComponentKind::EntranceDoor => {
-            // A glazed stair or shop door with a top light over it.
-            frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
-            frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
-            frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
-            let top = (v1 - v0 - 2100.0).clamp(0.0, 600.0);
-            let door_top = v1 - FRAME - top;
-            if top > 0.0 {
-                frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (door_top - FRAME, door_top)));
-                glass.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), (REVEAL + 32.0, REVEAL + 38.0), (door_top, v1 - FRAME)));
-            }
-            let (f, g) =
-                door_leaf(fr, (u0 + FRAME, u1 - FRAME), (v0, door_top - if top > 0.0 { FRAME } else { 0.0 }), (REVEAL + 15.0, REVEAL + 60.0));
-            frame.append(&f);
-            glass.append(&g);
+            let gate = u1 - u0 > 2000.0;
+            let top = if gate { 0.0 } else { (v1 - v0 - 2100.0).clamp(0.0, 600.0) };
+            detail = opening::door(fr, rect, w, if gate { 2 } else { 1 }, !gate, top, false);
         }
         ComponentKind::FrenchDoor { leaves } | ComponentKind::FrenchBalcony { leaves, .. } | ComponentKind::Balcony { leaves, .. } => {
-            frame.append(&fbox(fr, (u0, u0 + FRAME), w, (v0, v1)));
-            frame.append(&fbox(fr, (u1 - FRAME, u1), w, (v0, v1)));
-            frame.append(&fbox(fr, (u0 + FRAME, u1 - FRAME), w, (v1 - FRAME, v1)));
-            let cuts: Vec<f64> =
-                std::iter::once(u0 + FRAME).chain(dividers(u0 + FRAME, u1 - FRAME, *leaves)).chain(std::iter::once(u1 - FRAME)).collect();
-            for pair in cuts.windows(2) {
-                let (f, g) = door_leaf(fr, (pair[0], pair[1]), (v0, v1 - FRAME), w);
-                frame.append(&f);
-                glass.append(&g);
-            }
+            detail = opening::door(fr, rect, w, *leaves, true, 0.0, false);
         }
         ComponentKind::DoorWindow { door_width, door_side, window_sill, lights } => {
-            // Split the opening: a glazed door on one side, a window over a panel on the other.
-            let (du0, du1, wu0, wu1) = match door_side {
-                Side::Left => (u0, u0 + door_width, u0 + door_width, u1),
-                Side::Right => (u1 - door_width, u1, u0, u1 - door_width),
-            };
-            frame.append(&fbox(fr, (u0, u1), w, (v1 - FRAME, v1)));
-            let (f, g) = door_leaf(fr, (du0, du1), (v0, v1 - FRAME), w);
-            frame.append(&f);
-            glass.append(&g);
+            let (dr, wr) = opening_split(rect, *door_width, *door_side);
+            let (dr, wr) = opening_joint(dr, wr, *door_side);
+            detail = opening::door(fr, dr, w, 1, true, 0.0, *door_side == Side::Right);
             let ws = v0 + window_sill;
-            parts.push((at.finish, fbox(fr, (wu0, wu1), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
-            let (f, g) = window_lights(fr, (wu0, wu1), (ws, v1 - FRAME), w, *lights, 0.0);
-            frame.append(&f);
-            glass.append(&g);
-            sill(&mut parts, (wu0 + 30.0, wu1 - 30.0), ws);
+            if ws > v0 {
+                parts.push((at.finish, fbox(fr, (wr.u0, wr.u1), (0.0, REVEAL + FRAME_DEPTH), (v0, ws))));
+            }
+            detail.append(opening::window(fr, Rect { v0: ws, ..wr }, w, *lights, 0.0, true, *door_side == Side::Left));
+            detail.sill.append(&opening::sill(fr, (wr.u0, wr.u1), ws, REVEAL));
         }
         ComponentKind::Loggia { depth, rail_height, door_width, door_side } => {
             // Set back behind the facade: brick returns, a soffit, and the back wall with its
@@ -1291,21 +1250,12 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             parts.push((Material::BrickRed, brick));
             parts.push((Material::Render, fbox(fr, (u0, u1), (at.wall, back), (v1, ceiling))));
             let gw = (back - FRAME_DEPTH, back);
-            let (du0, du1, wu0, wu1) = match door_side {
-                Side::Left => (u0, u0 + door_width, u0 + door_width, u1),
-                Side::Right => (u1 - door_width, u1, u0, u1 - door_width),
-            };
-            frame.append(&fbox(fr, (u0, u1), gw, (v1 - FRAME, v1)));
-            let (f, g) = door_leaf(fr, (du0, du1), (floor, v1 - FRAME), gw);
-            frame.append(&f);
-            glass.append(&g);
-            let ws = floor + 800.0;
-            if wu1 - wu0 > 300.0 {
-                parts.push((Material::BrickRed, fbox(fr, (wu0, wu1), (back - 20.0, back + RETURN), (floor, ws))));
-                let (f, g) = window_lights(fr, (wu0, wu1), (ws, v1 - FRAME), gw, 2, 0.0);
-                frame.append(&f);
-                glass.append(&g);
-            }
+            let (dr, wr) = opening_split(Rect { v0: floor, ..rect }, *door_width, *door_side);
+            let (dr, wr) = opening_joint(dr, wr, *door_side);
+            detail.append(opening::door(fr, dr, gw, 1, true, 0.0, *door_side == Side::Right));
+            let ws = (floor + 800.0).min(v1 - 100.0);
+            parts.push((Material::BrickRed, fbox(fr, (wr.u0, wr.u1), (back - 20.0, back + RETURN), (floor, ws))));
+            detail.append(opening::window(fr, Rect { v0: ws, ..wr }, gw, 2, 0.0, true, *door_side == Side::Left));
             // Two white rails and end posts across the opening, over the parapet.
             let (top, mid) = (floor + rail_height, (v0 + floor + rail_height) / 2.0);
             let wr = at.wall * 0.4;
@@ -1320,10 +1270,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
         }
         ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
     }
-    parts.push((Material::Frame, frame));
-    if !glass.is_empty() {
-        parts.push((Material::Glass, glass));
-    }
+    parts.extend(detail.finish());
     parts
 }
 

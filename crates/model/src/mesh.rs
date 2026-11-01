@@ -31,10 +31,18 @@ pub enum Material {
     BrickRed,
     /// Yellow facing brick, explicitly assigned rather than changing a building's default brick.
     BrickYellow,
+    /// Appended site presentation materials; existing indices stay stable.
+    Paving,
+    Gravel,
+    Grass,
+    Bark,
+    Foliage,
+    Soil,
+    Planter,
 }
 
 impl Material {
-    pub const ALL: [Material; 17] = [
+    pub const ALL: [Material; 24] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -52,6 +60,13 @@ impl Material {
         Material::Render,
         Material::BrickRed,
         Material::BrickYellow,
+        Material::Paving,
+        Material::Gravel,
+        Material::Grass,
+        Material::Bark,
+        Material::Foliage,
+        Material::Soil,
+        Material::Planter,
     ];
 
     pub fn name(self) -> &'static str {
@@ -73,6 +88,13 @@ impl Material {
             Material::Render => "render",
             Material::BrickRed => "brick_red",
             Material::BrickYellow => "brick_yellow",
+            Material::Paving => "paving",
+            Material::Gravel => "gravel",
+            Material::Grass => "grass",
+            Material::Bark => "bark",
+            Material::Foliage => "foliage",
+            Material::Soil => "soil",
+            Material::Planter => "planter",
         }
     }
 
@@ -96,6 +118,13 @@ impl Material {
             Material::Render => [0.90, 0.90, 0.88, 1.0],
             Material::BrickRed => [0.55, 0.22, 0.14, 1.0],
             Material::BrickYellow => [0.57, 0.43, 0.22, 1.0],
+            Material::Paving => [0.52, 0.51, 0.47, 1.0],
+            Material::Gravel => [0.62, 0.58, 0.48, 1.0],
+            Material::Grass => [0.22, 0.31, 0.12, 1.0],
+            Material::Bark => [0.25, 0.16, 0.09, 1.0],
+            Material::Foliage => [0.19, 0.32, 0.10, 1.0],
+            Material::Soil => [0.20, 0.14, 0.08, 1.0],
+            Material::Planter => [0.30, 0.31, 0.28, 1.0],
         }
     }
 

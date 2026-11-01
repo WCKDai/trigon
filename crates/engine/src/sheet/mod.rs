@@ -4,6 +4,7 @@
 //! feeds the PNG and PDF output) and DXF.
 
 pub(crate) mod cut;
+pub(crate) mod display;
 pub(crate) mod dxf;
 pub(crate) mod project;
 pub(crate) mod style;
@@ -52,6 +53,7 @@ pub(crate) fn overlap<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; D
 }
 
 /// The shared presentation scene, used both by file exports and live drafting workspaces.
+#[derive(Clone)]
 pub(crate) struct Sheet {
     pub(crate) scene: Scene,
     pub(crate) vp: Viewport,
@@ -210,11 +212,16 @@ pub(crate) struct Stroke {
     pub(crate) pen: f64,
     pub(crate) colour: Rgb,
     pub(crate) dashed: bool,
+    pub(crate) pattern: trigon_model::annotation::LinePattern,
 }
 
 impl Stroke {
+    pub(crate) fn pattern(&self) -> trigon_model::annotation::LinePattern {
+        if self.dashed { trigon_model::annotation::LinePattern::Dashed } else { self.pattern }
+    }
+
     pub(crate) fn new(pen: f64) -> Self {
-        Stroke { pen, colour: INK, dashed: false }
+        Stroke { pen, colour: INK, dashed: false, pattern: Default::default() }
     }
 }
 

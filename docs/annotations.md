@@ -117,3 +117,88 @@ phase visibility and the read-only `view.pick` command.
 Saved annotations also support sans/serif/mono fonts, bold/italic faces and filled polygon regions.
 See [coordinated authoring](coordinated-authoring.md#drawing-text-and-filled-regions) for styles,
 export behaviour and current editing boundaries.
+
+## Manual drafting lines and temporary alignment
+
+`annotation.define` also accepts `{"annotation":"line","from":[1000,1000],"to":[6000,1000],"stroke":{"colour":[184,65,44],"width_mm":0.5,"pattern":"dash_dot"}}` as its `kind`.
+Patterns are `solid`, `dashed`, `dotted` and `dash_dot`. Widths are paper mm, 0.05–2.11;
+RGB channels are integers 0–255. Zero-length lines and hostile coordinates are refused atomically.
+Studio's Line tool picks two points; Select or the annotation list reopens its coordinates,
+colour, width and pattern. These are manual marks; they make no BIM/apartment separation claim.
+All four exports use the same scene. SVG/PNG/PDF retain RGB; AC1015 DXF approximates colours
+with indexed ACI colours and rounds weights to the nearest supported 1/100 mm. The export result
+reports those limits. Dash lengths are 2 mm on / 1 mm off; dots repeat at 1 mm, and dash-dot
+uses 2 / 1 / dot / 1 mm, scaled by `$LTSCALE` in DXF.
+
+Temporary alignment guides use drawing x/y axes through visible endpoints, midpoints, text
+insertions and points already picked, plus infinite lines parallel to drawn segments. Guide offset
+is a perpendicular drawing-mm distance on either side. Exact enabled endpoint/intersection/midpoint
+snaps take priority over guides, followed by grid fallback. Guide tolerance is ten window points
+through the actual pan/zoom transform. Disable Temporary alignment guides or hold Alt to bypass
+snaps; typed coordinates remain available. Guides do not create constraints or journal entries.
+`view.snap` exposes the same behavior with optional `alignment: {"anchors":[[1000,2000]],"offset_mm":500}`;
+at most 512 anchors are accepted. Its result includes drawing-plane `guides`.
+
+## Persistent view templates, paper scale and plan ranges
+
+A saved view optionally owns a reusable `template`. Omitting it, or using
+`view.configure {"id":"ground","template":null}`, preserves legacy rendering and fingerprints.
+`view.configure` changes the template atomically; `view.apply_template {"source":"ground","targets":["upper","section-a"]}`
+copies it to existing saved views while retaining each coordinate frame and annotations. A range
+can only be applied to plans. Undo restores the exact prior document. Templates travel with project
+files and project templates; they are local, with no account or service requirement.
+
+```json
+{"command":"view.configure","params":{"id":"ground","template":{"name":"Plan 100","line_weights":"standard","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]},"crop":[-1000,-1000,13000,9000],"range":{"top_mm":2300,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000}}}}
+```
+
+Studio exposes these staged settings under **View template · paper · range**; **Apply view
+template** runs the shared command. **Use saved template** copies another view's configuration.
+Fine/Standard/Bold profiles multiply generated model pens by 0.75/1/1.4 (bounded 0.05–2.11 mm).
+Manual drafting line weights remain as explicitly chosen. Profiles affect all four formats.
+
+Sizing `{"mode":"fit"}` fits generated geometry and manual annotations, reporting its actual
+fitted scale. `{"mode":"fixed","denominator":100,"centre":[6000,4000]}` means physical 1:100
+on the existing 338.6667 × 190.5 mm sheet: 10,000 model mm prints as 100 paper mm at 100% print size.
+It crops instead of silently shrinking. SVG uses 96 CSS px/inch; PDF embeds the physical page size.
+PNG is 1600 × 900 at that same intended paper size; image viewers/printers can override print size.
+DXF remains model-space 1:1 with paper weights and linetype scale. An optional drawing-mm `crop`
+rectangle clips geometry before fitting or fixed paper placement. Viewport clipping is applied to
+exported DXF and picking too; text outside a crop is removed by insertion point (glyph outlines at
+its edge may extend past the DXF crop). Full paths/fills are clipped, not just hidden in SVG.
+
+Range offsets are mm relative to the first building's selected storey floor; the same horizontal
+planes apply to all buildings. They require `depth <= bottom < cut < top`, each within ±100,000 mm.
+An explicit range uses model mesh cuts, opaque cut faces and hidden-line projection. The primary
+range runs from cut down to bottom; visible geometry below bottom down to depth is dotted and
+lighter. Sloped edges split at the exact bottom plane. Uncut objects above cut up to top are dashed;
+objects intersecting the cut retain their cut outline instead of a duplicate overhead outline.
+Adjacent-storey elements participate when inside the range; objects outside top/depth are clipped.
+Floor and room picking retains source IDs. Mesh ranges show actual stair meshes instead of legacy
+symbolic tread/door-swing/label conventions. Leaving range unset retains the legacy plan symbols.
+
+
+## Shared component libraries in Studio
+
+Families includes **Portable component libraries** with local `.trigonlib` import/export paths,
+native file pickers where supported, selected-type/all-type export, and an explicit global
+replacement checkbox (off by default). These controls dispatch `types.import {path, replace:false}`
+and `types.export {path, ids?:[...]}` through the normal app command runner. They check engine
+command availability; on older engines the transfer buttons stay disabled with a clear reason.
+The library commands and versioned format are provided by the component-library implementation.
+
+Imported definitions become shared project types; files are portable snapshots. **Update shared
+type and its instances** changes the definition for all referencing placements. Explicit instance
+overrides remain local. **Duplicate as new type** creates an independent definition. This UI does
+not imply live file watching or automatic external-library reload. It ships no client branding,
+reference page assets or copied starter geometry.
+
+Explicit plan ranges retain requested phase visibility: demolished components supplied by `All`
+or `Demolition` draw as a non-occluding red dashed overlay, with source IDs preserved. Complete
+views exclude removed components. The normal section/elevation styles remain unchanged.
+
+Existing `trigon/1` files without these optional features load and serialize unchanged. Older
+releases with strict annotation/view schemas cannot read the new `line` kind or `template` field.
+For a downgrade, keep the original file, export drawings, clear templates through `view.configure`
+with null and remove new line annotations from a separate copy. Reverting code does not migrate
+saved files automatically. No destructive downgrade is performed by Studio.

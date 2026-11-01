@@ -25,6 +25,7 @@ pub enum DrawingRequest {
 
 pub struct PreparedDrawing {
     pub tree: Arc<usvg::Tree>,
+    pub display_trees: Vec<Arc<usvg::Tree>>,
     pub transform: DrawingTransform,
     pub segments: Vec<[[f64; 2]; 2]>,
     /// Visible model linework, in drawing-plane mm, with the built element id that owns each stroke.
@@ -37,6 +38,8 @@ pub struct Job {
     pub doc: Arc<Document>,
     pub view: View,
     pub want_scene: bool,
+    /// Ephemeral presentation choice, independent of phase visibility.
+    pub phase_colors: bool,
     /// One drawing workspace, prepared with its exact picking geometry.
     pub drawing: Option<DrawingRequest>,
 }
@@ -79,12 +82,13 @@ pub fn run(job: &Job) -> Done {
         let built = guarded("building the model", || trigon_model::build::build_view(&job.doc, job.view).map_err(|e| e.to_string()));
         build_ms = ms(t);
         let t = Instant::now();
-        let phases = job.doc.phases.len() > 1;
+        let phases = job.phase_colors;
         let scene = built.and_then(|b| {
             guarded("preparing the view", || {
                 let schedule = opening_schedule_from_built(&job.doc, &b).map_err(|e| e.to_string())?;
                 let properties = element_properties_from_built(&job.doc, &b, job.view).map_err(|e| e.to_string())?;
-                Ok(PreparedScene { scene: Scene::from_built(&b, phases).with_rooms(&job.doc), schedule, properties })
+                let site = trigon_model::site::build(&job.doc, job.view, None).map_err(|e| e.to_string())?;
+                Ok(PreparedScene { scene: Scene::from_built(&b, phases).with_site(&site).with_rooms(&job.doc), schedule, properties })
             })
         });
         scene_ms = ms(t);
@@ -93,13 +97,18 @@ pub fn run(job: &Job) -> Done {
     let drawing = job.drawing.as_ref().map(|request| {
         let t = Instant::now();
         let tree = guarded("drawing the workspace", || {
-            let DrawingPreview { svg, transform, segments, element_segments, element_regions } = match request {
-                DrawingRequest::Plan(level) => trigon_engine::plan_drawing(&job.doc, *level, job.view),
-                DrawingRequest::Saved(id) => trigon_engine::drawing_view(&job.doc, id, job.view),
+            let display = match request {
+                DrawingRequest::Plan(level) => trigon_engine::plan_drawing_display(&job.doc, *level, job.view),
+                DrawingRequest::Saved(id) => trigon_engine::drawing_view_display(&job.doc, id, job.view),
             }
             .map_err(|e| e.to_string())?;
+            let DrawingPreview { svg, transform, segments, element_segments, element_regions } = display.exact;
+            let display_trees = [display.reduced_svg, display.overview_svg]
+                .iter()
+                .map(|svg| trigon_engine::parse_svg(svg).map(Arc::new).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
             let tree = trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())?;
-            Ok(PreparedDrawing { tree, transform, segments, element_segments, element_regions })
+            Ok(PreparedDrawing { tree, display_trees, transform, segments, element_segments, element_regions })
         });
         plan_ms = ms(t);
         (request.clone(), tree)
@@ -145,8 +154,28 @@ mod tests {
             doc: Arc::new(doc),
             view: View { phase: 0, filter: PhaseFilter::Complete },
             want_scene: true,
+            phase_colors: false,
             drawing: plan_level.map(DrawingRequest::Plan),
         }
+    }
+
+    #[test]
+    fn presentation_uses_finishes_even_with_multiple_phases() {
+        let s = crate::schedules::tests::phase_session();
+        let mut request = job(s.doc.clone(), None);
+        request.view = View::latest(&s.doc);
+        let built = trigon_model::build::build_view(&s.doc, request.view).unwrap();
+        let expected = Scene::from_built(&built, false).with_rooms(&s.doc);
+        let actual = run(&request).scene.unwrap().unwrap();
+        assert!(actual.scene.vertices == expected.vertices, "material presentation must not automatically tint new finishes green");
+        request.phase_colors = true;
+        let reviewed = run(&request).scene.unwrap().unwrap();
+        assert_ne!(reviewed.scene.vertices, actual.scene.vertices);
+        assert_eq!(reviewed.scene.tri_element, actual.scene.tri_element);
+        assert_eq!(reviewed.scene.edges, actual.scene.edges);
+        assert_eq!(reviewed.schedule, actual.schedule);
+        assert_eq!(reviewed.properties, actual.properties);
+        assert_eq!(*request.doc, s.doc, "appearance never changes the document or journal");
     }
 
     #[test]
@@ -230,6 +259,7 @@ mod tests {
             let (actual, drawing) = result.drawing.unwrap();
             assert_eq!(actual, request);
             let drawing = drawing.unwrap();
+            assert_eq!(drawing.display_trees.len(), 2);
             assert!(!drawing.element_segments.is_empty());
             for line in &drawing.element_segments {
                 assert!(scene.find(&line.id).is_some(), "{request:?}: {} must resolve to a real scene element", line.id);
@@ -242,7 +272,7 @@ mod tests {
                 element_regions: drawing.element_regions,
             };
             let (point, expected) = match &request {
-                DrawingRequest::Saved(id) if id == "facade" => ([session.doc.buildings[0].facades[0].bays[0], 850.0], "b.f1.L0.B0"),
+                DrawingRequest::Saved(id) if id == "facade" => ([session.doc.buildings[0].facades[0].bays[0], 896.0], "b.f1.L0.B0"),
                 DrawingRequest::Saved(id) if id == "section" => ([2000.0, 1500.0], "partition.L0"),
                 _ => ([3000.0, 3925.0], "partition.L0"),
             };

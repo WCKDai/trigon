@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use trigon_model::annotation::{FontFamily, TextStyle};
+use trigon_model::annotation::{FontFamily, LinePattern, TextStyle};
 
 use super::{Anchor, Fill, Item, Layer, Path, Rgb, Scene, Stroke, Text, scale_text};
 
@@ -104,10 +104,19 @@ impl W {
         self.pair(330, format_args!("{H_MS_RECORD:X}"));
         self.pair(100, "AcDbEntity");
         self.pair(8, layer.name());
-        if let Some(s) = stroke
-            && s.dashed != layer.dashed()
-        {
-            self.pair(6, if s.dashed { "DASHED" } else { "Continuous" });
+        if let Some(s) = stroke {
+            let inherited = if layer.dashed() { LinePattern::Dashed } else { LinePattern::Solid };
+            if s.pattern() != inherited {
+                self.pair(
+                    6,
+                    match s.pattern() {
+                        LinePattern::Solid => "Continuous",
+                        LinePattern::Dashed => "DASHED",
+                        LinePattern::Dotted => "DOTTED",
+                        LinePattern::DashDot => "DASHDOT",
+                    },
+                );
+            }
         }
         if let Some(c) = colour {
             self.pair(62, c);
@@ -488,7 +497,12 @@ pub(crate) fn write(scene: &Scene, block: &TitleBlock<'_>) -> String {
     w.num(146, 0.0);
     w.pair(0, "ENDTAB");
 
-    w.table("LTYPE", H_LTYPES, 4);
+    let used = |pattern| scene.items.iter().any(|i| matches!(i, Item::Path(p) if p.stroke.is_some_and(|s| s.pattern() == pattern)));
+    let extra: Vec<_> = [(LinePattern::Dotted, "DOTTED", vec![0.0_f64, -1.0]), (LinePattern::DashDot, "DASHDOT", vec![2.0_f64, -1.0, 0.0, -1.0])]
+        .into_iter()
+        .filter(|(pattern, _, _)| used(*pattern))
+        .collect();
+    w.table("LTYPE", H_LTYPES, 4 + extra.len());
     for name in ["ByBlock", "ByLayer", "Continuous"] {
         w.record("LTYPE", H_LTYPES, "AcDbLinetypeTableRecord");
         w.pair(2, name);
@@ -509,6 +523,21 @@ pub(crate) fn write(scene: &Scene, block: &TitleBlock<'_>) -> String {
     for (len, kind) in [(2.0, 0), (-1.0, 0)] {
         w.num(49, len);
         w.pair(74, kind);
+    }
+
+    // Add only used patterns, preserving legacy DXF bytes and handles.
+    for (_, name, lengths) in extra {
+        w.record("LTYPE", H_LTYPES, "AcDbLinetypeTableRecord");
+        w.pair(2, name);
+        w.pair(70, 0);
+        w.pair(3, name);
+        w.pair(72, 65);
+        w.pair(73, lengths.len());
+        w.num(40, lengths.iter().map(|v| v.abs()).sum());
+        for length in lengths {
+            w.num(49, length);
+            w.pair(74, 0);
+        }
     }
     w.pair(0, "ENDTAB");
 
@@ -802,7 +831,7 @@ pub(crate) fn summary(dxf: &str) -> serde_json::Value {
             _ => {}
         }
     }
-    serde_json::json!({"entities": counts, "layers": layers})
+    serde_json::json!({"entities": counts, "layers": layers, "colour_mode":"AC1015 indexed ACI approximation; arbitrary RGB is not preserved", "lineweights":"nearest supported 1/100 mm"})
 }
 
 #[cfg(test)]

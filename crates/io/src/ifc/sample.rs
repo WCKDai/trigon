@@ -94,6 +94,7 @@ pub fn document() -> Result<Document> {
         verge_mm: 100.0,
         thickness_mm: 250.0,
         gutters: true,
+        drainage: None,
     };
     b.plinth = Some(Plinth { height: 500.0, projection: 30.0 });
     // A rendered courtyard side, and rendered bands at the floors of the street front.

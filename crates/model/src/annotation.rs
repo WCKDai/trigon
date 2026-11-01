@@ -46,6 +46,119 @@ impl TextStyle {
     }
 }
 
+/// Pattern lengths are paper mm: dash 2, gap 1; dots have round caps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinePattern {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+    DashDot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LineStyle {
+    pub colour: [u8; 3],
+    /// Paper mm. DXF rounds to its nearest supported lineweight.
+    pub width_mm: f64,
+    #[serde(default)]
+    pub pattern: LinePattern,
+}
+
+impl Default for LineStyle {
+    fn default() -> Self {
+        Self { colour: [26; 3], width_mm: 0.25, pattern: LinePattern::Solid }
+    }
+}
+
+/// A portable drawing preset stored with a saved view and reusable via view.apply_template.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DrawingTemplate {
+    pub name: String,
+    #[serde(default)]
+    pub line_weights: LineWeightProfile,
+    #[serde(default)]
+    pub sizing: ViewSizing,
+    /// Drawing-plane crop [x0,y0,x1,y1], in mm. Fit uses this rectangle; fixed scale clips to it.
+    pub crop: Option<[f64; 4]>,
+    /// Plan only, relative to the selected storey floor. None retains legacy plan symbols.
+    pub range: Option<PlanRange>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LineWeightProfile {
+    Fine,
+    #[default]
+    Standard,
+    Bold,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ViewSizing {
+    #[default]
+    Fit,
+    /// Physical 1:denominator on the 338.6667 x 190.5 mm sheet, cropped around drawing centre.
+    Fixed { denominator: f64, centre: [f64; 2] },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRange {
+    pub top_mm: f64,
+    pub cut_mm: f64,
+    pub bottom_mm: f64,
+    pub depth_mm: f64,
+}
+
+impl Default for PlanRange {
+    fn default() -> Self {
+        Self { top_mm: 2300.0, cut_mm: 1200.0, bottom_mm: 0.0, depth_mm: -1000.0 }
+    }
+}
+impl Default for DrawingTemplate {
+    fn default() -> Self {
+        Self { name: "Custom".into(), line_weights: Default::default(), sizing: Default::default(), crop: None, range: None }
+    }
+}
+impl PlanRange {
+    pub fn validate(&self) -> Result<()> {
+        for value in [self.top_mm, self.cut_mm, self.bottom_mm, self.depth_mm] {
+            checked("plan range relative to floor (mm)", value, -100_000.0, 100_000.0)?;
+        }
+        if !(self.depth_mm <= self.bottom_mm && self.bottom_mm < self.cut_mm && self.cut_mm < self.top_mm) {
+            return Err(ModelError::Invalid("plan range requires depth <= bottom < cut < top (relative to floor)".into()));
+        }
+        Ok(())
+    }
+}
+impl DrawingTemplate {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.name, false)?;
+        if self.name.len() > 80 {
+            return Err(ModelError::Invalid("template name is limited to 80 bytes".into()));
+        }
+        if let ViewSizing::Fixed { denominator, centre } = self.sizing {
+            checked("physical scale denominator", denominator, 1.0, 10000.0)?;
+            point(centre)?;
+        }
+        if let Some([x0, y0, x1, y1]) = self.crop {
+            point([x0, y0])?;
+            point([x1, y1])?;
+            checked("crop width (mm)", x1 - x0, 1.0, 1_000_000.0)?;
+            checked("crop height (mm)", y1 - y0, 1.0, 1_000_000.0)?;
+        }
+        if let Some(range) = self.range {
+            range.validate()?;
+        }
+        Ok(())
+    }
+}
+
 fn default_region_border() -> bool {
     true
 }
@@ -56,6 +169,8 @@ pub struct DrawingView {
     pub id: String,
     pub name: String,
     pub kind: DrawingViewKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<DrawingTemplate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -101,6 +216,13 @@ pub struct Annotation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "annotation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AnnotationKind {
+    /// Manual drafting geometry, never a model element or an apartment boundary assertion.
+    Line {
+        from: [f64; 2],
+        to: [f64; 2],
+        #[serde(default)]
+        stroke: LineStyle,
+    },
     Text {
         at: [f64; 2],
         text: String,
@@ -203,6 +325,12 @@ impl DrawingView {
     pub fn validate(&self) -> Result<()> {
         identifier(&self.id)?;
         text(&self.name, false)?;
+        if let Some(template) = &self.template {
+            template.validate()?;
+            if template.range.is_some() && !matches!(self.kind, DrawingViewKind::Plan { .. }) {
+                return Err(ModelError::Invalid("floor-relative view ranges belong to plan views".into()));
+            }
+        }
         if self.name.len() > 200 {
             return Err(ModelError::Invalid("drawing view names are limited to 200 bytes".into()));
         }
@@ -249,6 +377,12 @@ impl Annotation {
         identifier(&self.view)?;
         checked("size_mm (paper)", self.size_mm, 0.5, 12.0)?;
         match &self.kind {
+            AnnotationKind::Line { from, to, stroke } => {
+                point(*from)?;
+                point(*to)?;
+                checked("drafting line length (mm)", (to[0] - from[0]).hypot(to[1] - from[1]), 0.001, 1_000_000.0)?;
+                checked("line width (paper mm)", stroke.width_mm, 0.05, 2.11)?;
+            }
             AnnotationKind::Text { at, text: label, rotation_deg } => {
                 point(*at)?;
                 text(label, false)?;

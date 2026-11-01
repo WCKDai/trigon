@@ -31,6 +31,7 @@ pub(crate) struct Set {
 
 #[derive(Clone)]
 enum Source {
+    Site(usize),
     Facade(usize, usize),
     Placement(usize, usize, usize),
     Interior(usize, usize, usize),
@@ -507,6 +508,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
             }
         }
     }
+    result.extend(crate::site::records(doc, view)?.into_iter().map(|(i, data)| Record { data, source: Source::Site(i) }));
     result.sort_by(|a, b| a.data["id"].as_str().cmp(&b.data["id"].as_str()).then(a.data["status"].as_str().cmp(&b.data["status"].as_str())));
     Ok(result)
 }
@@ -522,7 +524,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
         trigon_model::roof::Roof::Flat => {
             properties.push(number("thickness_mm", "Flat roof slab thickness", building.roof_slab_thickness_mm.unwrap_or(300.0), "mm", 20.0, 1000.0));
         }
-        trigon_model::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters } => {
+        trigon_model::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage } => {
             properties.extend([
                 number("pitch_deg", "Roof pitch", *pitch_deg, "deg", 5.0, 75.0),
                 number("overhang_mm", "Eave overhang", *overhang_mm, "mm", 0.0, 2000.0),
@@ -531,6 +533,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 number("straighten_mm", "Eave straightening", *straighten_mm, "mm", 0.0, 10000.0),
                 field("gutters", "Gutters", *gutters, true),
                 field("gables", "Gable facade IDs", json!(gables), true),
+                field("drainage", "Optional drainage detail / explicit downpipes", json!(drainage), true),
             ]);
         }
     }
@@ -597,7 +600,9 @@ pub(crate) fn set(session: &mut Session, params: Set) -> Result<Value> {
     let descriptors = records(&candidate, &built, view)?;
     let target = if matches!(selected.source, Source::Placement(..)) && descriptors.iter().any(|r| r.data["id"] == params.id) {
         params.id
-    } else if descriptors.iter().any(|r| r.data["id"] == target) {
+    } else if descriptors.iter().any(|r| r.data["id"] == target) || matches!(selected.source, Source::Site(_)) {
+        // A site source keeps its exact ID even when a valid lifetime edit hides it in this view.
+        // site::apply has validated the complete source list before reaching this branch.
         target
     } else {
         descriptors
@@ -682,6 +687,7 @@ fn ensure_definition_id(doc: &mut Document, bi: usize, index: usize, kind: &str)
 
 fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Value>, selected_id: &str) -> Result<String> {
     match *source {
+        Source::Site(index) => crate::site::apply(doc, index, properties),
         Source::Facade(bi, fi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
             let edge = b.facades.get(fi).ok_or_else(|| invalid("missing facade"))?.edge;
@@ -949,6 +955,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             verge_mm: 0.0,
                             thickness_mm: 0.0,
                             gutters: false,
+                            drainage: None,
                         }
                     }
                     Some("pitched") => {}
@@ -967,24 +974,32 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             return Err(invalid("this roof property requires a pitched roof"));
                         }
                     }
-                    trigon_model::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters } => {
-                        match key.as_str() {
-                            "pitch_deg" => *pitch_deg = numeric(key, value)?,
-                            "gables" => {
-                                let ids: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| invalid("gables must be facade IDs"))?;
-                                if ids.len() > 200 {
-                                    return Err(invalid("at most 200 gables"));
-                                }
-                                *gables = ids;
+                    trigon_model::roof::Roof::Pitched {
+                        pitch_deg,
+                        gables,
+                        straighten_mm,
+                        overhang_mm,
+                        verge_mm,
+                        thickness_mm,
+                        gutters,
+                        drainage,
+                    } => match key.as_str() {
+                        "pitch_deg" => *pitch_deg = numeric(key, value)?,
+                        "gables" => {
+                            let ids: Vec<String> = serde_json::from_value(value.clone()).map_err(|_| invalid("gables must be facade IDs"))?;
+                            if ids.len() > 200 {
+                                return Err(invalid("at most 200 gables"));
                             }
-                            "straighten_mm" => *straighten_mm = numeric(key, value)?,
-                            "overhang_mm" => *overhang_mm = numeric(key, value)?,
-                            "verge_mm" => *verge_mm = numeric(key, value)?,
-                            "thickness_mm" => *thickness_mm = numeric(key, value)?,
-                            "gutters" => *gutters = boolean(key, value)?,
-                            _ => return Err(invalid("unknown roof property")),
+                            *gables = ids;
                         }
-                    }
+                        "straighten_mm" => *straighten_mm = numeric(key, value)?,
+                        "overhang_mm" => *overhang_mm = numeric(key, value)?,
+                        "verge_mm" => *verge_mm = numeric(key, value)?,
+                        "thickness_mm" => *thickness_mm = numeric(key, value)?,
+                        "gutters" => *gutters = boolean(key, value)?,
+                        "drainage" => *drainage = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("drainage: {e}")))?,
+                        _ => return Err(invalid("unknown roof property")),
+                    },
                 }
             }
             Ok(selected_id.to_string())

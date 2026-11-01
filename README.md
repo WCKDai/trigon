@@ -60,6 +60,10 @@ slab to edit its source properties; dimensional markers provide drag edits with 
 Saved annotations support font families/styles and filled regions. See
 [coordinated authoring](docs/coordinated-authoring.md) for supported edits and current limits.
 
+Reusable component libraries use local `.trigonlib` files. `types.export` saves a selection and
+`types.import` loads it; explicit replacement updates every linked instance in one undoable batch.
+See [component libraries](docs/component-libraries.md) and the original `libraries/balconies.trigonlib` starter pack.
+
 Studio's **Schedules** workspace and `schedule.openings` list the built windows and doors with their model IDs, storeys, types,
 dimensions, phase status and lining areas. It includes interior/cellar doors and explicitly
 excludes loggia facade-hole areas from the totals. `schedule.export` saves the inventory as

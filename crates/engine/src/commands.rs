@@ -44,6 +44,41 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "site.add",
+        summary: "Add a typed ground area, tree, bench or planter in site-local mm. Explicit design intent; validated, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Add>,
+        run: |s, v| crate::site::add(s, parse("site.add", v)?),
+    },
+    CommandSpec {
+        id: "site.set",
+        summary: "Replace one site's typed source while preserving its ID. Validated, atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Set>,
+        run: |s, v| crate::site::set(s, parse("site.set", v)?),
+    },
+    CommandSpec {
+        id: "site.delete",
+        summary: "Delete a site source, in every phase. Undo restores its exact parameters and lifetime.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Id>,
+        run: |s, v| crate::site::delete(s, parse("site.delete", v)?),
+    },
+    CommandSpec {
+        id: "site.list",
+        summary: "List exact site sources and design intent; these are not building opening or room quantities.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("site.list", v)?;
+            Ok(json!({"objects":s.doc.site_objects}))
+        },
+    },
+    CommandSpec {
         id: "element.get",
         summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
         mutates: false,
@@ -82,6 +117,22 @@ static COMMANDS: &[CommandSpec] = &[
         journaled: true,
         schema: schema::<trigon_model::annotation::DrawingView>,
         run: |s, v| crate::views::define_view(s, parse("view.define", v)?),
+    },
+    CommandSpec {
+        id: "view.configure",
+        summary: "Set or clear a saved view's persistent template: line weights, physical scale or fit/crop, and optional plan-only floor-relative cut/top/bottom/depth. Null template restores legacy drawing defaults. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::view_config::Configure>,
+        run: |s, v| crate::view_config::configure(s, parse("view.configure", v)?),
+    },
+    CommandSpec {
+        id: "view.apply_template",
+        summary: "Copy a configured saved view's template to 1 to 256 distinct target views, preserving their coordinate frames and annotations. All targets validate before any change; atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::view_config::Apply>,
+        run: |s, v| crate::view_config::apply(s, parse("view.apply_template", v)?),
     },
     CommandSpec {
         id: "view.list",
@@ -761,6 +812,22 @@ static COMMANDS: &[CommandSpec] = &[
             }
             Ok(json!({"defined": t.id}))
         },
+    },
+    CommandSpec {
+        id: "types.export",
+        summary: "Export selected component types (or all) to a portable, parametric .trigonlib library.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::libraries::Export>,
+        run: |s, v| crate::libraries::export(s, parse("types.export", v)?),
+    },
+    CommandSpec {
+        id: "types.import",
+        summary: "Import a parametric .trigonlib library; replace explicitly updates all linked instances as one undoable change.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::libraries::Import>,
+        run: |s, v| crate::libraries::import(s, parse("types.import", v)?),
     },
     CommandSpec {
         id: "evidence.photos",
@@ -1472,7 +1539,11 @@ static COMMANDS: &[CommandSpec] = &[
                 None if p.cut_mm.is_some() => return Err(ModelError::Invalid("cut_mm needs cut_level".into()).into()),
                 None => None,
             };
-            let bytes = trigon_io::glb::write(&trigon_model::build::build_cut(&s.doc, view, cut)?, &refs);
+            let bytes = trigon_io::glb::write_with_site(
+                &trigon_model::build::build_cut(&s.doc, view, cut)?,
+                &trigon_model::site::build(&s.doc, view, cut)?,
+                &refs,
+            );
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
@@ -1492,7 +1563,13 @@ static COMMANDS: &[CommandSpec] = &[
             let path = checked_path(&p.path, "ifc")?;
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model.ifc").to_string();
-            let text = trigon_io::ifc::write(&s.doc, &trigon_model::build::build_view(&s.doc, view)?, &name, &time::now_utc());
+            let text = trigon_io::ifc::write_with_site(
+                &s.doc,
+                &trigon_model::build::build_view(&s.doc, view)?,
+                &trigon_model::site::build(&s.doc, view, None)?,
+                &name,
+                &time::now_utc(),
+            );
             write_file(&path, text.as_bytes())?;
             Ok(json!({"written": path, "bytes": text.len()}))
         },
@@ -1944,6 +2021,8 @@ struct SetRoof {
     thickness_mm: Option<f64>,
     /// Gutters along the eaves (default false).
     gutters: Option<bool>,
+    /// Opt-in channel detail and explicit pipe positions; requires gutters.
+    drainage: Option<trigon_model::roof::drainage::Drainage>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -2097,7 +2176,7 @@ fn selected(list: &Option<Vec<usize>>, i: usize) -> bool {
 }
 
 /// Paths must carry the expected extension, so a command can't overwrite an unrelated file.
-fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
+pub(crate) fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
     let path = PathBuf::from(p);
     if path.extension().and_then(|e| e.to_str()) != Some(ext) {
         return Err(EngineError::Io(format!("{p}: the file name must end in .{ext}")));
@@ -2105,7 +2184,7 @@ fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::Io(format!("{}: {e}", dir.display())))?;
     }
@@ -2338,6 +2417,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 verge_mm: trigon_model::checked("verge_mm", p.verge_mm.unwrap_or(0.0), 0.0, 1500.0)?,
                 thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,
                 gutters: p.gutters.unwrap_or(false),
+                drainage: p.drainage,
             }
         }
         other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
@@ -2645,8 +2725,16 @@ fn comparison(c: &trigon_ifcread::Comparison) -> Value {
 /// Bounding boxes of this document's elements, keyed by the GlobalId the IFC export gives them.
 fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f64; 3], [f64; 3])>> {
     let built = trigon_model::build(doc)?;
+    let site = trigon_model::site::build(doc, trigon_model::build::View::latest(doc), None)?;
     Ok(trigon_io::ifc::model_shapes(doc, &built)
         .into_iter()
+        .chain(site.into_iter().map(|o| {
+            let mut m = trigon_model::Mesh::default();
+            for (_, part) in o.parts {
+                m.append(&part);
+            }
+            (o.id, m)
+        }))
         .filter_map(|(id, mesh)| Some((trigon_io::ifc::guid(&format!("trigon:{id}")), mesh.bounds()?)))
         .collect())
 }

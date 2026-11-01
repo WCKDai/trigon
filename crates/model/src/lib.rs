@@ -14,6 +14,7 @@ pub mod footprint;
 pub mod joins;
 pub mod mesh;
 pub mod roof;
+pub mod site;
 pub mod stair;
 pub mod wall_cleanup;
 pub mod walls;
