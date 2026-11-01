@@ -90,6 +90,7 @@ pub fn document() -> Result<Document> {
         pitch_deg: 40.0,
         gables: vec![id(1), id(4)],
         straighten_mm: 1200.0,
+        eave_facades: None,
         overhang_mm: 300.0,
         verge_mm: 100.0,
         thickness_mm: 250.0,

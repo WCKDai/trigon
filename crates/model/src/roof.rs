@@ -100,6 +100,10 @@ pub enum Roof {
         /// straight along the outer corners (a stepped street facade under one roof plane).
         #[serde(default = "default_steps")]
         straighten_mm: f64,
+        /// Optional ordered source facade lines. Adjacent lines determine each eave corner;
+        /// overrides straightening without changing the footprint. None retains legacy bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eave_facades: Option<Vec<String>>,
         /// How far the roof runs past the walls at the eaves, mm (0: it stops at the wall line).
         #[serde(default, skip_serializing_if = "is_zero")]
         overhang_mm: f64,
@@ -196,6 +200,146 @@ pub fn eave_outline(ring: &[[f64; 2]], tolerance: f64) -> Vec<usize> {
         }
     }
     keep
+}
+
+/// Intersect ordered source facade lines without moving or simplifying the source walls.
+/// Each returned edge owns the corresponding original footprint edge. The first corner is
+/// the intersection of the last and first selected lines; no point is an arbitrary input.
+pub(crate) fn selected_eave_outline(b: &crate::Building, facades: &[String]) -> Result<(Vec<usize>, Vec<[f64; 2]>)> {
+    let invalid = |message: String| ModelError::Invalid(format!("eave_facades: {message}"));
+    let n = b.footprint.len();
+    if !(3..=2000).contains(&n) || !(3..=256).contains(&facades.len()) || facades.len() > n {
+        return Err(invalid("select 3 to 256 source facades in footprint order, on a footprint with 3 to 2000 corners".into()));
+    }
+    if b.footprint.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
+        return Err(invalid("source footprint must be finite and within 100 km of the site origin".into()));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut edges = Vec::with_capacity(facades.len());
+    let mut frames = Vec::with_capacity(facades.len());
+    for id in facades {
+        if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+            return Err(invalid("facade IDs need 1 to 128 bytes without control characters".into()));
+        }
+        if !ids.insert(id) {
+            return Err(invalid(format!("duplicate facade {id}; select each source line once")));
+        }
+        let mut matches = b.facades.iter().filter(|f| &f.id == id);
+        let f = matches.next().ok_or_else(|| invalid(format!("unknown facade {id}; select a facade of {}", b.id)))?;
+        if matches.next().is_some() || edges.contains(&f.edge) {
+            return Err(invalid(format!("{id} does not identify a unique source edge")));
+        }
+        let (a, c) = b.edge(f.edge).ok_or_else(|| invalid(format!("{id} has no source edge")))?;
+        let frame = crate::FacadeFrame::new(a, c).ok_or_else(|| invalid(format!("{id} has a degenerate source line")))?;
+        crate::checked(&format!("eave_facades source length {id}"), frame.length, 1.0, 200000.0)?;
+        edges.push(f.edge);
+        frames.push(frame);
+    }
+    let travelled: usize = edges.iter().zip(edges.iter().cycle().skip(1)).take(edges.len()).map(|(&a, &c)| (c + n - a) % n).sum();
+    if travelled != n {
+        return Err(invalid("facades must follow the counter-clockwise source footprint order once; any cyclic starting facade is allowed".into()));
+    }
+    let mut outline = Vec::with_capacity(frames.len());
+    for k in 0..frames.len() {
+        let prev = (k + frames.len() - 1) % frames.len();
+        let (a, c) = (frames[prev], frames[k]);
+        let det = a.t[0] * c.t[1] - a.t[1] * c.t[0];
+        if det.abs() < 1e-6 {
+            return Err(invalid(format!(
+                "{} and {} have parallel or unstable lines; select a turning facade between them",
+                facades[prev], facades[k]
+            )));
+        }
+        let delta = [c.origin[0] - a.origin[0], c.origin[1] - a.origin[1]];
+        let along = (delta[0] * c.t[1] - delta[1] * c.t[0]) / det;
+        let p = [a.origin[0] + along * a.t[0], a.origin[1] + along * a.t[1]];
+        if p.iter().any(|v| !v.is_finite() || v.abs() > 1e8)
+            || (p[0] - a.origin[0]).hypot(p[1] - a.origin[1]) > 200000.0
+            || (p[0] - c.origin[0]).hypot(p[1] - c.origin[1]) > 200000.0
+        {
+            return Err(invalid(format!(
+                "intersection of {} and {} is unbounded; select nearer intersecting facade lines (within 200 m)",
+                facades[prev], facades[k]
+            )));
+        }
+        outline.push(p);
+    }
+    for (k, fr) in frames.iter().enumerate() {
+        let (a, c) = (outline[k], outline[(k + 1) % outline.len()]);
+        let forward = (c[0] - a[0]) * fr.t[0] + (c[1] - a[1]) * fr.t[1];
+        crate::checked(&format!("eave_facades forward run {}", facades[k]), forward, 1.0, 200000.0)?;
+    }
+    crate::site::polygon(&outline).map_err(|e| invalid(format!("selected lines must form a simple ring: {e}")))?;
+    if crate::footprint::signed_area2(&outline) <= 0.0 {
+        return Err(invalid("selected lines must form a counter-clockwise ring".into()));
+    }
+    if let Some(edge) = uncovered_edge(&outline, &b.footprint) {
+        let id = b.facades.iter().find(|f| f.edge == edge).map_or_else(|| format!("source edge {edge}"), |f| f.id.clone());
+        return Err(invalid(format!(
+            "selected ring does not cover the full footprint at {id}; include an outer source facade, without moving the walls"
+        )));
+    }
+    Ok((edges, outline))
+}
+
+/// Test every open interval of each source edge, split where it meets the selected boundary.
+/// Checking only the source vertices misses an edge crossing a concavity of the selected ring.
+fn uncovered_edge(outline: &[[f64; 2]], source: &[[f64; 2]]) -> Option<usize> {
+    let cross = |a: [f64; 2], b: [f64; 2]| a[0] * b[1] - a[1] * b[0];
+    let sub = |a: [f64; 2], b: [f64; 2]| [a[0] - b[0], a[1] - b[1]];
+    let inside = |p: [f64; 2]| {
+        let mut yes = false;
+        for (&a, &c) in outline.iter().zip(outline.iter().cycle().skip(1)).take(outline.len()) {
+            let d = sub(c, a);
+            let length = d[0].hypot(d[1]);
+            if cross(d, sub(p, a)).abs() <= 1e-6 * length && (0..2).all(|i| p[i] >= a[i].min(c[i]) - 1e-6 && p[i] <= a[i].max(c[i]) + 1e-6) {
+                return true;
+            }
+            if (a[1] > p[1]) != (c[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) * d[0] / d[1] {
+                yes = !yes;
+            }
+        }
+        yes
+    };
+    for (edge, (&a, &c)) in source.iter().zip(source.iter().cycle().skip(1)).take(source.len()).enumerate() {
+        if !inside(a) || !inside(c) {
+            return Some(edge);
+        }
+        let d = sub(c, a);
+        let length2 = d[0] * d[0] + d[1] * d[1];
+        if length2 < 1.0 {
+            return Some(edge);
+        }
+        let mut stations = vec![0.0, 1.0];
+        for (&p, &q) in outline.iter().zip(outline.iter().cycle().skip(1)).take(outline.len()) {
+            let e = sub(q, p);
+            let det = cross(d, e);
+            if det.abs() > 1e-12 {
+                let delta = sub(p, a);
+                let t = cross(delta, e) / det;
+                let u = cross(delta, d) / det;
+                if (0.0..=1.0).contains(&t) && (-1e-10..=1.0 + 1e-10).contains(&u) {
+                    stations.push(t);
+                }
+            } else {
+                for v in [p, q] {
+                    let delta = sub(v, a);
+                    let t = (delta[0] * d[0] + delta[1] * d[1]) / length2;
+                    if (0.0..=1.0).contains(&t) {
+                        stations.push(t);
+                    }
+                }
+            }
+        }
+        stations.sort_by(f64::total_cmp);
+        for pair in stations.windows(2) {
+            let t = (pair[0] + pair[1]) / 2.0;
+            if !inside([a[0] + t * d[0], a[1] + t * d[1]]) {
+                return Some(edge);
+            }
+        }
+    }
+    None
 }
 
 /// A pitched roof's geometry, in site mm.
@@ -529,6 +673,72 @@ mod tests {
         // Nothing asked: the plain roof.
         assert_eq!(pitched_with(&WING, 16000.0, 40.0, &[1, 3], &Buildup::default()).unwrap(), plain);
         assert!(pitched_with(&WING, 16000.0, 40.0, &[], &Buildup { overhang: f64::NAN, ..b }).is_err());
+    }
+
+    #[test]
+    fn selected_eaves_validate_order_coverage_and_hostile_sources_without_changing_defaults() {
+        let ring = [[0., 0.], [4000., 0.], [4000., 800.], [10000., 800.], [10000., 0.], [24000., 0.], [24000., 10000.], [0., 10000.]];
+        let b = crate::Building::new("b", "Synthetic line selection", &ring, 2, 3400.).unwrap();
+        let ids = |numbers: &[usize]| numbers.iter().map(|i| format!("b.f{i}")).collect::<Vec<_>>();
+        let (owners, outline) = selected_eave_outline(&b, &ids(&[1, 6, 7, 8])).unwrap();
+        assert_eq!(owners, vec![0, 5, 6, 7]);
+        assert_eq!(outline, vec![[0., 0.], [24000., 0.], [24000., 10000.], [0., 10000.]]);
+        let (rotated, points) = selected_eave_outline(&b, &ids(&[7, 8, 1, 6])).unwrap();
+        assert_eq!(rotated, vec![6, 7, 0, 5]);
+        assert_eq!(points, vec![outline[2], outline[3], outline[0], outline[1]]);
+        for bad in [
+            vec![],
+            ids(&[1, 6]),
+            ids(&[1, 6, 6, 8]),
+            ids(&[1, 7, 6, 8]),
+            ids(&[1, 3, 6, 7, 8]),
+            ids(&[3, 6, 7, 8]),
+            ids(&[1, 6, 7, 99]),
+            vec!["x".repeat(129); 3],
+            vec!["\n".into(); 3],
+            vec!["b.f1".into(); 257],
+        ] {
+            assert!(selected_eave_outline(&b, &bad).is_err(), "must reject {bad:?}");
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 1e8 + 1.] {
+            let mut hostile = b.clone();
+            hostile.footprint[0][0] = value;
+            assert!(selected_eave_outline(&hostile, &ids(&[1, 6, 7, 8])).is_err());
+        }
+        let mut unstable = b.clone();
+        unstable.footprint = vec![[0., 0.], [30000., 0.], [35000., 10000.], [30000., 10000.1], [0., 11000.]];
+        unstable.facades.truncate(5);
+        let error = selected_eave_outline(&unstable, &ids(&[1, 3, 4, 5])).unwrap_err().to_string();
+        assert!(error.contains("unbounded"), "{error}");
+        unstable.footprint[3][1] = 10000.0001;
+        let error = selected_eave_outline(&unstable, &ids(&[1, 3, 4, 5])).unwrap_err().to_string();
+        assert!(error.contains("unstable"), "{error}");
+        let mut hostile = b.clone();
+        hostile.facades[0].edge = usize::MAX;
+        assert!(selected_eave_outline(&hostile, &ids(&[1, 6, 7, 8])).is_err());
+        let mut hostile = b.clone();
+        hostile.facades.push(hostile.facades[0].clone());
+        assert!(selected_eave_outline(&hostile, &ids(&[1, 6, 7, 8])).is_err());
+        let legacy = r#"{"kind":"pitched","pitch_deg":46.0,"gables":[],"straighten_mm":1200.0}"#;
+        let roof: Roof = serde_json::from_str(legacy).unwrap();
+        assert_eq!(serde_json::to_string(&roof).unwrap(), legacy);
+        let mut null = serde_json::to_value(&roof).unwrap();
+        null["eave_facades"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_string(&serde_json::from_value::<Roof>(null).unwrap()).unwrap(), legacy);
+        for value in [serde_json::json!(4), serde_json::json!([1, 2, 3]), serde_json::json!({}), serde_json::json!("b.f1")] {
+            let mut bad = serde_json::to_value(&roof).unwrap();
+            bad["eave_facades"] = value;
+            assert!(serde_json::from_value::<Roof>(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn eave_coverage_checks_whole_source_edges_across_concavities() {
+        let u = [[0., 0.], [10000., 0.], [10000., 10000.], [7000., 10000.], [7000., 3000.], [3000., 3000.], [3000., 10000.], [0., 10000.]];
+        // All three source vertices are inside, but the first edge crosses the open notch.
+        let source = [[1000., 9000.], [9000., 9000.], [5000., 1000.]];
+        assert_eq!(uncovered_edge(&u, &source), Some(0));
+        assert_eq!(uncovered_edge(&u, &u), None);
     }
 
     #[test]

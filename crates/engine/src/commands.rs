@@ -2558,6 +2558,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 pitch_deg: pitch,
                 gables,
                 straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                eave_facades: None,
                 overhang_mm: trigon_model::checked("overhang_mm", p.overhang_mm.unwrap_or(0.0), 0.0, 2000.0)?,
                 verge_mm: trigon_model::checked("verge_mm", p.verge_mm.unwrap_or(0.0), 0.0, 1500.0)?,
                 thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,

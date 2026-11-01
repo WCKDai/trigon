@@ -1,0 +1,97 @@
+[
+  {
+    "command": "building.add",
+    "params": {
+      "id": "b",
+      "name": "Synthetic selected source eaves",
+      "footprint": [
+        [
+          0,
+          0
+        ],
+        [
+          16000,
+          0
+        ],
+        [
+          16000,
+          800
+        ],
+        [
+          24000,
+          800
+        ],
+        [
+          24000,
+          12800
+        ],
+        [
+          28000,
+          12800
+        ],
+        [
+          28000,
+          30000
+        ],
+        [
+          0,
+          30000
+        ]
+      ],
+      "storeys": 3,
+      "storey_height_mm": 3400
+    }
+  },
+  {
+    "command": "building.set_roof",
+    "params": {
+      "building": "b",
+      "kind": "pitched",
+      "pitch_deg": 46,
+      "straighten_mm": 10000,
+      "thickness_mm": 220,
+      "overhang_mm": 250,
+      "gutters": true
+    }
+  },
+  {
+    "command": "element.set",
+    "params": {
+      "id": "b.roof",
+      "properties": {
+        "eave_facades": [
+          "b.f1",
+          "b.f4",
+          "b.f5",
+          "b.f6",
+          "b.f7",
+          "b.f8"
+        ],
+        "drainage": {
+          "downpipes": [
+            {
+              "id": "source-four",
+              "facade": "b.f4",
+              "along_mm": 6000,
+              "diameter_mm": 80,
+              "wall_offset_mm": 100,
+              "bottom_mm": 150,
+              "shoe_mm": 200
+            }
+          ]
+        },
+        "dormers": [
+          {
+            "id": "source-host",
+            "facade": "b.f4",
+            "u_mm": 6000,
+            "window_type": "window.casement.2",
+            "width_mm": 1100,
+            "height_mm": 1100,
+            "setback_mm": 350
+          }
+        ]
+      }
+    }
+  }
+]

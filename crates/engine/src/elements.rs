@@ -618,13 +618,25 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
         trigon_model::roof::Roof::Flat => {
             properties.push(number("thickness_mm", "Flat roof slab thickness", building.roof_slab_thickness_mm.unwrap_or(300.0), "mm", 20.0, 1000.0));
         }
-        trigon_model::roof::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, drainage, dormers } => {
+        trigon_model::roof::Roof::Pitched {
+            pitch_deg,
+            gables,
+            straighten_mm,
+            eave_facades,
+            overhang_mm,
+            verge_mm,
+            thickness_mm,
+            gutters,
+            drainage,
+            dormers,
+        } => {
             properties.extend([
                 number("pitch_deg", "Roof pitch", *pitch_deg, "deg", 5.0, 75.0),
                 number("overhang_mm", "Eave overhang", *overhang_mm, "mm", 0.0, 2000.0),
                 number("verge_mm", "Verge overhang", *verge_mm, "mm", 0.0, 1500.0),
                 number("thickness_mm", "Roof build-up normal to slope", *thickness_mm, "mm", 0.0, 1000.0),
                 number("straighten_mm", "Eave straightening", *straighten_mm, "mm", 0.0, 10000.0),
+                field("eave_facades", "Optional ordered source eave facade IDs", json!(eave_facades), true),
                 field("gutters", "Gutters", *gutters, true),
                 field("gables", "Gable facade IDs", json!(gables), true),
                 field("drainage", "Optional drainage detail / explicit downpipes", json!(drainage), true),
@@ -1112,6 +1124,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             pitch_deg: 35.0,
                             gables: Vec::new(),
                             straighten_mm: 1200.0,
+                            eave_facades: None,
                             overhang_mm: 0.0,
                             verge_mm: 0.0,
                             thickness_mm: 0.0,
@@ -1144,6 +1157,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         pitch_deg,
                         gables,
                         straighten_mm,
+                        eave_facades,
                         overhang_mm,
                         verge_mm,
                         thickness_mm,
@@ -1160,6 +1174,11 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             *gables = ids;
                         }
                         "straighten_mm" => *straighten_mm = numeric(key, value)?,
+                        "eave_facades" => {
+                            *eave_facades = serde_json::from_value(value.clone()).map_err(|_| {
+                                invalid("eave_facades requires an ordered list of source facade IDs, or null for legacy straightening")
+                            })?
+                        }
                         "overhang_mm" => *overhang_mm = numeric(key, value)?,
                         "verge_mm" => *verge_mm = numeric(key, value)?,
                         "thickness_mm" => *thickness_mm = numeric(key, value)?,
@@ -1169,6 +1188,9 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         _ => return Err(invalid("unknown roof property")),
                     },
                     trigon_model::Roof::Mansard { parameters: p } => match key.as_str() {
+                        "eave_facades" => {
+                            return Err(invalid("eave_facades is supported only on pitched roofs; mansard selection is not implemented"));
+                        }
                         "covering" => {
                             p.covering =
                                 serde_json::from_value(value.clone()).map_err(|_| invalid("covering requires typed lower and upper roof surfaces"))?
