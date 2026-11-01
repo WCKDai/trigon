@@ -1,4 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#e11d48"/>
-  <text x="32" y="32" dy="0.35em" text-anchor="middle" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="32" font-weight="600" fill="#ffffff">T</text>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Trigon" shape-rendering="crispEdges"><title>Trigon</title><rect width="1024" height="1024" fill="#FFFFFF"/><rect x="426.667" y="256" width="170.667" height="85.3333" fill="#B5470F"/><rect x="256" y="341.333" width="512" height="85.3333" fill="#B5470F"/><rect x="426.667" y="426.667" width="170.667" height="85.3333" fill="#B5470F"/><rect x="426.667" y="512" width="170.667" height="85.3333" fill="#B5470F"/><rect x="426.667" y="597.333" width="170.667" height="85.3333" fill="#B5470F"/><rect x="512" y="682.667" width="256" height="85.3333" fill="#B5470F"/></svg>
