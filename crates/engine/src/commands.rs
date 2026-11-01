@@ -539,7 +539,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "facade.set_finish",
-        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick or render (white). Without \
+        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick, yellow_brick or render (white). Without \
                   `facades` it sets the building's default; `clear: true` makes the listed facades follow the building again.",
         mutates: true,
         journaled: true,

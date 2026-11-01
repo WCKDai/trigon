@@ -29,10 +29,12 @@ pub enum Material {
     Render,
     /// Red brick, where a facade isn't the building's usual brick.
     BrickRed,
+    /// Yellow facing brick, explicitly assigned rather than changing a building's default brick.
+    BrickYellow,
 }
 
 impl Material {
-    pub const ALL: [Material; 16] = [
+    pub const ALL: [Material; 17] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -49,6 +51,7 @@ impl Material {
         Material::Plaster,
         Material::Render,
         Material::BrickRed,
+        Material::BrickYellow,
     ];
 
     pub fn name(self) -> &'static str {
@@ -69,6 +72,7 @@ impl Material {
             Material::Plaster => "plaster",
             Material::Render => "render",
             Material::BrickRed => "brick_red",
+            Material::BrickYellow => "brick_yellow",
         }
     }
 
@@ -91,7 +95,31 @@ impl Material {
             Material::Plaster => [0.93, 0.92, 0.89, 1.0],
             Material::Render => [0.90, 0.90, 0.88, 1.0],
             Material::BrickRed => [0.55, 0.22, 0.14, 1.0],
+            Material::BrickYellow => [0.57, 0.43, 0.22, 1.0],
         }
+    }
+
+    pub fn masonry(self) -> bool {
+        matches!(self, Self::Wall | Self::BrickRed | Self::BrickYellow)
+    }
+
+    /// Original running-bond material coordinates, anchored to site-local millimetres.
+    /// One repeat is 480 × 132 mm: two 240 × 66 modules with 228 × 54 brick faces and
+    /// 12 mm joints. This is a presentation template, not a measurement of an existing bond.
+    /// `normal` is the triangle cross product in original coordinates; it need not be unit.
+    pub fn masonry_uv(self, point: [f64; 3], normal: [f64; 3]) -> Option<[f32; 2]> {
+        if !self.masonry() || point.iter().any(|v| !v.is_finite() || v.abs() > 1e9) || normal.iter().any(|v| !v.is_finite() || v.abs() > 1e30) {
+            return None;
+        }
+        let horizontal = normal[0].hypot(normal[1]);
+        if normal[2].abs() > horizontal {
+            return Some([(point[0] / 480.0) as f32, (-point[1] / 132.0) as f32]);
+        }
+        if horizontal <= 1e-12 {
+            return None;
+        }
+        let along = point[0] * (normal[1] / horizontal) - point[1] * (normal[0] / horizontal);
+        Some([(along / 480.0) as f32, (-point[2] / 132.0) as f32])
     }
 }
 
@@ -207,6 +235,27 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masonry_coordinates_preserve_physical_scale_and_ignore_normal_magnitude() {
+        for material in [Material::Wall, Material::BrickRed, Material::BrickYellow] {
+            assert_eq!(material.masonry_uv([480.0, 0.0, -132.0], [0.0, 1.0, 0.0]), Some([1.0, 1.0]));
+            assert_eq!(material.masonry_uv([480.0, 0.0, -132.0], [0.0, 9000.0, 0.0]), Some([1.0, 1.0]));
+            assert_eq!(material.masonry_uv([0.0, 480.0, 132.0], [1.0, 0.0, 0.0]), Some([-1.0, -1.0]));
+            assert_eq!(material.masonry_uv([480.0, 132.0, 0.0], [0.0, 0.0, 1.0]), Some([1.0, -1.0]));
+            assert!(material.masonry_uv([f64::NAN, 0.0, 0.0], [0.0, 1.0, 0.0]).is_none());
+            assert!(material.masonry_uv([0.0; 3], [f64::INFINITY, 0.0, 0.0]).is_none());
+            assert!(material.masonry_uv([f64::MAX, 0.0, 0.0], [0.0, 1.0, 0.0]).is_none());
+            assert!(material.masonry_uv([0.0; 3], [0.0; 3]).is_none());
+        }
+        for material in Material::ALL.into_iter().filter(|m| !m.masonry()) {
+            assert!(material.masonry_uv([0.0; 3], [0.0, 1.0, 0.0]).is_none());
+        }
+        assert_ne!(Material::BrickYellow.rgba(), Material::Wall.rgba());
+        assert_eq!(serde_json::from_str::<Material>("\"wall\"").unwrap(), Material::Wall);
+        assert_eq!(serde_json::from_str::<Material>("\"brick_red\"").unwrap(), Material::BrickRed);
+        assert_eq!(serde_json::from_str::<Material>("\"brick_yellow\"").unwrap(), Material::BrickYellow);
+    }
 
     #[test]
     fn polygon_with_hole_triangulates() {

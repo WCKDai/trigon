@@ -592,6 +592,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         let finish = match f.finish.unwrap_or(b.finish) {
             crate::doc::WallFinish::Brick => Material::Wall,
             crate::doc::WallFinish::RedBrick => Material::BrickRed,
+            crate::doc::WallFinish::YellowBrick => Material::BrickYellow,
             crate::doc::WallFinish::Render => Material::Render,
         };
         let all = resolve_facade(doc, b, f)?;

@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 trigon-model = { workspace = true }
 serde_json = { workspace = true }
+# Original procedural masonry embedded in portable GLB files (already in the workspace closure).
+png = "0.18"
 
 [dev-dependencies]
 # Both IFC readers check the export in tests (workspace crate).
