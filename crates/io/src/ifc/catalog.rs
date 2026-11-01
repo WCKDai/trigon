@@ -39,6 +39,8 @@ pub const DOOR: Mat = mat("Træ, dørblad", "wood", [0.42, 0.26, 0.16]);
 pub const SILL: Mat = mat("Sålbænk og beklædning", "metal", [0.80, 0.78, 0.74]);
 pub const RAIL: Mat = mat("Stål, malet mørk", "steel", [0.18, 0.18, 0.18]);
 pub const STEEL: Mat = mat("Stål, varmforzinket", "steel", [0.66, 0.68, 0.70]);
+pub const STEEL_WHITE: Mat = mat("Stål, malet hvid", "steel", FRAME.rgb);
+pub const GASKET: Mat = mat("Elastomertætning", "rubber", RAIL.rgb);
 pub const DECK: Mat = mat("Træ, terrassebrædder", "wood", [0.55, 0.35, 0.20]);
 pub const STAIR: Mat = mat("Trappe", "stair", [0.70, 0.62, 0.52]);
 pub const PLINTH: Mat = mat("Sokkel, puds", "plaster", [0.55, 0.55, 0.53]);
@@ -67,6 +69,8 @@ pub fn of(m: Material) -> Mat {
         Material::Render => RENDER,
         Material::BrickRed => BRICK_RED,
         Material::BrickYellow => BRICK_YELLOW,
+        Material::SteelWhite => STEEL_WHITE,
+        Material::Gasket => GASKET,
         Material::Paving => mat("Site paving", "stone", [0.52, 0.51, 0.47]),
         Material::Gravel => mat("Site gravel", "stone", [0.62, 0.58, 0.48]),
         Material::Grass => mat("Site grass", "vegetation", [0.22, 0.31, 0.12]),

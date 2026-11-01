@@ -198,7 +198,7 @@ mod tests {
         let rails: Vec<_> = built[0].walls[0].attachments.iter().filter(|e| e.class == ElementClass::Railing).collect();
         assert_eq!(rails.len(), 2);
         assert_eq!([rails[0].width, rails[1].width], [3200.0, 2300.0]);
-        assert!(rails.iter().all(|e| e.parts.iter().any(|(material, _)| *material == Material::Frame)));
+        assert!(rails.iter().all(|e| e.parts.iter().any(|(material, _)| *material == Material::SteelWhite)));
         assert_ne!(built, initial);
         assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
         s.execute("edit.undo", json!({})).unwrap();

@@ -18,6 +18,51 @@ fn count(text: &str, entity: &str) -> usize {
 }
 
 #[test]
+fn painted_balcony_metal_is_classified_as_steel_instead_of_timber() {
+    let mut doc = sample::document().unwrap();
+    for ty in &mut doc.types {
+        if let trigon_model::ComponentKind::SteelBalcony { finish, .. } = &mut ty.kind {
+            *finish = trigon_model::component::Finish::White;
+        }
+    }
+    let built = trigon_model::build(&doc).unwrap();
+    let white_metals: Vec<_> = built
+        .iter()
+        .flat_map(|b| &b.walls)
+        .flat_map(|w| &w.attachments)
+        .filter(|e| matches!(doc.component(&e.type_id).unwrap().kind, trigon_model::ComponentKind::SteelBalcony { .. }))
+        .flat_map(|e| &e.parts)
+        .filter(|(m, _)| m.rgba() == trigon_model::Material::Frame.rgba())
+        .collect();
+    assert!(!white_metals.is_empty());
+    assert!(white_metals.iter().all(|(m, _)| catalog::of(*m).category == "steel"));
+}
+
+#[test]
+fn detailed_glazing_seals_have_rubber_material_semantics() {
+    let doc = sample::document().unwrap();
+    let built = trigon_model::build(&doc).unwrap();
+    let seals: Vec<_> = built
+        .iter()
+        .flat_map(|b| &b.walls)
+        .flat_map(|w| &w.openings)
+        .flat_map(|o| &o.fill.parts)
+        .filter(|(m, _)| m.rgba() == trigon_model::Material::Railing.rgba())
+        .collect();
+    assert!(!seals.is_empty());
+    assert!(seals.iter().all(|(m, _)| catalog::of(*m).category == "rubber"));
+}
+
+#[test]
+fn opening_material_constituents_are_exported_and_linked_to_named_shape_aspects() {
+    let (_, _, text) = sample();
+    assert!(text.contains(&format!("IFCMATERIAL({},$,'rubber')", string(catalog::GASKET.name))));
+    assert!(count(&text, "IFCMATERIALCONSTITUENTSET") > 0);
+    assert!(text.contains("IFCMATERIALCONSTITUENT('Gasket',$,"));
+    assert!(text.lines().any(|line| line.contains("IFCSHAPEASPECT(") && line.contains(",'Gasket',$,.T.,")));
+}
+
+#[test]
 fn the_sample_has_every_kind_of_building_element() {
     let (doc, built, text) = sample();
     let b = &built[0];

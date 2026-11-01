@@ -1266,7 +1266,7 @@ fn fill_parts(fr: &FacadeFrame, rect: Rect, kind: &ComponentKind, at: Fill) -> V
             for u in [u0 + 15.0, u1 - 45.0] {
                 rail.append(&fbox(fr, (u, u + 30.0), (wr - 15.0, wr + 15.0), (v0, top)));
             }
-            parts.push((Material::Frame, rail));
+            parts.push((Material::SteelWhite, rail));
         }
         ComponentKind::BalconySlab { .. } | ComponentKind::SteelBalcony { .. } => return Vec::new(),
     }
@@ -1435,7 +1435,7 @@ fn attachment(fr: &FacadeFrame, id: &str, r: &Resolved, elevation: f64, status: 
         ComponentKind::SteelBalcony { depth, railing, finish, deck, handrail, screens, tie_rods } => {
             let metal = match finish {
                 Finish::Galvanised => Material::Steel,
-                Finish::White => Material::Frame,
+                Finish::White => Material::SteelWhite,
                 Finish::Anthracite => Material::Railing,
             };
             let deck_material = if deck == Deck::FibreConcrete { Material::Slab } else { Material::Deck };

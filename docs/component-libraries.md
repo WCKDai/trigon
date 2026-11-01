@@ -57,6 +57,20 @@ The pack contains original parameters; reference photos, commercial models and c
 are not distributed. Current steel finishes are galvanised, white and anthracite; current deck
 choices are Cumaru, fibre concrete, composite and bamboo.
 
+Painted white steel and dark glazing seals have distinct `steel_white` and `gasket` export
+materials, with steel and rubber IFC classifications. Their colors are unchanged. The public
+Rust `Material` enum appends `SteelWhite` and `Gasket` after the existing 24 values; exhaustive
+Rust matches must handle these variants. Existing material indices and source finish strings
+remain unchanged. GLB includes every referenced appended material, including in projects without
+site objects, while retaining the legacy material prefixes.
+
+Window/door IFC exports associate a material constituent set with the product and give each
+material group a matching named shape aspect. Framing, glazing, panels, seals and hardware remain
+separate; material fractions are unset rather than invented. This follows the public IFC4
+[material constituent](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcmaterialresource/lexical/ifcmaterialconstituent.htm),
+[constituent set](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcmaterialresource/lexical/ifcmaterialconstituentset.htm)
+and [shape aspect](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2/HTML/schema/ifcrepresentationresource/lexical/ifcshapeaspect.htm) contracts.
+
 Regression tests cover exact type round trips, read-only exports, shared dimension/finish changes,
 preserved instance overrides, batch/host failures, file limits and exact Undo. Revert the library
 feature commit to roll back the commands; imported ordinary type definitions remain compatible

@@ -146,7 +146,6 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
     let mut w = Writer { bin: Vec::new(), views: Vec::new(), accessors: Vec::new() };
     let mut materials: Vec<Value> = Material::ALL
         .iter()
-        .filter(|m| !site.is_empty() || (**m as usize) < 17)
         .map(|m| {
             let c = m.rgba();
             let mut v = json!({
@@ -232,6 +231,16 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
             node["extras"] = json!({"trigon_source":o.source,"phase_status":o.status.name(),"exchange_classification":format!("Trigon {} (presentation geometry)",o.class.name())});
         }
     }
+    // Keep all legacy indices stable and include every appended material actually referenced.
+    // Building-only legacy scenes retain their original 17-entry inventory; site scenes retain
+    // their 24-entry prefix. Additional semantic materials extend that prefix only when used.
+    let used = meshes
+        .iter()
+        .flat_map(|m| m["primitives"].as_array().into_iter().flatten())
+        .filter_map(|p| p["material"].as_u64())
+        .max()
+        .map_or(0, |i| i as usize + 1);
+    materials.truncate(used.max(if site.is_empty() { 17 } else { 24 }));
     let (mut images, mut textures) = (Vec::new(), Vec::new());
     for material in masonry {
         // The infallible public writer predates textures. If encoding cannot complete, retain
@@ -456,6 +465,61 @@ mod tests {
         }
         assert_eq!(doc["nodes"][0]["name"], "reference");
         assert!(doc["meshes"][0]["primitives"][0]["attributes"].get("TEXCOORD_0").is_none());
+    }
+
+    #[test]
+    fn appended_materials_keep_legacy_indices_and_every_primitive_reference_valid() {
+        let mut legacy = Document::default();
+        legacy.buildings.push(Building::new("b", "Legacy palette", &[[0., 0.], [9000., 0.], [9000., 8000.], [0., 8000.]], 1, 3000.).unwrap());
+        let bytes = write(&build(&legacy).unwrap(), &[]);
+        assert_eq!(parse(&bytes).0["materials"].as_array().unwrap().len(), 17);
+        let mut doc = crate::ifc::sample::document().unwrap();
+        for ty in &mut doc.types {
+            if let trigon_model::ComponentKind::SteelBalcony { finish, .. } = &mut ty.kind {
+                *finish = trigon_model::component::Finish::White;
+            }
+        }
+        let bytes = write(&build(&doc).unwrap(), &[]);
+        let (json, _) = parse(&bytes);
+        let materials = json["materials"].as_array().unwrap();
+        let legacy_names = [
+            "wall",
+            "slab",
+            "roof",
+            "frame",
+            "glass",
+            "door",
+            "sill",
+            "railing",
+            "reference",
+            "steel",
+            "deck",
+            "demolished",
+            "plinth",
+            "plaster",
+            "render",
+            "brick_red",
+            "brick_yellow",
+            "paving",
+            "gravel",
+            "grass",
+            "bark",
+            "foliage",
+            "soil",
+            "planter",
+        ];
+        for (index, name) in legacy_names.into_iter().enumerate() {
+            assert_eq!(materials[index]["name"], name);
+        }
+        assert_eq!(materials[24]["name"], "steel_white");
+        assert_eq!(materials[25]["name"], "gasket");
+        assert_eq!(materials[24]["pbrMetallicRoughness"]["baseColorFactor"], materials[3]["pbrMetallicRoughness"]["baseColorFactor"]);
+        assert_eq!(materials[25]["pbrMetallicRoughness"]["baseColorFactor"], materials[7]["pbrMetallicRoughness"]["baseColorFactor"]);
+        let primitives: Vec<_> = json["meshes"].as_array().unwrap().iter().flat_map(|m| m["primitives"].as_array().unwrap()).collect();
+        assert!(primitives.iter().all(|p| p["material"].as_u64().unwrap() < materials.len() as u64));
+        for material in [24, 25] {
+            assert!(primitives.iter().any(|p| p["material"] == material));
+        }
     }
 
     #[test]

@@ -232,11 +232,16 @@ impl<'a> Ifc<'a> {
 
     /// Tessellated parts in `frame`'s coordinates, each in its material's colour.
     fn tessellated(&mut self, parts: &[(Material, Mesh)], frame: &Frame) -> Vec<usize> {
+        self.tessellated_parts(parts, frame).into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// Retain the material of each emitted item, including when empty meshes are omitted.
+    fn tessellated_parts(&mut self, parts: &[(Material, Mesh)], frame: &Frame) -> Vec<(Material, usize)> {
         let mut items = Vec::with_capacity(parts.len());
         for (m, mesh) in parts {
             if let Some(item) = self.w.faceset(mesh, frame) {
                 self.cat.paint(&mut self.w, item, catalog::of(*m));
-                items.push(item);
+                items.push((*m, item));
             }
         }
         items
