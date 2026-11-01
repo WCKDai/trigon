@@ -51,6 +51,7 @@ pub struct Level {
     pub name: String,
     /// Floor level, site mm.
     pub elevation: f64,
+    /// Full-storey floor-to-floor height; on a marked roof level, knee wall only.
     pub height: f64,
 }
 
@@ -422,6 +423,7 @@ impl Scene {
             hi: [f32::MIN; 3],
         };
         let mut levels = Vec::new();
+        let roof_levels = built.iter().any(|b| b.storeys.iter().any(|s| s.roof_level));
         for building in built {
             if let Some(terrain) = &building.terrain {
                 b.add(
@@ -433,8 +435,9 @@ impl Scene {
                     &[Part { mesh: terrain, rgba: Material::Ground.rgba(), material: Material::Ground }],
                 );
             }
-            if levels.is_empty() {
-                levels = building.storeys.iter().map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }).collect();
+            if levels.is_empty() || roof_levels {
+                let count = levels.len();
+                levels.extend(building.storeys.iter().skip(count).map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }));
             }
             for w in building.exterior_walls() {
                 let first = b.elements.len();
@@ -488,7 +491,9 @@ impl Scene {
                 b.facing(first, w.frame.n);
             }
             for s in &building.slabs {
+                let roof_floor = building.storeys.get(s.level).is_some_and(|s| s.roof_level);
                 let (kind, m) = match s.kind {
+                    SlabKind::Floor if roof_floor => ("roof floor slab", Material::Slab),
                     SlabKind::Floor => ("floor slab", Material::Slab),
                     SlabKind::Roof => ("roof slab", Material::Roof),
                 };
@@ -497,7 +502,11 @@ impl Scene {
                     &s.id,
                     kind,
                     Some(s.level),
-                    vec![("thickness", mm(s.thickness)), ("underside", mm(s.z_bottom)), ("area", format!("{:.1} m²", area / 1e6))],
+                    vec![
+                        ("thickness", mm(s.thickness)),
+                        ("underside", mm(s.z_bottom)),
+                        (if roof_floor { "slab footprint (not room area)" } else { "area" }, format!("{:.1} m²", area / 1e6)),
+                    ],
                     true,
                     &[Part { mesh: &s.mesh, rgba: m.rgba(), material: m }],
                 );
@@ -847,6 +856,24 @@ fn ray_triangle(o: [f32; 3], d: [f32; 3], a: [f32; 3], b: [f32; 3], c: [f32; 3])
 mod tests {
     use super::*;
     use trigon_model::{Building, Document, build};
+
+    #[test]
+    fn attic_level_labels_and_floor_properties_do_not_claim_room_height_or_area() {
+        let mut doc = Document::default();
+        let mut building = Building::new("b", "Roof floor", &[[0., 0.], [12000., 0.], [12000., 10000.], [0., 10000.]], 3, 3400.).unwrap();
+        building.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":35})).unwrap();
+        building.set_attic(Some(9450.), Some("3. sal / tagkvist")).unwrap();
+        doc.buildings
+            .push(Building::new("context", "Lower context", &[[20000., 0.], [22000., 0.], [22000., 2000.], [20000., 2000.]], 1, 3000.).unwrap());
+        doc.buildings.push(building);
+        let scene = Scene::from_built(&build(&doc).unwrap(), false);
+        assert_eq!(scene.levels[3].name, "3. sal / tagkvist");
+        assert_eq!(scene.levels[3].elevation, 9450.);
+        let floor = scene.elements.iter().find(|e| e.id == "b.attic").unwrap();
+        assert_eq!(floor.level, Some(3));
+        assert_eq!(floor.kind, "roof floor slab");
+        assert!(floor.props.iter().any(|(key, _)| *key == "slab footprint (not room area)"));
+    }
 
     fn cube() -> Mesh {
         let mut m = Mesh::default();

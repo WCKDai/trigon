@@ -254,7 +254,7 @@ impl StudioApp {
 
     /// `ui.view`: checked whole, then applied.
     fn ui_view(&mut self, p: &Value) -> Result<Value, String> {
-        let levels = self.session.doc.buildings.first().map_or(0, |b| b.storeys.len());
+        let levels = self.levels().len();
         let doc = &self.session.doc;
         let req = parse_view(p, levels, &|id| doc.phase_index(id).map_err(|e| e.to_string()))?;
         let drawing = req.drawing.as_deref().unwrap_or(&self.drawing);
@@ -307,7 +307,6 @@ impl StudioApp {
     }
 
     pub(crate) fn view_state(&self) -> Value {
-        let b = self.session.doc.buildings.first();
         json!({
             "mode": self.mode.name(),
             "level": self.level,
@@ -316,7 +315,7 @@ impl StudioApp {
             "drawing_raster": self.plan.diagnostics(),
             "drawing_mapping": if self.mode!=Mode::ThreeD && !self.drawing_plan() {self.viewport_rect.filter(|r|self.plan.ready(*r,self.ppp)).and_then(|r|self.plan.screen_mapping(r))} else {None},
             "drawings": self.session.doc.views.iter().map(|v|(&v.id,&v.name)).collect::<Vec<_>>(),
-            "levels": b.map(|b| b.storeys.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()).unwrap_or_default(),
+            "levels": self.levels(),
             "phase": self.session.doc.phases.get(self.phase).map(|p| p.id.as_str()),
             "phases": self.session.doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             "filter": filter_name(self.filter),

@@ -194,9 +194,10 @@ impl<'a> Ifc<'a> {
             let p = self.w.place(Some(placed), Frame::at([0.0, 0.0, s.elevation]));
             fl.placed.push(p);
             storeys.push(self.w.add(format!(
-                "IFCBUILDINGSTOREY({},$,{},$,$,#{},$,$,.ELEMENT.,{})",
+                "IFCBUILDINGSTOREY({},$,{},{},$,#{},$,$,.ELEMENT.,{})",
                 gid(&format!("{}.storey.{i}", b.building_id)),
                 string(&s.name),
+                if s.roof_level { string("Roof level; knee wall is not room height; roof-clipped interiors unavailable") } else { "$".into() },
                 p.id,
                 real(s.elevation)
             )));

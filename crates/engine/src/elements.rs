@@ -495,18 +495,48 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
             let level = slab.level;
             let Some(storey) = building.storeys.get(level) else { continue };
             let attic = slab.id == format!("{}.attic", building.id);
+            let roof_level = storey.roof_level;
             let properties = vec![
                 number("thickness_mm", if attic { "Attic slab thickness" } else { "Slab thickness" }, slab.thickness, "mm", 20.0, 1000.0),
                 field("storey_name", "Storey name (shared)", storey.name.clone(), true),
-                number("elevation_mm", "Storey elevation (adjusts adjacent heights)", storey.elevation, "mm", -15000.0, 1000000.0),
-                number("storey_height_mm", "Storey height (moves storeys above)", storey.height, "mm", 2000.0, 10000.0),
-                field("scope", "Level parameter scope", "Name/elevation/height affect all elements hosted on the storey", false),
+                number(
+                    "elevation_mm",
+                    if roof_level { "Roof floor elevation (keeps eaves fixed)" } else { "Storey elevation (adjusts adjacent heights)" },
+                    storey.elevation,
+                    "mm",
+                    -15000.0,
+                    1000000.0,
+                ),
+                number(
+                    "storey_height_mm",
+                    if roof_level { "Knee wall to eaves (not room height; keeps eaves fixed)" } else { "Storey height (moves storeys above)" },
+                    storey.height,
+                    "mm",
+                    if roof_level { 100.0 } else { 2000.0 },
+                    if roof_level { 2000.0 } else { 10000.0 },
+                ),
+                field(
+                    "scope",
+                    "Level parameter scope",
+                    if roof_level {
+                        "Roof floor/knee wall only; roof-clipped interiors and habitable quantities unsupported"
+                    } else {
+                        "Name/elevation/height affect all elements hosted on the storey"
+                    },
+                    false,
+                ),
             ];
             let c = polygon_centre(&slab.polygon);
             let position = [c[0], c[1], slab.z_bottom];
             result.push(record(
                 &slab.id,
-                if attic { "attic slab" } else { "floor slab" },
+                if roof_level {
+                    "roof floor slab"
+                } else if attic {
+                    "attic slab"
+                } else {
+                    "floor slab"
+                },
                 building,
                 (Some(level), Status::Existing),
                 Source::Slab(bi, level, attic),
@@ -1053,6 +1083,10 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                     "storey_name" => b.storeys.get_mut(level).ok_or_else(|| invalid("missing storey"))?.name = text(key, value)?,
                     "elevation_mm" => {
                         let n = numeric(key, value)?;
+                        if b.attic_level() == Some(level) {
+                            b.set_attic(Some(n), None)?;
+                            continue;
+                        }
                         let next = b.storeys.get(level + 1).map(|s| s.elevation);
                         let previous = level.checked_sub(1).and_then(|l| b.storeys.get(l)).map(|s| s.elevation);
                         let s = b.storeys.get_mut(level).ok_or_else(|| invalid("missing storey"))?;
@@ -1066,6 +1100,10 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                     }
                     "storey_height_mm" => {
                         let n = numeric(key, value)?;
+                        if b.attic_level() == Some(level) {
+                            b.set_attic(Some(b.height() - n), None)?;
+                            continue;
+                        }
                         let current = b.storeys.get_mut(level).ok_or_else(|| invalid("missing storey"))?;
                         let delta = n - current.height;
                         current.height = n;
@@ -1212,10 +1250,13 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
 }
 
 fn validate_storeys(b: &Building) -> Result<()> {
+    b.validate_attic()?;
     let mut previous = None;
     for s in &b.storeys {
         checked("storey elevation", s.elevation, -15000.0, 1000000.0)?;
-        checked("storey height", s.height, 2000.0, 10000.0)?;
+        if !s.roof_level {
+            checked("storey height", s.height, 2000.0, 10000.0)?;
+        }
         if previous.is_some_and(|p| s.elevation <= p) {
             return Err(invalid("storey elevations must increase"));
         }

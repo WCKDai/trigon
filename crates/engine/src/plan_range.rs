@@ -138,7 +138,7 @@ pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange)
         scene,
         vp,
         clip,
-        title: storey.name.clone(),
+        title: doc.level_label(level).unwrap_or_else(|| storey.name.clone()),
         project: first.name.clone(),
         caption: String::new(),
         note: Some(

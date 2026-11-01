@@ -493,6 +493,14 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| crate::local_building::add(s, parse("building.add", v)?),
     },
     CommandSpec {
+        id: "building.set_attic",
+        summary: "Create/edit an explicit last roof floor below fixed eaves on a pitched or mansard host; floor is site-local mm. Reuses the attic slab, preserves existing levels/openings and rehosts facade bands in world height. A 100..2000 mm knee wall is not room height. No automatic stair copies; roof-clipped rooms/interiors/quantities are unsupported. remove:true explicitly restores the legacy eaves slab. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::attic::SetAttic>,
+        run: |s, v| crate::attic::set(s, parse("building.set_attic", v)?),
+    },
+    CommandSpec {
         id: "building.set_storeys",
         summary: "Set the number of storeys, the floor-to-floor height and the ground floor's level above the terrain (mm). \
                   Placements and facade-band occurrences above the new top storey are removed.",
@@ -1325,6 +1333,9 @@ static COMMANDS: &[CommandSpec] = &[
             let p: AddRooms = parse("interior.add_rooms", v)?;
             let b = s.doc.building_mut(p.building.as_deref())?;
             let n = b.storeys.len();
+            if p.rooms.iter().any(|r| r.levels.iter().any(|l| b.attic_level() == Some(*l))) {
+                return Err(ModelError::Invalid("roof-level rooms and habitable quantities require unsupported roof clipping".into()).into());
+            }
             let start = b.rooms.len();
             for (k, mut r) in p.rooms.into_iter().enumerate() {
                 if r.polygon.len() < 3
@@ -1356,6 +1367,12 @@ static COMMANDS: &[CommandSpec] = &[
             let levels = p.levels.clone().unwrap_or_else(|| (0..b.storeys.len()).collect());
             if levels.iter().any(|l| *l >= b.storeys.len()) {
                 return Err(ModelError::Invalid("levels must be existing storeys".into()).into());
+            }
+            if levels.iter().any(|l| b.attic_level() == Some(*l)) {
+                return Err(ModelError::Invalid(
+                    "roof-level room detection and habitable areas require unsupported roof clipping; select full storeys explicitly".into(),
+                )
+                .into());
             }
             let min = trigon_model::checked("min_area_m2", p.min_area_m2.unwrap_or(1.0), 0.2, 100.0)?;
             let contrast = trigon_model::checked("contrast", p.contrast.unwrap_or(40.0), 5.0, 250.0)?;
@@ -2385,12 +2402,12 @@ fn info(doc: &Document) -> Value {
             "terrain_m_dvr90": s.elevation,
             "evidence": s.evidence,
         })),
-        "buildings": doc.buildings.iter().map(|b| json!({
+        "buildings": doc.buildings.iter().map(|b| { let mut result = json!({
             "id": b.id,
             "name": b.name,
             "storeys": b.storeys.len(),
             "storey_height_mm": b.storeys.first().map(|s| s.height),
-            "levels_mm": b.storeys.iter().map(|s| json!({"name": s.name, "floor": s.elevation, "height": s.height})).collect::<Vec<_>>(),
+            "levels_mm": b.storeys.iter().map(|s| if s.roof_level { json!({"name": s.name, "floor": s.elevation, "knee_wall_mm": s.height, "roof_level": true}) } else { json!({"name": s.name, "floor": s.elevation, "height": s.height}) }).collect::<Vec<_>>(),
             "ground_floor_mm": b.ground_floor,
             "ground_level": b.ground_level,
             "height_mm": b.height(),
@@ -2399,7 +2416,12 @@ fn info(doc: &Document) -> Value {
             "attributes": b.attributes,
             "facades": facades(doc, b),
             "evidence": b.evidence,
-        })).collect::<Vec<_>>(),
+        });
+        if b.attic_level().is_some() {
+            result["roof_level"] = crate::attic::description(b);
+            result["full_storeys_above_ground"] = json!(b.storeys.iter().skip(b.ground_level).filter(|s| !s.roof_level).count());
+        }
+        result }).collect::<Vec<_>>(),
         "types": doc.types.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
         "phases": doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
         "active_phase": doc.phases.get(doc.active_index()).map(|p| p.id.as_str()),

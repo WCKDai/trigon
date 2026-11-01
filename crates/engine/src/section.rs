@@ -249,18 +249,53 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
     // Levels: a dashed line across, a mark and the level at the right, the name at the left.
     let s = scale;
     let mut levels: Vec<(f64, String)> = Vec::new();
-    if let (Some(mb), Some(b)) = (doc.buildings.first(), built.first()) {
+    let roof_levels = doc.buildings.iter().any(|b| b.attic_level().is_some());
+    let cuts_building = |b: &trigon_model::Building| {
+        crate::drawings::inside(&b.footprint, from)
+            || crate::drawings::inside(&b.footprint, to)
+            || b.footprint.iter().zip(b.footprint.iter().cycle().skip(1)).any(|(a, b)| {
+                let (a, b) = (look.map([a[0], a[1], 0.0]), look.map([b[0], b[1], 0.0]));
+                let delta = a[2] - b[2];
+                if delta.abs() < 1e-9 {
+                    return a[2].abs() < 1e-6 && a[0].max(b[0]) >= 0.0 && a[0].min(b[0]) <= length;
+                }
+                let t = a[2] / delta;
+                let along = a[0] + t * (b[0] - a[0]);
+                (0.0..=1.0).contains(&t) && (0.0..=length).contains(&along)
+            })
+    };
+    // Legacy sheets keep their first-building datums. Opt-in roof sections must identify
+    // the actual cut wing(s), whose roof floors can have different indices and elevations.
+    let level_buildings: Vec<_> = doc
+        .buildings
+        .iter()
+        .zip(&built)
+        .enumerate()
+        .filter(|(i, (b, _))| if roof_levels { cuts_building(b) } else { *i == 0 })
+        .map(|(_, pair)| pair)
+        .collect();
+    if let Some((mb, b)) = level_buildings.first() {
         let zero = b.storeys.get(mb.ground_level).map_or(0.0, |st| st.elevation);
-        levels.extend(b.storeys.iter().map(|st| (st.elevation, st.name.clone())));
+        for (mb, b) in &level_buildings {
+            let label = |name: &str| if level_buildings.len() > 1 { format!("{name} ({})", mb.name) } else { name.into() };
+            levels.extend(b.storeys.iter().map(|st| (st.elevation, label(&st.name))));
+            if let Some(top) = b.storeys.last() {
+                levels.push((top.elevation + top.height, label("Tagfod")));
+            }
+            if let Some(r) = &b.roof {
+                levels.push((r.ridge, label("Kip")));
+            }
+        }
         levels.push((0.0, "Terræn".into()));
-        if let Some(top) = b.storeys.last() {
-            levels.push((top.elevation + top.height, "Tagfod".into()));
-        }
-        if let Some(r) = &b.roof {
-            levels.push((r.ridge, "Kip".into()));
-        }
         levels.sort_by(|a, b| a.0.total_cmp(&b.0));
-        levels.dedup_by(|a, b| (a.0 - b.0).abs() < 1.0);
+        levels.dedup_by(|a, b| {
+            let same = (a.0 - b.0).abs() < 1.0;
+            if roof_levels && same && a.1 != b.1 {
+                b.1.push_str(" / ");
+                b.1.push_str(&a.1);
+            }
+            same
+        });
         for (k, (z, name)) in levels.iter().enumerate() {
             let (x0, x1) = (-3.0 * s, length + 3.0 * s);
             let dashed = Stroke { dashed: true, ..Stroke::new(0.18) };
@@ -286,7 +321,7 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
         }
     }
 
-    let project_name = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
+    let project_name = level_buildings.first().map(|(b, _)| b.name.as_str()).unwrap_or_default();
     let cut_area: f64 = all_poche.iter().flatten().map(|r| cut::area2(r)).sum::<f64>() / 2.0;
     let metrics = json!({
         "scale": scale_text(scale),

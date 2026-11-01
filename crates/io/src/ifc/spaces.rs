@@ -11,6 +11,11 @@ use super::{Floors, Ifc};
 impl Ifc<'_> {
     pub(super) fn spaces(&mut self, bd: &Building, fl: &mut Floors) {
         for (level, s) in bd.storeys.iter().enumerate() {
+            // Knee height is not room height. Do not fabricate unclipped roof spaces/areas,
+            // even if this writer is called with an externally assembled built model.
+            if s.roof_level {
+                continue;
+            }
             let mut n = 0;
             for (k, r) in bd.rooms.iter().enumerate().filter(|(_, r)| r.levels.contains(&level)) {
                 let ring = ccw(clean_ring(&r.polygon));

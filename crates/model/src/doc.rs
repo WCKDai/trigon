@@ -255,8 +255,11 @@ pub struct Storey {
     pub name: String,
     /// Floor level above the site origin, mm.
     pub elevation: f64,
-    /// Floor-to-floor height, mm.
+    /// Floor-to-floor height, mm; on an explicit roof level, knee wall to eaves only.
     pub height: f64,
+    /// Opt-in roof floor below fixed eaves. Only the last storey may carry this marker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub roof_level: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -751,13 +754,15 @@ impl Building {
 
     /// Storeys of equal height with the ground storey's floor `ground_floor` mm above the terrain.
     pub fn set_storeys_from(&mut self, count: usize, height: f64, ground_floor: f64) -> Result<()> {
+        self.require_full_storey_stack()?;
         if count == 0 || count > 60 {
             return Err(ModelError::Invalid(format!("storey count must be 1 to 60 (got {count})")));
         }
         let height = checked("storey height", height, 2000.0, 10000.0)?;
         let ground_floor = checked("ground floor level", ground_floor, 0.0, 5000.0)?;
         self.ground_floor = ground_floor;
-        self.storeys = (0..count).map(|i| Storey { name: storey_name(i), elevation: ground_floor + i as f64 * height, height }).collect();
+        self.storeys =
+            (0..count).map(|i| Storey { name: storey_name(i), elevation: ground_floor + i as f64 * height, height, roof_level: false }).collect();
         self.fit_schedule();
         // Placements on storeys that no longer exist go away.
         for f in &mut self.facades {
@@ -770,6 +775,7 @@ impl Building {
     /// `top` (the eaves or attic floor). For buildings whose storeys differ in height, as read
     /// from a section drawing.
     pub fn set_levels(&mut self, floors: &[f64], top: f64) -> Result<()> {
+        self.require_full_storey_stack()?;
         if floors.is_empty() || floors.len() > 60 {
             return Err(ModelError::Invalid(format!("give 1 to 60 floor levels (got {})", floors.len())));
         }
@@ -785,10 +791,173 @@ impl Building {
         }
         let count = floors.len();
         self.ground_floor = levels[0];
-        self.storeys = levels.windows(2).enumerate().map(|(i, w)| Storey { name: storey_name(i), elevation: w[0], height: w[1] - w[0] }).collect();
+        self.storeys = levels
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| Storey { name: storey_name(i), elevation: w[0], height: w[1] - w[0], roof_level: false })
+            .collect();
         self.fit_schedule();
         for f in &mut self.facades {
             f.placements.retain(|p| p.level < count);
+        }
+        Ok(())
+    }
+
+    /// The explicit last roof level; its height is the knee wall to the eaves, not room height.
+    pub fn attic_level(&self) -> Option<usize> {
+        self.storeys.last().filter(|s| s.roof_level).map(|_| self.storeys.len() - 1)
+    }
+
+    /// Validate the opt-in roof-level contract, including documents loaded outside commands.
+    /// Legacy buildings retain their existing validation/defaults.
+    pub fn validate_attic(&self) -> Result<()> {
+        if !self.storeys.iter().any(|s| s.roof_level) {
+            return Ok(());
+        }
+        let level = self.attic_level().ok_or_else(|| ModelError::Invalid("only the last storey may be a roof level".into()))?;
+        if level == 0 || self.ground_level >= level || self.storeys.len() > 60 || self.storeys[..level].iter().any(|s| s.roof_level) {
+            return Err(ModelError::Invalid("one last roof level requires full storeys below it, at most 60 levels total".into()));
+        }
+        if matches!(self.roof, crate::Roof::Flat) {
+            return Err(ModelError::Invalid("a roof level requires a pitched or mansard host; remove it before setting a flat roof".into()));
+        }
+        for (i, s) in self.storeys.iter().enumerate() {
+            checked("storey elevation", s.elevation, -15_000.0, 1_000_000.0)?;
+            if s.roof_level {
+                checked("roof knee wall (not room height)", s.height, 100.0, 2000.0)?;
+            } else {
+                checked("full storey height", s.height, 2000.0, 10000.0)?;
+            }
+            if let Some(next) = self.storeys.get(i + 1)
+                && (s.elevation + s.height - next.elevation).abs() > 1e-6
+            {
+                return Err(ModelError::Invalid("storeys must meet at their floor levels".into()));
+            }
+        }
+        if self.interior_walls.iter().any(|w| w.levels.contains(&level)) || self.rooms.iter().any(|r| r.levels.contains(&level)) {
+            return Err(ModelError::Invalid(
+                "roof-level interior walls, rooms and habitable quantities require roof clipping, which is not supported".into(),
+            ));
+        }
+        let previous = &self.storeys[level - 1];
+        let clearance = previous.height - self.floor_thickness(level);
+        if self.interior_walls.iter().any(|w| w.levels.contains(&(level - 1)) && w.doors.iter().any(|d| d.height + 50.0 > clearance)) {
+            return Err(ModelError::Invalid("the roof floor slab would collide with an interior door on the full storey below".into()));
+        }
+        if self.stairs.iter().any(|st| st.levels.contains(&level)) {
+            return Err(ModelError::Invalid("stairs may arrive at the roof floor from a selected full-storey departure; departures within the roof require unsupported roof clipping".into()));
+        }
+        Ok(())
+    }
+
+    /// Create/edit/remove a last roof floor while keeping eaves and all existing full-level
+    /// indices, names and nominal facade placements fixed. The command validates geometry too.
+    pub fn set_attic(&mut self, floor: Option<f64>, name: Option<&str>) -> Result<()> {
+        self.validate_attic()?;
+        if matches!(self.roof, crate::Roof::Flat) {
+            return Err(ModelError::Invalid("a roof floor requires a pitched or mansard host".into()));
+        }
+        if let Some(name) = name
+            && (name.trim().is_empty() || name.chars().count() > 200)
+        {
+            return Err(ModelError::Invalid("roof level name needs 1 to 200 characters".into()));
+        }
+        let old_roof = self.attic_level();
+        let full = old_roof
+            .unwrap_or(self.storeys.len())
+            .checked_sub(1)
+            .ok_or_else(|| ModelError::Invalid("a roof floor requires a full storey below it".into()))?;
+        let eaves = self.height();
+        checked("eaves elevation", eaves, 0.0, 1_000_000.0)?;
+        let previous = self.storeys.get(full).ok_or_else(|| ModelError::Invalid("missing full storey below the roof".into()))?;
+        let mut candidate = self.clone();
+        match floor {
+            Some(floor) => {
+                checked("roof floor elevation", floor, -15_000.0, 1_000_000.0)?;
+                let knee = checked("roof knee wall (not room height)", eaves - floor, 100.0, 2000.0)?;
+                let height = checked("full storey below roof floor", floor - previous.elevation, 2000.0, 10000.0)?;
+                if let Some(level) = old_roof {
+                    if self.storeys[level].elevation != floor && self.facades.iter().any(|f| f.placements.iter().any(|p| p.level == level)) {
+                        return Err(ModelError::Invalid(
+                            "remove or explicitly rehost roof-level facade placements before moving their floor; dormers stay fixed".into(),
+                        ));
+                    }
+                    let s = &mut candidate.storeys[level];
+                    s.elevation = floor;
+                    s.height = knee;
+                    if let Some(name) = name {
+                        s.name = name.into();
+                    }
+                } else {
+                    if self.storeys.len() >= 60 {
+                        return Err(ModelError::Invalid("at most 60 levels including the roof level".into()));
+                    }
+                    let default_name = format!("{} / tagkvist", storey_name(self.storeys.len().saturating_sub(self.ground_level)));
+                    candidate.storeys.push(Storey { name: name.unwrap_or(&default_name).into(), elevation: floor, height: knee, roof_level: true });
+                }
+                candidate.storeys[full].height = height;
+            }
+            None => {
+                let level = old_roof.ok_or_else(|| ModelError::Invalid("the building has no explicit roof level".into()))?;
+                if name.is_some() {
+                    return Err(ModelError::Invalid("removing a roof level cannot rename it".into()));
+                }
+                if self.facades.iter().any(|f| f.placements.iter().any(|p| p.level == level))
+                    || self.entrances.iter().any(|e| e.stair_by_level.contains_key(&level))
+                {
+                    return Err(ModelError::Invalid("remove roof-level hosted placements and entrance links before removing the level".into()));
+                }
+                candidate.storeys[full].height = checked("restored full storey height", eaves - previous.elevation, 2000.0, 10000.0)?;
+                candidate.storeys.pop();
+            }
+        }
+        candidate.rehost_attic_bands(&self.storeys, full)?;
+        candidate.fit_schedule();
+        candidate.validate_attic()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Split only affected repeated occurrences; preserve every band's world vertical range,
+    /// projection and finish. Bands crossing the floor may have a negative relative bottom.
+    fn rehost_attic_bands(&mut self, before: &[Storey], full: usize) -> Result<()> {
+        let roof = self.attic_level();
+        for facade in &mut self.facades {
+            let mut bands = Vec::new();
+            for band in &facade.bands {
+                band.validate(before.len())?;
+                let mut parts: Vec<Band> = Vec::new();
+                for &level in &band.levels {
+                    let (host, bottom, top) = if level >= full {
+                        let old = &before[level];
+                        let (bottom, top) = (old.elevation + band.bottom, old.elevation + band.top);
+                        let host = roof.filter(|&l| top > self.storeys[l].elevation).unwrap_or(full);
+                        (host, bottom - self.storeys[host].elevation, top - self.storeys[host].elevation)
+                    } else {
+                        (level, band.bottom, band.top)
+                    };
+                    if let Some(part) = parts.iter_mut().find(|p| p.bottom == bottom && p.top == top) {
+                        part.levels.push(host);
+                    } else {
+                        parts.push(Band { levels: vec![host], bottom, top, ..band.clone() });
+                    }
+                }
+                bands.extend(parts);
+            }
+            if bands.len() > 50 {
+                return Err(ModelError::Invalid("rehosting roof bands would exceed the 50-band facade limit".into()));
+            }
+            for band in &bands {
+                band.validate(self.storeys.len())?;
+            }
+            facade.bands = bands;
+        }
+        Ok(())
+    }
+
+    fn require_full_storey_stack(&self) -> Result<()> {
+        if self.storeys.iter().any(|s| s.roof_level) {
+            return Err(ModelError::Invalid("remove the explicit roof level with building.set_attic before resetting full storeys".into()));
         }
         Ok(())
     }
@@ -895,7 +1064,7 @@ impl Building {
     }
 
     pub fn floor_thickness(&self, level: usize) -> f64 {
-        self.floor_thicknesses.get(level).copied().unwrap_or(200.0)
+        if self.attic_level() == Some(level) { self.attic_thickness() } else { self.floor_thicknesses.get(level).copied().unwrap_or(200.0) }
     }
 
     pub fn attic_thickness(&self) -> f64 {
@@ -916,10 +1085,17 @@ impl Building {
     /// Adds a basement storey below the lowest one, with its floor at `floor` mm (below the terrain),
     /// and shifts every storey reference (placements, interior, plans) up by one.
     pub fn add_basement(&mut self, floor: f64, name: &str) -> Result<()> {
+        self.validate_attic()?;
         let first = self.storeys.first().cloned().ok_or_else(|| ModelError::Invalid("the building has no storeys".into()))?;
         let floor = checked("basement floor", floor, -15_000.0, first.elevation - 2000.0)?;
         if self.storeys.len() >= 60 {
             return Err(ModelError::Invalid("at most 60 storeys".into()));
+        }
+        if self.attic_level().is_some() {
+            checked("basement full storey height", first.elevation - floor, 2000.0, 10000.0)?;
+        }
+        for band in self.facades.iter().flat_map(|f| &f.bands) {
+            band.validate(self.storeys.len())?;
         }
         // Check before changing anything, including hostile keys in externally loaded documents.
         let entrance_stairs: Vec<BTreeMap<usize, String>> = self
@@ -938,7 +1114,7 @@ impl Building {
                     .collect::<Result<_>>()
             })
             .collect::<Result<_>>()?;
-        self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor });
+        self.storeys.insert(0, Storey { name: name.to_string(), elevation: floor, height: first.elevation - floor, roof_level: false });
         if !self.floor_thicknesses.is_empty() {
             self.floor_thicknesses.insert(0, 200.0);
         }
@@ -954,6 +1130,11 @@ impl Building {
         for f in &mut self.facades {
             for p in &mut f.placements {
                 p.level += 1;
+            }
+            for band in &mut f.bands {
+                for level in &mut band.levels {
+                    *level += 1;
+                }
             }
         }
         for w in &mut self.interior_walls {
@@ -999,6 +1180,23 @@ pub fn storey_name(i: usize) -> String {
 }
 
 impl Document {
+    /// Shared browser/plan label. An index may be a full storey in one wing and a roof
+    /// level in another. Show both names only for opt-in roof levels; legacy labels stay intact.
+    pub fn level_label(&self, level: usize) -> Option<String> {
+        let storeys: Vec<_> = self.buildings.iter().filter_map(|b| b.storeys.get(level)).collect();
+        let first = storeys.first()?;
+        if !storeys.iter().any(|s| s.roof_level) {
+            return Some(first.name.clone());
+        }
+        let mut names = Vec::new();
+        for storey in storeys {
+            if !names.contains(&storey.name) {
+                names.push(storey.name.clone());
+            }
+        }
+        Some(names.join(" · "))
+    }
+
     pub fn building(&self, id: Option<&str>) -> Result<&Building> {
         match id {
             Some(id) => self.buildings.iter().find(|b| b.id == id).ok_or_else(|| ModelError::NotFound(format!("building {id}"))),

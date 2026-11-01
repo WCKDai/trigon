@@ -99,6 +99,23 @@ fn session() -> Session {
 }
 
 #[test]
+fn explicit_roof_floor_keeps_eaves_and_reuses_the_attic_slab() {
+    let mut s = session();
+    s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":35})).unwrap();
+    let eaves = s.doc.buildings[0].height();
+    let floors = s.doc.buildings[0].storeys.clone();
+    s.execute("building.set_attic", json!({"floor":eaves - 750.0,"name":"Tagkvist"})).unwrap();
+    let b = &s.doc.buildings[0];
+    assert_eq!(b.height(), eaves);
+    assert_eq!(b.storeys.len(), floors.len() + 1);
+    let built = trigon_model::build(&s.doc).unwrap();
+    let slab = built[0].slabs.iter().find(|slab| slab.id == format!("{}.attic", b.id)).unwrap();
+    assert_eq!(slab.z_bottom + slab.thickness, eaves - 750.0);
+    assert_eq!(slab.level, floors.len());
+    assert_eq!(built[0].slabs.len(), floors.len() + 1, "no duplicate eaves slab");
+}
+
+#[test]
 fn reducing_storeys_prunes_facade_band_levels_and_undo_restores_them() {
     for (command, params) in
         [("building.set_storeys", json!({"count":2,"height":3000})), ("building.set_levels", json!({"floors":[0,3000],"top":6000}))]
