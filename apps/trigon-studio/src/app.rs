@@ -1114,7 +1114,9 @@ impl StudioApp {
             return;
         }
         if self.authoring.tab == Tab::Families {
-            self.authoring.library(ui, &self.session.doc);
+            if let Some(run) = self.authoring.library(ui, &self.session.doc) {
+                let _ = self.run(Who::Owner, run.command, run.params);
+            }
             return;
         }
         theme::eyebrow(ui, "PROJECT BROWSER");

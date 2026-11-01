@@ -176,3 +176,19 @@ objects intersecting the cut retain their cut outline instead of a duplicate ove
 Adjacent-storey elements participate when inside the range; objects outside top/depth are clipped.
 Floor and room picking retains source IDs. Mesh ranges show actual stair meshes instead of legacy
 symbolic tread/door-swing/label conventions. Leaving range unset retains the legacy plan symbols.
+
+
+## Shared component libraries in Studio
+
+Families includes **Portable component libraries** with local `.trigonlib` import/export paths,
+native file pickers where supported, selected-type/all-type export, and an explicit global
+replacement checkbox (off by default). These controls dispatch `types.import {path, replace:false}`
+and `types.export {path, ids?:[...]}` through the normal app command runner. They check engine
+command availability; on older engines the transfer buttons stay disabled with a clear reason.
+The library commands and versioned format are provided by the component-library implementation.
+
+Imported definitions become shared project types; files are portable snapshots. **Update shared
+type and its instances** changes the definition for all referencing placements. Explicit instance
+overrides remain local. **Duplicate as new type** creates an independent definition. This UI does
+not imply live file watching or automatic external-library reload. It ships no client branding,
+reference page assets or copied starter geometry.
