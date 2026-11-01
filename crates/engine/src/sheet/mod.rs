@@ -266,12 +266,12 @@ impl Path {
         })
     }
 
-    pub(crate) fn attribute(&mut self, sources: &[DrawingElementSegment]) {
+    pub(crate) fn attribute<'a>(&mut self, sources: impl Iterator<Item = &'a DrawingElementSegment> + Clone) {
         let elements: Vec<_> = self
             .segments()
             .flat_map(|drawn| {
                 sources
-                    .iter()
+                    .clone()
                     .filter_map(move |source| overlap(drawn, source.segment, 0.5).map(|segment| DrawingElementSegment { segment, ..source.clone() }))
             })
             .collect();
@@ -363,6 +363,11 @@ pub(crate) struct Scene {
     pub(crate) element_regions: Vec<crate::views::DrawingElementRegion>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static ATTRIBUTION_SOURCE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Scene {
     pub(crate) fn new(scale: f64) -> Self {
         Scene { scale, items: Vec::new(), element_regions: Vec::new() }
@@ -392,7 +397,13 @@ impl Scene {
     }
 
     pub(crate) fn attribute_last(&mut self, sources: &[DrawingElementSegment]) {
+        self.attribute_last_from(sources.iter());
+    }
+
+    pub(crate) fn attribute_last_from<'a>(&mut self, sources: impl ExactSizeIterator<Item = &'a DrawingElementSegment> + Clone) {
         if let Some(Item::Path(path)) = self.items.last_mut() {
+            #[cfg(test)]
+            ATTRIBUTION_SOURCE_VISITS.with(|count| count.set(count.get() + sources.len()));
             path.attribute(sources);
         }
     }
