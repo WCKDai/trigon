@@ -1443,7 +1443,17 @@ impl StudioApp {
             }
             if let Some(p) = response.hover_pos() {
                 let snap = (!ui.input(|i| i.modifiers.alt)).then(|| self.drafting.options());
-                if let Some((point, snapped)) = self.plan.cursor(rect, p, snap) {
+                let settings = self.drafting.alignment_options(&self.session.doc, &self.drawing);
+                let alignment = (picking && self.drafting.alignment).then_some(&settings);
+                if let Some((point, aligned)) = self.plan.aligned_cursor(rect, p, snap, alignment) {
+                    let snapped = aligned.as_ref().map(|a| a.snap);
+                    if picking && let Some(aligned) = &aligned {
+                        for guide in &aligned.guides {
+                            if let (Some(a), Some(b)) = (self.plan.model_to_screen(rect, guide[0]), self.plan.model_to_screen(rect, guide[1])) {
+                                painter.line_segment([a, b], egui::Stroke::new(0.8, theme::ACCENT.gamma_multiply(0.6)));
+                            }
+                        }
+                    }
                     if picking {
                         response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
                         if let Some(at) = self.plan.model_to_screen(rect, point) {

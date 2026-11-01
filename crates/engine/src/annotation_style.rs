@@ -18,6 +18,9 @@ pub(crate) fn draw(scene: &mut Scene, a: &Annotation) {
     let s = scene.scale;
     let pen = Stroke::new(0.18);
     match &a.kind {
+        AnnotationKind::Line { from, to, stroke } => {
+            scene.line(Layer::Annotation, *from, *to, Stroke { pen: stroke.width_mm, colour: stroke.colour, pattern: stroke.pattern, dashed: false });
+        }
         AnnotationKind::Text { at, text, rotation_deg } => lettering(scene, *at, text, a.size_mm, *rotation_deg, a.style),
         AnnotationKind::Dimension { from, to, offset_mm } => {
             let length = (to[0] - from[0]).hypot(to[1] - from[1]);

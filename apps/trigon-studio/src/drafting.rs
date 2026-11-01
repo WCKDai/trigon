@@ -5,7 +5,7 @@ use eframe::egui;
 use serde_json::json;
 use trigon_engine::SnapOptions;
 use trigon_model::Document;
-use trigon_model::annotation::{Annotation, AnnotationKind, DrawingViewKind, FontFamily, TextStyle};
+use trigon_model::annotation::{Annotation, AnnotationKind, DrawingViewKind, FontFamily, LinePattern, LineStyle, TextStyle};
 
 use crate::{authoring::Run, theme};
 
@@ -32,6 +32,9 @@ pub struct Drafting {
     size: f64,
     rotation: f64,
     style: TextStyle,
+    stroke: LineStyle,
+    pub alignment: bool,
+    pub alignment_offset: f64,
     region_points: Vec<[f64; 2]>,
     region_fill: [u8; 3],
     region_border: bool,
@@ -65,6 +68,9 @@ impl Default for Drafting {
             size: 2.5,
             rotation: 0.0,
             style: TextStyle::default(),
+            stroke: LineStyle::default(),
+            alignment: true,
+            alignment_offset: 0.0,
             region_points: Vec::new(),
             region_fill: [232, 232, 220],
             region_border: true,
@@ -218,6 +224,12 @@ impl Drafting {
         self.style = a.style;
         self.picking = None;
         match &a.kind {
+            AnnotationKind::Line { from, to, stroke } => {
+                self.kind = 5;
+                self.points[0] = *from;
+                self.points[1] = *to;
+                self.stroke = *stroke;
+            }
             AnnotationKind::Text { at, text, rotation_deg } => {
                 self.kind = 0;
                 self.points[0] = *at;
@@ -259,7 +271,7 @@ impl Drafting {
             self.picking = None;
         }
         let view = doc.views.iter().find(|v| v.id == id);
-        for (i, label) in ["Text", "Dimension", "Leader", "Level", "Area fill"].into_iter().enumerate() {
+        for (i, label) in ["Text", "Dimension", "Leader", "Level", "Area fill", "Line"].into_iter().enumerate() {
             let enabled = view.is_some_and(|v| i != 3 || !matches!(v.kind, DrawingViewKind::Plan { .. }));
             if ui.add_enabled(enabled, egui::Button::selectable(self.picking.is_some() && self.kind == i, label)).clicked() {
                 self.new_note(doc);
@@ -273,6 +285,22 @@ impl Drafting {
         SnapOptions { grid_mm: self.grid.then_some(self.grid_step), ..self.snaps }
     }
 
+    pub fn alignment_options(&self, doc: &Document, view: &str) -> trigon_engine::AlignmentOptions {
+        let mut anchors = Vec::new();
+        for a in doc.annotations.iter().filter(|a| a.view == view && self.selected.as_deref() != Some(&a.id)) {
+            match &a.kind {
+                AnnotationKind::Text { at, .. } | AnnotationKind::Level { at, .. } | AnnotationKind::Leader { at, .. } => anchors.push(*at),
+                _ => {}
+            }
+            if anchors.len() == 509 {
+                break;
+            }
+        }
+        let picked = if self.kind == 4 { self.region_points.as_slice() } else { &self.points[..self.picking.unwrap_or(0).min(3)] };
+        anchors.extend(picked.iter().copied().take(512 - anchors.len()));
+        trigon_engine::AlignmentOptions { anchors, offset_mm: self.alignment_offset }
+    }
+
     pub fn picked(&mut self, p: [f64; 2]) {
         if self.kind == 4 && self.picking.is_some() {
             if self.region_points.len() < 256 && self.region_points.last().is_none_or(|last| (last[0] - p[0]).hypot(last[1] - p[1]) > 0.001) {
@@ -284,7 +312,7 @@ impl Drafting {
         if let Some(i) = self.picking.filter(|i| *i < 3) {
             self.points[i] = p;
             self.picking = match (self.kind, i) {
-                (1, 0) | (2, 0) => Some(1),
+                (1, 0) | (2, 0) | (5, 0) => Some(1),
                 (2, 1) => Some(2),
                 _ => None,
             };
@@ -304,6 +332,7 @@ impl Drafting {
             .filter_map(|a| {
                 let distance = match &a.kind {
                     AnnotationKind::Text { at, .. } | AnnotationKind::Level { at, .. } => segment_distance(*at, *at),
+                    AnnotationKind::Line { from, to, .. } => segment_distance(*from, *to),
                     AnnotationKind::Leader { tip, elbow, at, .. } => segment_distance(*tip, *elbow).min(segment_distance(*elbow, *at)),
                     AnnotationKind::Dimension { from, to, offset_mm } => {
                         let length = (to[0] - from[0]).hypot(to[1] - from[1]);
@@ -342,7 +371,7 @@ impl Drafting {
             return &self.region_points;
         }
         &self.points[..match self.kind {
-            1 => 2,
+            1 | 5 => 2,
             2 => 3,
             _ => 1,
         }]
@@ -366,6 +395,7 @@ impl Drafting {
         for a in doc.annotations.iter().filter(|a| a.view == id) {
             let label = match &a.kind {
                 AnnotationKind::Text { text, .. } => format!("Text · {text}"),
+                AnnotationKind::Line { .. } => format!("Manual line · {}", a.id),
                 AnnotationKind::Dimension { .. } => format!("Dimension · {}", a.id),
                 AnnotationKind::Leader { text, .. } => format!("Tag · {text}"),
                 AnnotationKind::Level { label, .. } => format!("Level · {label}"),
@@ -383,7 +413,7 @@ impl Drafting {
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            for (i, name) in ["Text", "Dimension", "Leader", "Level", "Area fill"].into_iter().enumerate() {
+            for (i, name) in ["Text", "Dimension", "Leader", "Level", "Area fill", "Line"].into_iter().enumerate() {
                 if ui
                     .add_enabled(i != 3 || !matches!(view.kind, DrawingViewKind::Plan { .. }), egui::Button::selectable(self.kind == i, name))
                     .clicked()
@@ -396,7 +426,7 @@ impl Drafting {
         ui.label("Annotation id");
         ui.add_enabled(self.selected.is_none(), egui::TextEdit::singleline(&mut self.note_id));
         let labels: &[&str] = match self.kind {
-            1 => &["From", "To"],
+            1 | 5 => &["From", "To"],
             2 => &["Arrow tip", "Bend", "Text position"],
             4 => &[],
             _ => &["Position"],
@@ -438,6 +468,28 @@ impl Drafting {
                 ui.label("Zero datum height");
                 number(ui, &mut self.datum);
             }
+            5 => {
+                ui.weak("Manual drafting line · independent of BIM geometry");
+                ui.horizontal(|ui| {
+                    ui.label("Line colour");
+                    ui.color_edit_button_srgb(&mut self.stroke.colour);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Paper width");
+                    ui.add(egui::DragValue::new(&mut self.stroke.width_mm).range(0.05..=2.11).speed(0.01).suffix(" mm"));
+                });
+                egui::ComboBox::from_id_salt("line-pattern").selected_text(format!("{:?}", self.stroke.pattern)).show_ui(ui, |ui| {
+                    for (pattern, label) in [
+                        (LinePattern::Solid, "Solid"),
+                        (LinePattern::Dashed, "Dashed"),
+                        (LinePattern::Dotted, "Dotted"),
+                        (LinePattern::DashDot, "Dash-dot"),
+                    ] {
+                        ui.selectable_value(&mut self.stroke.pattern, pattern, label);
+                    }
+                });
+                ui.weak("DXF uses indexed colour approximations and its nearest supported lineweight.");
+            }
             _ => {
                 ui.horizontal(|ui| {
                     ui.label("Fill colour");
@@ -469,7 +521,7 @@ impl Drafting {
                 ui.weak("Pick at least three corners. Do not repeat the first corner; Trigon closes and validates the boundary.");
             }
         }
-        if self.kind != 4 {
+        if self.kind != 4 && self.kind != 5 {
             ui.horizontal(|ui| {
                 ui.label("Paper text size");
                 ui.add(egui::DragValue::new(&mut self.size).range(0.5..=12.0).speed(0.1).suffix(" mm"));
@@ -512,6 +564,11 @@ impl Drafting {
                 ui.checkbox(&mut self.snaps.midpoints, "Midpoints");
                 ui.checkbox(&mut self.snaps.intersections, "Intersections");
             });
+            ui.checkbox(&mut self.alignment, "Temporary alignment guides");
+            ui.horizontal(|ui| {
+                ui.label("Guide offset");
+                ui.add(egui::DragValue::new(&mut self.alignment_offset).range(-100_000.0..=100_000.0).speed(1.0).suffix(" mm"));
+            });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.grid, "Grid");
                 ui.add(egui::DragValue::new(&mut self.grid_step).range(0.01..=100000.0).suffix(" mm"));
@@ -533,6 +590,7 @@ impl Drafting {
 
     fn annotation_kind(&self) -> AnnotationKind {
         match self.kind {
+            5 => AnnotationKind::Line { from: self.points[0], to: self.points[1], stroke: self.stroke },
             1 => AnnotationKind::Dimension { from: self.points[0], to: self.points[1], offset_mm: self.offset },
             2 => AnnotationKind::Leader { tip: self.points[0], elbow: self.points[1], at: self.points[2], text: self.text.clone() },
             3 => AnnotationKind::Level { at: self.points[0], datum_mm: self.datum, label: self.text.clone() },
@@ -545,6 +603,29 @@ impl Drafting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_line_selection_and_picking_preserve_paper_style_and_ownership() {
+        let mut tool = Drafting {
+            kind: 5,
+            picking: Some(0),
+            stroke: LineStyle { colour: [184, 65, 44], width_mm: 0.7, pattern: LinePattern::DashDot },
+            ..Default::default()
+        };
+        tool.picked([1000.0, 2000.0]);
+        assert_eq!(tool.picking, Some(1));
+        tool.picked([5000.0, 2000.0]);
+        assert!(tool.picking.is_none());
+        let line = Annotation { id: "separation".into(), view: "plan".into(), size_mm: 2.5, style: Default::default(), kind: tool.annotation_kind() };
+        line.validate().unwrap();
+        let doc = Document { annotations: vec![line.clone()], ..Default::default() };
+        assert_eq!(Drafting::hit(&doc, "plan", [3000.0, 2003.0], 10.0), Some(&line));
+        assert!(Drafting::hit(&doc, "other", [3000.0, 2003.0], 10.0).is_none());
+        let mut edit = Drafting::default();
+        edit.select(&line);
+        assert_eq!(edit.annotation_kind(), line.kind);
+        assert_eq!(edit.points(), &[[1000.0, 2000.0], [5000.0, 2000.0]]);
+    }
 
     #[test]
     fn opening_the_same_drawing_preserves_a_custom_new_drawing_id() {

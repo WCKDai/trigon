@@ -117,3 +117,24 @@ phase visibility and the read-only `view.pick` command.
 Saved annotations also support sans/serif/mono fonts, bold/italic faces and filled polygon regions.
 See [coordinated authoring](coordinated-authoring.md#drawing-text-and-filled-regions) for styles,
 export behaviour and current editing boundaries.
+
+## Manual drafting lines and temporary alignment
+
+`annotation.define` also accepts `{"annotation":"line","from":[1000,1000],"to":[6000,1000],"stroke":{"colour":[184,65,44],"width_mm":0.5,"pattern":"dash_dot"}}` as its `kind`.
+Patterns are `solid`, `dashed`, `dotted` and `dash_dot`. Widths are paper mm, 0.05–2.11;
+RGB channels are integers 0–255. Zero-length lines and hostile coordinates are refused atomically.
+Studio's Line tool picks two points; Select or the annotation list reopens its coordinates,
+colour, width and pattern. These are manual marks; they make no BIM/apartment separation claim.
+All four exports use the same scene. SVG/PNG/PDF retain RGB; AC1015 DXF approximates colours
+with indexed ACI colours and rounds weights to the nearest supported 1/100 mm. The export result
+reports those limits. Dash lengths are 2 mm on / 1 mm off; dots repeat at 1 mm, and dash-dot
+uses 2 / 1 / dot / 1 mm, scaled by `$LTSCALE` in DXF.
+
+Temporary alignment guides use drawing x/y axes through visible endpoints, midpoints, text
+insertions and points already picked, plus infinite lines parallel to drawn segments. Guide offset
+is a perpendicular drawing-mm distance on either side. Exact enabled endpoint/intersection/midpoint
+snaps take priority over guides, followed by grid fallback. Guide tolerance is ten window points
+through the actual pan/zoom transform. Disable Temporary alignment guides or hold Alt to bypass
+snaps; typed coordinates remain available. Guides do not create constraints or journal entries.
+`view.snap` exposes the same behavior with optional `alignment: {"anchors":[[1000,2000]],"offset_mm":500}`;
+at most 512 anchors are accepted. Its result includes drawing-plane `guides`.

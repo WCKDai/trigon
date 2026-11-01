@@ -46,6 +46,33 @@ impl TextStyle {
     }
 }
 
+/// Pattern lengths are paper mm: dash 2, gap 1; dots have round caps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinePattern {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+    DashDot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LineStyle {
+    pub colour: [u8; 3],
+    /// Paper mm. DXF rounds to its nearest supported lineweight.
+    pub width_mm: f64,
+    #[serde(default)]
+    pub pattern: LinePattern,
+}
+
+impl Default for LineStyle {
+    fn default() -> Self {
+        Self { colour: [26; 3], width_mm: 0.25, pattern: LinePattern::Solid }
+    }
+}
+
 fn default_region_border() -> bool {
     true
 }
@@ -101,6 +128,13 @@ pub struct Annotation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "annotation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AnnotationKind {
+    /// Manual drafting geometry, never a model element or an apartment boundary assertion.
+    Line {
+        from: [f64; 2],
+        to: [f64; 2],
+        #[serde(default)]
+        stroke: LineStyle,
+    },
     Text {
         at: [f64; 2],
         text: String,
@@ -249,6 +283,12 @@ impl Annotation {
         identifier(&self.view)?;
         checked("size_mm (paper)", self.size_mm, 0.5, 12.0)?;
         match &self.kind {
+            AnnotationKind::Line { from, to, stroke } => {
+                point(*from)?;
+                point(*to)?;
+                checked("drafting line length (mm)", (to[0] - from[0]).hypot(to[1] - from[1]), 0.001, 1_000_000.0)?;
+                checked("line width (paper mm)", stroke.width_mm, 0.05, 2.11)?;
+            }
             AnnotationKind::Text { at, text: label, rotation_deg } => {
                 point(*at)?;
                 text(label, false)?;

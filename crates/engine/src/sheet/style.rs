@@ -207,7 +207,7 @@ pub(crate) fn edges(scene: &mut Scene, p: &Projection) {
         let b = if e.class == Class::Railing { (b + 1).min(2) } else { b };
         let colour = [INK, [0x60, 0x60, 0x60], [0x96, 0x96, 0x96]][b];
         let pen = if e.class == Class::Railing { base } else { thinner(base, b) };
-        styled.push((e.a, e.b, layer(e.class), Stroke { pen, colour, dashed: false }));
+        styled.push((e.a, e.b, layer(e.class), Stroke { pen, colour, dashed: false, pattern: Default::default() }));
     }
     let elements: Vec<_> = p.edges.iter().flat_map(|edge| edge.element_segments.iter().cloned()).collect();
     for (a, b, layer, stroke) in merge(styled) {

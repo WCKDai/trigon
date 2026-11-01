@@ -210,11 +210,16 @@ pub(crate) struct Stroke {
     pub(crate) pen: f64,
     pub(crate) colour: Rgb,
     pub(crate) dashed: bool,
+    pub(crate) pattern: trigon_model::annotation::LinePattern,
 }
 
 impl Stroke {
+    pub(crate) fn pattern(&self) -> trigon_model::annotation::LinePattern {
+        if self.dashed { trigon_model::annotation::LinePattern::Dashed } else { self.pattern }
+    }
+
     pub(crate) fn new(pen: f64) -> Self {
-        Stroke { pen, colour: INK, dashed: false }
+        Stroke { pen, colour: INK, dashed: false, pattern: Default::default() }
     }
 }
 

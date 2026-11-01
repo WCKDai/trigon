@@ -140,6 +140,23 @@ impl PlanView {
         Some((snap.map_or(point, |s| s.point), snap))
     }
 
+    pub fn aligned_cursor(
+        &self,
+        rect: egui::Rect,
+        p: egui::Pos2,
+        options: Option<SnapOptions>,
+        alignment: Option<&trigon_engine::AlignmentOptions>,
+    ) -> Option<([f64; 2], Option<trigon_engine::AlignedSnap>)> {
+        let point = self.screen_to_model(rect, p)?;
+        let segments = &self.geometry.as_ref()?.segments;
+        if alignment.is_none() {
+            let (point, snap) = self.cursor(rect, p, options)?;
+            return Some((point, snap.map(|snap| trigon_engine::AlignedSnap { snap, guides: Vec::new() })));
+        }
+        let snapped = options.and_then(|settings| trigon_engine::snap_drawing_aligned(segments, point, self.tolerance_mm()?, settings, alignment));
+        Some((snapped.as_ref().map_or(point, |s| s.snap.point), snapped))
+    }
+
     /// Pick the actual visible model linework within ten window points of the cursor.
     /// The caller waits for the current generation and raster before exposing interaction.
     pub fn pick_element(&self, rect: egui::Rect, p: egui::Pos2) -> Option<DrawingElementHit> {
@@ -271,6 +288,31 @@ impl PlanView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alignment_remains_in_drawing_mm_after_pan_and_zoom_and_alt_bypasses_it() {
+        let mut view = PlanView::new(egui::Context::default());
+        view.geometry = Some(DrawingPreview {
+            svg: String::new(),
+            transform: trigon_engine::DrawingTransform { x0: -24000.0, y1: 18000.0, mm_per_px: 40.0 },
+            segments: vec![],
+            element_segments: vec![],
+            element_regions: vec![],
+        });
+        let rect = egui::Rect::from_min_size(egui::pos2(200.0, 80.0), egui::vec2(1000.0, 700.0));
+        let settings = trigon_engine::AlignmentOptions { anchors: vec![[1000.0, 3000.0], [4000.0, 2000.0]], offset_mm: 500.0 };
+        for zoom in [0.3, 1.0, 3.5] {
+            view.zoom = zoom;
+            view.centre = [200.0 * zoom, 300.0 / zoom];
+            let screen = view.model_to_screen(rect, [1503.0, 2504.0]).unwrap();
+            let (point, snap) = view.aligned_cursor(rect, screen, Some(SnapOptions::default()), Some(&settings)).unwrap();
+            assert_eq!(point, [1500.0, 2500.0]);
+            assert_eq!(snap.unwrap().guides.len(), 2);
+            let (point, snap) = view.aligned_cursor(rect, screen, None, Some(&settings)).unwrap();
+            assert!((point[0] - 1503.0).abs() < 0.05 && (point[1] - 2504.0).abs() < 0.05);
+            assert!(snap.is_none());
+        }
+    }
 
     #[test]
     fn room_region_interiors_are_pickable_through_the_live_drawing_transform() {

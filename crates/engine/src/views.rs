@@ -380,6 +380,7 @@ pub enum SnapKind {
     Intersection,
     Midpoint,
     Grid,
+    Alignment,
 }
 
 impl SnapKind {
@@ -389,6 +390,7 @@ impl SnapKind {
             Self::Intersection => "Intersection",
             Self::Midpoint => "Midpoint",
             Self::Grid => "Grid",
+            Self::Alignment => "Alignment",
         }
     }
 }
@@ -479,10 +481,16 @@ pub fn snap_drawing(segments: &[[[f64; 2]; 2]], point: [f64; 2], tolerance_mm: f
             }
         }
     }
-    if let Some(step) = options.grid_mm.filter(|s| s.is_finite() && (0.01..=1_000_000.0).contains(s)) {
-        consider([(point[0] / step).round() * step, (point[1] / step).round() * step], SnapKind::Grid);
+    if let Some((_, snap)) = best {
+        return Some(snap);
     }
-    best.map(|(_, s)| s)
+    if let Some(step) = options.grid_mm.filter(|s| s.is_finite() && (0.01..=1_000_000.0).contains(s)) {
+        let p = [(point[0] / step).round() * step, (point[1] / step).round() * step];
+        if p.iter().all(|v| v.is_finite() && v.abs() <= 1_000_000.0) && distance(p) <= tolerance_mm {
+            return Some(DrawingSnap { point: p, kind: SnapKind::Grid });
+        }
+    }
+    None
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -494,6 +502,7 @@ pub(crate) struct SnapRequest {
     pub tolerance_mm: f64,
     #[serde(default)]
     pub options: SnapOptions,
+    pub alignment: Option<crate::AlignmentOptions>,
     pub phase: Option<String>,
     pub filter: Option<String>,
 }
@@ -525,9 +534,14 @@ pub(crate) fn snap(doc: &Document, p: SnapRequest, view: View) -> Result<Value> 
     if let Some(grid) = p.options.grid_mm {
         trigon_model::checked("grid_mm", grid, 0.01, 1_000_000.0)?;
     }
+    if let Some(settings) = &p.alignment {
+        settings.validate()?;
+    }
     let preview = drawing_view(doc, &p.id, view)?;
-    let snapped = snap_drawing(&preview.segments, p.point, p.tolerance_mm, p.options);
-    Ok(json!({"point":snapped.map_or(p.point,|s|s.point),"snap":snapped}))
+    let snapped = crate::snap_drawing_aligned(&preview.segments, p.point, p.tolerance_mm, p.options, p.alignment.as_ref());
+    Ok(
+        json!({"point":snapped.as_ref().map_or(p.point,|s|s.snap.point),"snap":snapped.as_ref().map(|s|s.snap),"guides":snapped.map(|s|s.guides).unwrap_or_default()}),
+    )
 }
 
 #[cfg(test)]
@@ -555,6 +569,53 @@ mod picking_tests {
             session.execute(command, params).unwrap();
         }
         session
+    }
+
+    #[test]
+    fn manual_lines_keep_style_in_all_exports_round_trip_and_undo_exactly() {
+        let mut session = session();
+        for pattern in ["solid", "dashed", "dotted", "dash_dot"] {
+            let before = session.doc.clone();
+            let payload = json!({"id":"separation","view":"plan","kind":{"annotation":"line","from":[1500,1200],"to":[6500,1200],"stroke":{"colour":[184,65,44],"width_mm":0.5,"pattern":pattern}}});
+            session.execute("annotation.define", payload.clone()).unwrap();
+            let saved = serde_json::to_string(&session.doc).unwrap();
+            let loaded: Document = serde_json::from_str(&saved).unwrap();
+            assert_eq!(loaded, session.doc);
+            let scene = sheet(&session.doc, "plan", View::latest(&session.doc)).unwrap();
+            let svg = scene.svg();
+            assert!(svg.contains("stroke=\"#b8412c\" stroke-width=\"2.362\""));
+            assert_eq!(svg.contains("stroke-dasharray=\"0 4.72\""), pattern == "dotted");
+            assert_eq!(svg.contains("stroke-dasharray=\"9.45 4.72 0 4.72\""), pattern == "dash_dot");
+            let dxf = crate::sheet::dxf::write(
+                &scene.scene,
+                &crate::sheet::dxf::TitleBlock { title: "Fixture", project: "Synthetic", caption: "Manual separation", note: None },
+            );
+            assert!(dxf.contains("62\n1\n"));
+            assert!(dxf.contains("370\n50\n"));
+            if pattern == "dotted" {
+                assert!(dxf.contains("6\nDOTTED\n"));
+            }
+            if pattern == "dash_dot" {
+                assert!(dxf.contains("6\nDASHDOT\n"));
+            }
+            let png = crate::plan_output::png(&svg).unwrap();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let pdf = crate::plan_output::pdf(&[svg], crate::sheet::PAGE_MM).unwrap();
+            let parsed = lopdf::Document::load_mem(&pdf).unwrap();
+            assert_eq!(parsed.get_pages().len(), 1);
+            let preview = drawing_view(&session.doc, "plan", View::latest(&session.doc)).unwrap();
+            assert!(preview.segments.contains(&[[1500.0, 1200.0], [6500.0, 1200.0]]));
+            assert!(!preview.element_segments.iter().any(|s| s.id == "separation"));
+            for bad in [json!(-0.1), json!(0), json!(f64::MAX)] {
+                let mut bad_payload = payload.clone();
+                bad_payload["kind"]["stroke"]["width_mm"] = bad;
+                let valid_doc = session.doc.clone();
+                assert!(session.execute("annotation.define", bad_payload).is_err());
+                assert_eq!(session.doc, valid_doc);
+            }
+            session.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(session.doc, before);
+        }
     }
 
     fn fingerprint(bytes: &[u8]) -> u64 {

@@ -11,7 +11,9 @@ use trigon_data::{DataError, Provider};
 use trigon_model::doc::JournalEntry;
 use trigon_model::{Document, ModelError};
 
+mod alignment;
 mod annotation_style;
+pub use alignment::{AlignedSnap, AlignmentOptions, snap_drawing_aligned};
 mod commands;
 mod drawings;
 mod edit;
