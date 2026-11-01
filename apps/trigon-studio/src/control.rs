@@ -20,6 +20,7 @@ pub struct ViewRequest {
     pub level: Option<Option<usize>>,
     pub phase: Option<usize>,
     pub filter: Option<trigon_model::build::PhaseFilter>,
+    pub phase_colors: Option<bool>,
     pub fit: bool,
     pub focus: Option<String>,
 }
@@ -65,13 +66,19 @@ pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result
         None => None,
         Some(f) => Some(parse_filter(f).ok_or_else(|| format!("ui.view: filter {f}: use complete, demolition, new or all"))?),
     };
+    let phase_colors = match opt_str(p, "appearance")? {
+        None => None,
+        Some("materials") => Some(false),
+        Some("phases") => Some(true),
+        Some(_) => return Err("ui.view: appearance must be materials or phases".into()),
+    };
     let fit = match p.get("fit") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err("ui.view: `fit` must be true or false".into()),
     };
     let focus = opt_str(p, "focus")?.map(str::to_string);
-    Ok(ViewRequest { mode, drawing, level, phase, filter, fit, focus })
+    Ok(ViewRequest { mode, drawing, level, phase, filter, phase_colors, fit, focus })
 }
 
 /// Longest queue of synthetic input.
@@ -268,7 +275,8 @@ impl StudioApp {
         };
         let phase = req.phase.unwrap_or(self.phase);
         let filter = req.filter.unwrap_or(self.filter);
-        let phase_changed = phase != self.phase || filter != self.filter;
+        let phase_colors = req.phase_colors.unwrap_or(self.phase_colors);
+        let phase_changed = phase != self.phase || filter != self.filter || phase_colors != self.phase_colors;
         let before = (self.mode, self.level, self.plan_level, self.drawing.clone());
         self.mode = req.mode.unwrap_or(self.mode);
         if let Some(id) = req.drawing {
@@ -279,6 +287,7 @@ impl StudioApp {
         }
         self.phase = phase;
         self.filter = filter;
+        self.phase_colors = phase_colors;
         if let Some(l) = req.level {
             self.level = l;
             if let Some(l) = l {
@@ -310,6 +319,7 @@ impl StudioApp {
             "phase": self.session.doc.phases.get(self.phase).map(|p| p.id.as_str()),
             "phases": self.session.doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             "filter": filter_name(self.filter),
+            "appearance": if self.phase_colors { "phases" } else { "materials" },
             "selection": self.selection.and_then(|i| self.scene.elements.get(i)).map(|e| e.id.as_str()),
             "camera": {
                 "target_m": self.camera.target,
@@ -430,6 +440,17 @@ impl StudioApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appearance_control_is_explicit_checked_and_optional() {
+        let phase = |_: &str| Ok(0);
+        for (value, expected) in [("materials", false), ("phases", true)] {
+            assert_eq!(parse_view(&json!({"appearance": value}), 1, &phase).unwrap().phase_colors, Some(expected));
+        }
+        for value in [json!(true), json!(23), json!("green")] {
+            assert!(parse_view(&json!({"appearance":value}), 1, &phase).is_err());
+        }
+    }
 
     #[test]
     fn halving_averages_blocks() {

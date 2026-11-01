@@ -135,6 +135,14 @@ impl Properties {
                 }
             }
         }
+        if let Some(scope) =
+            descriptor["properties"].as_array().into_iter().flatten().find(|p| matches!(p["key"].as_str(), Some("scope" | "source_scope")))
+        {
+            egui::Frame::new().fill(theme::CHROME).inner_margin(10.0).corner_radius(3).show(ui, |ui| {
+                ui.label(egui::RichText::new("EDIT SCOPE").size(10.0).color(theme::ACCENT));
+                ui.add(egui::Label::new(scope["value"].as_str().unwrap_or_default()).wrap());
+            });
+        }
         theme::eyebrow(ui, "MODEL PARAMETERS");
         let reason =
             blocked.or_else(|| (descriptor["editable"] != true).then(|| descriptor["reason"].as_str().unwrap_or("This element is read-only.")));
@@ -145,6 +153,9 @@ impl Properties {
         let mut changed = serde_json::Map::new();
         for property in descriptor["properties"].as_array().into_iter().flatten() {
             let Some(key) = property["key"].as_str() else { continue };
+            if matches!(key, "scope" | "source_scope") {
+                continue;
+            }
             let label = property["label"].as_str().unwrap_or(key);
             let original = &property["value"];
             let editable = enabled && property["editable"] == true;

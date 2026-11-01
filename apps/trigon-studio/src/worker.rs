@@ -37,6 +37,8 @@ pub struct Job {
     pub doc: Arc<Document>,
     pub view: View,
     pub want_scene: bool,
+    /// Ephemeral presentation choice, independent of phase visibility.
+    pub phase_colors: bool,
     /// One drawing workspace, prepared with its exact picking geometry.
     pub drawing: Option<DrawingRequest>,
 }
@@ -79,7 +81,7 @@ pub fn run(job: &Job) -> Done {
         let built = guarded("building the model", || trigon_model::build::build_view(&job.doc, job.view).map_err(|e| e.to_string()));
         build_ms = ms(t);
         let t = Instant::now();
-        let phases = job.doc.phases.len() > 1;
+        let phases = job.phase_colors;
         let scene = built.and_then(|b| {
             guarded("preparing the view", || {
                 let schedule = opening_schedule_from_built(&job.doc, &b).map_err(|e| e.to_string())?;
@@ -145,8 +147,28 @@ mod tests {
             doc: Arc::new(doc),
             view: View { phase: 0, filter: PhaseFilter::Complete },
             want_scene: true,
+            phase_colors: false,
             drawing: plan_level.map(DrawingRequest::Plan),
         }
+    }
+
+    #[test]
+    fn presentation_uses_finishes_even_with_multiple_phases() {
+        let s = crate::schedules::tests::phase_session();
+        let mut request = job(s.doc.clone(), None);
+        request.view = View::latest(&s.doc);
+        let built = trigon_model::build::build_view(&s.doc, request.view).unwrap();
+        let expected = Scene::from_built(&built, false).with_rooms(&s.doc);
+        let actual = run(&request).scene.unwrap().unwrap();
+        assert!(actual.scene.vertices == expected.vertices, "material presentation must not automatically tint new finishes green");
+        request.phase_colors = true;
+        let reviewed = run(&request).scene.unwrap().unwrap();
+        assert_ne!(reviewed.scene.vertices, actual.scene.vertices);
+        assert_eq!(reviewed.scene.tri_element, actual.scene.tri_element);
+        assert_eq!(reviewed.scene.edges, actual.scene.edges);
+        assert_eq!(reviewed.schedule, actual.schedule);
+        assert_eq!(reviewed.properties, actual.properties);
+        assert_eq!(*request.doc, s.doc, "appearance never changes the document or journal");
     }
 
     #[test]
