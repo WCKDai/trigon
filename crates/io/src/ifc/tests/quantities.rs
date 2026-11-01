@@ -6,6 +6,9 @@ use trigon_model::{Built, ComponentKind, ComponentType, Document, ElementClass};
 
 use crate::ifc::{fills, part21::gid, sample, write};
 
+#[path = "stepped_walls.rs"]
+mod stepped_walls;
+
 #[derive(Debug)]
 struct Entity<'a> {
     kind: &'a str,

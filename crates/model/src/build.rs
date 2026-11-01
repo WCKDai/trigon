@@ -242,7 +242,8 @@ pub struct BuiltInterior {
     /// Centre line after joining, site mm.
     pub axis: [[f64; 2]; 2],
     pub thickness: f64,
-    /// Plan outline after joining (4 corners, counter-clockwise, site mm).
+    /// Quadrilateral join reference (counter-clockwise, site mm). At a mixed-width step,
+    /// `cut` and `mesh` carry the exact material; four corners cannot describe its termination.
     pub outline: [[f64; 2]; 4],
     /// What the ends at `axis[0]` and `axis[1]` join.
     pub ends: [Option<Join>; 2],
@@ -1054,13 +1055,14 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         }
         let wall_height = top_at(s.elevation + s.height - b.ceiling_thickness(level)) - s.elevation;
         let axes: Vec<Axis> = on.iter().map(|(_, w)| Axis { a: w.a, b: w.b, thickness: w.thickness }).collect();
-        let joined = crate::joins::join(&axes, storey_inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
-        for ((k, iw), j) in on.iter().zip(joined) {
+        let joined = crate::joins::profiles::join(&axes, storey_inners.get(level).map_or(&[][..], Vec::as_slice), b.thickest_wall(level));
+        for ((k, iw), profiled) in on.iter().zip(joined) {
+            let j = &profiled.joined;
             if !(crate::footprint::signed_area2(&j.outline).abs() > 1.0) {
                 continue;
             }
             let id = if iw.id.is_empty() { format!("{}.iw{k}", b.id) } else { iw.id.clone() };
-            if let Some(mut w) = interior_wall(iw, &format!("{id}.L{level}"), level, &j, (s.elevation, wall_height)) {
+            if let Some(mut w) = interior_wall(iw, &format!("{id}.L{level}"), level, &profiled, (s.elevation, wall_height)) {
                 if cut.is_some() {
                     for d in &mut w.doors {
                         d.fill = clip_element(d.fill.clone(), cut);
@@ -1210,7 +1212,14 @@ fn cellar_stair(fr: &FacadeFrame, id: &str, c: &crate::doc::CellarStair, level: 
 /// An interior wall on one storey after joining: a closed prism with its doors cut out, a
 /// frame and a closed leaf in each door, and the plan cut with the doors left open. `None` if
 /// the wall is degenerate.
-fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crate::joins::Joined, (z0, height): (f64, f64)) -> Option<BuiltInterior> {
+fn interior_wall(
+    iw: &crate::doc::InteriorWall,
+    id: &str,
+    level: usize,
+    profiled: &crate::joins::profiles::Profiled,
+    (z0, height): (f64, f64),
+) -> Option<BuiltInterior> {
+    let j = &profiled.joined;
     let [r0, r1, l1, l0] = j.outline;
     let fr = FacadeFrame::new(r0, r1)?;
     let d = iw.thickness;
@@ -1242,7 +1251,10 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
         doors.push(BuiltOpening { id: door_id, level, rect, profile: Vec::new(), fill, attached: Vec::new(), status: Status::Existing });
     }
     let holes: Vec<Rect> = doors.iter().map(|o| o.rect).collect();
-    let mesh = crate::walls::segment(&fr, id, &span, &holes).map_or_else(|| prism(&j.outline, z0, height), |s| s.mesh);
+    let mesh = match &profiled.material {
+        Some(material) => crate::joins::profiles::mesh(material, &fr, &holes, d, z0, height)?,
+        None => crate::walls::segment(&fr, id, &span, &holes).map_or_else(|| prism(&j.outline, z0, height), |s| s.mesh),
+    };
     let footprints: Vec<Vec<[f64; 2]>> = holes
         .iter()
         .map(|r| {
@@ -1255,7 +1267,9 @@ fn interior_wall(iw: &crate::doc::InteriorWall, id: &str, level: usize, j: &crat
                 .collect()
         })
         .collect();
-    let cut = if footprints.is_empty() {
+    let cut = if let Some(material) = &profiled.material {
+        crate::joins::profiles::cut(material, &footprints)
+    } else if footprints.is_empty() {
         vec![j.outline.to_vec()]
     } else {
         crate::walls::cut(&j.outline, &footprints).into_iter().filter_map(|shape| shape.into_iter().next()).collect()

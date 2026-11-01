@@ -5,6 +5,8 @@
 //! storey either sits on a face or is free. Walls closer than 20° to parallel never join end to
 //! face (collinear pieces either side of a door stay apart), and an end moves at most `REACH`.
 
+pub(crate) mod profiles;
+
 /// The farthest a wall end is extended to reach a face, mm.
 pub const REACH: f64 = 300.0;
 /// sin 20°: walls closer to parallel than this don't join end to face.
@@ -54,6 +56,25 @@ pub struct Joined {
     pub outline: [[f64; 2]; 4],
     /// What the ends at `a` and at `b` join, if anything.
     pub ends: [Option<Join>; 2],
+}
+
+/// Disjoint plan shapes in site millimetres. Each shape has an outer ring followed by holes.
+pub type MaterialProfile = Vec<Vec<Vec<[f64; 2]>>>;
+
+/// A legacy join reference and, where a quad is insufficient, its actual gross material.
+/// Door voids are not included; the built wall's mesh and cut contain its finished material.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinedMaterial {
+    pub joined: Joined,
+    /// `None` preserves the ordinary quadrilateral path. `Some` may be concave or disconnected.
+    pub material: Option<MaterialProfile>,
+}
+
+/// Join source axes with the same ordering and reach policy as [`join`], preserving stepped
+/// material for mesh/export consumers. Compare `joined` with a built reference before pairing
+/// it with separately supplied built walls. This does not validate arbitrary source numbers.
+pub fn join_material(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<JoinedMaterial> {
+    profiles::join(walls, facade, band)
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -125,6 +146,11 @@ fn endpoint_key(point: [f64; 2]) -> [u64; 2] {
 /// Joins the walls of one storey. `facade` is the facade's inner face for this storey
 /// (counter-clockwise, one vertex per footprint corner) and `band` the facade wall's thickness.
 /// Output order matches the input.
+///
+/// This quadrilateral interface handles single-face terminations. A branch meeting an exact
+/// mixed-width continuation can need a stepped end with more than four corners; mesh and
+/// exchange consumers use [`join_material`] for that case. These legacy quads alone do not
+/// describe its material partition.
 pub fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Joined> {
     let frames: Vec<_> = walls.iter().map(|w| frame(w.a, w.b)).collect();
     // A shared, exactly collinear endpoint is a seam inside a continuous run,
@@ -404,6 +430,283 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn stepped_sources() -> [Axis; 3] {
+        [
+            Axis { a: [5000.0, 5000.0], b: [5000.0, 6500.0], thickness: 120.0 },
+            Axis { a: [5000.0, 5000.0], b: [5000.0, 3700.0], thickness: 240.0 },
+            Axis { a: [4300.0, 4250.0], b: [5000.0, 5000.0], thickness: 120.0 },
+        ]
+    }
+
+    fn source_document(sources: &[Axis]) -> crate::Document {
+        let bounds = sources.iter().flat_map(|w| [w.a, w.b]).fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |b, p| {
+            [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]
+        });
+        let [x0, y0, x1, y1] = bounds;
+        let footprint = [[x0 - 3000.0, y0 - 3000.0], [x1 + 3000.0, y0 - 3000.0], [x1 + 3000.0, y1 + 3000.0], [x0 - 3000.0, y1 + 3000.0]];
+        let mut b = crate::Building::new("junction", "Synthetic stepped junction", &footprint, 1, 3000.0).unwrap();
+        b.interior_walls = sources
+            .iter()
+            .enumerate()
+            .map(|(i, w)| crate::InteriorWall {
+                id: format!("wall{i}"),
+                levels: vec![0],
+                a: w.a,
+                b: w.b,
+                thickness: w.thickness,
+                load_bearing: false,
+                doors: Vec::new(),
+            })
+            .collect();
+        let mut doc = crate::Document::default();
+        doc.buildings.push(b);
+        doc
+    }
+
+    fn built_sources(sources: &[Axis]) -> Vec<crate::build::BuiltInterior> {
+        let doc = source_document(sources);
+        let before = serde_json::to_vec(&doc).unwrap();
+        let mut built = crate::build(&doc).unwrap();
+        assert_eq!(before, serde_json::to_vec(&doc).unwrap(), "building must not edit the document or source endpoints");
+        let walls = std::mem::take(&mut built[0].interior);
+        assert_eq!(walls.len(), sources.len());
+        for (i, w) in walls.iter().enumerate() {
+            assert_eq!(w.id, format!("wall{i}.L0"), "source identity and order");
+            assert_eq!(w.thickness, sources[i].thickness);
+        }
+        walls
+    }
+
+    fn overlay_area(a: &[Vec<[f64; 2]>], b: &[Vec<[f64; 2]>], rule: i_overlay::core::overlay_rule::OverlayRule) -> f64 {
+        use i_overlay::core::fill_rule::FillRule;
+        use i_overlay::float::overlay::FloatOverlay;
+        FloatOverlay::with_subj_and_clip(&a.to_vec(), &b.to_vec())
+            .overlay(rule, FillRule::NonZero)
+            .iter()
+            .map(|shape| shape.iter().map(|r| crate::footprint::signed_area2(r) / 2.0).sum::<f64>().abs())
+            .sum()
+    }
+
+    fn assert_complete_partition(sources: &[Axis], walls: &[crate::build::BuiltInterior]) {
+        use i_overlay::core::overlay_rule::OverlayRule;
+        for (i, a) in walls.iter().enumerate() {
+            for b in &walls[..i] {
+                let overlap = overlay_area(&a.cut, &b.cut, OverlayRule::Intersect);
+                assert!(overlap < 0.05, "{} / {} overlap {overlap} mm²", a.id, b.id);
+            }
+        }
+        let expected: Vec<_> = sources.iter().map(|w| square(w, None).outline.to_vec()).collect();
+        let actual: Vec<_> = walls.iter().flat_map(|w| w.cut.clone()).collect();
+        let missing = overlay_area(&expected, &actual, OverlayRule::Difference);
+        let extra = overlay_area(&actual, &expected, OverlayRule::Difference);
+        assert!(missing < 0.05 && extra < 0.05, "source union coverage: missing={missing}, extra={extra} mm²");
+    }
+
+    #[test]
+    fn mixed_thickness_step_build_has_single_complete_coverage() {
+        let sources = stepped_sources();
+        let walls = built_sources(&sources);
+        let point = [5020.0, 4980.0];
+        let coverage = walls.iter().filter(|w| w.cut.iter().any(|ring| inside(ring, point))).count();
+        assert_eq!(coverage, 1, "one physical material at the mixed-width junction");
+        assert_complete_partition(&sources, &walls);
+        // This oblique source leaves a main band and a small triangular return beyond the
+        // thick wall's shoulder. Both touch the run; a single quad cannot describe them.
+        assert_eq!(walls[2].cut.len(), 2, "retain the source-union return rather than throwing it away");
+        assert!(shared_boundary(&walls[2].cut, &walls[0].cut) > 20.0);
+        assert!(shared_boundary(&walls[2].cut, &walls[1].cut) > 100.0);
+        for w in &walls {
+            let volume = closed_outward_volume(&w.mesh);
+            let area: f64 = w.cut.iter().map(|r| crate::footprint::signed_area2(r) / 2.0).sum();
+            assert!((volume - area * w.height).abs() < 1.0);
+        }
+    }
+
+    fn shared_boundary(a: &[Vec<[f64; 2]>], b: &[Vec<[f64; 2]>]) -> f64 {
+        let edges = |rings: &[Vec<[f64; 2]>]| -> Vec<_> {
+            rings.iter().flat_map(|r| r.iter().copied().zip(r.iter().copied().cycle().skip(1)).take(r.len())).collect()
+        };
+        let mut shared = 0.0;
+        for (p, q) in edges(a) {
+            let Some((t, _, len)) = frame(p, q) else { continue };
+            for (r, s) in edges(b) {
+                if cross(sub(r, p), t).abs() < 1e-3 && cross(sub(s, p), t).abs() < 1e-3 {
+                    let (a, b) = (dot(sub(r, p), t), dot(sub(s, p), t));
+                    shared += (a.max(b).min(len) - a.min(b).max(0.0)).max(0.0);
+                }
+            }
+        }
+        shared
+    }
+
+    fn closed_outward_volume(mesh: &crate::Mesh) -> f64 {
+        use std::collections::{BTreeMap, BTreeSet};
+        assert!(!mesh.triangles.is_empty());
+        // Overlay uses a fixed integer grid; weld at 0.001 mm, well below source precision.
+        let key = |p: [f64; 3]| p.map(|v| (v * 1000.0).round() as i64);
+        let mut faces = BTreeSet::new();
+        let mut edges = BTreeMap::<_, (usize, i32)>::new();
+        let origin = mesh.positions[0];
+        let mut volume = 0.0;
+        for tri in &mesh.triangles {
+            let points = tri.map(|i| mesh.positions[i as usize]);
+            assert!(points.iter().flatten().all(|v| v.is_finite()));
+            let mut face = points.map(key);
+            face.sort();
+            assert!(faces.insert(face), "duplicate triangle");
+            for i in 0..3 {
+                let (a, b) = (key(points[i]), key(points[(i + 1) % 3]));
+                assert_ne!(a, b, "collapsed triangle edge: {points:?}");
+                let entry = edges.entry([a.min(b), a.max(b)]).or_default();
+                entry.0 += 1;
+                entry.1 += if a < b { 1 } else { -1 };
+            }
+            let [a, b, c] = points.map(|p| std::array::from_fn::<_, 3, _>(|i| p[i] - origin[i]));
+            volume += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+        }
+        let bad: Vec<_> = edges.iter().filter(|(_, v)| **v != (2, 0)).take(5).collect();
+        assert!(bad.is_empty(), "open, nonmanifold or inconsistent solid: {bad:?}");
+        assert!(volume > 0.0, "outward positive volume: {volume}");
+        volume
+    }
+
+    #[test]
+    fn stepped_profiles_preserve_union_under_order_direction_and_rigid_transforms() {
+        for (angle, offset) in [(0_f64, [5000.0, 5000.0]), (37.0, [150000.0, -270000.0]), (-118.0, [-30000.0, 41000.0])] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |p: [f64; 2]| [offset[0] + p[0] * cos - p[1] * sin, offset[1] + p[0] * sin + p[1] * cos];
+            for (north, south, branch) in [(120.0, 240.0, 120.0), (240.0, 120.0, 120.0), (40.0, 1000.0, 1000.0), (120.0, 120.5, 120.0)] {
+                for endpoint in [[-700.0, -750.0], [-700.0, 750.0], [700.0, -750.0], [700.0, 750.0], [-1800.0, 0.0]] {
+                    let raw = [
+                        Axis { a: at([0.0, 0.0]), b: at([0.0, 2500.0]), thickness: north },
+                        Axis { a: at([0.0, 0.0]), b: at([0.0, -2300.0]), thickness: south },
+                        Axis { a: at(endpoint), b: at([0.0, 0.0]), thickness: branch },
+                    ];
+                    for order in [[0, 1, 2], [1, 0, 2], [2, 0, 1], [2, 1, 0], [0, 2, 1], [1, 2, 0]] {
+                        for reversals in 0..8 {
+                            let sources: Vec<_> = order
+                                .iter()
+                                .map(|&i| if reversals & (1 << i) == 0 { raw[i] } else { Axis { a: raw[i].b, b: raw[i].a, ..raw[i] } })
+                                .collect();
+                            let walls = built_sources(&sources);
+                            assert_complete_partition(&sources, &walls);
+                            for w in &walls {
+                                let volume = closed_outward_volume(&w.mesh);
+                                let area: f64 = w.cut.iter().map(|r| crate::footprint::signed_area2(r) / 2.0).sum();
+                                assert!(
+                                    (volume - area * w.height).abs() < 1.0,
+                                    "volume/plan mismatch at {angle}/{north}/{south}/{branch}/{endpoint:?}"
+                                );
+                                for end in w.ends.iter().flatten() {
+                                    if let Target::Wall(target) = end.target {
+                                        assert!(shared_boundary(&w.cut, &walls[target].cut) > 1e-3, "join metadata must name a contacted wall");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn perpendicular_branch_has_six_corners_and_opposite_branches_remain_disjoint() {
+        let mut sources = stepped_sources().to_vec();
+        sources[2].a = [3200.0, 5000.0];
+        let walls = built_sources(&sources);
+        assert_complete_partition(&sources, &walls);
+        assert_eq!(walls[2].cut.len(), 1);
+        assert_eq!(walls[2].cut[0].len(), 6, "a shoulder needs six corners");
+        sources.push(Axis { a: [6800.0, 5000.0], b: [5000.0, 5000.0], thickness: 120.0 });
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2]] {
+            let raw: Vec<_> = order.iter().map(|&i| sources[i]).collect();
+            let walls = built_sources(&raw);
+            assert_complete_partition(&raw, &walls);
+            for w in &walls {
+                closed_outward_volume(&w.mesh);
+            }
+        }
+        sources[3].thickness = 180.0;
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2]] {
+            let raw: Vec<_> = order.iter().map(|&i| sources[i]).collect();
+            let walls = built_sources(&raw);
+            assert_complete_partition(&raw, &walls);
+            for w in &walls {
+                closed_outward_volume(&w.mesh);
+            }
+        }
+        sources[3] = Axis { a: [3500.0, 5600.0], b: [5000.0, 5000.0], thickness: 120.0 };
+        let walls = built_sources(&sources);
+        assert_complete_partition(&sources, &walls);
+        for w in &walls {
+            closed_outward_volume(&w.mesh);
+        }
+    }
+
+    #[test]
+    fn stepped_profiles_retain_doors_including_a_door_across_the_shoulder() {
+        let mut sources = stepped_sources();
+        sources[2].a = [3200.0, 5000.0];
+        for reversed in [false, true] {
+            let sources = sources.map(|w| if reversed { Axis { a: w.b, b: w.a, ..w } } else { w });
+            for at in [700.0, 1650.0] {
+                let mut doc = source_document(&sources);
+                let at = if reversed { 1800.0 - at } else { at };
+                doc.buildings[0].interior_walls[2].doors.push(crate::WallDoor { at, width: 300.0, height: 2100.0 });
+                let before = serde_json::to_vec(&doc).unwrap();
+                let built = crate::build(&doc).unwrap();
+                assert_eq!(serde_json::to_vec(&doc).unwrap(), before);
+                let wall = &built[0].interior[2];
+                assert_eq!(wall.doors.len(), 1);
+                let full = built_sources(&sources);
+                let area = |w: &crate::build::BuiltInterior| w.cut.iter().map(|r| crate::footprint::signed_area2(r) / 2.0).sum::<f64>();
+                let gross = area(&full[2]);
+                let opening = gross - area(wall);
+                assert!(opening > 20_000.0, "the intended doorway must remain open");
+                let expected = gross * wall.height - opening * 2100.0;
+                let volume = closed_outward_volume(&wall.mesh);
+                assert!((volume - expected).abs() < 1.0, "door volume: {volume} vs {expected}");
+                // The same profile must remain closed when a 3D plan cut opens the door
+                // through the top of the wall.
+                let p = profiles::join(&sources, &[], 0.0);
+                let material = p[2].material.as_ref().unwrap();
+                let holes: Vec<_> = wall.doors.iter().map(|d| d.rect).collect();
+                let short = profiles::mesh(material, &wall.frame, &holes, wall.thickness, wall.z_bottom, 1500.0).unwrap();
+                let volume = closed_outward_volume(&short);
+                assert!((volume - (gross - opening) * 1500.0).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn profile_path_preserves_independent_corners_gaps_near_collinear_and_reach() {
+        let sources = stepped_sources();
+        let mut gap = sources;
+        gap[0].a[1] += 900.0;
+        let mut nearby = sources;
+        nearby[0].a[1] += 0.01;
+        let mut almost_parallel = sources;
+        almost_parallel[2].a = [4900.0, 3500.0];
+        let mut beyond_reach = sources;
+        beyond_reach[2].b = [4500.0, 4500.0];
+        let mut equal_width = sources;
+        equal_width[0].thickness = equal_width[1].thickness;
+        for raw in [&sources[..2], &[sources[0], sources[2]], &gap, &nearby, &almost_parallel, &beyond_reach, &equal_width] {
+            let legacy = join(raw, &[], 0.0);
+            let profiled = profiles::join(raw, &[], 0.0);
+            assert!(profiled.iter().all(|p| p.material.is_none()), "only exact supported shared stations use profiles");
+            assert_eq!(legacy, profiled.into_iter().map(|p| p.joined).collect::<Vec<_>>());
+        }
+        let mut hostile = sources.to_vec();
+        hostile.extend([
+            Axis { a: sources[0].a, b: [f64::NAN, 0.0], thickness: 120.0 },
+            Axis { a: sources[0].a, b: [5000.0, 6000.0], thickness: f64::INFINITY },
+            Axis { a: sources[0].a, b: sources[0].a, thickness: 120.0 },
+        ]);
+        assert_eq!(profiles::join(&hostile, &[], 0.0).len(), hostile.len());
     }
 
     #[test]

@@ -75,6 +75,29 @@ Why these choices:
   through the wall. Wherever Trigon's own wall piece is a closed solid this is its volume (the tests
   check it); see the limits below for where it isn't.
 
+### Stepped interior-wall ends
+
+At an exact mixed-width continuation, an incident wall can end in a concave profile or
+multiple material components. Its public four-corner outline is a join reference. The model's
+`joins::join_material` API supplies the corresponding gross profiles without changing the
+existing `join`, `Joined` or `BuiltInterior` types. The writer pairs each profile with its source
+ID, axis and quad reference, and writes its actual contours as one or more extrusions in a
+single `IfcWall` body. Ordinary quad walls keep their existing export path and standard-case
+classification. Doors keep their opening/void/filling relationships; their cuts act on the
+actual material, including a doorway through a stepped end.
+
+For these walls, gross footprint/volume come from the actual gross profiles, net footprint
+from the cut material, and net volume from the built mesh in a local frame. Side areas use the
+union of the material's projection along the wall axis, viewed perpendicular to that axis;
+door areas are clipped to that silhouette. This avoids counting a whole nominal rectangle
+where only part of the stepped end exists. Length, width and height remain reference dimensions.
+This side-area basis follows the elevation-view definition in the
+[buildingSMART quantity specification](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/HTML/lexical/Qto_WallBaseQuantities.htm).
+The regressions compare both readers' actual material, volumes and bounds, exact quantities
+on an analytic stepped case, reversed source directions, and ordinary/full-height door voids.
+Bimifc does not apply voids, so its body is compared with the gross source material, rather than
+mistaking its successful parse for a match with the door-cut solid.
+
 ### Roof fragments and solid coverage
 
 Roof cuts can leave small positive triangular caps. The ordinary profile path still requires

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use trigon_model::build::{BuiltInterior, BuiltWall};
-use trigon_model::joins::Target;
+use trigon_model::joins::{Axis, JoinedMaterial, MaterialProfile, Target};
 use trigon_model::walls::WallSegment;
 use trigon_model::{Building, Built, FacadeKind};
 
@@ -25,6 +25,32 @@ pub(crate) struct Piece<'b> {
 
 /// Slack when deciding whether a profile follows the wall's axis and thickness, mm.
 const ON_LINE: f64 = 0.5;
+
+/// The silhouette of connected plan shapes along the wall axis. Holes within an outer ring
+/// do not break its one-dimensional projection; disconnected shapes may overlap in projection.
+fn profile_intervals(material: &MaterialProfile, frame: &Frame) -> Vec<[f64; 2]> {
+    let mut spans: Vec<_> = material
+        .iter()
+        .filter_map(|shape| {
+            let outer = shape.first()?;
+            let lo = outer.iter().map(|p| frame.local2(*p)[0]).reduce(f64::min)?;
+            let hi = outer.iter().map(|p| frame.local2(*p)[0]).reduce(f64::max)?;
+            (hi > lo).then_some([lo, hi])
+        })
+        .collect();
+    spans.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    let mut merged: Vec<[f64; 2]> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && span[0] <= last[1]
+        {
+            last[1] = last[1].max(span[1]);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
+}
 
 impl Ifc<'_> {
     /// Every wall of a building and the connections between them. Returns the facade pieces.
@@ -51,9 +77,31 @@ impl Ifc<'_> {
                 }
             }
         }
+        // Reuse the model's gross profiles once per occupied level. Quad references cannot
+        // describe a stepped termination; source/build pairing remains explicit below.
+        let mut materials = BTreeMap::<String, JoinedMaterial>::new();
+        if let Some(bd) = bd {
+            for level in b.interior.iter().map(|w| w.level).collect::<BTreeSet<_>>() {
+                let axes: Vec<_> =
+                    bd.interior_walls.iter().filter(|w| w.levels.contains(&level)).map(|w| Axis { a: w.a, b: w.b, thickness: w.thickness }).collect();
+                for (j, profile) in
+                    trigon_model::joins::join_material(&axes, &bd.storey_inner(level), bd.thickest_wall(level)).into_iter().enumerate()
+                {
+                    if profile.material.is_some()
+                        && let Some(id) = on_storey(bd, level, j)
+                    {
+                        materials.insert(id, profile);
+                    }
+                }
+            }
+        }
         let mut interior = BTreeMap::new();
         for iw in &b.interior {
-            if let Some(id) = self.interior_wall(iw, fl) {
+            let material = materials
+                .get(&iw.id)
+                .filter(|p| p.joined.outline == iw.outline && [p.joined.a, p.joined.b] == iw.axis)
+                .and_then(|p| p.material.as_ref());
+            if let Some(id) = self.interior_wall(iw, fl, material) {
                 interior.insert(iw.id.clone(), id);
             }
         }
@@ -112,7 +160,7 @@ impl Ifc<'_> {
         Some((id, placed))
     }
 
-    fn interior_wall(&mut self, iw: &BuiltInterior, fl: &mut Floors) -> Option<usize> {
+    fn interior_wall(&mut self, iw: &BuiltInterior, fl: &mut Floors, material: Option<&MaterialProfile>) -> Option<usize> {
         let [a, b] = iw.axis;
         let dir = [b[0] - a[0], b[1] - a[1]];
         let len = dir[0].hypot(dir[1]);
@@ -121,7 +169,8 @@ impl Ifc<'_> {
         let p = iw.outline.map(|q| frame.local2(q));
         let (t, h) = (iw.thickness, iw.height);
         let half = t / 2.0;
-        let standard = len > 1.0
+        let standard = material.is_none()
+            && len > 1.0
             && (p[0][1] + half).abs() < ON_LINE
             && (p[1][1] + half).abs() < ON_LINE
             && (p[2][1] - half).abs() < ON_LINE
@@ -135,15 +184,29 @@ impl Ifc<'_> {
         let up = catalog::interior(t, iw.load_bearing);
         let placed = self.w.place(Some(fl.at(iw.level)), frame);
         let axis = (len > 1.0).then(|| self.w.polyline(&[[0.0, 0.0], [len, 0.0]], false));
-        let solid = self.extruded(&ring, &[], h, up.face());
-        let shape = self.shape("SweptSolid", &[solid], axis, catalog::L_INTERIOR)?;
+        let solids = if let Some(material) = material {
+            material
+                .iter()
+                .filter_map(|shape| {
+                    let (outer, holes) = shape.split_first()?;
+                    let local = |r: &Vec<[f64; 2]>| r.iter().map(|p| frame.local2(*p)).collect::<Vec<_>>();
+                    Some(self.extruded(&local(outer), &holes.iter().map(local).collect::<Vec<_>>(), h, up.face()))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![self.extruded(&ring, &[], h, up.face())]
+        };
+        let shape = self.shape("SweptSolid", &solids, axis, catalog::L_INTERIOR)?;
         let class = if standard { "IFCWALLSTANDARDCASE" } else { "IFCWALL" };
         let id =
             self.w.add(format!("{class}({},$,{},$,$,#{},#{shape},{},.{}.)", gid(&iw.id), string(&up.name), placed.id, string(&iw.id), up.predefined));
-        let footprint = area(&ring);
+        let footprint = material.map_or_else(
+            || area(&ring),
+            |shapes| shapes.iter().map(|shape| shape.iter().enumerate().map(|(i, r)| if i == 0 { area(r) } else { -area(r) }).sum::<f64>()).sum(),
+        );
         let doors: f64 =
             iw.doors.iter().map(|d| (d.rect.u1 - d.rect.u0).max(0.0) * (d.rect.v1.min(iw.z_bottom + h) - d.rect.v0.max(iw.z_bottom)).max(0.0)).sum();
-        let qs = [
+        let mut qs = vec![
             Qty::Length("Length", len),
             Qty::Length("Width", t),
             Qty::Length("Height", h),
@@ -154,6 +217,34 @@ impl Ifc<'_> {
             Qty::Volume("GrossVolume", footprint * h / 1e9),
             Qty::Volume("NetVolume", (footprint * h - doors * t).max(0.0) / 1e9),
         ];
+        if let Some(material) = material {
+            let net_footprint: f64 = iw.cut.iter().map(|ring| area(ring)).sum();
+            let local_mesh =
+                trigon_model::Mesh { positions: iw.mesh.positions.iter().map(|p| frame.local(*p)).collect(), triangles: iw.mesh.triangles.clone() };
+            let spans = profile_intervals(material, &frame);
+            let side: f64 = spans.iter().map(|[a, b]| b - a).sum::<f64>() * h;
+            let open_side: f64 = iw
+                .doors
+                .iter()
+                .map(|door| {
+                    let u = |at| frame.local(iw.frame.point(at, 0.0, iw.z_bottom))[0];
+                    let (a, b) = (u(door.rect.u0), u(door.rect.u1));
+                    let width: f64 = spans.iter().map(|[lo, hi]| (hi.min(a.max(b)) - lo.max(a.min(b))).max(0.0)).sum();
+                    width * (door.rect.v1.min(iw.z_bottom + h) - door.rect.v0.max(iw.z_bottom)).max(0.0)
+                })
+                .sum();
+            qs = vec![
+                Qty::Length("Length", len),
+                Qty::Length("Width", t),
+                Qty::Length("Height", h),
+                Qty::Area("GrossFootprintArea", footprint / 1e6),
+                Qty::Area("NetFootprintArea", net_footprint / 1e6),
+                Qty::Area("GrossSideArea", side / 1e6),
+                Qty::Area("NetSideArea", (side - open_side).max(0.0) / 1e6),
+                Qty::Volume("GrossVolume", footprint * h / 1e9),
+                Qty::Volume("NetVolume", super::part21::volume(&local_mesh) / 1e9),
+            ];
+        }
         self.wall_data(id, &iw.id, &up, standard.then_some(-half), false, iw.load_bearing, &qs);
         fl.contain(iw.level, id);
         self.interior_doors(iw, id, placed, fl);
