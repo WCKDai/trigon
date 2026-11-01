@@ -54,6 +54,31 @@ positioned downpipe assemblies. These are tessellated geometric assemblies witho
 ports. Their IDs are stable under dimension edits. See the public buildingSMART
 [IfcPipeSegmentTypeEnum specification](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2/HTML/schema/ifchvacdomain/lexical/ifcpipesegmenttypeenum.htm).
 
+### Source ownership on selected eaves
+
+Pitched roofs can opt into ordered source facade lines with `eave_facades`; see
+[dormer-hosts.md](dormer-hosts.md#preserve-source-eave-directions-across-recesses).
+Detailed drainage retains an explicit original source edge for every selected run. Each pipe's
+`along_mm` remains anchored to its original facade, then projects to that facade's own parallel
+eave at the declared overhang. No nearest-edge guessing or ring-position alias is used.
+Absent selected hosts and gables are refused with the pipe/facade IDs and corrective feedback.
+Coincident parallel lines cannot both be adjacent selected hosts; choose the source ownership
+explicitly. All dimensional, mitre, outlet separation, closure and joint guards still apply.
+
+For an opted-in ring, `building.roof.gutterN` uses the **original zero-based footprint edge** N,
+so a cyclic change of the selector's starting facade preserves every run's ID and geometry.
+These IDs may differ from legacy compact ring indices when first opting in. Downpipes retain
+`building.roof.downpipe.ID`; roof, source-wall and cornice identities are unchanged. There is
+one channel for every selected sloping run, with joints and shared mitres; no run is silently
+omitted. The existing public drainage `build` API retains its signature, behavior and legacy
+IDs; a separate selected-host helper validates explicit source ownership. `eave_facades: null`
+continues down the exact legacy path.
+
+A roof-bearing cornice on a selected source facade follows that source eave's soffit without
+moving its source wall or band. A declared bearing cap on an unselected facade is refused with
+its facade ID; revise the explicit cap/roof selection. Projection and minimum remaining cap
+depth checks remain unchanged. Selecting eaves does not design cornice returns at gables.
+
 ### Seating an eave cornice
 
 On an opted-in detailed pitched roof, a band whose top is exactly the wall bearing height gets

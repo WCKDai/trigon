@@ -326,10 +326,12 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         let profile = crate::profile::opening(&ty.kind, rect);
         let mut segment = crate::walls::segment_profiles(&face, &wall_id, &span, std::slice::from_ref(&profile))
             .ok_or_else(|| ModelError::Invalid("dormer front could not be triangulated".into()))?;
-        if spec.yaw_deg != 0.0 {
+        if spec.yaw_deg != 0.0 || matches!(&b.roof, crate::Roof::Pitched { eave_facades: Some(_), .. }) {
             // The wall polygon overlay quantizes its output; caps/reveals use the exact
             // inputs. Restore those known stations within the existing numerical EPS so
             // both sides share identical vertices, including at fractional host elevations.
+            // Selected eave hosts can have these heights even at zero yaw; legacy None keeps
+            // its original construction bytes.
             let stations: Vec<_> = [[0.0, span.z0], [width, span.z0], [width, span.z1], [0.0, span.z1]]
                 .into_iter()
                 .chain(profile.iter().copied())

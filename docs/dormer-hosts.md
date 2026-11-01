@@ -46,6 +46,53 @@ corner and opening vertices within the unchanged `1e-6` mm numerical epsilon. Th
 keeps overlay faces, exact caps and reveals joined at fractional host elevations; the
 input dimensions and orientation remain exact source choices.
 
+## Preserve source eave directions across recesses
+
+When the intended eave follows source walls across a recess, use the pitched roof's optional
+`eave_facades` property before considering dormer yaw. Legacy `eave_outline` drops footprint
+vertices and connects the remaining corners; that chord can rotate the roof plane away from a
+long source wall. The opt-in selector instead intersects each pair of adjacent selected source
+**lines**. Edge k belongs to selected facade k. No wall, footprint vertex or facade ID moves,
+and no arbitrary new point, automatic rotation or inferred photo measurement is accepted.
+
+```json
+{"command":"element.set","params":{"id":"b.roof","properties":{
+  "eave_facades":["b.f1","b.f4","b.f5","b.f6","b.f7","b.f8"]
+}}}
+```
+
+Select 3–256 unique known facade IDs in counter-clockwise footprint order, wrapping once;
+any cyclic starting facade is allowed. Parallel adjacent selected lines have no unique corner.
+Intersections must be finite, within 100 km of the site origin and 200 m of both source starts;
+source lengths and forward eave runs must be 1–200000 mm. The derived ring must be simple,
+counter-clockwise, at most 1000000 m², and cover every interval of the original footprint
+boundary, including edges crossing concavities. An inward roof that merely covers the vertices
+is refused. Named gables must be selected and retain both original endpoints; include their
+adjacent source lines rather than extrapolating an unsupported gable wall.
+
+The selector overrides `straighten_mm` while present. Set it through the existing roof
+Properties/`element.set` command; `building.set_roof` still replaces the roof with its legacy
+selection default. Omitted or `null` selection preserves exact legacy source serialization,
+geometry and export paths. An empty list is invalid. This feature is not supported on mansards.
+Rust `Roof::Pitched` literals initialize `eave_facades: None` for legacy behavior. Opted-in
+files require a supporting reader: older readers may ignore this field. For rollback, restore
+a pre-selection copy or deliberately rework dependent dormers/drainage/caps with commands;
+silently deleting the selector changes the design. Clearing it is rejected if a hosted feature
+would become invalid. Successful edits are journalled and undoable; failed edits are atomic.
+
+Dormers retain the same source-wall `u_mm` anchors and all existing continuous-plane, build-up,
+hip, clearance, spacing and through-void checks. A matching source eave normally permits zero
+yaw; selecting lines does not guarantee that a whole dormer fits. On selected hosts, the
+existing source-vertex reconciliation also joins zero-yaw front-wall overlay vertices to exact
+caps/reveals within the unchanged `1e-6` mm epsilon. Legacy `None` meshes remain unchanged.
+
+[`examples/roof-source-eaves.json`](../examples/roof-source-eaves.json) is an entirely synthetic
+command recipe with a notched footprint, selected eave, explicit downpipe and a zero-yaw dormer.
+Without the selector the dormer requires approximately −18.434948823 degrees of yaw because of
+chording; the recipe corrects the eave instead. No private survey coordinates enter the example.
+Use the resulting model and exported views for source review through a complete 360 degrees;
+this construction option does not establish that any real building is complete or measured.
+
 ## Public synthetic reproduction
 
 Use `building.add` with id `b`, three storeys at 3400 mm and the entirely synthetic outline

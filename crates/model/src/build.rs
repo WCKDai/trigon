@@ -930,15 +930,36 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 thickness: b.attic_thickness(),
                 holes,
             });
-            let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
-            let outline: Vec<[f64; 2]> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+            let selected = match &b.roof {
+                crate::Roof::Pitched { eave_facades, .. } => eave_facades.as_deref(),
+                _ => None,
+            };
+            let (kept, outline) = if let Some(ids) = selected {
+                crate::roof::selected_eave_outline(b, ids)?
+            } else {
+                let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
+                let outline = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+                (kept, outline)
+            };
             // A gable facade is an edge of the eave outline when both its corners were kept next to each other.
             let mut edges = Vec::with_capacity(gables.len());
             for g in gables {
                 let f = b.facade(g)?;
                 let (i, j) = (f.edge, (f.edge + 1) % n);
-                let pos = kept.iter().position(|&k| k == i).filter(|&p| kept.get((p + 1) % kept.len()) == Some(&j));
-                edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
+                let pos = kept.iter().position(|&k| k == i);
+                if selected.is_some() {
+                    let p = pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} is absent from eave_facades; select its source facade")))?;
+                    let (a, c) = b.edge(i).ok_or_else(|| ModelError::Invalid(format!("gable {g} has no source edge")))?;
+                    if [a, c].iter().zip([outline[p], outline[(p + 1) % outline.len()]]).any(|(a, c)| (a[0] - c[0]).hypot(a[1] - c[1]) > 1e-6) {
+                        return Err(ModelError::Invalid(format!(
+                            "gable {g} must retain its source endpoints; include its adjacent facade lines in eave_facades"
+                        )));
+                    }
+                    edges.push(p);
+                } else {
+                    let pos = pos.filter(|&p| kept.get((p + 1) % kept.len()) == Some(&j));
+                    edges.push(pos.ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))?);
+                }
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
             let (mut r, pitch_deg, compound) = match &b.roof {
@@ -952,7 +973,11 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     return Err(ModelError::Invalid("detailed drainage requires gutters".into()));
                 }
                 let out = inner_ring_by(&outline, |k| if edges.contains(&k) { -*verge_mm } else { -*overhang_mm });
-                drain_parts = crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, pitch_deg, &edges, d)?;
+                drain_parts = if selected.is_some() {
+                    crate::roof::drainage::build_selected(b, &kept, &out, h, *overhang_mm, pitch_deg, &edges, d)?
+                } else {
+                    crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, pitch_deg, &edges, d)?
+                };
                 r.gutters = Mesh::default();
                 for part in &drain_parts {
                     r.gutters.append(&part.mesh);
@@ -1061,9 +1086,19 @@ fn seat_cornice(piece: &mut Mesh, b: &Building, f: &Facade, fr: &FacadeFrame, to
     if (top - b.height()).abs() > 1e-6 || gables.contains(&f.id) {
         return Ok(());
     }
-    let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
-    if !kept.iter().enumerate().any(|(k, &i)| i == f.edge && kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len()) {
-        return Err(ModelError::Invalid("a roof-bearing cornice needs an eave facade retained by roof straightening".into()));
+    if let crate::Roof::Pitched { eave_facades: Some(ids), .. } = &b.roof {
+        let (owners, _) = crate::roof::selected_eave_outline(b, ids)?;
+        if !owners.contains(&f.edge) {
+            return Err(ModelError::Invalid(format!(
+                "roof-bearing cornice on {} needs its source facade in eave_facades; revise the cap or select its eave line",
+                f.id
+            )));
+        }
+    } else {
+        let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
+        if !kept.iter().enumerate().any(|(k, &i)| i == f.edge && kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len()) {
+            return Err(ModelError::Invalid("a roof-bearing cornice needs an eave facade retained by roof straightening".into()));
+        }
     }
     let rise = crate::checked("cornice roof pitch", *pitch_deg, 5.0, 75.0)?.to_radians().tan();
     let overhang = crate::checked("cornice roof overhang", *overhang_mm, 0.0, 2000.0)?;
@@ -1926,6 +1961,150 @@ mod tests {
         assert_eq!(triangles.len(), r.gables.triangles.len());
         for t in &r.gables.triangles {
             assert!(triangles.contains(&t.map(|i| r.gables.positions[i as usize])));
+        }
+    }
+
+    fn roof_shell_is_closed_and_outward(mesh: &Mesh) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let key = |p: [f64; 3]| p.map(|v| (v * 1e6).round() as i64);
+        let mut faces = BTreeSet::new();
+        let mut edges = BTreeMap::<_, (usize, i32)>::new();
+        let mut volume = 0.;
+        let origin = mesh.positions[0];
+        for tri in &mesh.triangles {
+            let points = tri.map(|i| mesh.positions[i as usize]);
+            assert!(points.iter().flatten().all(|v| v.is_finite()));
+            let mut face = points.map(key);
+            face.sort();
+            assert!(faces.insert(face), "duplicate face");
+            for i in 0..3 {
+                let (a, b) = (key(points[i]), key(points[(i + 1) % 3]));
+                let e = edges.entry([a.min(b), a.max(b)]).or_default();
+                e.0 += 1;
+                e.1 += if a < b { 1 } else { -1 };
+            }
+            let [a, b, c] = points.map(|p| std::array::from_fn::<_, 3, _>(|i| p[i] - origin[i]));
+            volume += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.;
+        }
+        let bad: Vec<_> = edges.iter().filter(|(_, v)| **v != (2, 0)).take(8).collect();
+        assert!(bad.is_empty(), "open/nonmanifold/misoriented roof assembly: {bad:?}");
+        assert!(volume > 0., "roof solids must face outward: {volume}");
+    }
+
+    fn roof_vertical_hits(mesh: &Mesh, p: [f64; 3]) -> usize {
+        mesh.triangles
+            .iter()
+            .filter(|t| {
+                let [a, b, c] = t.map(|i| mesh.positions[i as usize]);
+                let det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                if det.abs() < 1e-8 {
+                    return false;
+                }
+                let s = ((p[0] - a[0]) * (c[1] - a[1]) - (p[1] - a[1]) * (c[0] - a[0])) / det;
+                let t = ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / det;
+                s >= -1e-8 && t >= -1e-8 && s + t <= 1. + 1e-8
+            })
+            .count()
+    }
+
+    #[test]
+    fn selected_source_eaves_remove_chord_skew_without_rotating_the_dormer_or_moving_walls() {
+        let source = [[0., 0.], [16000., 0.], [16000., 800.], [24000., 800.], [24000., 12800.], [28000., 12800.], [28000., 30000.], [0., 30000.]];
+        for (shear, angle, offset) in [(0., 0_f64, [0., 0.]), (0.17, 37.25, [150000., -270000.]), (-0.12, -118., [-30000., 41000.])] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let transform = |[x, y]: [f64; 2]| {
+                let x = x + shear * y;
+                [offset[0] + x * cos - y * sin, offset[1] + x * sin + y * cos]
+            };
+            let mut doc = Document::default();
+            let mut b = Building::new("b", "Synthetic notched source eaves", &source.map(transform), 3, 3400.).unwrap();
+            assert_eq!(b.footprint.len(), 8);
+            let original = b.clone();
+            b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,"straighten_mm":10000,
+                "eave_facades":["b.f1","b.f4","b.f5","b.f6","b.f7","b.f8"],"thickness_mm":220,"overhang_mm":250,
+                "dormers":[{"id":"source-host","facade":"b.f4","u_mm":6000,"window_type":"window.casement.2",
+                    "width_mm":1100,"height_mm":1100,"setback_mm":350}]}))
+            .unwrap();
+            doc.buildings.push(b);
+            let before = serde_json::to_vec(&doc).unwrap();
+            let built = build(&doc).expect("the original facade direction must be a level zero-yaw host, without chording across the recess");
+            let roof = built[0].roof.as_ref().unwrap();
+            assert_eq!(roof.dormers.len(), 1);
+            assert_eq!(roof.id, "b.roof");
+            assert_eq!(doc.buildings[0].roof.dormers()[0].yaw_deg, 0.);
+            assert_eq!(before, serde_json::to_vec(&doc).unwrap());
+            assert_eq!(doc.buildings[0].footprint, original.footprint);
+            assert_eq!(doc.buildings[0].facades, original.facades);
+            // Every source wall and its stable ID remain independent of the eave proposal.
+            let mut flat = doc.clone();
+            flat.buildings[0].roof = crate::Roof::Flat;
+            assert_eq!(built[0].walls, build(&flat).unwrap()[0].walls);
+            let fr = FacadeFrame::new(transform([24000., 800.]), transform([24000., 12800.])).unwrap();
+            assert!(roof.dormers[0].front.frame.t.iter().zip(fr.t).all(|(a, b)| (a - b).abs() < 1e-9));
+            for mesh in [&roof.cover, &roof.dormers[0].front.mesh, &roof.dormers[0].cheeks, &roof.dormers[0].roof] {
+                roof_shell_is_closed_and_outward(mesh);
+            }
+            let mut uncut = doc.clone();
+            uncut.buildings[0].roof.dormers_mut().unwrap().clear();
+            let host = build(&uncut).unwrap();
+            let host = &host[0].roof.as_ref().unwrap().cover;
+            for u in [5451., 6000., 6549.] {
+                let q = fr.point(u, 550., 0.);
+                assert!(roof_vertical_hits(host, q) >= 2, "upper and lower host planes must exist before the cut");
+                assert_eq!(roof_vertical_hits(&roof.cover, q), 0, "the selected host must have a real through-void");
+            }
+            assert!(roof_vertical_hits(&roof.cover, fr.point(6551., 550., 0.)) >= 2, "the cut cannot remove the cheek seat");
+            let reopened: Document = serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert_eq!(built, build(&reopened).unwrap());
+        }
+    }
+
+    #[test]
+    fn selected_eaves_preserve_gable_hosts_and_seat_source_cornices_above_connected_drainage() {
+        let ring = [[0., 0.], [4000., 0.], [4000., 800.], [10000., 800.], [10000., 0.], [24000., 0.], [24000., 10000.], [0., 10000.]];
+        let mut b = Building::new("b", "Synthetic selected bearings", &ring, 3, 3400.).unwrap();
+        b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,"eave_facades":["b.f1","b.f6","b.f7","b.f8"],
+            "gables":["b.f6","b.f8"],"thickness_mm":220,"overhang_mm":180,"verge_mm":180,"gutters":true,"drainage":{}}))
+        .unwrap();
+        b.facades[0].bands.push(crate::doc::Band {
+            levels: vec![2],
+            bottom: 3220.,
+            top: 3400.,
+            projection: 135.,
+            finish: Some(crate::doc::WallFinish::YellowBrick),
+        });
+        let mut doc = Document::default();
+        doc.buildings.push(b);
+        let source = serde_json::to_vec(&doc).unwrap();
+        let built = build(&doc).unwrap();
+        let roof = built[0].roof.as_ref().unwrap();
+        assert_eq!(roof.drainage.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["b.roof.gutter0", "b.roof.gutter6"]);
+        assert!(!roof.gables.is_empty());
+        roof_shell_is_closed_and_outward(&roof.cover);
+        let wall = &built[0].walls[0];
+        assert_eq!(wall.trim_parts[0].0, Material::BrickYellow);
+        for p in &wall.trim.positions {
+            let outward = ((p[0] - wall.frame.origin[0]) * wall.frame.n[0] + (p[1] - wall.frame.origin[1]) * wall.frame.n[1]).max(0.);
+            assert!(p[2] <= 10200. - outward * 46_f64.to_radians().tan() + 1e-6, "cap must clear the actual selected source-line soffit");
+        }
+        roof_shell_is_closed_and_outward(&wall.trim);
+        assert_eq!(source, serde_json::to_vec(&doc).unwrap());
+        for (key, value, detail) in [("gables", serde_json::json!(["b.f3"]), "absent"), ("gables", serde_json::json!(["b.f1"]), "endpoints")] {
+            let mut bad = doc.clone();
+            let mut roof = serde_json::to_value(&bad.buildings[0].roof).unwrap();
+            roof[key] = value;
+            bad.buildings[0].roof = serde_json::from_value(roof).unwrap();
+            assert!(build(&bad).unwrap_err().to_string().contains(detail));
+        }
+        let mut bad = doc.clone();
+        bad.buildings[0].facades[2].bands = bad.buildings[0].facades[0].bands.clone();
+        let err = build(&bad).unwrap_err().to_string();
+        assert!(err.contains("b.f3") && err.contains("eave_facades"), "{err}");
+        for (bottom, projection) in [(3350., 135.), (3220., 200.)] {
+            let mut bad = doc.clone();
+            bad.buildings[0].facades[0].bands[0].bottom = bottom;
+            bad.buildings[0].facades[0].bands[0].projection = projection;
+            assert!(build(&bad).is_err(), "selected eaves retain cap depth/overhang guards");
         }
     }
 

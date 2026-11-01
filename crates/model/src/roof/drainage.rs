@@ -86,6 +86,69 @@ pub fn build(
     gables: &[usize],
     d: &Drainage,
 ) -> Result<Vec<DrainPart>> {
+    build_with_sources(b, kept, outline, eaves, overhang, pitch, gables, d, false)
+}
+
+/// Detailed drainage on explicitly selected source facade lines. `source_edges[k]` owns
+/// eave run k, independent of the ring's cyclic starting corner. Along distances still use
+/// the original facade, and gutter IDs use the original edge number (legacy IDs are untouched).
+pub fn build_selected(
+    b: &Building,
+    source_edges: &[usize],
+    outline: &[[f64; 2]],
+    eaves: f64,
+    overhang: f64,
+    pitch: f64,
+    gables: &[usize],
+    d: &Drainage,
+) -> Result<Vec<DrainPart>> {
+    if !(3..=256).contains(&source_edges.len()) || source_edges.len() != outline.len() || !(3..=2000).contains(&b.footprint.len()) {
+        return Err(invalid("selected drainage needs 3 to 256 eave runs with one original source edge per run"));
+    }
+    if outline.iter().flatten().chain(b.footprint.iter().flatten()).any(|v| !v.is_finite() || v.abs() > 1e8) {
+        return Err(invalid("selected drainage needs finite site-local eaves and source lines"));
+    }
+    let mut edges = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    for (k, &edge) in source_edges.iter().enumerate() {
+        let mut matches = b.facades.iter().filter(|f| f.edge == edge);
+        let f = matches.next().ok_or_else(|| invalid(&format!("selected gutter run {k} has no known source facade for edge {edge}")))?;
+        if matches.next().is_some()
+            || !edges.insert(edge)
+            || !ids.insert(&f.id)
+            || f.id.is_empty()
+            || f.id.len() > 128
+            || f.id.chars().any(char::is_control)
+        {
+            return Err(invalid(&format!("selected gutter run {k} needs a unique source facade/edge; check {}", f.id)));
+        }
+        let (a, c) = b.edge(edge).ok_or_else(|| invalid(&format!("selected gutter source {} has no footprint edge", f.id)))?;
+        let source = FacadeFrame::new(a, c).ok_or_else(|| invalid(&format!("selected gutter source {} is too short", f.id)))?;
+        let run = FacadeFrame::new(outline[k], outline[(k + 1) % outline.len()])
+            .ok_or_else(|| invalid(&format!("selected gutter run for {} is too short", f.id)))?;
+        let direction = run.t[0] * source.t[0] + run.t[1] * source.t[1];
+        let offset = (run.origin[0] - source.origin[0]) * source.n[0] + (run.origin[1] - source.origin[1]) * source.n[1];
+        if direction < 1.0 - 1e-10 || (!gables.contains(&k) && (offset - overhang).abs() > 1e-5) {
+            return Err(invalid(&format!(
+                "selected gutter run {k} does not follow source facade {} at its declared overhang; revise eave_facades",
+                f.id
+            )));
+        }
+    }
+    build_with_sources(b, source_edges, outline, eaves, overhang, pitch, gables, d, true)
+}
+
+fn build_with_sources(
+    b: &Building,
+    kept: &[usize],
+    outline: &[[f64; 2]],
+    eaves: f64,
+    overhang: f64,
+    pitch: f64,
+    gables: &[usize],
+    d: &Drainage,
+    selected: bool,
+) -> Result<Vec<DrainPart>> {
     checked("drainage overhang", overhang, 0.0, 2000.0)?;
     checked("drainage pitch", pitch, 5.0, 75.0)?;
     if b.footprint.len() < 3 || kept.iter().any(|&i| i >= b.footprint.len()) || outline.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
@@ -145,13 +208,22 @@ pub fn build(
         if f.edge >= b.footprint.len() {
             return Err(invalid("invalid downpipe facade edge"));
         }
-        let k = kept
-            .iter()
-            .position(|&i| i == f.edge)
-            .filter(|&k| kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len())
-            .ok_or_else(|| invalid("downpipe facade was straightened away; lower roof straighten_mm"))?;
+        let k = if selected {
+            kept.iter().position(|&i| i == f.edge).ok_or_else(|| {
+                invalid(&format!("downpipe {} facade {} is absent from eave_facades; select its original eave facade", p.id, p.facade))
+            })?
+        } else {
+            kept.iter()
+                .position(|&i| i == f.edge)
+                .filter(|&k| kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len())
+                .ok_or_else(|| invalid("downpipe facade was straightened away; lower roof straighten_mm"))?
+        };
         if gables.contains(&k) {
-            return Err(invalid("a downpipe needs an eave facade, not a gable"));
+            return Err(if selected {
+                invalid(&format!("downpipe {} facade {} is a gable; choose a selected sloping eave facade", p.id, p.facade))
+            } else {
+                invalid("a downpipe needs an eave facade, not a gable")
+            });
         }
         let (a, c) = b.edge(f.edge).ok_or_else(|| invalid("missing downpipe facade edge"))?;
         let wall = FacadeFrame::new(a, c).ok_or_else(|| invalid("downpipe facade too short"))?;
@@ -216,7 +288,8 @@ pub fn build(
                 sleeve(&mut mesh, run, u, r, profile.bead)?;
             }
         }
-        parts.push(DrainPart { id: format!("{}.roof.gutter{k}", b.id), class: DrainClass::Gutter, mesh });
+        let owner = if selected { kept[k] } else { k };
+        parts.push(DrainPart { id: format!("{}.roof.gutter{owner}", b.id), class: DrainClass::Gutter, mesh });
         for (_, u, wall, p) in mine {
             let mut mesh = Mesh::default();
             let z = low - r;
@@ -658,6 +731,66 @@ mod tests {
             mesh.append(&p.mesh);
         }
         mesh
+    }
+
+    #[test]
+    fn selected_source_runs_keep_ids_outlets_and_mitres_after_notches_and_transformations() {
+        let ring = [[0., 0.], [16000., 0.], [16000., 800.], [24000., 800.], [24000., 12800.], [28000., 12800.], [28000., 30000.], [0., 30000.]];
+        for (angle, offset) in [(0_f64, [0., 0.]), (37.25, [150000., -270000.]), (-118., [-30000., 41000.])] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let ring = ring.map(|[x, y]| [offset[0] + x * cos - y * sin, offset[1] + x * sin + y * cos]);
+            let b = Building::new("b", "Synthetic selected drainage", &ring, 3, 3400.).unwrap();
+            let ids = [1, 4, 5, 6, 7, 8].map(|i| format!("b.f{i}"));
+            let (mut owners, points) = crate::roof::selected_eave_outline(&b, &ids).unwrap();
+            let mut outline = crate::build::inner_ring_by(&points, |_| -250.);
+            let d = Drainage {
+                downpipes: vec![Downpipe {
+                    id: "source-four".into(),
+                    facade: "b.f4".into(),
+                    along_mm: 6000.,
+                    diameter_mm: 80.,
+                    wall_offset_mm: 100.,
+                    bottom_mm: 150.,
+                    shoe_mm: 200.,
+                }],
+                ..Drainage::default()
+            };
+            let parts = build_selected(&b, &owners, &outline, 10200., 250., 46., &[], &d).unwrap();
+            let gutters: Vec<_> = parts.iter().filter(|p| p.class == DrainClass::Gutter).map(|p| p.id.clone()).collect();
+            assert_eq!(gutters, vec!["b.roof.gutter0", "b.roof.gutter3", "b.roof.gutter4", "b.roof.gutter5", "b.roof.gutter6", "b.roof.gutter7"]);
+            assert!(parts.iter().any(|p| p.id == "b.roof.downpipe.source-four"));
+            closed(&assembly(&parts));
+            // Reordering only the cyclic starting corner cannot change semantic ownership.
+            owners.rotate_left(2);
+            outline.rotate_left(2);
+            let shifted = build_selected(&b, &owners, &outline, 10200., 250., 46., &[], &d).unwrap();
+            for part in &parts {
+                assert_eq!(part, shifted.iter().find(|p| p.id == part.id).unwrap());
+            }
+            let mut bad = d.clone();
+            bad.downpipes[0].facade = "b.f3".into();
+            let err = build_selected(&b, &owners, &outline, 10200., 250., 46., &[], &bad).unwrap_err().to_string();
+            assert!(err.contains("b.f3") && err.contains("absent") && err.contains("eave_facades"), "{err}");
+            let k = owners.iter().position(|&e| e == 3).unwrap();
+            let err = build_selected(&b, &owners, &outline, 10200., 250., 46., &[k], &d).unwrap_err().to_string();
+            assert!(err.contains("b.f4") && err.contains("gable"), "{err}");
+            for bad in [vec![], vec![0, 0, 4, 5, 6, 7], vec![0, 3, 4, 5, 6, usize::MAX], vec![0, 3, 4]] {
+                assert!(build_selected(&b, &bad, &outline, 10200., 250., 46., &[], &d).is_err());
+            }
+            let mut wrong = owners.clone();
+            wrong.rotate_left(1);
+            assert!(
+                build_selected(&b, &wrong, &outline, 10200., 250., 46., &[], &d).is_err(),
+                "a known source must map to its actual parallel offset run"
+            );
+        }
+        let b = Building::new("r", "Legacy drainage", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 2, 3000.).unwrap();
+        let outline = crate::build::inner_ring_by(&b.footprint, |_| -180.);
+        let d = Drainage::default();
+        assert_eq!(
+            build(&b, &[0, 1, 2, 3], &outline, 6000., 180., 46., &[], &d).unwrap(),
+            build_selected(&b, &[0, 1, 2, 3], &outline, 6000., 180., 46., &[], &d).unwrap()
+        );
     }
 
     #[test]
