@@ -310,6 +310,7 @@ pub fn build_cut(doc: &Document, view: View, cut: Option<f64>) -> Result<Vec<Bui
     if let Some(z) = cut {
         crate::checked("cut height", z, -50_000.0, 500_000.0)?;
     }
+    crate::site::validate(doc)?;
     doc.buildings.iter().map(|b| build_building(doc, b, view, cut)).collect()
 }
 

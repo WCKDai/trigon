@@ -1713,3 +1713,96 @@ fn detailed_roof_drainage_is_explicit_atomic_and_undoable() {
     assert_eq!(s.doc, before);
     assert_eq!(trigon_model::build(&s.doc).unwrap(), legacy);
 }
+
+#[test]
+fn site_objects_are_real_sources_with_atomic_properties_and_exact_undo() {
+    let mut s = session();
+    let before = s.doc.clone();
+    let building = trigon_model::build(&s.doc).unwrap();
+    let object = json!({"id":"site.tree","name":"Proposed tree","intent":"proposal","geometry":{"kind":"tree","position_mm":[-18000,20000,0],"height_mm":4500,"crown_radius_mm":1500,"trunk_radius_mm":100}});
+    s.execute("site.add", json!({"object":object})).unwrap();
+    assert_eq!(trigon_model::build(&s.doc).unwrap(), building, "landscape is not another building or facade opening");
+    let added = s.doc.clone();
+    assert_eq!(s.execute("element.get", json!({"id":"site.tree"})).unwrap()["kind"], "tree");
+    s.execute("element.set", json!({"id":"site.tree","properties":{"height_mm":5000,"x_mm":-17000}})).unwrap();
+    assert_ne!(s.doc, added);
+    let changed = s.doc.clone();
+    for patch in
+        [json!({"height_mm":1e300}), json!({"crown_radius_mm":-1}), json!({"x_mm":1e300}), json!({"intent":"measured"}), json!({"unknown":42})]
+    {
+        assert!(s.execute("element.set", json!({"id":"site.tree","properties":patch})).is_err());
+        assert_eq!(s.doc, changed);
+    }
+    assert!(s.execute("site.add", json!({"object":object})).is_err());
+    assert_eq!(s.doc, changed);
+    let copy: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&s.doc).unwrap()).unwrap();
+    assert_eq!(copy, s.doc);
+    s.execute("site.delete", json!({"id":"site.tree"})).unwrap();
+    assert!(s.execute("element.get", json!({"id":"site.tree"})).is_err());
+    assert!(s.undo());
+    assert_eq!(s.doc, changed);
+    assert!(s.undo());
+    assert_eq!(s.doc, added);
+    assert!(s.undo());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn site_ground_plan_picks_only_displayed_objects_and_keeps_building_schedules() {
+    let mut s = session();
+    let schedule = crate::opening_schedule(&s.doc, trigon_model::build::View::latest(&s.doc)).unwrap();
+    let fixture: trigon_model::Document = serde_json::from_str(include_str!("../../model/tests/fixtures/courtyard.trigon")).unwrap();
+    for mut object in fixture.site_objects {
+        object.created = None;
+        match &mut object.geometry {
+            trigon_model::site::SiteGeometry::Ground { polygon, .. } => {
+                for p in polygon {
+                    p[1] -= 12000.;
+                }
+            }
+            trigon_model::site::SiteGeometry::Tree { position_mm, .. }
+            | trigon_model::site::SiteGeometry::Bench { position_mm, .. }
+            | trigon_model::site::SiteGeometry::Planter { position_mm, .. } => position_mm[1] -= 12000.,
+        }
+        s.execute("site.add", json!({"object":object})).unwrap();
+    }
+    let unchanged = crate::opening_schedule(&s.doc, trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert_eq!(serde_json::to_value(schedule).unwrap(), serde_json::to_value(unchanged).unwrap());
+    s.execute("view.define", json!({"id":"ground-site","name":"Ground","kind":{"view":"plan","level":0}})).unwrap();
+    s.execute("view.define", json!({"id":"upper-site","name":"Upper","kind":{"view":"plan","level":1}})).unwrap();
+    let ground = crate::drawing_view(&s.doc, "ground-site", trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert!(ground.element_segments.iter().any(|e| e.id == "site.paving"));
+    // The tree is outside the building footprint. Picking uses the actual ground-plan outline.
+    let hit = ground.pick_element([-5000., -17600.], 100.).unwrap();
+    assert_eq!(hit.id, "site.tree");
+    assert_eq!(hit.kind, crate::DrawingElementKind::Site);
+    let upper = crate::drawing_view(&s.doc, "upper-site", trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert!(upper.element_segments.iter().all(|e| !e.id.starts_with("site.")));
+}
+
+#[test]
+fn each_site_family_add_replace_delete_and_properties_preserve_exact_sources() {
+    let mut s = session();
+    let fixture: trigon_model::Document = serde_json::from_str(include_str!("../../model/tests/fixtures/courtyard.trigon")).unwrap();
+    for mut object in fixture.site_objects {
+        object.created = None;
+        let before = s.doc.clone();
+        let id = object.id.clone();
+        s.execute("site.add", json!({"object":object})).unwrap();
+        let added = s.doc.clone();
+        object.name.push_str(" edited");
+        s.execute("site.set", json!({"id":id,"object":object})).unwrap();
+        let replaced = s.doc.clone();
+        s.execute("element.set", json!({"id":id,"properties":{"name":"Proposal under review"}})).unwrap();
+        let properties = s.doc.clone();
+        s.execute("site.delete", json!({"id":id})).unwrap();
+        assert!(s.undo());
+        assert_eq!(s.doc, properties);
+        assert!(s.undo());
+        assert_eq!(s.doc, replaced);
+        assert!(s.undo());
+        assert_eq!(s.doc, added);
+        assert!(s.undo());
+        assert_eq!(s.doc, before);
+    }
+}

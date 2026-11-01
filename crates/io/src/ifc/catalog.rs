@@ -67,6 +67,13 @@ pub fn of(m: Material) -> Mat {
         Material::Render => RENDER,
         Material::BrickRed => BRICK_RED,
         Material::BrickYellow => BRICK_YELLOW,
+        Material::Paving => mat("Site paving", "stone", [0.52, 0.51, 0.47]),
+        Material::Gravel => mat("Site gravel", "stone", [0.62, 0.58, 0.48]),
+        Material::Grass => mat("Site grass", "vegetation", [0.22, 0.31, 0.12]),
+        Material::Bark => mat("Tree bark", "wood", [0.25, 0.16, 0.09]),
+        Material::Foliage => mat("Tree crown", "vegetation", [0.19, 0.32, 0.10]),
+        Material::Soil => mat("Planter soil", "soil", [0.20, 0.14, 0.08]),
+        Material::Planter => mat("Planter shell", "concrete", [0.30, 0.31, 0.28]),
     }
 }
 
@@ -214,6 +221,7 @@ pub fn pitched_roof(t: f64) -> BuildUp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     Label(String),
+    Text(String),
     Id(String),
     Bool(bool),
     Length(f64),
@@ -226,6 +234,7 @@ pub enum Val {
 impl Val {
     fn text(&self) -> String {
         match self {
+            Val::Text(s) => format!("IFCTEXT({})", string(s)),
             Val::Label(s) => format!("IFCLABEL({})", string(s)),
             Val::Id(s) => format!("IFCIDENTIFIER({})", string(s)),
             Val::Bool(b) => format!("IFCBOOLEAN({})", if *b { ".T." } else { ".F." }),

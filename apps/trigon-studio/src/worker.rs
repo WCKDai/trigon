@@ -84,7 +84,8 @@ pub fn run(job: &Job) -> Done {
             guarded("preparing the view", || {
                 let schedule = opening_schedule_from_built(&job.doc, &b).map_err(|e| e.to_string())?;
                 let properties = element_properties_from_built(&job.doc, &b, job.view).map_err(|e| e.to_string())?;
-                Ok(PreparedScene { scene: Scene::from_built(&b, phases).with_rooms(&job.doc), schedule, properties })
+                let site = trigon_model::site::build(&job.doc, job.view, None).map_err(|e| e.to_string())?;
+                Ok(PreparedScene { scene: Scene::from_built(&b, phases).with_site(&site).with_rooms(&job.doc), schedule, properties })
             })
         });
         scene_ms = ms(t);

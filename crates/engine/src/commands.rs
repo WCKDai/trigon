@@ -44,6 +44,41 @@ pub fn commands() -> &'static [CommandSpec] {
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "site.add",
+        summary: "Add a typed ground area, tree, bench or planter in site-local mm. Explicit design intent; validated, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Add>,
+        run: |s, v| crate::site::add(s, parse("site.add", v)?),
+    },
+    CommandSpec {
+        id: "site.set",
+        summary: "Replace one site's typed source while preserving its ID. Validated, atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Set>,
+        run: |s, v| crate::site::set(s, parse("site.set", v)?),
+    },
+    CommandSpec {
+        id: "site.delete",
+        summary: "Delete a site source, in every phase. Undo restores its exact parameters and lifetime.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Id>,
+        run: |s, v| crate::site::delete(s, parse("site.delete", v)?),
+    },
+    CommandSpec {
+        id: "site.list",
+        summary: "List exact site sources and design intent; these are not building opening or room quantities.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("site.list", v)?;
+            Ok(json!({"objects":s.doc.site_objects}))
+        },
+    },
+    CommandSpec {
         id: "element.get",
         summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
         mutates: false,
@@ -1472,7 +1507,11 @@ static COMMANDS: &[CommandSpec] = &[
                 None if p.cut_mm.is_some() => return Err(ModelError::Invalid("cut_mm needs cut_level".into()).into()),
                 None => None,
             };
-            let bytes = trigon_io::glb::write(&trigon_model::build::build_cut(&s.doc, view, cut)?, &refs);
+            let bytes = trigon_io::glb::write_with_site(
+                &trigon_model::build::build_cut(&s.doc, view, cut)?,
+                &trigon_model::site::build(&s.doc, view, cut)?,
+                &refs,
+            );
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
@@ -1492,7 +1531,13 @@ static COMMANDS: &[CommandSpec] = &[
             let path = checked_path(&p.path, "ifc")?;
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model.ifc").to_string();
-            let text = trigon_io::ifc::write(&s.doc, &trigon_model::build::build_view(&s.doc, view)?, &name, &time::now_utc());
+            let text = trigon_io::ifc::write_with_site(
+                &s.doc,
+                &trigon_model::build::build_view(&s.doc, view)?,
+                &trigon_model::site::build(&s.doc, view, None)?,
+                &name,
+                &time::now_utc(),
+            );
             write_file(&path, text.as_bytes())?;
             Ok(json!({"written": path, "bytes": text.len()}))
         },
@@ -2648,8 +2693,16 @@ fn comparison(c: &trigon_ifcread::Comparison) -> Value {
 /// Bounding boxes of this document's elements, keyed by the GlobalId the IFC export gives them.
 fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f64; 3], [f64; 3])>> {
     let built = trigon_model::build(doc)?;
+    let site = trigon_model::site::build(doc, trigon_model::build::View::latest(doc), None)?;
     Ok(trigon_io::ifc::model_shapes(doc, &built)
         .into_iter()
+        .chain(site.into_iter().map(|o| {
+            let mut m = trigon_model::Mesh::default();
+            for (_, part) in o.parts {
+                m.append(&part);
+            }
+            (o.id, m)
+        }))
         .filter_map(|(id, mesh)| Some((trigon_io::ifc::guid(&format!("trigon:{id}")), mesh.bounds()?)))
         .collect())
 }

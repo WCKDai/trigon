@@ -31,6 +31,7 @@ pub(crate) struct Set {
 
 #[derive(Clone)]
 enum Source {
+    Site(usize),
     Facade(usize, usize),
     Placement(usize, usize, usize),
     Interior(usize, usize, usize),
@@ -507,6 +508,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
             }
         }
     }
+    result.extend(crate::site::records(doc, view)?.into_iter().map(|(i, data)| Record { data, source: Source::Site(i) }));
     result.sort_by(|a, b| a.data["id"].as_str().cmp(&b.data["id"].as_str()).then(a.data["status"].as_str().cmp(&b.data["status"].as_str())));
     Ok(result)
 }
@@ -683,6 +685,7 @@ fn ensure_definition_id(doc: &mut Document, bi: usize, index: usize, kind: &str)
 
 fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Value>, selected_id: &str) -> Result<String> {
     match *source {
+        Source::Site(index) => crate::site::apply(doc, index, properties),
         Source::Facade(bi, fi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
             let edge = b.facades.get(fi).ok_or_else(|| invalid("missing facade"))?.edge;
