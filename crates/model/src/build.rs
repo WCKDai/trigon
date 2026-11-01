@@ -492,15 +492,20 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
         ty_eff.width = p.width.unwrap_or(ty.width);
         ty_eff.height = p.height.unwrap_or(ty.height);
         ty_eff.sill = p.sill.unwrap_or(ty.sill);
-        // The sill may go below the floor (down to the terrain); everything else as for the type.
+        // Above ground a sill may drop to terrain. Basements instead permit openings
+        // below terrain, bounded by their own floor; exposed portions/light wells are
+        // site geometry and must not silently move the building opening upwards.
         let mut check = ty_eff.clone();
         check.sill = check.sill.max(0.0);
         check.validate().map_err(|e| ModelError::Invalid(format!("{slot}: {e}")))?;
-        if !ty_eff.sill.is_finite() || ty_eff.sill < -storey.elevation {
-            return Err(ModelError::Invalid(format!(
-                "{slot}: sill {} mm would put the opening below the terrain (the floor is {:.0} mm above it)",
-                ty_eff.sill, storey.elevation
-            )));
+        let basement_opening = p.level < b.ground_level && ty_eff.kind.is_opening();
+        let minimum_sill = if basement_opening { 0.0 } else { -storey.elevation };
+        if !ty_eff.sill.is_finite() || ty_eff.sill < minimum_sill {
+            return Err(ModelError::Invalid(if basement_opening {
+                format!("{slot}: sill {} mm would put the opening below the basement floor", ty_eff.sill)
+            } else {
+                format!("{slot}: sill {} mm would put the opening below the terrain (the floor is {:.0} mm above it)", ty_eff.sill, storey.elevation)
+            }));
         }
         let opening = ty_eff.kind.is_opening();
         if opening && !b.edge_on_storey(f.edge, p.level) {
@@ -1829,6 +1834,32 @@ mod tests {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].placements[1].height = Some(2900.0);
         assert!(format!("{}", build(&doc).unwrap_err()).contains("storey above"));
+    }
+
+    #[test]
+    fn basement_windows_may_cross_terrain_but_cannot_start_below_their_floor() {
+        let mut doc = doc_with_block();
+        let b = &mut doc.buildings[0];
+        b.set_storeys_from(3, 3000.0, 650.0).unwrap();
+        b.facades[0].placements.clear();
+        b.add_basement(-1560.0, "Basement").unwrap();
+        b.facades[0].placements.push(Placement {
+            u: None,
+            level: 0,
+            bay: 0,
+            type_id: "window.fixed".into(),
+            width: Some(900.0),
+            height: Some(650.0),
+            sill: Some(1350.0),
+            spans_storeys: false,
+            created: None,
+            demolished: None,
+        });
+        let built = build(&doc).unwrap();
+        assert_eq!(built[0].walls[0].openings[0].rect.v0, -210.0);
+        assert_eq!(built[0].walls[0].openings[0].rect.v1, 440.0);
+        doc.buildings[0].facades[0].placements[0].sill = Some(-1.0);
+        assert!(build(&doc).unwrap_err().to_string().contains("below the basement floor"));
     }
 
     #[test]
