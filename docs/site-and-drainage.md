@@ -54,6 +54,31 @@ positioned downpipe assemblies. These are tessellated geometric assemblies witho
 ports. Their IDs are stable under dimension edits. See the public buildingSMART
 [IfcPipeSegmentTypeEnum specification](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2/HTML/schema/ifchvacdomain/lexical/ifcpipesegmenttypeenum.htm).
 
+### Seating an eave cornice
+
+On an opted-in detailed pitched roof, a band whose top is exactly the wall bearing height gets
+a bevelled upper face against the roof underside. Other bands, gable bands and legacy `None`
+drainage retain their existing geometry. This changes neither the roof planes nor their bearing,
+cover thickness, wall height, source band dimensions or material ownership. A cut view clips
+the seated geometry rather than rebuilding a flat top at the cut.
+
+Let `H` be the top storey's elevation plus height, `P` the projection, `a` the roof pitch, and `d`
+distance outward from the wall. The cap top at the wall is `H`, and its top outward is
+`H - d * tan(a)`. Set the band's storey-relative `top` to that storey's height. Its bottom and
+any opening head must stay at least 1 mm below `H - P * tan(a)`; a practical cap has further
+construction clearance. `P` must fit inside `overhang_mm`, and the facade must survive roof
+straightening. Violations return an error rather than producing inverted or crossing faces.
+
+For example, a 135 mm projection at 46 degrees needs more than 140.8 mm of cap depth at the
+wall; 180 mm leaves about 40.2 mm at its outer face. Merely raising a 50 mm rectangular band to
+`H` cannot fit. Place the lower stepped courses beneath this cap, retaining their own finishes.
+The roof's underside already bears at `H`; its outer eave is at `H - overhang_mm * tan(a)` and
+its cover rises vertically by `thickness_mm / cos(a)`. Do not add that cover lift to the cornice.
+
+At an adjacent gable, the existing band mitre can project past the gable wall. A covered cornice
+return requires sufficient `verge_mm` for that actual plan projection, or a separately designed
+termination. This seating operation does not invent those returns or change gable topology.
+
 ## Courtyard/site sources
 
 `Document.site_objects` is an optional source list, omitted when empty. The legacy building
