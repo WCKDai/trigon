@@ -143,3 +143,7 @@ Pan/zoom changes this mapping, so read it again before synthetic point picking. 
 pending drawing does not expose an old transform.
 
 The 3D appearance choice is ephemeral UI state: it does not alter the model, its journal, phase visibility, schedules or phase status. Materials preserve the existing demolition cue. Phase colors explicitly highlight new work.
+
+For native drawing performance investigation, `ui.view` includes `drawing_raster` upload/discard
+counters and last CPU allocation/render/conversion/texture-enqueue times. GPU upload and frame
+pacing require native profiling; the response sets `gpu_upload_measured: false`.

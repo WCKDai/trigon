@@ -313,6 +313,7 @@ impl StudioApp {
             "level": self.level,
             "plan_level": self.plan_level,
             "drawing": if self.mode==Mode::Drawing {Some(&self.drawing)} else {None},
+            "drawing_raster": self.plan.diagnostics(),
             "drawing_mapping": if self.mode!=Mode::ThreeD && !self.drawing_plan() {self.viewport_rect.filter(|r|self.plan.ready(*r,self.ppp)).and_then(|r|self.plan.screen_mapping(r))} else {None},
             "drawings": self.session.doc.views.iter().map(|v|(&v.id,&v.name)).collect::<Vec<_>>(),
             "levels": b.map(|b| b.storeys.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()).unwrap_or_default(),
