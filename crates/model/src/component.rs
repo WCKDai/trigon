@@ -1,4 +1,4 @@
-//! Parametric component families: windows, doors and balconies.
+//! Parametric component families: windows, doors, balconies and independent guards.
 //!
 //! A [`ComponentType`] is a family with its parameters set (a "type" in BIM terms). Placements
 //! refer to a type by id and may override width, height and sill per slot. Geometry is always
@@ -13,11 +13,11 @@ use crate::{Result, checked};
 pub struct ComponentType {
     pub id: String,
     pub name: String,
-    /// Opening width, mm.
+    /// Opening or attachment width, mm.
     pub width: f64,
-    /// Opening height, mm.
+    /// Opening or attachment height, mm. For an independent guard this includes its handrail.
     pub height: f64,
-    /// Bottom of the opening above the storey's floor, mm.
+    /// Bottom of the opening or attachment above the storey's floor, mm.
     pub sill: f64,
     pub kind: ComponentKind,
 }
@@ -70,6 +70,16 @@ pub enum ComponentKind {
         /// Tie rods from the front corners up to the wall; otherwise wall anchoring.
         #[serde(default)]
         tie_rods: bool,
+    },
+    /// A straight guard attached to the facade without a door, opening or balcony deck.
+    /// `projection` is the distance from the wall to the guard's centreline, mm.
+    GuardRail {
+        projection: f64,
+        railing: Railing,
+        finish: Finish,
+        /// Optional hardwood cap, included in the type's overall height.
+        #[serde(default)]
+        handrail: bool,
     },
 }
 
@@ -142,13 +152,14 @@ impl ComponentKind {
     /// Cuts an opening in the wall (windows and doors). Attachments (balconies hung on the
     /// wall) don't, and a slot can hold one opening and one attachment.
     pub fn is_opening(&self) -> bool {
-        !matches!(self, Self::BalconySlab { .. } | Self::SteelBalcony { .. })
+        !matches!(self, Self::BalconySlab { .. } | Self::SteelBalcony { .. } | Self::GuardRail { .. })
     }
 
     /// Projection from the wall, mm, for attachments.
     pub fn depth(&self) -> Option<f64> {
         match self {
             Self::BalconySlab { depth, .. } | Self::SteelBalcony { depth, .. } | Self::Balcony { depth, .. } => Some(*depth),
+            Self::GuardRail { projection, .. } => Some(*projection),
             _ => None,
         }
     }
@@ -197,6 +208,10 @@ impl ComponentType {
             ComponentKind::SteelBalcony { depth, .. } => {
                 checked("depth", *depth, 300.0, 3000.0)?;
                 checked("railing height (the type's height)", self.height, 900.0, 1500.0).map(|_| ())
+            }
+            ComponentKind::GuardRail { projection, handrail, .. } => {
+                checked("projection to guard centreline", *projection, if *handrail { 35.0 } else { 20.0 }, 3000.0)?;
+                checked("guard height including handrail", self.height, 900.0, 1500.0).map(|_| ())
             }
             _ => Ok(()),
         }

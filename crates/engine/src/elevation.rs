@@ -118,6 +118,9 @@ pub(crate) fn scene(doc: &Document, side: Side<'_>, view: View, range: (Option<f
     for (mb, (id, wf)) in doc.buildings.iter().filter(|x| x.id == b.building_id).flat_map(|mb| facing.iter().map(move |f| (mb, f))) {
         let Ok(f) = mb.facade(id) else { continue };
         for r in resolve_facade(doc, mb, f)? {
+            if matches!(r.ty.kind, ComponentKind::GuardRail { .. }) {
+                continue;
+            }
             let Some(depth) = r.ty.kind.depth() else { continue };
             if !matches!(view.status(r.lifetime), Some(Status::Existing | Status::New)) {
                 continue;

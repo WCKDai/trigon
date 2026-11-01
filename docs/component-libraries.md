@@ -49,13 +49,30 @@ schemas and ranges, with no external meshes, textures, URLs or executable conten
 formats, unknown file fields and duplicate IDs are rejected. File diagnostics do not echo
 arbitrary file contents. Existing project/type JSON and default types remain unchanged.
 
-The original starter pack in `libraries/balconies.trigonlib` includes two steel-balcony guard/deck
-variants and a French-balcony type. Sizes are editable family defaults, not measurements of the
-private integration building. Its railing/deck options follow the existing parametric vocabulary,
+The starter pack in `libraries/balconies.trigonlib` includes two steel-balcony guard/deck
+variants, a French-balcony type and an independent flat-bar guard. Sizes are editable family
+defaults, not measurements of the private integration building. Its railing/deck options follow
+the existing parametric vocabulary,
 checked against [MinAltan's published specifications](https://minaltan.dk/altaner/stalaltaner).
 The pack contains original parameters; reference photos, commercial models and client artwork
 are not distributed. Current steel finishes are galvanised, white and anthracite; current deck
 choices are Cumaru, fibre concrete, composite and bamboo.
+
+The optional `guard_rail` family creates one railing attachment, with no wall cut, door or deck.
+It can share a bay with a separately placed window or door. `width` is the guard's overall run,
+`height` includes the optional 40 mm hardwood handrail, and `sill` is its base above the storey.
+`projection` is the distance from the wall to the guard centreline, not a balcony depth. Width
+is 300–6000 mm, height 900–1500 mm and projection 20–3000 mm (at least 35 mm with the handrail).
+These are modelling limits; bracket geometry does not establish structural capacity or approval.
+Properties and pull handles change the selected instance; replacing its shared type changes every
+linked instance while preserving placement overrides. Plans and IFC classify it as a railing.
+The stable `.balcony.rail` suffix is the existing attachment namespace; it does not add a slab.
+
+Default project types and existing family forms are unchanged. `ComponentKind::GuardRail` is a
+new public Rust enum variant, and `family: "guard_rail"` is an optional file-format extension.
+Earlier readers can still open files without this family; feature-bearing projects/libraries need
+an updated reader. Before downgrading, export a separate library subset or save a separate project
+copy with these definitions and placements removed. Reverting the feature commit rolls back code.
 
 Painted white steel and dark glazing seals have distinct `steel_white` and `gasket` export
 materials, with steel and rubber IFC classifications. Their colors are unchanged. The public

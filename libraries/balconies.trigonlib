@@ -46,6 +46,20 @@
         "leaves": 2,
         "rail_height": 1000.0
       }
+    },
+    {
+      "id": "library.railing.flat",
+      "name": "Independent guard / flat bars",
+      "width": 1500.0,
+      "height": 1100.0,
+      "sill": 0.0,
+      "kind": {
+        "family": "guard_rail",
+        "projection": 150.0,
+        "railing": "norrebro",
+        "finish": "galvanised",
+        "handrail": false
+      }
     }
   ]
 }

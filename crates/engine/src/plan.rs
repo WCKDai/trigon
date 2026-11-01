@@ -326,6 +326,41 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     .iter()
                     .find(|element| element.class == trigon_model::ElementClass::Railing)
                     .map(|element| Element::new(&element.id, DrawingElementKind::Railing));
+                if let ComponentKind::GuardRail { projection, railing, handrail, .. } = r.ty.kind {
+                    let half = if handrail { 35.0 } else { 20.0 };
+                    let inset = if railing == trigon_model::component::Railing::Osterbro { 0.0 } else { 20.0 };
+                    let outline = [
+                        pt(fr, u0, -projection - half),
+                        pt(fr, u1, -projection - half),
+                        pt(fr, u1, -projection + half),
+                        pt(fr, u0, -projection + half),
+                    ];
+                    let start = prims.len();
+                    for k in 0..4 {
+                        prims.push(Prim::Line { a: outline[k], b: outline[(k + 1) % 4], color, width: 14.0, dashed: status == Status::Demolished });
+                    }
+                    for u in [u0 + inset + 20.0, u1 - inset - 20.0] {
+                        prims.push(Prim::Line {
+                            a: pt(fr, u, -projection + 20.0),
+                            b: pt(fr, u, 0.0),
+                            color,
+                            width: 14.0,
+                            dashed: status == Status::Demolished,
+                        });
+                    }
+                    if let Some(rail) = rail {
+                        for index in start..prims.len() {
+                            elements.insert(index, rail.clone());
+                        }
+                        prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
+                            id: rail.id,
+                            kind: DrawingElementKind::Railing,
+                            rings: vec![outline.to_vec()],
+                            depth_plane: None,
+                        }));
+                    }
+                    continue;
+                }
                 let mut rail_indices = Vec::new();
                 if let Some(element) = &owner {
                     prims.push(Prim::PickRegion(crate::views::DrawingElementRegion {
