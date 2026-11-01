@@ -9,20 +9,27 @@ use trigon_model::{ModelError, terrain::Terrain};
 #[serde(deny_unknown_fields)]
 pub(crate) struct Set {
     /// null removes terrain; heights are mm above the site's terrain datum.
-    #[serde(deserialize_with = "terrain_field")]
-    #[schemars(required)]
-    terrain: Option<Terrain>,
+    terrain: Update,
 }
 
-fn terrain_field<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Terrain>, D::Error> {
-    Option::deserialize(d)
+// A required field that can explicitly contain null. `schemars(required)` on an
+// Option removes null from the schema, despite the deserializer accepting it.
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+enum Update {
+    Grid(Terrain),
+    Remove(()),
 }
 
 pub(crate) fn set(s: &mut Session, p: Set) -> Result<Value> {
-    if let Some(t) = &p.terrain {
+    let terrain = match p.terrain {
+        Update::Grid(t) => Some(t),
+        Update::Remove(()) => None,
+    };
+    if let Some(t) = &terrain {
         t.validate()?;
     }
-    s.doc.terrain = p.terrain;
+    s.doc.terrain = terrain;
     let built = trigon_model::build(&s.doc)?;
     let triangles = built.iter().filter_map(|b| b.terrain.as_ref()).map(|m| m.triangles.len()).sum::<usize>();
     Ok(json!({"terrain":s.doc.terrain,"triangles":triangles,"datum":"site-local mm"}))
@@ -61,5 +68,5 @@ pub(crate) fn sample(s: &mut Session, p: Sample) -> Result<Value> {
         source: Some("dhm:dhm_terraen".into()),
         attribution: Some("Indeholder data fra Styrelsen for Dataforsyning og Infrastruktur (Danmarks Højdemodel)".into()),
     };
-    set(s, Set { terrain: Some(t) })
+    set(s, Set { terrain: Update::Grid(t) })
 }

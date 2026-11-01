@@ -31,6 +31,7 @@ pub(crate) struct Set {
 
 #[derive(Clone)]
 enum Source {
+    Terrain,
     Facade(usize, usize),
     Placement(usize, usize, usize),
     Interior(usize, usize, usize),
@@ -154,6 +155,28 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
     for model in built {
         let bi = doc.buildings.iter().position(|b| b.id == model.building_id).ok_or_else(|| invalid("built building has no document source"))?;
         let building = &doc.buildings[bi];
+        if model.terrain.is_some()
+            && let Some(t) = &doc.terrain
+        {
+            let mut terrain = record(
+                "site.terrain",
+                "terrain",
+                building,
+                (None, Status::Existing),
+                Source::Terrain,
+                vec![
+                    field("origin_mm", "Grid origin (mm)", json!(t.origin), false),
+                    field("spacing_mm", "Sample spacing (mm)", json!(t.spacing_mm), false),
+                    field("rows", "Grid rows", t.heights_mm.len(), false),
+                    field("columns", "Grid columns", t.heights_mm.first().map_or(0, Vec::len), false),
+                    field("source", "Source", json!(t.source), false),
+                ],
+                Vec::new(),
+            );
+            terrain.data["editable"] = json!(false);
+            terrain.data["reason"] = json!("Terrain is edited as a complete height grid.");
+            result.push(terrain);
+        }
         for wall in &model.walls {
             let Some(fi) = building.facades.iter().position(|f| f.id == wall.id) else {
                 result.push(record(
@@ -682,6 +705,7 @@ fn ensure_definition_id(doc: &mut Document, bi: usize, index: usize, kind: &str)
 
 fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Value>, selected_id: &str) -> Result<String> {
     match *source {
+        Source::Terrain => Err(invalid("terrain is edited as a complete height grid")),
         Source::Facade(bi, fi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
             let edge = b.facades.get(fi).ok_or_else(|| invalid("missing facade"))?.edge;

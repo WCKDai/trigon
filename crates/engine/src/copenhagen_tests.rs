@@ -111,3 +111,38 @@ fn fbx_export_is_read_only_and_refuses_document_supplied_executables() {
         assert_eq!(s.doc, before);
     }
 }
+
+#[test]
+fn terrain_removal_is_required_explicitly_and_described_as_nullable() {
+    fn nullable(v: &serde_json::Value, root: &serde_json::Value) -> bool {
+        if v["type"] == "null" || v["type"].as_array().is_some_and(|a| a.iter().any(|t| t == "null")) {
+            return true;
+        }
+        if let Some(reference) = v["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
+            return root.pointer(reference).is_some_and(|s| nullable(s, root));
+        }
+        ["anyOf", "oneOf"].iter().any(|key| v[key].as_array().is_some_and(|a| a.iter().any(|s| nullable(s, root))))
+    }
+    let schema = commands().iter().find(|c| c.id == "site.set_terrain").unwrap().params_schema();
+    assert!(schema["required"].as_array().unwrap().iter().any(|x| x == "terrain"));
+    assert!(nullable(&schema["properties"]["terrain"], &schema), "explicit null removal must be accepted by the command schema");
+    let mut s = session();
+    s.execute("site.set_terrain", json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[65000,30000],"heights_mm":[[0,0],[0,0]]}})).unwrap();
+    let before = s.doc.clone();
+    s.execute("site.set_terrain", json!({"terrain":null})).unwrap();
+    assert!(s.doc.terrain.is_none());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn displayed_terrain_has_read_only_source_properties_in_the_shared_authoring_api() {
+    let mut s = session();
+    s.execute("site.set_terrain", json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[65000,30000],"heights_mm":[[0,0],[0,0]]}})).unwrap();
+    let before = s.doc.clone();
+    let p = s.execute("element.get", json!({"id":"site.terrain"})).unwrap();
+    assert_eq!(p["kind"], "terrain");
+    assert_eq!(p["editable"], false);
+    assert!(s.execute("element.set", json!({"id":"site.terrain","properties":{"width_mm":1234}})).is_err());
+    assert_eq!(s.doc, before);
+}
