@@ -250,6 +250,10 @@ impl Ifc<'_> {
             ("OuterSkinAreas", Val::Text("Unavailable: no certified gross/net outer-skin partition is retained; no Qto_RoofBaseQuantities area is inferred from volume or upward reveals".into())),
             ("Representation", Val::Text(if represented { "Original parametric cover" } else { "Unavailable: empty or unrepresentable source coordinates/indices; no substitute geometry emitted" }.into())),
         ];
+        if let Some(depth) = self.doc.buildings.iter().find(|source| source.id == b.building_id).and_then(|source| source.roof.fascia_depth()) {
+            props.push(("RafterCut", Val::Text("Two Cut–Plumb; vertical fascia and horizontal underside return".into())));
+            props.push(("FasciaDepth", Val::Length(depth)));
+        }
         if let Some(thickness) = split::source_roof_thickness(self.doc, b) {
             let key = format!("roof:{}:{kind}", up.name);
             let created = !self.cat.types.contains_key(&key);
@@ -351,7 +355,10 @@ impl Ifc<'_> {
             placed.id,
             string(&r.id)
         ));
-        let reference = if half_hipped {
+        let two_cut = self.doc.buildings.iter().any(|source| source.id == b.building_id && source.roof.fascia_depth().is_some());
+        let reference = if two_cut {
+            "Original Two Cut-Plumb shell - illustrative build-up; actual horizontal return retained"
+        } else if half_hipped {
             "Original half-hipped shell - illustrative build-up"
         } else if r.compound {
             "Original mansard shell - illustrative build-up; covering is separate"

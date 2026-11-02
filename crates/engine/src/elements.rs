@@ -690,15 +690,16 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
     let mut properties = vec![choice(
         "roof_kind",
         "Roof kind",
-        match building.roof {
+        match building.roof.base() {
             trigon_model::Roof::Flat => "flat",
             trigon_model::Roof::Pitched { .. } => "pitched",
             trigon_model::Roof::HalfHipped { .. } => "half_hipped",
             trigon_model::Roof::Mansard { .. } => "mansard",
+            trigon_model::Roof::TwoCutPlumb(_) => return Err(invalid("nested roof cuts are unsupported")),
         },
         json!(["flat", "pitched", "half_hipped", "mansard"]),
     )];
-    match &building.roof {
+    match building.roof.base() {
         trigon_model::roof::Roof::Flat => {
             properties.push(number("thickness_mm", "Flat roof slab thickness", building.roof_slab_thickness_mm.unwrap_or(300.0), "mm", 20.0, 1000.0));
         }
@@ -742,6 +743,13 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("dormers", "Parametric roof dormers", json!(dormers), true),
                 field("rooflights", "Parametric inclined roof windows", json!(rooflights), true),
                 field("half_hips", "Explicit clipped gable caps (drop below original underside tip)", json!(building.roof.half_hips()), true),
+                choice(
+                    "rafter_cut",
+                    "Rafter cut",
+                    if building.roof.fascia_depth().is_some() { "two_cut_plumb" } else { "plumb" },
+                    json!(["plumb", "two_cut_plumb"]),
+                ),
+                number("fascia_depth_mm", "Two-cut vertical fascia depth", building.roof.fascia_depth().unwrap_or(20.0), "mm", 1.0, 1000.0),
             ]);
         }
         trigon_model::Roof::Mansard { parameters: p } => {
@@ -760,6 +768,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("covering", "Lower/upper roof covering", json!(p.covering), true),
             ]);
         }
+        trigon_model::Roof::TwoCutPlumb(_) => return Err(invalid("nested roof cuts are unsupported")),
     }
     Ok(record(id, "roof", building, (level, Status::Existing), Source::Roof(bi), properties, Vec::new()))
 }
@@ -1287,6 +1296,26 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
         }
         Source::Roof(bi) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing building"))?;
+            // Apply the complete candidate before cross-field support checks: a sorted
+            // property map visits fascia depth before its coordinated overhang change.
+            let mut fascia = b.roof.fascia_depth();
+            if let Some(value) = properties.get("rafter_cut") {
+                fascia = match value.as_str() {
+                    Some("plumb") => None,
+                    Some("two_cut_plumb") => Some(fascia.unwrap_or(20.0)),
+                    _ => return Err(invalid("rafter_cut must be plumb or two_cut_plumb")),
+                };
+            }
+            if let Some(value) = properties.get("fascia_depth_mm") {
+                let requested = if value.is_null() { None } else { Some(numeric("fascia_depth_mm", value)?) };
+                if let Some(mode) = properties.get("rafter_cut").and_then(Value::as_str)
+                    && ((mode == "plumb" && requested.is_some()) || (mode == "two_cut_plumb" && requested.is_none()))
+                {
+                    return Err(invalid("rafter_cut and fascia_depth_mm disagree"));
+                }
+                fascia = requested;
+            }
+            b.roof = b.roof.clone().with_two_cut_plumb(None)?;
             if let Some(kind) = properties.get("roof_kind") {
                 match kind.as_str() {
                     Some("flat") => b.roof = trigon_model::roof::Roof::Flat,
@@ -1327,7 +1356,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                 }
             }
             for (key, value) in properties {
-                if key == "roof_kind" {
+                if matches!(key.as_str(), "roof_kind" | "rafter_cut" | "fascia_depth_mm") {
                     continue;
                 }
                 if key == "half_hips" {
@@ -1422,8 +1451,10 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         }
                         _ => return Err(invalid("unknown mansard roof property")),
                     },
+                    trigon_model::Roof::TwoCutPlumb(_) => return Err(invalid("nested roof cuts are unsupported")),
                 }
             }
+            b.roof = b.roof.clone().with_two_cut_plumb(fascia)?;
             Ok(selected_id.to_string())
         }
         Source::Building(bi) => {
@@ -2061,6 +2092,79 @@ mod tests {
         assert_eq!(b.floor_thicknesses.len(), 1);
         b.add_basement(-2500.0, "Basement").unwrap();
         assert_eq!(b.floor_thicknesses, vec![200.0, 200.0]);
+    }
+
+    #[test]
+    fn two_cut_plumb_properties_are_coordinated_atomic_and_exactly_undoable() {
+        let mut s = session();
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46.,"overhang_mm":180.,"thickness_mm":200.,"gables":["b.f2","b.f4"]}))
+            .unwrap();
+        let before = s.doc.clone();
+        let before_built = trigon_model::build(&s.doc).unwrap();
+        let action = json!({"command":"element.set","params":{"id":"b.roof","properties":{"fascia_depth_mm":20.,"overhang_mm":400.}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(property(&descriptor(&mut s, "b.roof"), "roof_kind"), "pitched");
+        assert_eq!(property(&descriptor(&mut s, "b.roof"), "rafter_cut"), "two_cut_plumb");
+        assert_eq!(property(&descriptor(&mut s, "b.roof"), "fascia_depth_mm"), 20.);
+        assert_eq!(property(&descriptor(&mut s, "b.roof"), "thickness_mm"), 200.);
+        let after = s.doc.clone();
+        let after_built = trigon_model::build(&s.doc).unwrap();
+        assert_ne!(after_built, before_built);
+        let reopened: Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(trigon_model::build(&reopened).unwrap(), after_built);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), before_built);
+        let undo = s.undo.clone();
+        let redo = s.redo.clone();
+        for properties in [
+            json!({"fascia_depth_mm":20}),
+            json!({"fascia_depth_mm":0,"overhang_mm":400}),
+            json!({"fascia_depth_mm":201,"overhang_mm":400}),
+            json!({"fascia_depth_mm":20,"overhang_mm":400,"thickness_mm":0}),
+            json!({"fascia_depth_mm":20,"overhang_mm":400,"roof_kind":"flat"}),
+            json!({"rafter_cut":"square"}),
+            json!({"rafter_cut":"plumb","fascia_depth_mm":20}),
+            json!({"rafter_cut":"two_cut_plumb","fascia_depth_mm":null}),
+        ] {
+            assert!(s.execute("element.set", json!({"id":"b.roof","properties":properties})).is_err());
+            assert_eq!(s.doc, before);
+            assert_eq!(s.undo, undo);
+            assert_eq!(s.redo, redo);
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after);
+        update(&mut s, "b.roof", json!({"pitch_deg":45.}));
+        assert_eq!(s.doc.buildings[0].roof.fascia_depth(), Some(20.));
+        s.execute("edit.undo", json!({})).unwrap();
+        update(&mut s, "b.roof", json!({"fascia_depth_mm":null,"overhang_mm":180.}));
+        // Journaling differs; the complete model source and geometry return exactly.
+        assert_eq!(s.doc.buildings, before.buildings);
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), before_built);
+        update(&mut s, "b.roof", json!({"rafter_cut":"two_cut_plumb","overhang_mm":400.}));
+        assert_eq!(s.doc.buildings[0].roof.fascia_depth(), Some(20.));
+        update(&mut s, "b.roof", json!({"fascia_depth_mm":300.,"thickness_mm":400.}));
+        assert_eq!(s.doc.buildings[0].roof.fascia_depth(), Some(300.));
+    }
+
+    #[test]
+    fn typed_roof_command_exposes_the_cut_without_changing_legacy_defaults() {
+        let mut s = session();
+        let before = s.doc.clone();
+        for params in [
+            json!({"kind":"pitched","pitch_deg":46,"thickness_mm":200,"fascia_depth_mm":20,"overhang_mm":180}),
+            json!({"kind":"flat","fascia_depth_mm":20}),
+            json!({"kind":"mansard","fascia_depth_mm":20}),
+        ] {
+            assert!(s.execute("building.set_roof", params).is_err());
+            assert_eq!(s.doc, before);
+        }
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":200,"fascia_depth_mm":20,"overhang_mm":400})).unwrap();
+        assert_eq!(s.doc.buildings[0].roof.fascia_depth(), Some(20.));
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
     }
 
     #[test]

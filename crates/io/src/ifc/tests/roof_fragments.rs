@@ -6,6 +6,48 @@ use super::*;
 use crate::ifc::{guid, part21, write};
 
 #[test]
+fn unopened_two_cut_roof_exports_the_actual_return_and_declared_build_up() {
+    let mut doc = Document::default();
+    let mut b =
+        trigon_model::Building::new("b", "Public two-cut section", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 3, 3000.).unwrap();
+    b.roof=serde_json::from_value(serde_json::json!({"kind":"two_cut_plumb","fascia_depth_mm":20.,"roof":{"kind":"pitched","pitch_deg":46,"gables":["b.f2","b.f4"],"overhang_mm":400.,"verge_mm":135.,"thickness_mm":200.}})).unwrap();
+    doc.buildings.push(b);
+    let built = trigon_model::build(&doc).unwrap();
+    assert!(split::opening_shell(&doc, &built[0]), "even an unopened cut must keep its actual shell");
+    assert_eq!(split::source_roof_thickness(&doc, &built[0]), Some(200.));
+    let cover = &built[0].roof.as_ref().unwrap().cover;
+    assert!(roof_shell_quantities(cover, &Frame::plan([0.; 3], [1., 0.]).unwrap()).is_some());
+    let shapes = split::model_shapes(&doc, &built);
+    assert_eq!(&shapes.iter().find(|(id, _)| id == "b.roof").unwrap().1, cover);
+    let text = write(&doc, &built, "two-cut.ifc", "2026-01-01T00:00:00");
+    assert!(text.contains("'FasciaDepth',$,IFCPOSITIVELENGTHMEASURE(20.)"));
+    assert!(text.contains("'SourceNormalThickness',$,IFCPOSITIVELENGTHMEASURE(200.)"));
+    assert!(text.contains("Trigon_RoofQuantities"));
+    assert!(!text.lines().any(|l| l.contains("=IFCSLAB(") && l.contains("b.roof.face")));
+    assert!(text.lines().find(|l| l.contains("=IFCROOF(")).unwrap().contains(".GABLE_ROOF."));
+    let volume = |mesh: &Mesh| {
+        mesh.triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| mesh.positions[i as usize]);
+                (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.
+            })
+            .sum::<f64>()
+    };
+    let toe = 9000. - 400. * 46_f64.to_radians().tan() + 200. / 46_f64.to_radians().cos() - 20.;
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        assert!(read.failures.is_empty());
+        let actual = &read.elements.iter().find(|p| p.global_id == guid("trigon:b.roof")).unwrap().mesh;
+        let mesh = Mesh { positions: actual.positions.clone(), triangles: actual.triangles.clone() };
+        assert!((volume(&mesh) / volume(cover) - 1.).abs() < 1e-4);
+        assert!((mesh.positions.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min) - toe).abs() < 0.01);
+        let edge: Vec<_> = mesh.positions.iter().filter(|p| (p[1] + 400.).abs() < 0.01).collect();
+        let (bottom, top) = edge.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p[2]), b.max(p[2])));
+        assert!((top - bottom - 20.).abs() < 0.01, "fascia lost in {}", read.reader.name());
+    }
+}
+
+#[test]
 fn clipped_gables_keep_one_complete_product_per_source_facade() {
     for rotation in [0.0_f64, 31.] {
         for caps in [

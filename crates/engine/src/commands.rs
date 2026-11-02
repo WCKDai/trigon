@@ -648,6 +648,8 @@ static COMMANDS: &[CommandSpec] = &[
                   gable (wing ends, walls against neighbours). A pitched roof can carry on past the walls (`overhang_mm` at the \
                   eaves, `verge_mm` at the gables), have a build-up (`thickness_mm`, with fascia, soffit and verge boards) and \
                   `gutters`. Kind half_hipped adds explicit half_hips source-gable caps on a convex four-edge wing. \
+                  Optional `fascia_depth_mm` makes a Two Cut-Plumb vertical fascia and horizontal underside return, \
+                  retaining full normal thickness and requiring coordinated wall/cornice support. \
                   `source` records where the values came from.",
         mutates: true,
         journaled: true,
@@ -2226,6 +2228,9 @@ pub(crate) struct SetRoof {
     /// Build-up square to the roof (rafters, battens, tiles), mm (default 0: a surface). Its underside rests on the
     /// wall line at the eaves.
     thickness_mm: Option<f64>,
+    /// Opt-in Two Cut–Plumb vertical fascia depth, mm (1..normal build-up thickness).
+    /// Retains the full build-up inboard and requires sufficient overhang for wall/cornice support.
+    fascia_depth_mm: Option<f64>,
     /// Gutters along the eaves (default false).
     gutters: Option<bool>,
     /// Opt-in channel detail and explicit pipe positions; requires gutters.
@@ -2420,9 +2425,11 @@ fn check_building(doc: &Document, id: Option<&str>) -> Result<()> {
     // Above-eaves gable apertures depend on the actual roof underside, which cannot
     // be certified by rectangular facade resolution. Cover every direct caller
     // (placement, bay/level/thickness edits and phase changes), before history commits.
-    // Layouts without half-hipped roof-level placements keep their existing path.
-    if matches!(b.roof, trigon_model::Roof::HalfHipped { .. })
-        && b.attic_level().is_some_and(|level| b.facades.iter().any(|f| f.placements.iter().any(|p| p.level == level)))
+    // A two-cut roof also depends on actual wall/cornice support. Other legacy
+    // layouts retain their existing validation path.
+    if b.roof.fascia_depth().is_some()
+        || (matches!(b.roof.base(), trigon_model::Roof::HalfHipped { .. })
+            && b.attic_level().is_some_and(|level| b.facades.iter().any(|f| f.placements.iter().any(|p| p.level == level))))
     {
         trigon_model::build(doc)?;
     }
@@ -2687,7 +2694,7 @@ pub(crate) fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
         }
         other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat, pitched, half_hipped or mansard")).into()),
     };
-    b.roof = roof;
+    b.roof = roof.with_two_cut_plumb(p.fascia_depth_mm)?;
     if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
         b.evidence.push(trigon_model::Evidence { source: src, supplies: "roof".into(), attribution: p.attribution.unwrap_or_default() });
     }
