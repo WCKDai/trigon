@@ -921,6 +921,15 @@ struct PlanSheet {
     note: Option<String>,
 }
 
+/// A level-index plan can include or crop any building at that level. Retain the
+/// legacy name only when one building supplies it; multi-building sheets use an
+/// explicit caption instead of misidentifying the first building as the project.
+pub(crate) fn project_name(doc: &Document, level: usize) -> String {
+    let mut sources = doc.buildings.iter().filter(|b| b.storeys.get(level).is_some());
+    let source = sources.next();
+    if sources.next().is_none() { source.map(|b| b.name.clone()).unwrap_or_default() } else { String::new() }
+}
+
 fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<PlanSheet> {
     if doc.buildings.iter().any(|b| b.attic_level() == Some(level)) {
         if rotation != 0.0 || region.is_some() {
@@ -940,9 +949,8 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
     let (prims, _, elements) = scene(doc, level, view, true)?;
     let f = sheet_frame(doc, region, rotation, level, view)?;
     let vp = Viewport { x0: f.x0, y1: f.y1, mm: f.mm };
-    let source = doc.buildings.iter().find(|b| b.storeys.get(level).is_some());
     let floor = doc.level_label(level).unwrap_or_default();
-    let project = source.map(|b| b.name.clone()).unwrap_or_default();
+    let project = project_name(doc, level);
     let caption = if caption.is_empty() { project.clone() } else { caption.to_string() };
     let clip = if let Some(region) = region {
         let mut lo = [f64::INFINITY; 2];

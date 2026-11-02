@@ -139,7 +139,7 @@ pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange)
         vp,
         clip,
         title: doc.level_label(level).unwrap_or_else(|| storey.name.clone()),
-        project: first.name.clone(),
+        project: crate::plan::project_name(doc, level),
         caption: String::new(),
         note: Some(
             if demolition > 0 {

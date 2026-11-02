@@ -2582,3 +2582,67 @@ fn multi_building_plans_keep_upper_floors_when_another_building_is_lower() {
         assert_eq!(s.doc, before);
     }
 }
+
+#[test]
+fn multi_building_plan_headers_do_not_misidentify_crops_in_any_plan_path() {
+    let mut wrong = Vec::new();
+    for west_first in [true, false] {
+        for path in ["symbolic", "ranged", "attic", "attic-ranged"] {
+            let mut s = Session::new(Box::new(Canned));
+            let west =
+                trigon_model::Building::new("west", "West fixture", &[[0., 0.], [12000., 0.], [12000., 9000.], [0., 9000.]], 1, 3000.).unwrap();
+            let east = trigon_model::Building::new("east", "East fixture", &[[50000., 0.], [62000., 0.], [62000., 9000.], [50000., 9000.]], 2, 3000.)
+                .unwrap();
+            s.doc.buildings = if west_first { vec![west, east] } else { vec![east, west] };
+            let level = if path.starts_with("attic") {
+                s.execute("building.set_roof", json!({"building":"west","kind":"pitched","pitch_deg":35})).unwrap();
+                s.execute("building.set_attic", json!({"building":"west","floor":2250})).unwrap();
+                1
+            } else {
+                0
+            };
+            let mut template = json!({"name":"East detail","crop":[49000,-1000,63000,10000],"caption":"Public project",
+                "sizing":{"mode":"fixed","denominator":100,"centre":[56000,4500]}});
+            if path.ends_with("ranged") {
+                template["range"] = json!({"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300});
+            }
+            s.execute("view.define", json!({"id":"detail","name":"East review plan","kind":{"view":"plan","level":level},"template":template}))
+                .unwrap();
+            let sheet = crate::views::sheet(&s.doc, "detail", trigon_model::build::View::latest(&s.doc)).unwrap();
+            if !sheet.project.is_empty() {
+                wrong.push((west_first, path, sheet.project.clone()));
+            }
+            assert_eq!(sheet.caption, "Public project");
+            let drawing = crate::drawing_view(&s.doc, "detail", trigon_model::build::View::latest(&s.doc)).unwrap();
+            assert!(drawing.svg.contains("Public project"));
+            if drawing.svg.contains("West fixture") || drawing.svg.contains("East fixture") {
+                assert!(!sheet.project.is_empty(), "only the incorrect automatic project header may name a source building");
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "multi-building index-wide plans cannot use the first building as their project header: {wrong:?}");
+}
+
+#[test]
+fn plan_headers_preserve_the_sole_building_present_at_a_floor_index() {
+    let mut s = Session::new(Box::new(Canned));
+    s.doc
+        .buildings
+        .push(trigon_model::Building::new("west", "West fixture", &[[0., 0.], [12000., 0.], [12000., 9000.], [0., 9000.]], 1, 3000.).unwrap());
+    s.doc.buildings.push(
+        trigon_model::Building::new("east", "East fixture", &[[50000., 0.], [62000., 0.], [62000., 9000.], [50000., 9000.]], 2, 3000.).unwrap(),
+    );
+    for ranged in [false, true] {
+        let template =
+            if ranged { json!({"name":"Ranged","range":{"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300}}) } else { Value::Null };
+        s.execute("view.define", json!({"id":"upper","name":"Upper","kind":{"view":"plan","level":1},"template":template})).unwrap();
+        let sheet = crate::views::sheet(&s.doc, "upper", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert_eq!(sheet.project, "East fixture");
+    }
+    s.doc.buildings.remove(1);
+    s.doc.views.clear();
+    s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":35})).unwrap();
+    s.execute("building.set_attic", json!({"floor":2250})).unwrap();
+    s.execute("view.define", json!({"id":"roof","name":"Roof","kind":{"view":"plan","level":1}})).unwrap();
+    assert_eq!(crate::views::sheet(&s.doc, "roof", trigon_model::build::View::latest(&s.doc)).unwrap().project, "West fixture");
+}

@@ -164,7 +164,11 @@ at most 512 anchors are accepted. Its result includes drawing-plane `guides`.
 ## Persistent view templates, paper scale and plan ranges
 
 A saved view optionally owns a reusable `template`. Omitting it, or using
-`view.configure {"id":"ground","template":null}`, preserves legacy rendering and fingerprints.
+`view.configure {"id":"ground","template":null}`, uses the unconfigured rendering path.
+An index-wide plan with multiple buildings at that level omits the automatic building-name
+project header; a crop may show another building. Set the template's `caption` (or `plan.sheet`
+caption) to the project name. Symbolic, ranged and roof plans use this same rule. A floor index
+supplied by only one building retains its existing automatic name.
 `view.configure` changes the template atomically; `view.apply_template {"source":"ground","targets":["upper","section-a"]}`
 copies it to existing saved views while retaining each coordinate frame and annotations. A range
 can only be applied to plans. Undo restores the exact prior document. Templates travel with project
