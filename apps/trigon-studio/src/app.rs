@@ -1217,6 +1217,12 @@ impl StudioApp {
 
     /// The view settings changed: rebuild what the new view needs.
     pub(crate) fn view_changed(&mut self, phase_changed: bool) {
+        if self.mode == Mode::Drawing
+            && let Some(trigon_model::annotation::DrawingViewKind::Plan { level }) =
+                self.session.doc.views.iter().find(|view| view.id == self.drawing).map(|view| &view.kind)
+        {
+            self.plan_level = *level;
+        }
         self.sync_open_views();
         self.properties.gizmo.cancel();
         self.redraw = true;
@@ -2455,6 +2461,23 @@ mod tests {
         app.level = None;
         assert_eq!(app.reference_level(), None);
         app.level = Some(1);
+        assert_eq!(app.reference_level(), Some(1));
+    }
+
+    #[test]
+    fn control_and_dropdown_saved_plan_changes_report_the_actual_active_floor() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"upper-control","name":"Upper control","kind":{"view":"plan","level":1}})).unwrap();
+        app.plan_level = 0;
+        app.mode = Mode::Drawing;
+        app.drawing = "upper-control".into();
+        app.view_changed(false);
+        let state = app.view_state();
+        assert_eq!(state["plan_level"], 1, "MCP feedback must describe the active saved plan's floor");
+        app.plan_level = 0;
+        app.drawing = "upper-control".into();
+        app.view_changed(false); // The same transition as the saved-view dropdown.
+        assert_eq!(app.plan_level, 1);
         assert_eq!(app.reference_level(), Some(1));
     }
 
