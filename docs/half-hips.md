@@ -6,6 +6,9 @@ below its original underside tip at the wall line. The end plane uses the existi
 pitch. The eaves, wall axes, storeys and side gutters stay fixed. At least 100 mm of gable
 above the eaves and 100 mm of the original ridge must remain. A tapered wing can have a
 sloping ridge; the retained portion follows the original side-plane intersection.
+The inclusive 100 mm retained-gable limit accounts for scale-dependent `f64` arithmetic roundoff after
+rigid transforms. Coordinates are not snapped and physical margins are unchanged; the
+regression matrix also verifies refusal of a deliberate 0.001 mm shortfall.
 
 The initial supported layout is a strictly convex four-edge eave ring with two opposite
 gables. Drops must be finite and 1–10000 mm, with positive 1–1000 mm roof build-up. The

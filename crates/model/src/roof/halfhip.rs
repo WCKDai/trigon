@@ -40,7 +40,12 @@ pub(super) fn planes(
             .map(|p| p[2])
             .fold(f64::NEG_INFINITY, f64::max);
         let plane = CapPlane::new(frame, tip, drop, pitch)?;
-        if tip - drop < eaves + 100. {
+        // An inclusive physical boundary must survive roundoff in the normalized
+        // source frame and derived intersection. Keep the 100 mm margin; only bound
+        // the f64 arithmetic error by its operand scale, without snapping geometry.
+        let retained = tip - eaves - drop;
+        let roundoff = 64. * f64::EPSILON * (tip.abs() + eaves.abs() + drop.abs()).max(1.);
+        if retained < 100. && 100. - retained > roundoff {
             return Err(ModelError::Invalid(format!(
                 "half-hip edge {edge}: drop {drop:.6} mm exceeds available {:.6} mm with 100 mm retained gable",
                 tip - eaves - 100.
@@ -336,6 +341,24 @@ mod tests {
                         closed(&roof.cover).unwrap();
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn inclusive_gable_limit_survives_rigid_transform_roundoff() {
+        for rotation in [0.0_f64, 31., -118.] {
+            for translation in [[0., 0.], [142000., -270000.]] {
+                let (sin, cos) = rotation.to_radians().sin_cos();
+                let outline = [[0., 0.], [30000., 0.], [30000., 12000.], [0., 12000.]]
+                    .map(|[x, y]| [translation[0] + x * cos - y * sin, translation[1] + x * sin + y * cos]);
+                let buildup = super::super::Buildup { overhang: 180., verge: 135., thickness: 200., gutters: false };
+                let result = super::super::pitched_with_caps(&outline, 9000., 45., &[1, 3], &buildup, &[(3, 5900.)]);
+                assert!(result.is_ok(), "inclusive100mm: rotation{rotation}, translation{translation:?}: {:?}", result.as_ref().err());
+                assert!(
+                    super::super::pitched_with_caps(&outline, 9000., 45., &[1, 3], &buildup, &[(3, 5900.001)]).is_err(),
+                    "a deliberate0.001mm physical shortfall must remain refused"
+                );
             }
         }
     }
