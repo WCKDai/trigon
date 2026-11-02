@@ -28,6 +28,7 @@ warms the renderer, then measures five repetitions of 96 pan increments (0.5/0.2
 and 96 zoom increments (×1.005), in a 1000 × 700 point viewport. Output includes parse time,
 allocation/render/conversion times, raster demands, readiness stalls and candidate image bytes.
 It calls the same region-key/readiness functions and CPU rasterizer as the live drawing view.
+It uses the preset display trees; it does not measure the newer adaptive stroke parser/cache.
 It opens no app, uses no GPU, reads no credentials and requires no network or private model.
 
 Before the cache change, this workload demanded 96 rasters and exact-key readiness stalled on
@@ -50,8 +51,9 @@ completion; `gpu_upload_measured` is explicitly false.
 
 ## Adaptive screen detail
 
-The worker prepares full, reduced and overview SVG trees once per drawing generation. Zoom
-buckets select among those immutable trees; pan never reparses SVG or rebuilds model geometry.
+The model worker prepares the exact SVG tree and retains full, reduced and overview SVG sources
+once per drawing generation. Zoom buckets select a source; the raster worker adapts its strokes
+and parses it away from the UI thread. Pan never reparses SVG or rebuilds model geometry.
 Below roughly 80% sheet zoom, display pens become finer and masonry hatch becomes a pale solid
 fill. Fine glazing/stair/railing lines shorter than 0.75 screen points are omitted; dense parallel
 fine detail is sampled on sheet-anchored cells. Cut walls, major wall/roof/floor silhouettes and
@@ -61,5 +63,30 @@ Full detail returns on zoom-in. The detail band follows window zoom independentl
 These are display styles. Export SVG/PNG/PDF/DXF retain the selected paper pens and full detail.
 The exact vector scene still supplies every pick, snap and handle; no semantic ID is deleted by
 screen LOD. Each band is deterministic and pan-invariant, and shares the bounded raster cache.
-Preparing three parsed trees adds initial generation work and memory; it is not a model-building
-or first-load optimization. The CPU profile reports preparation and parse time separately.
+
+## Zoom-aware screen pens
+
+Explicit model and manual path strokes use logical window zoom, independently of Retina density
+and the raster resolution cap. At 1× their source SVG is byte-identical. Close views increase
+geometry spacing while pen widths approach separate bounded limits, retaining fine/medium/cut
+order. For example, the actual 0.35 mm plan-cut pen approaches about 2.25 logical points at 8×,
+instead of growing to about 13.23 points. This is a display policy, not a change in paper scale.
+Below 1×, a small per-pen floor keeps useful lines visible alongside the existing detail bands.
+
+Dash lengths, gaps and offsets follow the pen's display factor, including round zero-length red
+dots. Text, text halos, pattern definitions, fill-coloured seam covers, coordinates, clipping,
+colours and opacity remain unchanged. CSS-styled or inherited strokes are left to the SVG parser.
+The adapter accepts bounded Studio-generated SVG, not arbitrary imported markup.
+
+Stroke zoom uses 1/8-octave buckets. Each raster worker caches one adapted tree; pan, pixel density
+and small zoom steps inside its bucket reuse it. Crossing a bucket or detail band prepares another
+tree. Returning to an evicted bucket can reparse. Completed raster delivery has one bounded slot,
+and dropped or superseded work is retried for the latest view. A previous image stays movable
+while new styling is pending; picking continues against exact current-generation vectors.
+
+Viewport and window screenshot requests wait for the current source and stroke bucket. The
+viewport snapshot reuses the worker's styled tree and renders the exact current viewport.
+`drawing_raster` diagnostics expose `logical_zoom`, `stroke_zoom_bucket`,
+`shown_stroke_zoom_bucket`, `last_style_ms`, and `last_style_cache_hit`; these are CPU/display
+feedback, not GPU timing or a model accuracy claim. The new preparation cost needs native
+measurement; the historical CPU profile above does not establish an adaptive-rendering speedup.

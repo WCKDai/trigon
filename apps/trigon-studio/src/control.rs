@@ -357,6 +357,13 @@ impl StudioApp {
             }
             match shot.target {
                 ShotTarget::Viewport => {
+                    if self.mode != Mode::ThreeD
+                        && self.plan.error.is_none()
+                        && !self.viewport_rect.is_some_and(|rect| self.plan.snapshot_ready(rect, self.ppp))
+                    {
+                        keep.push(shot);
+                        continue;
+                    }
                     let r = self.viewport_png().and_then(|(size, png)| shot_reply(size, png, shot.path.as_deref(), "viewport"));
                     shot.responder.send(r);
                 }
@@ -374,7 +381,7 @@ impl StudioApp {
                 ShotTarget::Window => {
                     if self.mode != Mode::ThreeD
                         && self.plan.error.is_none()
-                        && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
+                        && !self.viewport_rect.is_some_and(|rect| self.plan.snapshot_ready(rect, self.ppp))
                     {
                         keep.push(shot);
                         continue;

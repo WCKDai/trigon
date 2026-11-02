@@ -20,6 +20,7 @@ mod properties;
 mod render;
 mod scene;
 mod schedules;
+mod screen_lines;
 mod terrain_panel;
 mod theme;
 mod worker;

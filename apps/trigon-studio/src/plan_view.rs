@@ -4,7 +4,7 @@
 //! picture is shown moved and scaled to the current view.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TrySendError, channel, sync_channel};
 
 use eframe::egui;
 
@@ -19,7 +19,79 @@ use crate::drawing_raster::{self, Key};
 
 struct Job {
     tree: Arc<usvg::Tree>,
+    source: Option<Arc<str>>,
     key: Key,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StyleKey {
+    generation: u64,
+    detail: u8,
+    zoom_bits: u32,
+}
+
+impl StyleKey {
+    fn from_raster(key: Key) -> Self {
+        Self { generation: key.generation, detail: key.detail, zoom_bits: key.line_zoom.to_bits() }
+    }
+}
+
+struct StyledTree {
+    key: StyleKey,
+    source: Arc<str>,
+    tree: Arc<usvg::Tree>,
+}
+
+/// One parsed adaptive tree per raster worker, independent of pan, raster size and Retina ratio.
+#[derive(Default)]
+struct StyleCache {
+    entry: Option<StyledTree>,
+}
+
+impl StyleCache {
+    fn tree(&mut self, job: &Job) -> Result<(Arc<usvg::Tree>, bool), String> {
+        let Some(source) = &job.source else {
+            self.entry = None;
+            return Ok((job.tree.clone(), false));
+        };
+        let key = StyleKey::from_raster(job.key);
+        if let Some(entry) = &self.entry
+            && entry.key == key
+            && Arc::ptr_eq(&entry.source, source)
+        {
+            return Ok((entry.tree.clone(), true));
+        }
+        // Release the previous worker entry before constructing another potentially large tree.
+        self.entry = None;
+        let styled = crate::screen_lines::svg_at_zoom(source, job.key.line_zoom)?;
+        let tree = if job.key.detail == 0 && job.key.line_zoom == 1.0 {
+            job.tree.clone()
+        } else {
+            Arc::new(trigon_engine::parse_svg(&styled).map_err(|e| format!("screen line styling: {e}"))?)
+        };
+        self.entry = Some(StyledTree { key, source: source.clone(), tree: tree.clone() });
+        Ok((tree, false))
+    }
+}
+
+struct PreparedRaster {
+    image: egui::ColorImage,
+    tree: Arc<usvg::Tree>,
+    times: drawing_raster::Times,
+    style_ms: f64,
+    style_cache_hit: bool,
+}
+
+struct RasterDone {
+    key: Key,
+    base: Arc<usvg::Tree>,
+    result: Result<PreparedRaster, String>,
+}
+
+/// The currently uploaded tree shares storage with the worker cache; snapshots never parse SVG.
+struct ScreenTree {
+    base: Arc<usvg::Tree>,
+    styled: Arc<usvg::Tree>,
 }
 
 /// Navigation belongs to a drawing tab, independently of its current raster generation.
@@ -32,18 +104,21 @@ pub(crate) struct Navigation {
 
 pub struct PlanView {
     tree: Option<(u64, Arc<usvg::Tree>)>,
-    display_trees: Vec<Arc<usvg::Tree>>,
+    display_svgs: Option<[Arc<str>; 3]>,
     geometry: Option<DrawingPreview>,
     /// Sheet pixel at the middle of the view, and screen points per sheet pixel.
     centre: [f32; 2],
     zoom: f32,
     fitted: bool,
     picture: Option<(egui::TextureHandle, Key)>,
+    picture_tree: Option<ScreenTree>,
     asked: Option<Key>,
     jobs: Sender<Job>,
-    done: Receiver<(Key, egui::ColorImage, drawing_raster::Times)>,
+    done: Receiver<RasterDone>,
     pub error: Option<String>,
     last_times: Option<drawing_raster::Times>,
+    last_style_ms: Option<f64>,
+    last_style_cache_hit: Option<bool>,
     uploads: u64,
     discarded: u64,
     enqueue_ms: f64,
@@ -62,34 +137,46 @@ impl PlanView {
 
     pub fn new(ctx: egui::Context) -> PlanView {
         let (jobs, rx) = channel::<Job>();
-        let (tx, done) = channel();
+        let (tx, done) = sync_channel(1);
         let _ = std::thread::Builder::new().name("trigon-plan-raster".into()).spawn(move || {
+            let mut styles = StyleCache::default();
             while let Ok(mut job) = rx.recv() {
                 // Only the latest view matters.
                 while let Ok(newer) = rx.try_recv() {
                     job = newer;
                 }
-                if let Some((img, times)) = drawing_raster::profiled(&job.tree, job.key.origin, job.key.scale, job.key.size) {
-                    if tx.send((job.key, img, times)).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
+                let start = std::time::Instant::now();
+                let result = styles.tree(&job).and_then(|(tree, style_cache_hit)| {
+                    let style_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let (image, times) = drawing_raster::profiled(&tree, job.key.origin, job.key.scale, job.key.size)
+                        .ok_or_else(|| "drawing raster allocation or camera failed".to_owned())?;
+                    Ok(PreparedRaster { image, tree, times, style_ms, style_cache_hit })
+                });
+                // A paused UI must not accumulate complete raster images or parsed style trees.
+                // If the queued result is stale, the UI clears `asked` and resubmits its latest key.
+                match tx.try_send(RasterDone { key: job.key, base: job.tree, result }) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => break,
                 }
+                ctx.request_repaint();
             }
         });
         PlanView {
-            display_trees: Vec::new(),
+            display_svgs: None,
             tree: None,
             geometry: None,
             centre: [800.0, 450.0],
             zoom: 1.0,
             fitted: false,
             picture: None,
+            picture_tree: None,
             asked: None,
             jobs,
             done,
             error: None,
             last_times: None,
+            last_style_ms: None,
+            last_style_cache_hit: None,
             uploads: 0,
             discarded: 0,
             enqueue_ms: 0.0,
@@ -99,13 +186,14 @@ impl PlanView {
     /// A new sheet (another level, a changed model). The view stays where it is.
     pub fn set_tree(&mut self, generation: u64, tree: Arc<usvg::Tree>) {
         self.tree = Some((generation, tree));
-        self.display_trees.clear();
+        self.display_svgs = None;
+        self.asked = None;
         self.error = None;
     }
 
     pub fn set_drawing(&mut self, generation: u64, drawing: crate::worker::PreparedDrawing) {
         self.set_tree(generation, drawing.tree);
-        self.display_trees = drawing.display_trees;
+        self.display_svgs = Some(drawing.display_svgs);
         self.geometry = Some(DrawingPreview {
             svg: String::new(),
             transform: drawing.transform,
@@ -117,7 +205,8 @@ impl PlanView {
 
     pub fn fail(&mut self, error: String) {
         self.tree = None;
-        self.display_trees.clear();
+        self.display_svgs = None;
+        self.picture_tree = None;
         self.geometry = None;
         self.picture = None;
         self.asked = None;
@@ -208,7 +297,7 @@ impl PlanView {
 
     /// CPU diagnostics for native profiling; enqueue timing does not measure GPU upload time.
     pub fn diagnostics(&self) -> serde_json::Value {
-        serde_json::json!({"uploads":self.uploads,"discarded_results":self.discarded,"last_allocate_ms":self.last_times.map(|t|t.allocate_ms),"last_render_ms":self.last_times.map(|t|t.render_ms),"last_convert_ms":self.last_times.map(|t|t.convert_ms),"last_texture_enqueue_ms":self.enqueue_ms,"gpu_upload_measured":false})
+        serde_json::json!({"uploads":self.uploads,"discarded_results":self.discarded,"logical_zoom":self.zoom,"stroke_zoom_bucket":drawing_raster::stroke_zoom(self.zoom),"shown_stroke_zoom_bucket":self.picture.as_ref().map(|(_,k)|k.line_zoom),"last_style_ms":self.last_style_ms,"last_style_cache_hit":self.last_style_cache_hit,"style_cache_capacity":1,"last_allocate_ms":self.last_times.map(|t|t.allocate_ms),"last_render_ms":self.last_times.map(|t|t.render_ms),"last_convert_ms":self.last_times.map(|t|t.convert_ms),"last_texture_enqueue_ms":self.enqueue_ms,"gpu_upload_measured":false})
     }
 
     pub fn fit(&mut self) {
@@ -230,19 +319,39 @@ impl PlanView {
         drawing_raster::key(*generation, self.centre, self.zoom, [rect.width(), rect.height()], ppp)
     }
 
-    /// A PNG-ready picture of what the view shows, made now.
+    fn accepts_raster(&self, key: Key, base: &Arc<usvg::Tree>, rect: egui::Rect, ppp: f32) -> bool {
+        self.key(rect, ppp).is_some_and(|wanted| drawing_raster::accept_result(key, wanted))
+            && self.tree.as_ref().is_some_and(|(_, current)| Arc::ptr_eq(current, base))
+    }
+
+    /// Capture readiness is stricter than picking readiness: current source, LOD and pen bucket.
+    pub fn snapshot_ready(&self, rect: egui::Rect, ppp: f32) -> bool {
+        let Some((generation, base)) = &self.tree else { return false };
+        let Some(key) = drawing_raster::exact_key(*generation, self.centre, self.zoom, [rect.width(), rect.height()], ppp) else { return false };
+        self.picture_tree
+            .as_ref()
+            .zip(self.picture.as_ref())
+            .is_some_and(|(tree, (_, shown))| Arc::ptr_eq(base, &tree.base) && StyleKey::from_raster(*shown) == StyleKey::from_raster(key))
+    }
+
+    /// A PNG-ready picture of the current style and exact viewport. A pending style returns None;
+    /// SVG adaptation and parsing happen exclusively on the raster worker.
     pub fn snapshot(&self, rect: egui::Rect, ppp: f32) -> Option<egui::ColorImage> {
+        if !self.snapshot_ready(rect, ppp) {
+            return None;
+        }
         let generation = self.tree.as_ref()?.0;
         let key = drawing_raster::exact_key(generation, self.centre, self.zoom, [rect.width(), rect.height()], ppp)?;
-        let (_, tree) = self.tree.as_ref()?;
-        let tree = if key.detail > 0 { self.display_trees.get(usize::from(key.detail) - 1).unwrap_or(tree) } else { tree };
-        rasterize(tree, key.origin, key.scale, key.size)
+        rasterize(&self.picture_tree.as_ref()?.styled, key.origin, key.scale, key.size)
     }
 
     /// Parsing the SVG finishes before the on-screen raster job. Interaction waits for current-generation pixels; pan/zoom reuses them with exact vector
-    /// picking. Snapshots independently rasterize the precise viewport at screen resolution.
+    /// picking. Snapshots rasterize the precise viewport once its current style is prepared.
     pub fn ready(&self, rect: egui::Rect, ppp: f32) -> bool {
-        self.key(rect, ppp).is_some_and(|wanted| self.picture.as_ref().is_some_and(|(_, shown)| drawing_raster::ready(*shown, wanted)))
+        self.key(rect, ppp).is_some_and(|wanted| {
+            self.picture.as_ref().is_some_and(|(_, shown)| drawing_raster::ready(*shown, wanted))
+                && self.tree.as_ref().zip(self.picture_tree.as_ref()).is_some_and(|((_, base), shown)| Arc::ptr_eq(base, &shown.base))
+        })
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, picking: bool) -> egui::Response {
@@ -284,32 +393,50 @@ impl PlanView {
                 self.discarded += 1;
             }
         }
-        if let Some((key, img, times)) = latest {
-            if self.key(rect, ppp).is_some_and(|wanted| drawing_raster::accept_result(key, wanted)) {
-                let start = std::time::Instant::now();
-                let options = egui::TextureOptions::LINEAR;
-                match &mut self.picture {
-                    Some((tex, k)) => {
-                        tex.set(img, options);
-                        *k = key;
+        if let Some(RasterDone { key, base, result }) = latest {
+            if self.accepts_raster(key, &base, rect, ppp) {
+                match result {
+                    Ok(PreparedRaster { image, tree, times, style_ms, style_cache_hit }) => {
+                        let start = std::time::Instant::now();
+                        let options = egui::TextureOptions::LINEAR;
+                        match &mut self.picture {
+                            Some((tex, k)) => {
+                                tex.set(image, options);
+                                *k = key;
+                            }
+                            None => self.picture = Some((ui.ctx().load_texture("trigon-plan", image, options), key)),
+                        }
+                        self.picture_tree = Some(ScreenTree { base, styled: tree });
+                        self.enqueue_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        self.last_times = Some(times);
+                        self.last_style_ms = Some(style_ms);
+                        self.last_style_cache_hit = Some(style_cache_hit);
+                        self.uploads += 1;
+                        self.asked = None;
+                        self.error = None;
                     }
-                    None => self.picture = Some((ui.ctx().load_texture("trigon-plan", img, options), key)),
+                    Err(error) => {
+                        self.asked = Some(key);
+                        self.error = Some(error);
+                    }
                 }
-                self.enqueue_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.last_times = Some(times);
-                self.uploads += 1;
             } else {
                 self.discarded += 1;
+                // The bounded completion slot may have discarded a more recent result.
+                self.asked = None;
             }
         }
         if let Some(key) = self.key(rect, ppp) {
             let shown = self.picture.as_ref().map(|(_, k)| *k);
-            if shown != Some(key)
+            let current_source = self.tree.as_ref().zip(self.picture_tree.as_ref()).is_some_and(|((_, base), shown)| Arc::ptr_eq(base, &shown.base));
+            if (shown != Some(key) || !current_source)
                 && self.asked != Some(key)
                 && let Some((_, tree)) = &self.tree
             {
-                let tree = if key.detail > 0 { self.display_trees.get(usize::from(key.detail) - 1).unwrap_or(tree) } else { tree };
-                let _ = self.jobs.send(Job { tree: tree.clone(), key });
+                let source = self.display_svgs.as_ref().and_then(|sources| sources.get(usize::from(key.detail))).cloned();
+                if self.jobs.send(Job { tree: tree.clone(), source, key }).is_err() {
+                    self.error = Some("drawing raster worker is unavailable".into());
+                }
                 self.asked = Some(key);
             }
         }
@@ -323,6 +450,9 @@ impl PlanView {
             let r = egui::Rect::from_min_max(to_screen(k.origin[0], k.origin[1]), to_screen(k.origin[0] + w, k.origin[1] + h));
             painter.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), theme::PAPER);
         }
+        if let Some(error) = &self.error {
+            painter.text(rect.left_top() + egui::vec2(12.0, 12.0), egui::Align2::LEFT_TOP, error, egui::FontId::proportional(13.0), theme::ACCENT);
+        }
         resp
     }
 }
@@ -330,6 +460,234 @@ impl PlanView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SCREEN_LINE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><path d="M10 50L90 50" fill="none" stroke="black" stroke-width="2.362"/></svg>"#;
+
+    fn screen_drawing() -> crate::worker::PreparedDrawing {
+        let source: Arc<str> = Arc::from(SCREEN_LINE);
+        crate::worker::PreparedDrawing {
+            tree: Arc::new(trigon_engine::parse_svg(SCREEN_LINE).unwrap()),
+            display_svgs: [source.clone(), source.clone(), source],
+            transform: trigon_engine::DrawingTransform { x0: 0.0, y1: 1000.0, mm_per_px: 10.0 },
+            segments: vec![[[100.0, 500.0], [900.0, 500.0]]],
+            element_segments: vec![trigon_engine::DrawingElementSegment {
+                id: "wall.L0".into(),
+                kind: trigon_engine::DrawingElementKind::InteriorWall,
+                segment: [[100.0, 500.0], [900.0, 500.0]],
+            }],
+            element_regions: vec![],
+        }
+    }
+
+    #[test]
+    fn style_cache_reuses_pan_retina_and_bucket_ticks_but_invalidates_every_style_input() {
+        let source: Arc<str> = Arc::from(SCREEN_LINE);
+        let tree = Arc::new(trigon_engine::parse_svg(SCREEN_LINE).unwrap());
+        let make = |generation, zoom, ppp, centre| Job {
+            tree: tree.clone(),
+            source: Some(source.clone()),
+            key: drawing_raster::key(generation, centre, zoom, [3000.0, 1500.0], ppp).unwrap(),
+        };
+        let mut cache = StyleCache::default();
+        let (first, hit) = cache.tree(&make(1, 4.01, 1.0, [50.0; 2])).unwrap();
+        assert!(!hit);
+        for ppp in [0.5, 1.0, 1.5, 2.0, 3.0, 4.0] {
+            let (same, hit) = cache.tree(&make(1, 4.02, ppp, [4000.0, -2000.0])).unwrap();
+            assert!(hit, "pan, Retina and sub-bucket ticks must not reparse");
+            assert!(Arc::ptr_eq(&first, &same));
+        }
+        for (generation, zoom) in [(1, 8.0), (2, 8.0), (1, 4.01)] {
+            let (next, hit) = cache.tree(&make(generation, zoom, 1.0, [50.0; 2])).unwrap();
+            assert!(!hit, "the one-entry cache must invalidate generation/zoom and evict old zooms");
+            assert!(!Arc::ptr_eq(&first, &next));
+        }
+        let mut changed = make(1, 4.01, 1.0, [50.0; 2]);
+        changed.key.detail = 1;
+        assert!(!cache.tree(&changed).unwrap().1, "LOD is part of the style key");
+        changed.source = Some(Arc::from(SCREEN_LINE));
+        assert!(!cache.tree(&changed).unwrap().1, "a newly prepared source invalidates even equal generation/zoom");
+        changed.source = Some(Arc::from("<svg>"));
+        assert!(cache.tree(&changed).is_err());
+        assert!(cache.entry.is_none(), "failed adaptation must not retain a misleading cached style");
+        changed.source = Some(source);
+        changed.key.line_zoom = f32::NAN;
+        assert!(cache.tree(&changed).is_err());
+        assert!(cache.entry.is_none());
+    }
+
+    #[test]
+    fn worker_styled_pixels_and_snapshot_match_without_moving_second_frame_picking() {
+        let ctx = egui::Context::default();
+        let mut view = PlanView::new(ctx.clone());
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 80.0));
+        view.set_drawing(7, screen_drawing());
+        view.centre = [50.0; 2];
+        view.fitted = true;
+        let before = view.geometry.clone().unwrap();
+        for zoom in [0.02, 0.3, 0.6, 1.0, 3.5, 8.0, 200.0] {
+            view.zoom = zoom;
+            for ppp in [0.5, 1.0, 1.5, 2.0, 3.0, 4.0] {
+                let key = view.key(rect, ppp).unwrap();
+                let base = view.tree.as_ref().unwrap().1.clone();
+                let source = view.display_svgs.as_ref().unwrap()[usize::from(key.detail)].clone();
+                view.jobs.send(Job { tree: base.clone(), source: Some(source), key }).unwrap();
+                let RasterDone { key: completed, base, result } = view.done.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                assert!(view.accepts_raster(completed, &base, rect, ppp));
+                let PreparedRaster { image, tree, .. } = result.unwrap();
+                view.picture_tree = Some(ScreenTree { base, styled: tree.clone() });
+                view.picture = Some((ctx.load_texture("styled-plan", image, egui::TextureOptions::LINEAR), completed));
+                let snapshot = view.snapshot(rect, ppp).unwrap();
+                let exact = drawing_raster::exact_key(7, view.centre, zoom, [rect.width(), rect.height()], ppp).unwrap();
+                let source = &view.display_svgs.as_ref().unwrap()[usize::from(key.detail)];
+                let adapted = crate::screen_lines::svg_at_zoom(source, key.line_zoom).unwrap();
+                let expected_tree = trigon_engine::parse_svg(&adapted).unwrap();
+                let expected = rasterize(&expected_tree, exact.origin, exact.scale, exact.size).unwrap();
+                assert_eq!(snapshot.pixels, expected.pixels, "snapshots must use the actual worker-prepared adaptive style");
+                if zoom == 8.0 {
+                    let ink = (0..snapshot.size[1])
+                        .map(|row| 1.0 - f32::from(snapshot.pixels[row * snapshot.size[0] + snapshot.size[0] / 2].r()) / 255.0)
+                        .sum::<f32>()
+                        / ppp;
+                    assert!(ink < 3.3, "the pipeline must not rasterize an 18.9-point paper pen at 8x: {ink}");
+                }
+                let point = view.model_to_screen(rect, [500.0, 500.0]).unwrap();
+                let hit = view.pick_element(rect, point).unwrap();
+                assert_eq!(hit.id, "wall.L0");
+                assert_eq!(hit.point, [500.0, 500.0]);
+                assert_eq!(view.screen_to_model(rect, point).unwrap(), [500.0, 500.0]);
+                assert!(view.ready(rect, ppp));
+                let after = view.geometry.as_ref().unwrap();
+                assert_eq!(before.transform, after.transform);
+                assert_eq!(before.segments, after.segments);
+                assert_eq!(before.element_segments, after.element_segments);
+                let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+                output.textures_delta.clear();
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_completion_slot_retries_the_latest_view_when_its_result_was_dropped() {
+        let ctx = egui::Context::default();
+        let mut view = PlanView::new(ctx.clone());
+        view.set_drawing(7, screen_drawing());
+        view.centre = [50.0; 2];
+        view.fitted = true;
+        let (jobs, received) = channel();
+        view.jobs = jobs;
+        let (completed, done) = sync_channel(1);
+        view.done = done;
+        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 120.0))), ..Default::default() };
+        let mut output = ctx.run_ui(input, |ui| {
+            let rect = ui.available_rect_before_wrap();
+            view.zoom = 4.0;
+            let old = view.key(rect, ui.ctx().pixels_per_point()).unwrap();
+            view.zoom = 8.0;
+            let wanted = view.key(rect, ui.ctx().pixels_per_point()).unwrap();
+            view.asked = Some(wanted);
+            let base = view.tree.as_ref().unwrap().1.clone();
+            assert!(completed.try_send(RasterDone { key: old, base: base.clone(), result: Err("obsolete error".into()) }).is_ok());
+            assert!(matches!(
+                completed.try_send(RasterDone { key: wanted, base, result: Err("dropped newer result".into()) }),
+                Err(TrySendError::Full(_))
+            ));
+            view.ui(ui, false);
+            assert_eq!(received.try_recv().unwrap().key, wanted, "rejecting the stale occupied slot must retry the dropped latest key");
+            assert!(view.error.is_none(), "an obsolete error must not replace the current drawing");
+            assert_eq!(view.discarded, 1);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn accepted_wheel_reversal_clears_a_dropped_later_zoom_request() {
+        let ctx = egui::Context::default();
+        let mut view = PlanView::new(ctx.clone());
+        view.set_drawing(7, screen_drawing());
+        view.centre = [50.0; 2];
+        view.fitted = true;
+        let (jobs, received) = channel();
+        view.jobs = jobs;
+        let (completed, done) = sync_channel(1);
+        view.done = done;
+        let input = |time| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 120.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input(0.0), |ui| {
+            let rect = ui.available_rect_before_wrap();
+            let ppp = ui.ctx().pixels_per_point();
+            view.zoom = 4.0;
+            let a = view.key(rect, ppp).unwrap();
+            view.zoom = 8.0;
+            let b = view.key(rect, ppp).unwrap();
+            view.asked = Some(b);
+            let base = view.tree.as_ref().unwrap().1.clone();
+            let prepared = PreparedRaster {
+                image: rasterize(&base, [0.0; 2], 1.0, [1, 1]).unwrap(),
+                tree: base.clone(),
+                times: drawing_raster::Times::default(),
+                style_ms: 0.0,
+                style_cache_hit: false,
+            };
+            assert!(completed.try_send(RasterDone { key: a, base: base.clone(), result: Ok(prepared) }).is_ok());
+            assert!(matches!(
+                completed.try_send(RasterDone { key: b, base, result: Err("B cannot occupy A's full completion slot".into()) }),
+                Err(TrySendError::Full(_))
+            ));
+            view.zoom = 4.0;
+            view.ui(ui, false);
+            assert!(view.ready(rect, ppp), "A is the current visible result after the wheel reversal");
+            assert!(received.try_recv().is_err(), "accepted A needs no duplicate raster");
+        });
+        output.textures_delta.clear();
+        view.zoom = 8.0;
+        let mut output = ctx.run_ui(input(0.1), |ui| {
+            let rect = ui.available_rect_before_wrap();
+            let wanted = view.key(rect, ui.ctx().pixels_per_point()).unwrap();
+            view.ui(ui, false);
+            assert_eq!(
+                received.try_recv().ok().map(|job| job.key),
+                Some(wanted),
+                "accepting A must clear the dropped B marker so a later return to B cannot wait forever"
+            );
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn pending_zoom_and_replaced_sources_cannot_snapshot_or_accept_stale_styles() {
+        let ctx = egui::Context::default();
+        let mut view = PlanView::new(ctx.clone());
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(120.0, 80.0));
+        view.set_drawing(7, screen_drawing());
+        view.centre = [50.0; 2];
+        view.zoom = 4.0;
+        view.fitted = true;
+        let key = view.key(rect, 2.0).unwrap();
+        let base = view.tree.as_ref().unwrap().1.clone();
+        assert!(!view.snapshot_ready(rect, 2.0));
+        assert!(view.snapshot(rect, 2.0).is_none());
+        view.jobs.send(Job { tree: base.clone(), source: Some(view.display_svgs.as_ref().unwrap()[0].clone()), key }).unwrap();
+        let RasterDone { base: completed_base, result, .. } = view.done.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let PreparedRaster { image, tree, .. } = result.unwrap();
+        view.picture_tree = Some(ScreenTree { base: completed_base, styled: tree });
+        view.picture = Some((ctx.load_texture("old-style", image, egui::TextureOptions::LINEAR), key));
+        assert!(view.snapshot_ready(rect, 2.0));
+        assert!(view.snapshot(rect, 2.0).is_some());
+        view.zoom = 8.0;
+        assert!(!view.snapshot_ready(rect, 2.0));
+        assert!(view.snapshot(rect, 2.0).is_none());
+        assert!(!view.accepts_raster(key, &base, rect, 2.0));
+        assert!(view.ready(rect, 2.0), "exact current-generation picking stays live during style preparation");
+        view.zoom = 4.0;
+        assert!(view.accepts_raster(key, &base, rect, 2.0), "rapid wheel reversal can reuse the original style");
+        view.set_drawing(7, screen_drawing());
+        assert!(!view.accepts_raster(key, &base, rect, 2.0), "same generation cannot alias a different prepared drawing");
+        assert!(!view.ready(rect, 2.0));
+        assert!(view.snapshot(rect, 2.0).is_none());
+    }
 
     #[test]
     fn pointer_drag_pans_the_live_canvas_without_changing_its_zoom() {
@@ -489,10 +847,12 @@ mod tests {
         view.fit_to(rect.size());
         assert!(!view.ready(rect, 1.0));
         let key = view.key(rect, 1.0).unwrap();
-        view.jobs.send(Job { tree: tree.clone(), key }).unwrap();
-        let (key, img, _) = view.done.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
-        assert!(img.pixels.iter().any(|p| p.r() < 10));
-        view.picture = Some((ctx.load_texture("ready-plan", img, egui::TextureOptions::LINEAR), key));
+        view.jobs.send(Job { tree: tree.clone(), source: None, key }).unwrap();
+        let RasterDone { key, base, result } = view.done.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let PreparedRaster { image, tree: styled, .. } = result.unwrap();
+        assert!(image.pixels.iter().any(|p| p.r() < 10));
+        view.picture_tree = Some(ScreenTree { base, styled });
+        view.picture = Some((ctx.load_texture("ready-plan", image, egui::TextureOptions::LINEAR), key));
         assert!(view.ready(rect, 1.0));
         view.set_tree(2, tree);
         assert!(!view.ready(rect, 1.0), "an older texture cannot stand in for a changed plan");

@@ -7,11 +7,18 @@ use trigon_engine::resvg::{self, tiny_skia, usvg};
 pub struct Key {
     pub generation: u64,
     pub detail: u8,
+    /// Logical window points per source SVG pixel, bucketed independently of Retina density.
+    pub line_zoom: f32,
     pub origin: [f32; 2],
     pub scale: f32,
     pub size: [u32; 2],
 }
 pub const MAX_SIDE: u32 = 4096;
+
+/// Pen styling follows logical zoom, never physical pixels or the bounded raster resolution.
+pub fn stroke_zoom(zoom: f32) -> Option<f32> {
+    (zoom.is_finite() && zoom > 0.0).then(|| 2.0_f32.powf((zoom.log2() * 8.0).ceil() / 8.0).clamp(0.02, 200.0))
+}
 
 pub fn exact_key(generation: u64, centre: [f32; 2], zoom: f32, view: [f32; 2], ppp: f32) -> Option<Key> {
     if !zoom.is_finite() || zoom <= 0.0 || !ppp.is_finite() || ppp <= 0.0 || centre.iter().chain(view.iter()).any(|v| !v.is_finite()) {
@@ -19,7 +26,7 @@ pub fn exact_key(generation: u64, centre: [f32; 2], zoom: f32, view: [f32; 2], p
     }
     let origin = [centre[0] - view[0] / 2.0 / zoom, centre[1] - view[1] / 2.0 / zoom];
     let size = [(view[0] * ppp).round().max(1.0) as u32, (view[1] * ppp).round().max(1.0) as u32];
-    let band = 2.0_f32.powf((zoom.log2() * 8.0).ceil() / 8.0);
+    let band = stroke_zoom(zoom)?;
     let detail = if band < 0.4 {
         2
     } else if band < 0.8 {
@@ -27,7 +34,11 @@ pub fn exact_key(generation: u64, centre: [f32; 2], zoom: f32, view: [f32; 2], p
     } else {
         0
     };
-    Some(Key { generation, detail, origin, scale: zoom * ppp, size })
+    let scale = zoom * ppp;
+    if origin.iter().any(|v| !v.is_finite()) || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    Some(Key { generation, detail, line_zoom: band, origin, scale, size })
 }
 /// Cache an overscanned region on a 128-pixel grid, with 1/8-octave upward resolution buckets.
 /// The cached image remains at least screen resolution unless the bounded raster budget is hit.
@@ -47,7 +58,7 @@ pub fn key(generation: u64, centre: [f32; 2], zoom: f32, view: [f32; 2], ppp: f3
     if origin.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    Some(Key { generation, detail: exact.detail, origin, scale, size: size.map(|v| v.clamp(1, MAX_SIDE)) })
+    Some(Key { generation, detail: exact.detail, line_zoom: exact.line_zoom, origin, scale, size: size.map(|v| v.clamp(1, MAX_SIDE)) })
 }
 /// Interaction uses exact current-generation vector geometry, while its cached pixels move live.
 pub fn ready(shown: Key, wanted: Key) -> bool {
@@ -144,6 +155,31 @@ mod tests {
         assert_eq!(k(1.0, 1.0).detail, 0);
         assert_eq!(k(0.3, 1.0).detail, k(0.3, 2.0).detail, "density follows window scale, independently of Retina pixel ratio");
         assert_eq!(k(0.6001, 1.0), k(0.6002, 1.0), "tiny zoom increments share raster resolution and display detail");
+    }
+    #[test]
+    fn logical_pen_zoom_is_pan_density_and_raster_budget_independent() {
+        for zoom in [0.02, 0.3, 0.6, 1.0, 3.5, 200.0] {
+            let reference = key(4, [0.0; 2], zoom, [1000.0, 700.0], 1.0).unwrap();
+            for ppp in [0.5, 1.0, 1.5, 2.0, 3.0, 4.0] {
+                let other = key(4, [900.0, -300.0], zoom, [3000.0, 1500.0], ppp).unwrap();
+                assert_eq!(reference.line_zoom, other.line_zoom);
+                assert_eq!(reference.detail, other.detail);
+                assert!((0.02..=200.0).contains(&other.line_zoom));
+            }
+        }
+        let low = key(1, [0.0; 2], 4.0, [3000.0; 2], 4.0).unwrap();
+        let high = key(1, [0.0; 2], 4.01, [3000.0; 2], 4.0).unwrap();
+        assert_ne!(low.line_zoom, high.line_zoom, "style must invalidate even when the raster budget caps resolution");
+        assert!(!accept_result(low, high), "old zoom pens cannot upload as current pixels");
+    }
+    #[test]
+    fn hostile_raster_inputs_never_produce_nonfinite_style_or_camera_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0] {
+            assert!(key(1, [0.0; 2], value, [1000.0; 2], 1.0).is_none());
+            assert!(key(1, [0.0; 2], 1.0, [1000.0; 2], value).is_none());
+        }
+        assert!(exact_key(1, [f32::INFINITY, 0.0], 1.0, [1000.0; 2], 1.0).is_none());
+        assert!(exact_key(1, [0.0; 2], f32::MAX, [1000.0; 2], 2.0).is_none());
     }
     #[test]
     fn obsolete_generations_and_superseded_rasters_are_rejected_before_upload() {
