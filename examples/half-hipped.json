@@ -1,0 +1,25 @@
+[
+  {
+    "command": "building.add",
+    "params": {
+      "id": "b",
+      "name": "Synthetic clipped gable",
+      "footprint": [[0, 0], [30000, 0], [30000, 12000], [0, 12000]],
+      "storeys": 3,
+      "storey_height_mm": 3000
+    }
+  },
+  {
+    "command": "building.set_roof",
+    "params": {
+      "kind": "half_hipped",
+      "pitch_deg": 45,
+      "gables": ["b.f2", "b.f4"],
+      "half_hips": [{"facade": "b.f4", "drop_mm": 1200}],
+      "thickness_mm": 200,
+      "overhang_mm": 180,
+      "verge_mm": 135,
+      "gutters": true
+    }
+  }
+]

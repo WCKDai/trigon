@@ -33,18 +33,24 @@ pub const CONCRETE: Mat = mat("Beton", "concrete", [0.72, 0.72, 0.70]);
 pub const TILES: Mat = mat("Tegltag på lægter", "clay", [0.62, 0.27, 0.18]);
 pub const RAFTERS: Mat = mat("Spær og undertag", "wood", [0.70, 0.55, 0.36]);
 pub const FELT: Mat = mat("Tagpap", "bitumen", [0.16, 0.16, 0.17]);
+pub const SLATE: Mat = mat("Slate roofing, illustrative family", "stone", [0.18, 0.20, 0.22]);
 pub const FRAME: Mat = mat("Træ, malet hvid", "wood", [0.95, 0.95, 0.93]);
 pub const GLASS: Mat = Mat { name: "Glas", category: "glass", rgb: [0.55, 0.70, 0.80], transparency: 0.6 };
 pub const DOOR: Mat = mat("Træ, dørblad", "wood", [0.42, 0.26, 0.16]);
 pub const SILL: Mat = mat("Sålbænk og beklædning", "metal", [0.80, 0.78, 0.74]);
 pub const RAIL: Mat = mat("Stål, malet mørk", "steel", [0.18, 0.18, 0.18]);
 pub const STEEL: Mat = mat("Stål, varmforzinket", "steel", [0.66, 0.68, 0.70]);
+pub const STEEL_WHITE: Mat = mat("Stål, malet hvid", "steel", FRAME.rgb);
+pub const GASKET: Mat = mat("Elastomertætning", "rubber", RAIL.rgb);
 pub const DECK: Mat = mat("Træ, terrassebrædder", "wood", [0.55, 0.35, 0.20]);
 pub const STAIR: Mat = mat("Trappe", "stair", [0.70, 0.62, 0.52]);
 pub const PLINTH: Mat = mat("Sokkel, puds", "plaster", [0.55, 0.55, 0.53]);
 pub const RENDER: Mat = mat("Facadepuds", "plaster", [0.91, 0.90, 0.87]);
+pub const RENDER_TERRACOTTA: Mat = mat("Terracotta painted render", "plaster", [0.798, 0.496, 0.424]);
 pub const BRICK_RED: Mat = mat("Tegl, røde sten", "brick", [0.62, 0.25, 0.17]);
+pub const BRICK_YELLOW: Mat = mat("Tegl, gule sten", "brick", [0.78, 0.68, 0.47]);
 pub const ZINC: Mat = mat("Zink", "metal", [0.60, 0.62, 0.63]);
+pub const GROUND: Mat = mat("Terrain surface", "ground", [0.65, 0.67, 0.62]);
 /// Spaces: a translucent volume, no material.
 pub const SPACE: Mat = Mat { name: "Rum", category: "space", rgb: [0.55, 0.75, 0.95], transparency: 0.75 };
 
@@ -64,7 +70,21 @@ pub fn of(m: Material) -> Mat {
         Material::Plinth => PLINTH,
         Material::Plaster => PLASTER,
         Material::Render => RENDER,
+        Material::RenderTerracotta => RENDER_TERRACOTTA,
         Material::BrickRed => BRICK_RED,
+        Material::BrickYellow => BRICK_YELLOW,
+        Material::SteelWhite => STEEL_WHITE,
+        Material::Gasket => GASKET,
+        Material::Paving => mat("Site paving", "stone", [0.52, 0.51, 0.47]),
+        Material::Gravel => mat("Site gravel", "stone", [0.62, 0.58, 0.48]),
+        Material::Grass => mat("Site grass", "vegetation", [0.22, 0.31, 0.12]),
+        Material::Bark => mat("Tree bark", "wood", [0.25, 0.16, 0.09]),
+        Material::Foliage => mat("Tree crown", "vegetation", [0.19, 0.32, 0.10]),
+        Material::Soil => mat("Planter soil", "soil", [0.20, 0.14, 0.08]),
+        Material::Planter => mat("Planter shell", "concrete", [0.30, 0.31, 0.28]),
+        Material::Ground => GROUND,
+        Material::Slate => SLATE,
+        Material::Felt => FELT,
     }
 }
 
@@ -151,14 +171,16 @@ pub fn facade(t: f64, party: bool, finish: Material) -> BuildUp {
     let what = if party { "Brandgavl" } else { "Ydervæg" };
     let (wall, brick, render) = match finish {
         Material::Render => ("pudset mur", BRICK, true),
+        Material::RenderTerracotta => ("pudset mur, terrakotta", BRICK, true),
         Material::BrickRed => ("massiv mur, røde sten", BRICK_RED, false),
+        Material::BrickYellow => ("massiv mur, gule sten", BRICK_YELLOW, false),
         _ => ("massiv mur", BRICK, false),
     };
     let name = match sten(t) {
         Some(s) => format!("{what}, {wall} {s} sten, {}", mm(t)),
         None => format!("{what}, {wall}, {}", mm(t)),
     };
-    let outside = render.then_some((RENDER, 15.0));
+    let outside = render.then_some((of(finish), 15.0));
     // From the outside in: render if any, brick, then the interior plaster.
     let mut layers = sandwich(t, (PLASTER, 15.0), brick, outside);
     layers.reverse();
@@ -207,10 +229,20 @@ pub fn pitched_roof(t: f64) -> BuildUp {
     BuildUp { name: format!("Tag, tegl på spær {}", mm(t)), layers, predefined: "ROOF" }
 }
 
+/// Original timber-front family build-up; illustrative, never inferred from a photograph.
+pub fn dormer_front(t: f64) -> BuildUp {
+    BuildUp {
+        name: format!("Dormer front, illustrative timber family {}", mm(t)),
+        layers: sandwich(t, (FRAME, 15.0), STUDS, Some((PLASTER, 15.0))),
+        predefined: "ELEMENTEDWALL",
+    }
+}
+
 /// A property value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     Label(String),
+    Text(String),
     Id(String),
     Bool(bool),
     Length(f64),
@@ -223,6 +255,7 @@ pub enum Val {
 impl Val {
     fn text(&self) -> String {
         match self {
+            Val::Text(s) => format!("IFCTEXT({})", string(s)),
             Val::Label(s) => format!("IFCLABEL({})", string(s)),
             Val::Id(s) => format!("IFCIDENTIFIER({})", string(s)),
             Val::Bool(b) => format!("IFCBOOLEAN({})", if *b { ".T." } else { ".F." }),
@@ -262,6 +295,7 @@ pub struct Catalog {
     associations: BTreeMap<String, (usize, Vec<usize>)>,
     /// Element types by key: entity and the occurrences typed by it.
     pub types: BTreeMap<String, (usize, Vec<usize>)>,
+    pub fill_quantity_counts: BTreeMap<(String, String), usize>,
     psets: BTreeMap<String, (usize, Vec<usize>)>,
     status_enum: Option<usize>,
     layers: BTreeMap<&'static str, Vec<usize>>,

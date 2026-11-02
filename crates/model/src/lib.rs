@@ -5,6 +5,8 @@
 //! (map coordinates in EPSG:25832 are about 6.1e9 mm, where one f64 step is already 1.4e-6 mm).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod annotation;
+pub mod balcony;
 pub mod build;
 pub mod component;
 pub mod doc;
@@ -12,8 +14,11 @@ pub mod doors;
 pub mod footprint;
 pub mod joins;
 pub mod mesh;
+pub mod profile;
 pub mod roof;
+pub mod site;
 pub mod stair;
+pub mod terrain;
 pub mod wall_cleanup;
 pub mod walls;
 

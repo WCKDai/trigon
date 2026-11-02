@@ -1,9 +1,11 @@
 //! glTF 2.0 binary (GLB) export. One node per element, one primitive per material.
 //!
 //! glTF is Y-up in metres; Trigon is Z-up in millimetres: (x, y, z) → (x, z, -y) / 1000.
-//! No normals are written, so viewers compute flat normals (glTF 2.0 §3.7.2.1).
+//! Masonry carries embedded original base-colour/normal images and physically scaled UVs.
+//! Its per-face normals and tangent frames preserve the model's flat faces. Other materials
+//! keep the original position-only representation (glTF 2.0 §3.7.2.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use trigon_model::{Built, Material, Mesh};
@@ -21,15 +23,21 @@ impl Writer {
         }
     }
 
-    fn view(&mut self, bytes: &[u8], target: u32) -> usize {
+    fn view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
         self.align();
-        self.views.push(json!({"buffer": 0, "byteOffset": self.bin.len(), "byteLength": bytes.len(), "target": target}));
+        let mut view = json!({"buffer": 0, "byteOffset": self.bin.len(), "byteLength": bytes.len()});
+        if let Some(target) = target {
+            view["target"] = json!(target);
+        }
+        self.views.push(view);
         self.bin.extend_from_slice(bytes);
         self.views.len() - 1
     }
 
-    /// Positions and indices for one mesh; returns (position accessor, index accessor).
-    fn mesh(&mut self, m: &Mesh) -> (usize, usize) {
+    /// Positions, indices and optional physically scaled material coordinates for one primitive.
+    fn mesh(&mut self, source: &Mesh, material: Material) -> (Value, usize) {
+        let expanded = material.masonry().then(|| masonry_mesh(source, material));
+        let m = expanded.as_ref().map_or(source, |expanded| &expanded.mesh);
         let mut lo = [f32::MAX; 3];
         let mut hi = [f32::MIN; 3];
         let mut pos = Vec::with_capacity(m.positions.len() * 12);
@@ -42,19 +50,101 @@ impl Writer {
             }
         }
         let idx: Vec<u8> = m.triangles.iter().flatten().flat_map(|i| i.to_le_bytes()).collect();
-        let pv = self.view(&pos, 34962);
+        let pv = self.view(&pos, Some(34962));
         self.accessors.push(json!({"bufferView": pv, "componentType": 5126, "count": m.positions.len(), "type": "VEC3", "min": lo, "max": hi}));
         let pa = self.accessors.len() - 1;
-        let iv = self.view(&idx, 34963);
+        let mut attributes = json!({"POSITION":pa});
+        let iv = self.view(&idx, Some(34963));
         self.accessors.push(json!({"bufferView": iv, "componentType": 5125, "count": m.triangles.len() * 3, "type": "SCALAR"}));
-        (pa, self.accessors.len() - 1)
+        let ia = self.accessors.len() - 1;
+        if let Some(expanded) = expanded {
+            for (name, kind, count, bytes) in [
+                ("TEXCOORD_0", "VEC2", expanded.uv.len(), expanded.uv.iter().flatten().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()),
+                ("NORMAL", "VEC3", expanded.normals.len(), expanded.normals.iter().flatten().flat_map(|value| value.to_le_bytes()).collect()),
+                ("TANGENT", "VEC4", expanded.tangents.len(), expanded.tangents.iter().flatten().flat_map(|value| value.to_le_bytes()).collect()),
+            ] {
+                let view = self.view(&bytes, Some(34962));
+                self.accessors.push(json!({"bufferView":view,"componentType":5126,"count":count,"type":kind}));
+                attributes[name] = json!(self.accessors.len() - 1);
+            }
+        }
+        (attributes, ia)
     }
+}
+
+/// A corner may belong to differently oriented faces. Give every triangle its own UVs while
+/// retaining its exact source points and winding; no geometry or element identity is inferred.
+#[derive(Default)]
+struct MasonryMesh {
+    mesh: Mesh,
+    uv: Vec<[f32; 2]>,
+    normals: Vec<[f32; 3]>,
+    tangents: Vec<[f32; 4]>,
+}
+
+fn unit(vector: [f64; 3]) -> [f64; 3] {
+    let length = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if length.is_finite() && length > 1e-20 { vector.map(|value| value / length) } else { [0.0, 0.0, 1.0] }
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn material_frame(ab: [f64; 3], ac: [f64; 3], normal: [f64; 3], uv: [[f32; 2]; 3]) -> ([f32; 3], [f32; 4]) {
+    let transform = |p: [f64; 3]| [p[0], p[2], -p[1]];
+    let n = unit(transform(normal));
+    let (ab, ac) = (transform(ab), transform(ac));
+    let duv1 = [f64::from(uv[1][0] - uv[0][0]), f64::from(uv[1][1] - uv[0][1])];
+    let duv2 = [f64::from(uv[2][0] - uv[0][0]), f64::from(uv[2][1] - uv[0][1])];
+    let determinant = duv1[0] * duv2[1] - duv2[0] * duv1[1];
+    let (tangent, bitangent) = if determinant.abs() > 1e-20 {
+        (
+            std::array::from_fn(|axis| (ab[axis] * duv2[1] - ac[axis] * duv1[1]) / determinant),
+            std::array::from_fn(|axis| (ac[axis] * duv1[0] - ab[axis] * duv2[0]) / determinant),
+        )
+    } else {
+        let tangent = cross(if n[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0] }, n);
+        (tangent, cross(n, tangent))
+    };
+    // Gram-Schmidt also removes small projection errors from stored f32 texture coordinates.
+    let projection: f64 = tangent.iter().zip(n).map(|(a, b)| a * b).sum();
+    let tangent = unit(std::array::from_fn(|axis| tangent[axis] - n[axis] * projection));
+    let handedness: f64 = cross(n, tangent).iter().zip(bitangent).map(|(a, b)| a * b).sum();
+    (n.map(|value| value as f32), [tangent[0] as f32, tangent[1] as f32, tangent[2] as f32, if handedness < 0.0 { -1.0 } else { 1.0 }])
+}
+
+fn masonry_mesh(source: &Mesh, material: Material) -> MasonryMesh {
+    let mut expanded = MasonryMesh::default();
+    for triangle in &source.triangles {
+        let [Some(a), Some(b), Some(c)] = triangle.map(|index| source.positions.get(index as usize)) else { continue };
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let normal = cross(ab, ac);
+        let uv = [*a, *b, *c].map(|point| material.masonry_uv(point, normal).unwrap_or([0.0; 2]));
+        let (normal, tangent) = material_frame(ab, ac, normal, uv);
+        let Ok(base) = u32::try_from(expanded.mesh.positions.len()) else { break };
+        let Some(last) = base.checked_add(2) else { break };
+        for point in [*a, *b, *c] {
+            expanded.mesh.positions.push(point);
+            expanded.normals.push(normal);
+            expanded.tangents.push(tangent);
+        }
+        expanded.uv.extend(uv);
+        expanded.mesh.triangles.push([base, base + 1, last]);
+    }
+    expanded
 }
 
 /// Writes every built building, plus named reference meshes (linked models), as one GLB scene.
 pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
+    write_with_site(built, &[], references)
+}
+
+/// Includes separately built site geometry, preserving source parameters in node extras.
+pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObject], references: &[(String, Mesh)]) -> Vec<u8> {
     let mut w = Writer { bin: Vec::new(), views: Vec::new(), accessors: Vec::new() };
-    let materials: Vec<Value> = Material::ALL
+    let mut materials: Vec<Value> = Material::ALL
         .iter()
         .map(|m| {
             let c = m.rgba();
@@ -73,6 +163,7 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
 
     let mut meshes = Vec::new();
     let mut nodes = Vec::new();
+    let mut masonry = BTreeSet::new();
     let mut add = |w: &mut Writer, name: &str, parts: &[(Material, &Mesh)]| {
         // Merge parts that share a material into one primitive.
         let mut by_mat: BTreeMap<Material, Mesh> = BTreeMap::new();
@@ -83,20 +174,32 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             .iter()
             .filter(|(_, m)| !m.is_empty())
             .map(|(mat, mesh)| {
-                let (pa, ia) = w.mesh(mesh);
-                json!({"attributes": {"POSITION": pa}, "indices": ia, "material": mat_index(*mat)})
+                let (attributes, ia) = w.mesh(mesh, *mat);
+                if mat.masonry() {
+                    masonry.insert(*mat);
+                }
+                json!({"attributes":attributes,"indices":ia,"material":mat_index(*mat)})
             })
             .collect();
         if prims.is_empty() {
             return;
         }
         meshes.push(json!({"name": name, "primitives": prims}));
-        nodes.push(json!({"name": name, "mesh": meshes.len() - 1}));
+        nodes.push(json!({"name": name, "mesh": meshes.len() - 1,"extras":{"trigon_id":name}}));
     };
 
     for b in built {
-        for wall in &b.walls {
-            add(&mut w, &wall.id, &[(wall.finish, &wall.mesh), (Material::Plinth, &wall.plinth), (Material::Render, &wall.trim)]);
+        if let Some(terrain) = &b.terrain {
+            add(&mut w, "site.terrain", &[(Material::Ground, terrain)]);
+        }
+        for wall in b.exterior_walls() {
+            let mut parts = vec![(wall.finish, &wall.mesh), (Material::Plinth, &wall.plinth)];
+            if wall.trim_parts.is_empty() {
+                parts.push((Material::Render, &wall.trim));
+            } else {
+                parts.extend(wall.trim_parts.iter().map(|(material, mesh)| (*material, mesh)));
+            }
+            add(&mut w, &wall.id, &parts);
             let elements = wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments);
             for e in elements {
                 // What a phase tears down is drawn in translucent red, as in Revit's demolition views.
@@ -111,7 +214,23 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             add(&mut w, &s.id, &[(m, &s.mesh)]);
         }
         if let Some(r) = &b.roof {
-            add(&mut w, &r.id, &[(Material::Roof, &r.cover), (Material::Wall, &r.gables), (Material::Steel, &r.gutters)]);
+            let mut parts = vec![(Material::Roof, &r.cover), (Material::Steel, &r.gutters)];
+            if r.gable_parts.is_empty() {
+                parts.insert(1, (Material::Wall, &r.gables));
+            } else {
+                parts.extend(r.gable_parts.iter().map(|(m, mesh)| (*m, mesh)));
+            }
+            parts.extend(r.covering.iter().map(|(m, mesh)| (*m, mesh)));
+            add(&mut w, &r.id, &parts);
+            for d in &r.dormers {
+                add(&mut w, &format!("{}.roof", d.id), &[(Material::Steel, &d.roof)]);
+                add(&mut w, &format!("{}.cheeks", d.id), &[(Material::Steel, &d.cheeks)]);
+            }
+            for light in &r.rooflights {
+                let parts: Vec<_> = light.fill.parts.iter().map(|(m, mesh)| (*m, mesh)).collect();
+                add(&mut w, &light.id, &parts);
+                add(&mut w, &format!("{}.flashing", light.id), &[(Material::Steel, &light.flashing)]);
+            }
         }
         for iw in &b.interior {
             add(&mut w, &iw.id, &[(Material::Plaster, &iw.mesh)]);
@@ -124,12 +243,77 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
             add(&mut w, &st.id, &[(Material::Sill, &st.mesh), (Material::Railing, &st.railing)]);
         }
     }
+    for o in site {
+        let demolished = o.status == trigon_model::build::Status::Demolished;
+        let parts: Vec<_> = o.parts.iter().map(|(m, mesh)| (if demolished { Material::Demolished } else { *m }, mesh)).collect();
+        add(&mut w, &o.id, &parts);
+    }
     for (name, mesh) in references {
         add(&mut w, name, &[(Material::Reference, mesh)]);
     }
+    for o in site {
+        if let Some(node) = nodes.iter_mut().find(|n| n["name"] == o.id) {
+            node["extras"]["trigon_source"] = json!(o.source);
+            node["extras"]["phase_status"] = json!(o.status.name());
+            node["extras"]["exchange_classification"] = json!(format!("Trigon {} (presentation geometry)", o.class.name()));
+        }
+    }
+    for b in built {
+        if let Some(r) = &b.roof {
+            for light in &r.rooflights {
+                if let Some(node) = nodes.iter_mut().find(|n| n["name"] == light.id) {
+                    node["extras"]["ifc_class"] = json!("IfcWindow");
+                    node["extras"]["ifc_global_id"] = json!(crate::ifc::guid(&format!("trigon:{}", light.id)));
+                    node["extras"]["predefined_type"] = json!("SKYLIGHT");
+                    node["extras"]["host_roof"] = json!(r.id);
+                    node["extras"]["opening_id"] = json!(light.opening_id);
+                    node["extras"]["window_type"] = json!(light.fill.type_id);
+                    node["extras"]["quantities"] =
+                        json!({"width_mm":light.fill.width,"height_mm":light.fill.height,"opening_area_m2":light.fill.width*light.fill.height/1e6});
+                }
+                nodes.push(json!({"name":light.opening_id,"extras":{"trigon_id":light.opening_id,"ifc_class":"IfcOpeningElement","host_roof":r.id,"fill":light.id,"geometry_role":"through-roof void (negative volume)"}}));
+            }
+        }
+    }
+    // Keep all legacy indices stable and include every appended material actually referenced.
+    // Building-only legacy scenes retain their original 17-entry inventory; site scenes retain
+    // their 24-entry prefix. Additional semantic materials extend that prefix only when used.
+    let used = meshes
+        .iter()
+        .flat_map(|m| m["primitives"].as_array().into_iter().flatten())
+        .filter_map(|p| p["material"].as_u64())
+        .max()
+        .map_or(0, |i| i as usize + 1);
+    materials.truncate(used.max(if site.is_empty() { 17 } else { 24 }));
+    let (mut images, mut textures) = (Vec::new(), Vec::new());
+    for material in masonry {
+        // The infallible public writer predates textures. If encoding cannot complete, retain
+        // its existing flat material instead of emitting a broken image or texture reference.
+        let Ok(bytes) = crate::masonry_texture::png(material) else { continue };
+        let view = w.view(&bytes, None);
+        images.push(json!({"name":format!("{} masonry",material.name()),"bufferView":view,"mimeType":"image/png"}));
+        textures.push(json!({"source":images.len()-1,"sampler":0}));
+        let pbr = &mut materials[mat_index(material)]["pbrMetallicRoughness"];
+        pbr["baseColorFactor"] = json!([1.0, 1.0, 1.0, 1.0]);
+        pbr["baseColorTexture"] = json!({"index":textures.len()-1,"texCoord":0});
+        pbr["roughnessFactor"] = json!(0.92);
+    }
+    if !textures.is_empty()
+        && let Ok(bytes) = crate::masonry_texture::normal_png()
+    {
+        let view = w.view(&bytes, None);
+        images.push(json!({"name":"masonry joint relief","bufferView":view,"mimeType":"image/png"}));
+        textures.push(json!({"source":images.len()-1,"sampler":0}));
+        let normal = textures.len() - 1;
+        for material in &mut materials {
+            if material["pbrMetallicRoughness"].get("baseColorTexture").is_some() {
+                material["normalTexture"] = json!({"index":normal,"texCoord":0,"scale":1.0});
+            }
+        }
+    }
     w.align();
     let node_ids: Vec<usize> = (0..nodes.len()).collect();
-    let doc = json!({
+    let mut doc = json!({
         "asset": {"version": "2.0", "generator": concat!("Trigon ", env!("CARGO_PKG_VERSION"))},
         "scene": 0,
         "scenes": [{"nodes": node_ids}],
@@ -140,6 +324,11 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
         "bufferViews": w.views,
         "buffers": [{"byteLength": w.bin.len()}],
     });
+    if !textures.is_empty() {
+        doc["images"] = json!(images);
+        doc["textures"] = json!(textures);
+        doc["samplers"] = json!([{"magFilter":9729,"minFilter":9987,"wrapS":10497,"wrapT":10497}]);
+    }
     let mut js = doc.to_string().into_bytes();
     while !js.len().is_multiple_of(4) {
         js.push(b' ');
@@ -162,6 +351,266 @@ pub fn write(built: &[Built], references: &[(String, Mesh)]) -> Vec<u8> {
 mod tests {
     use super::*;
     use trigon_model::{Building, Document, build};
+
+    #[test]
+    fn explicit_band_finishes_export_once_without_changing_legacy_white_material_bytes() {
+        let mut doc = Document::default();
+        let mut b = Building::new("b", "Band material fixture", &[[0., 0.], [9000., 0.], [9000., 6000.], [0., 6000.]], 1, 3000.).unwrap();
+        b.facades[0].bands.push(serde_json::from_value(json!({"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0})).unwrap());
+        doc.buildings.push(b);
+        let legacy = write(&build(&doc).unwrap(), &[]);
+        doc.buildings[0].facades[0].bands[0].finish = Some(trigon_model::WallFinish::Render);
+        assert_eq!(legacy, write(&build(&doc).unwrap(), &[]), "explicit white must preserve legacy export bytes");
+        doc.buildings[0].facades[0].bands[0].finish = Some(trigon_model::WallFinish::RenderTerracotta);
+        let built = build(&doc).unwrap();
+        let (data, _) = parse(&write(&built, &[]));
+        let index = Material::ALL.iter().position(|m| *m == Material::RenderTerracotta).unwrap();
+        assert_eq!(data["materials"][index]["pbrMetallicRoughness"]["baseColorFactor"], json!(Material::RenderTerracotta.rgba()));
+        assert!(data["materials"][index]["pbrMetallicRoughness"].get("baseColorTexture").is_none());
+        let node = data["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "b.f1").unwrap();
+        let primitives = data["meshes"][node["mesh"].as_u64().unwrap() as usize]["primitives"].as_array().unwrap();
+        let triangles = primitives
+            .iter()
+            .map(|p| data["accessors"][p["indices"].as_u64().unwrap() as usize]["count"].as_u64().unwrap() as usize / 3)
+            .sum::<usize>();
+        let wall = &built[0].walls[0];
+        assert_eq!(triangles, wall.mesh.triangles.len() + wall.plinth.triangles.len() + wall.trim.triangles.len());
+        assert_eq!(primitives.iter().filter(|p| p["material"] == index).count(), 1);
+    }
+
+    #[test]
+    fn site_sources_keep_mesh_identity_required_by_rendering_exchange() {
+        let doc: Document = serde_json::from_str(include_str!("../../model/tests/fixtures/courtyard.trigon")).unwrap();
+        let built = build(&doc).unwrap();
+        let site = trigon_model::site::build(&doc, trigon_model::build::View::latest(&doc), None).unwrap();
+        assert!(!site.is_empty());
+        let bytes = write_with_site(&built, &site, &[]);
+        let (glb, _) = parse(&bytes);
+        let nodes = glb["nodes"].as_array().unwrap();
+        for node in nodes.iter().filter(|node| node.get("mesh").is_some()) {
+            assert_eq!(node["extras"]["trigon_id"], node["name"], "every mesh needs its exact source identity for FBX: {}", node["name"]);
+        }
+        for source in site {
+            let node = nodes.iter().find(|node| node["name"] == source.id).unwrap();
+            assert_eq!(node["extras"]["trigon_source"], serde_json::to_value(source.source).unwrap());
+            assert_eq!(node["extras"]["phase_status"], source.status.name());
+            assert!(node["extras"]["exchange_classification"].as_str().unwrap().contains(source.class.name()));
+        }
+    }
+
+    fn parse(bytes: &[u8]) -> (Value, &[u8]) {
+        assert_eq!(&bytes[..4], b"glTF");
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize, bytes.len());
+        let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+        assert_eq!(&bytes[24 + json_len..28 + json_len], b"BIN\0");
+        let length = u32::from_le_bytes(bytes[20 + json_len..24 + json_len].try_into().unwrap()) as usize;
+        let bin = &bytes[28 + json_len..];
+        assert_eq!(length, bin.len());
+        (value, bin)
+    }
+
+    fn view<'a>(doc: &Value, bin: &'a [u8], index: usize) -> &'a [u8] {
+        let view = &doc["bufferViews"][index];
+        let start = view["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let length = view["byteLength"].as_u64().unwrap() as usize;
+        assert_eq!(start % 4, 0);
+        &bin[start..start + length]
+    }
+
+    fn floats(doc: &Value, bin: &[u8], index: usize) -> Vec<f32> {
+        let accessor = &doc["accessors"][index];
+        assert_eq!(accessor["componentType"], 5126);
+        let bytes = view(doc, bin, accessor["bufferView"].as_u64().unwrap() as usize);
+        bytes.as_chunks::<4>().0.iter().map(|bytes| f32::from_le_bytes(*bytes)).collect()
+    }
+
+    fn positions_in_triangle_order(doc: &Value, bin: &[u8], primitive: &Value) -> Vec<[f32; 3]> {
+        let positions = floats(doc, bin, primitive["attributes"]["POSITION"].as_u64().unwrap() as usize);
+        let accessor = &doc["accessors"][primitive["indices"].as_u64().unwrap() as usize];
+        assert_eq!(accessor["componentType"], 5125);
+        view(doc, bin, accessor["bufferView"].as_u64().unwrap() as usize)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| {
+                let index = u32::from_le_bytes(*bytes) as usize;
+                [positions[index * 3], positions[index * 3 + 1], positions[index * 3 + 2]]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn per_face_masonry_uvs_preserve_shared_corners_and_physical_repeat() {
+        let mut source = Mesh::default();
+        source.quad([0.0, 0.0, 0.0], [480.0, 0.0, 0.0], [480.0, 0.0, 132.0], [0.0, 0.0, 132.0]);
+        source.quad([480.0, 0.0, 0.0], [480.0, 480.0, 0.0], [480.0, 480.0, 132.0], [480.0, 0.0, 132.0]);
+        let expanded = masonry_mesh(&source, Material::BrickYellow);
+        let (mesh, uv) = (&expanded.mesh, &expanded.uv);
+        assert_eq!(mesh.triangles.len(), source.triangles.len());
+        assert_eq!(mesh.positions.len(), source.triangles.len() * 3);
+        assert_eq!(mesh.positions.len(), uv.len());
+        assert_eq!(mesh.bounds(), source.bounds());
+        for (index, triangle) in source.triangles.iter().enumerate() {
+            for (corner, original) in triangle.iter().enumerate() {
+                assert_eq!(mesh.positions[index * 3 + corner], source.positions[*original as usize]);
+            }
+        }
+        assert_eq!((uv[1][0] - uv[0][0]).abs(), 1.0, "480 mm is one repeat along the facade");
+        assert_eq!((uv[2][1] - uv[1][1]).abs(), 1.0, "132 mm is one repeat vertically");
+        assert_eq!(mesh.positions[1], mesh.positions[6]);
+        assert_ne!(uv[1], uv[6], "a shared corner can have different per-face UVs");
+        assert!(uv.iter().flatten().all(|coordinate| coordinate.is_finite()));
+        assert_eq!(expanded.normals.len(), mesh.positions.len());
+        assert_eq!(expanded.tangents.len(), mesh.positions.len());
+        for (normal, tangent) in expanded.normals.iter().zip(&expanded.tangents) {
+            assert!((normal.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
+            assert!((tangent[..3].iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
+            assert!(normal.iter().zip(tangent).map(|(a, b)| a * b).sum::<f32>().abs() < 1e-6);
+            assert!(matches!(tangent[3], -1.0 | 1.0));
+        }
+    }
+
+    #[test]
+    fn embedded_masonry_textures_keep_nodes_geometry_and_non_masonry_materials() {
+        let mut doc = Document::default();
+        // An oblique wall also checks that UVs are derived from each original face normal.
+        doc.buildings.push(
+            Building::new("oblique", "Texture fixture", &[[1000.0, 2000.0], [9000.0, 6000.0], [5000.0, 14000.0], [-3000.0, 10000.0]], 1, 3000.0)
+                .unwrap(),
+        );
+        let mut built = build(&doc).unwrap();
+        for (wall, material) in built[0].walls.iter_mut().zip([Material::Wall, Material::BrickRed, Material::BrickYellow, Material::Render]) {
+            wall.finish = material;
+        }
+        let bytes = write(&built, &[]);
+        assert_eq!(bytes, write(&built, &[]), "portable material bytes are deterministic");
+        let (data, bin) = parse(&bytes);
+        assert_eq!(data["images"].as_array().unwrap().len(), 4, "one image per used masonry material plus one shared normal map");
+        assert_eq!(data["textures"].as_array().unwrap().len(), 4);
+        assert_eq!(data["samplers"][0]["wrapS"], 10497);
+        assert_eq!(data["samplers"][0]["wrapT"], 10497);
+        for image in data["images"].as_array().unwrap() {
+            assert!(image.get("uri").is_none());
+            assert_eq!(image["mimeType"], "image/png");
+            let index = image["bufferView"].as_u64().unwrap() as usize;
+            assert!(data["bufferViews"][index].get("target").is_none(), "image views are not vertex/index buffers");
+            let png = view(&data, bin, index);
+            let reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+            assert_eq!((reader.info().width, reader.info().height), (960, 264));
+        }
+        for wall in &built[0].walls {
+            let node = data["nodes"].as_array().unwrap().iter().find(|node| node["name"] == wall.id).unwrap();
+            let mesh = &data["meshes"][node["mesh"].as_u64().unwrap() as usize];
+            let material = Material::ALL.iter().position(|m| *m == wall.finish).unwrap();
+            let primitive = mesh["primitives"].as_array().unwrap().iter().find(|primitive| primitive["material"] == material).unwrap();
+            let actual = positions_in_triangle_order(&data, bin, primitive);
+            let expected: Vec<_> = wall
+                .mesh
+                .triangles
+                .iter()
+                .flatten()
+                .map(|index| {
+                    let p = wall.mesh.positions[*index as usize];
+                    [(p[0] / 1000.0) as f32, (p[2] / 1000.0) as f32, (-p[1] / 1000.0) as f32]
+                })
+                .collect();
+            assert_eq!(actual, expected, "{} keeps every triangle point and its winding", wall.id);
+            let pbr = &data["materials"][material]["pbrMetallicRoughness"];
+            if wall.finish.masonry() {
+                let uv = primitive["attributes"]["TEXCOORD_0"].as_u64().unwrap() as usize;
+                let position = primitive["attributes"]["POSITION"].as_u64().unwrap() as usize;
+                assert_eq!(data["accessors"][uv]["type"], "VEC2");
+                assert_eq!(data["accessors"][uv]["count"], data["accessors"][position]["count"]);
+                assert!(floats(&data, bin, uv).iter().all(|value| value.is_finite()));
+                for attribute in ["NORMAL", "TANGENT"] {
+                    let accessor = primitive["attributes"][attribute].as_u64().unwrap() as usize;
+                    assert_eq!(data["accessors"][accessor]["count"], data["accessors"][position]["count"]);
+                    assert!(floats(&data, bin, accessor).iter().all(|value| value.is_finite()));
+                }
+                assert_eq!(pbr["baseColorFactor"], json!([1.0, 1.0, 1.0, 1.0]));
+                let texture = pbr["baseColorTexture"]["index"].as_u64().unwrap() as usize;
+                assert!(data["textures"].as_array().unwrap().get(texture).is_some());
+                assert_eq!(data["materials"][material]["normalTexture"]["index"], 3);
+                assert_eq!(data["materials"][material]["normalTexture"]["scale"], 1.0);
+            } else {
+                assert!(primitive["attributes"].get("TEXCOORD_0").is_none());
+                assert!(pbr.get("baseColorTexture").is_none());
+                assert_eq!(pbr["baseColorFactor"], json!(wall.finish.rgba()));
+            }
+        }
+        let glass = Material::ALL.iter().position(|material| *material == Material::Glass).unwrap();
+        assert_eq!(data["materials"][glass]["alphaMode"], "BLEND");
+        assert_eq!(data["materials"][glass]["pbrMetallicRoughness"]["baseColorFactor"], json!(Material::Glass.rgba()));
+    }
+
+    #[test]
+    fn non_masonry_only_exports_have_no_image_or_texture_requirements() {
+        let mut reference = Mesh::default();
+        reference.quad([0.0, 0.0, 0.0], [1000.0, 0.0, 0.0], [1000.0, 1000.0, 0.0], [0.0, 1000.0, 0.0]);
+        let bytes = write(&[], &[("reference".into(), reference)]);
+        let (doc, _) = parse(&bytes);
+        for key in ["images", "textures", "samplers"] {
+            assert!(doc.get(key).is_none());
+        }
+        assert_eq!(doc["nodes"][0]["name"], "reference");
+        assert!(doc["meshes"][0]["primitives"][0]["attributes"].get("TEXCOORD_0").is_none());
+    }
+
+    #[test]
+    fn appended_materials_keep_legacy_indices_and_every_primitive_reference_valid() {
+        let mut legacy = Document::default();
+        legacy.buildings.push(Building::new("b", "Legacy palette", &[[0., 0.], [9000., 0.], [9000., 8000.], [0., 8000.]], 1, 3000.).unwrap());
+        let bytes = write(&build(&legacy).unwrap(), &[]);
+        assert_eq!(parse(&bytes).0["materials"].as_array().unwrap().len(), 17);
+        let mut doc = crate::ifc::sample::document().unwrap();
+        for ty in &mut doc.types {
+            if let trigon_model::ComponentKind::SteelBalcony { finish, .. } = &mut ty.kind {
+                *finish = trigon_model::component::Finish::White;
+            }
+        }
+        let bytes = write(&build(&doc).unwrap(), &[]);
+        let (json, _) = parse(&bytes);
+        let materials = json["materials"].as_array().unwrap();
+        let legacy_names = [
+            "wall",
+            "slab",
+            "roof",
+            "frame",
+            "glass",
+            "door",
+            "sill",
+            "railing",
+            "reference",
+            "steel",
+            "deck",
+            "demolished",
+            "plinth",
+            "plaster",
+            "render",
+            "brick_red",
+            "brick_yellow",
+            "paving",
+            "gravel",
+            "grass",
+            "bark",
+            "foliage",
+            "soil",
+            "planter",
+        ];
+        for (index, name) in legacy_names.into_iter().enumerate() {
+            assert_eq!(materials[index]["name"], name);
+        }
+        assert_eq!(materials[24]["name"], "steel_white");
+        assert_eq!(materials[25]["name"], "gasket");
+        assert_eq!(materials[24]["pbrMetallicRoughness"]["baseColorFactor"], materials[3]["pbrMetallicRoughness"]["baseColorFactor"]);
+        assert_eq!(materials[25]["pbrMetallicRoughness"]["baseColorFactor"], materials[7]["pbrMetallicRoughness"]["baseColorFactor"]);
+        let primitives: Vec<_> = json["meshes"].as_array().unwrap().iter().flat_map(|m| m["primitives"].as_array().unwrap()).collect();
+        assert!(primitives.iter().all(|p| p["material"].as_u64().unwrap() < materials.len() as u64));
+        for material in [24, 25] {
+            assert!(primitives.iter().any(|p| p["material"] == material));
+        }
+    }
 
     #[test]
     fn glb_header_and_json_are_consistent() {

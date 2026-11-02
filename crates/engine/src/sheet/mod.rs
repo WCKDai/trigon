@@ -4,10 +4,118 @@
 //! feeds the PNG and PDF output) and DXF.
 
 pub(crate) mod cut;
+pub(crate) mod display;
 pub(crate) mod dxf;
 pub(crate) mod project;
 pub(crate) mod style;
 pub(crate) mod svg;
+
+use crate::views::{DrawingElementKind, DrawingElementSegment};
+
+#[derive(Clone, Debug)]
+pub(crate) struct Element {
+    pub(crate) id: String,
+    pub(crate) kind: DrawingElementKind,
+}
+
+impl Element {
+    pub(crate) fn new(id: &str, kind: DrawingElementKind) -> Self {
+        Self { id: id.into(), kind }
+    }
+
+    pub(crate) fn segment(&self, segment: [[f64; 2]; 2]) -> DrawingElementSegment {
+        DrawingElementSegment { id: self.id.clone(), kind: self.kind, segment }
+    }
+}
+
+#[inline]
+pub(crate) fn overlap<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; DIM]; 2], epsilon: f64) -> Option<[[f64; DIM]; 2]> {
+    // Most ownership candidates are on unrelated parts of the drawing. Reject disjoint bounds
+    // before doing the exact collinearity/interval arithmetic. Include its perpendicular
+    // tolerance and a few ULPs at the existing 1e8 mm coordinate limit. Keep this cheap
+    // rejection inline in the many ownership-attribution loops; the exact predicate is below.
+    let pad = epsilon.abs() + 1e-7;
+    if (0..DIM).any(|axis| {
+        drawn[0][axis].min(drawn[1][axis]) > source[0][axis].max(source[1][axis]) + pad
+            || source[0][axis].min(source[1][axis]) > drawn[0][axis].max(drawn[1][axis]) + pad
+    }) {
+        return None;
+    }
+    overlap_exact(drawn, source, epsilon)
+}
+
+fn overlap_exact<const DIM: usize>(drawn: [[f64; DIM]; 2], source: [[f64; DIM]; 2], epsilon: f64) -> Option<[[f64; DIM]; 2]> {
+    if drawn.iter().chain(source.iter()).flatten().any(|value| !value.is_finite() || value.abs() > 1e8) {
+        return None;
+    }
+    let direction: [f64; DIM] = std::array::from_fn(|axis| drawn[1][axis] - drawn[0][axis]);
+    let length2: f64 = direction.iter().map(|value| value * value).sum();
+    if length2 <= 1e-16 {
+        return None;
+    }
+    let parameters = source.map(|point| (0..DIM).map(|axis| (point[axis] - drawn[0][axis]) * direction[axis]).sum::<f64>() / length2);
+    for (point, parameter) in source.iter().zip(parameters) {
+        let distance2: f64 = (0..DIM).map(|axis| (point[axis] - drawn[0][axis] - parameter * direction[axis]).powi(2)).sum();
+        if distance2 > epsilon * epsilon {
+            return None;
+        }
+    }
+    let start = parameters[0].min(parameters[1]).max(0.0);
+    let end = parameters[0].max(parameters[1]).min(1.0);
+    if end <= start || (end - start) * length2.sqrt() <= 1e-8 {
+        return None;
+    }
+    Some([start, end].map(|parameter| std::array::from_fn(|axis| drawn[0][axis] + parameter * direction[axis])))
+}
+
+/// The shared presentation scene, used both by file exports and live drafting workspaces.
+#[derive(Clone)]
+pub(crate) struct Sheet {
+    pub(crate) scene: Scene,
+    pub(crate) vp: Viewport,
+    pub(crate) clip: [f64; 4],
+    pub(crate) title: String,
+    pub(crate) project: String,
+    pub(crate) caption: String,
+    pub(crate) note: Option<String>,
+    pub(crate) metrics: serde_json::Value,
+}
+
+impl Sheet {
+    pub(crate) fn svg(&self) -> String {
+        svg::sheet(
+            &svg::Frame { title: &self.title, project: &self.project, caption: &self.caption, footer: &self.title, note: self.note.clone() },
+            &self.scene,
+            &self.vp,
+            self.clip,
+        )
+    }
+
+    pub(crate) fn write(&self, path: std::path::PathBuf) -> crate::Result<serde_json::Value> {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
+        let mut result = self.metrics.clone();
+        result["written"] = serde_json::json!(path);
+        let bytes = match ext {
+            "dxf" => {
+                let text = dxf::write(
+                    &self.scene,
+                    &dxf::TitleBlock { title: &self.title, project: &self.project, caption: &self.caption, note: self.note.clone() },
+                );
+                result["dxf"] = dxf::summary(&text);
+                dxf::bytes(&text)
+            }
+            "svg" => self.svg().into_bytes(),
+            "png" => crate::plan_output::png(&self.svg())?,
+            "pdf" => crate::plan_output::pdf(&[self.svg()], PAGE_MM)?,
+            _ => return Err(trigon_model::ModelError::Invalid("use .pdf, .png, .svg or .dxf for a drawing view".into()).into()),
+        };
+        crate::plan::write_output(&path, &bytes)?;
+        if ext == "png" {
+            result["image_path"] = serde_json::json!(path);
+        }
+        Ok(result)
+    }
+}
 
 /// The 1600 × 900 px sheet prints as 338.67 × 190.5 mm (96 dpi).
 pub(crate) const PAGE_MM: [f64; 2] = [338.666_666_7, 190.5];
@@ -120,11 +228,16 @@ pub(crate) struct Stroke {
     pub(crate) pen: f64,
     pub(crate) colour: Rgb,
     pub(crate) dashed: bool,
+    pub(crate) pattern: trigon_model::annotation::LinePattern,
 }
 
 impl Stroke {
+    pub(crate) fn pattern(&self) -> trigon_model::annotation::LinePattern {
+        if self.dashed { trigon_model::annotation::LinePattern::Dashed } else { self.pattern }
+    }
+
     pub(crate) fn new(pen: f64) -> Self {
-        Stroke { pen, colour: INK, dashed: false }
+        Stroke { pen, colour: INK, dashed: false, pattern: Default::default() }
     }
 }
 
@@ -133,8 +246,6 @@ pub(crate) enum Fill {
     Solid(Rgb),
     /// Masonry: 45° lines over white.
     Masonry,
-    /// A stair core: dots over near-white.
-    Dots,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -145,6 +256,27 @@ pub(crate) struct Path {
     pub(crate) closed: bool,
     pub(crate) fill: Option<Fill>,
     pub(crate) stroke: Option<Stroke>,
+    pub(crate) element_segments: Vec<DrawingElementSegment>,
+}
+
+impl Path {
+    pub(crate) fn segments(&self) -> impl Iterator<Item = [[f64; 2]; 2]> + '_ {
+        self.rings.iter().flat_map(|ring| {
+            ring.windows(2).map(|pair| [pair[0], pair[1]]).chain((self.closed && ring.len() > 2).then(|| [ring[ring.len() - 1], ring[0]]))
+        })
+    }
+
+    pub(crate) fn attribute<'a>(&mut self, sources: impl Iterator<Item = &'a DrawingElementSegment> + Clone) {
+        let elements: Vec<_> = self
+            .segments()
+            .flat_map(|drawn| {
+                sources
+                    .clone()
+                    .filter_map(move |source| overlap(drawn, source.segment, 0.5).map(|segment| DrawingElementSegment { segment, ..source.clone() }))
+            })
+            .collect();
+        self.element_segments.extend(elements);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +295,21 @@ pub(crate) enum Halo {
     Box,
 }
 
+/// Transient source ownership for lettering diagnostics. Never persisted or exported as SVG attributes.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct TextSource {
+    pub(crate) kind: &'static str,
+    pub(crate) id: String,
+    pub(crate) role: &'static str,
+}
+
+/// A generated label's known dimension line. Transient layout data, never serialized.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TextClearance {
+    pub(crate) anchor: [f64; 2],
+    pub(crate) outward: [f64; 2],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Text {
     pub(crate) layer: Layer,
@@ -177,11 +324,28 @@ pub(crate) struct Text {
     pub(crate) middle: bool,
     pub(crate) colour: Rgb,
     pub(crate) halo: Halo,
+    pub(crate) style: trigon_model::annotation::TextStyle,
+    /// Stable source/role for read-only diagnostics, not SVG attributes or document data.
+    pub(crate) source: Option<TextSource>,
+    pub(crate) clearance: Option<TextClearance>,
 }
 
 impl Text {
     pub(crate) fn new(layer: Layer, at: [f64; 2], text: impl Into<String>, size: f64) -> Self {
-        Text { layer, at, text: text.into(), size, deg: 0.0, anchor: Anchor::Middle, middle: true, colour: LETTERING, halo: Halo::None }
+        Text {
+            layer,
+            at,
+            text: text.into(),
+            size,
+            deg: 0.0,
+            anchor: Anchor::Middle,
+            middle: true,
+            colour: LETTERING,
+            halo: Halo::None,
+            style: Default::default(),
+            source: None,
+            clearance: None,
+        }
     }
 }
 
@@ -196,27 +360,52 @@ pub(crate) enum Item {
 pub(crate) struct Scene {
     pub(crate) scale: f64,
     pub(crate) items: Vec<Item>,
+    pub(crate) element_regions: Vec<crate::views::DrawingElementRegion>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATTRIBUTION_SOURCE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Scene {
     pub(crate) fn new(scale: f64) -> Self {
-        Scene { scale, items: Vec::new() }
+        Scene { scale, items: Vec::new(), element_regions: Vec::new() }
     }
 
     pub(crate) fn polygon(&mut self, layer: Layer, rings: Vec<Vec<[f64; 2]>>, fill: Option<Fill>, stroke: Option<Stroke>) {
         if !rings.is_empty() {
-            self.items.push(Item::Path(Path { layer, rings, closed: true, fill, stroke }));
+            self.items.push(Item::Path(Path { layer, rings, closed: true, fill, stroke, element_segments: Vec::new() }));
         }
     }
 
     pub(crate) fn polyline(&mut self, layer: Layer, points: Vec<[f64; 2]>, stroke: Stroke) {
         if points.len() >= 2 {
-            self.items.push(Item::Path(Path { layer, rings: vec![points], closed: false, fill: None, stroke: Some(stroke) }));
+            self.items.push(Item::Path(Path {
+                layer,
+                rings: vec![points],
+                closed: false,
+                fill: None,
+                stroke: Some(stroke),
+                element_segments: Vec::new(),
+            }));
         }
     }
 
     pub(crate) fn line(&mut self, layer: Layer, a: [f64; 2], b: [f64; 2], stroke: Stroke) {
         self.polyline(layer, vec![a, b], stroke);
+    }
+
+    pub(crate) fn attribute_last(&mut self, sources: &[DrawingElementSegment]) {
+        self.attribute_last_from(sources.iter());
+    }
+
+    pub(crate) fn attribute_last_from<'a>(&mut self, sources: impl ExactSizeIterator<Item = &'a DrawingElementSegment> + Clone) {
+        if let Some(Item::Path(path)) = self.items.last_mut() {
+            #[cfg(test)]
+            ATTRIBUTION_SOURCE_VISITS.with(|count| count.set(count.get() + sources.len()));
+            path.attribute(sources);
+        }
     }
 
     pub(crate) fn text(&mut self, t: Text) {
@@ -241,6 +430,15 @@ impl Scene {
     /// Keeps what lies inside `rect` (`[x0, y0, x1, y1]`): rings are clipped as areas, polylines as
     /// lines. Texts are kept as they are.
     pub(crate) fn clip(&mut self, rect: [f64; 4]) {
+        let [x0, y0, x1, y1] = rect.map(|v| v.clamp(-1e8, 1e8));
+        let clip = vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+        self.element_regions = self
+            .element_regions
+            .iter()
+            .flat_map(|region| {
+                cut::intersect_rings(&region.rings, &clip).into_iter().map(|rings| crate::views::DrawingElementRegion { rings, ..region.clone() })
+            })
+            .collect();
         let items = std::mem::take(&mut self.items);
         for item in items {
             match item {
@@ -400,6 +598,32 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_broad_phase_preserves_exact_clipping_at_tolerance_and_coordinate_limits() {
+        for origin in [[0.0; 3], [-25000.0, 40000.0, 1200.0], [99_999_000.0; 3]] {
+            for direction in [[0.0, 10.0, 0.0], [10.0, 0.0, 0.0], [0.0, 0.0, 10.0], [10.0, -10.0, 10.0]] {
+                let at = |t: f64, offset: [f64; 3]| std::array::from_fn(|axis| origin[axis] + direction[axis] * t + offset[axis]);
+                for reverse in [false, true] {
+                    let drawn = if reverse { [at(1.0, [0.0; 3]), origin] } else { [origin, at(1.0, [0.0; 3])] };
+                    for (start, end) in [(-1.0, 2.0), (-0.2, 0.3), (0.0, 1.0), (0.2, 0.8), (0.9, 1.2), (1.1, 2.0)] {
+                        for offset in [[0.0; 3], [0.099, 0.0, 0.0], [0.0, -0.099, 0.0], [0.0, 0.0, 0.099], [0.2; 3]] {
+                            let source = [at(start, offset), at(end, offset)];
+                            assert_eq!(overlap(drawn, source, 0.1), overlap_exact(drawn, source, 0.1));
+                            assert_eq!(
+                                overlap(drawn.map(|p| [p[0], p[1]]), source.map(|p| [p[0], p[1]]), 0.5),
+                                overlap_exact(drawn.map(|p| [p[0], p[1]]), source.map(|p| [p[0], p[1]]), 0.5)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for bad in [f64::NAN, f64::INFINITY, 1e300] {
+            let a = [[bad, 0.0], [0.0, 1.0]];
+            assert_eq!(overlap(a, [[0.0, 0.0], [1.0, 1.0]], 0.1), None);
+        }
+    }
 
     #[test]
     fn scales_round_up_to_a_standard_one() {

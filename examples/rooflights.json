@@ -1,0 +1,33 @@
+[
+  {
+    "command": "building.add",
+    "params": {
+      "id": "b",
+      "name": "Synthetic inclined rooflight",
+      "footprint": [[0, 0], [24000, 0], [24000, 12000], [0, 12000]],
+      "storeys": 3,
+      "storey_height_mm": 3400
+    }
+  },
+  {
+    "command": "building.set_roof",
+    "params": {"kind": "pitched", "pitch_deg": 46, "thickness_mm": 220}
+  },
+  {
+    "command": "rooflight.add",
+    "params": {
+      "building": "b",
+      "rooflight": {
+        "id": "light",
+        "facade": "b.f1",
+        "u_mm": 10000,
+        "run_mm": 500,
+        "window_type": "window.casement.2",
+        "width_mm": 800,
+        "height_mm": 1000,
+        "stand_off_mm": 100,
+        "flashing_mm": 100
+      }
+    }
+  }
+]

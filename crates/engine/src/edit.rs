@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use trigon_model::build::FacadeFrame;
 use trigon_model::doc::{InteriorWall, Room, Stair};
@@ -15,7 +15,7 @@ use crate::{Result, Session};
 const MAX_TARGETS: usize = 256;
 const MAX_COPIES: usize = 5000;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Selection {
     /// Studio element ids, or wall:<id>, stair:<id>, room:<id> for every storey of a definition.
@@ -23,7 +23,7 @@ pub(crate) struct Selection {
     pub targets: Vec<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Move {
     pub targets: Vec<String>,
@@ -32,7 +32,7 @@ pub(crate) struct Move {
     pub delta: [f64; 3],
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Copy {
     pub targets: Vec<String>,
@@ -46,7 +46,7 @@ fn one() -> usize {
     1
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CopyToLevels {
     pub targets: Vec<String>,
@@ -57,7 +57,7 @@ pub(crate) struct CopyToLevels {
     pub replace: bool,
 }
 
-#[derive(Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Axis {
     X,
@@ -66,7 +66,7 @@ pub(crate) enum Axis {
     Z,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Anchor {
     Start,
@@ -75,7 +75,7 @@ pub(crate) enum Anchor {
     End,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Align {
     pub targets: Vec<String>,
@@ -90,12 +90,45 @@ pub(crate) struct Align {
     pub anchor: Anchor,
 }
 
+#[derive(Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WallFace {
+    #[default]
+    Center,
+    /// Left of the wall's source A-to-B direction.
+    Left,
+    /// Right of the wall's source A-to-B direction.
+    Right,
+}
+
+impl WallFace {
+    fn sign(self) -> f64 {
+        match self {
+            Self::Center => 0.0,
+            Self::Left => 1.0,
+            Self::Right => -1.0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AlignWalls {
+    pub targets: Vec<String>,
+    /// One interior wall or displayed storey occurrence. It remains unchanged.
+    pub reference: String,
+    #[serde(default)]
+    pub reference_face: WallFace,
+    #[serde(default)]
+    pub target_face: WallFace,
+}
+
 fn invalid(message: impl Into<String>) -> crate::EngineError {
     ModelError::Invalid(message.into()).into()
 }
 
 #[derive(Clone, PartialEq)]
-enum Item {
+pub(crate) enum Item {
     Wall(InteriorWall),
     Stair(Stair),
     Room(Room),
@@ -251,6 +284,10 @@ impl Entry {
 }
 
 fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
+    selected_at(doc, targets, doc.active_index())
+}
+
+fn selected_at(doc: &Document, targets: &[String], phase: usize) -> Result<Vec<Entry>> {
     if targets.len() > MAX_TARGETS {
         return Err(invalid("select at most 256 elements"));
     }
@@ -297,7 +334,12 @@ fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
                 };
                 let root = original.id();
                 let all = target == root || target == &format!("{kind}:{root}");
-                let level = target.strip_prefix(&format!("{root}.L")).and_then(|s| s.parse::<usize>().ok());
+                // Only rooms accept the IFC-compatible display alias. Do not reinterpret an
+                // actual wall/stair source whose own id happens to end with ".space".
+                let level = target
+                    .strip_prefix(&format!("{root}.L"))
+                    .or_else(|| if matches!(original, Item::Room(_)) { target.strip_prefix(&format!("{root}.space.L")) } else { None })
+                    .and_then(|s| s.parse::<usize>().ok());
                 if all || level.is_some_and(|l| original.levels().contains(&l)) {
                     let mut item = original.clone();
                     if !all && let Some(l) = level {
@@ -315,7 +357,7 @@ fn selected(doc: &Document, targets: &[String]) -> Result<Vec<Entry>> {
                 for (i, p) in f.placements.iter().enumerate() {
                     let hit = exact == Some(i)
                         || native.is_some_and(|(l, bay, attachment)| {
-                            let active = doc.lifetime(p).is_ok_and(|(c, d)| c <= doc.active_index() && doc.active_index() < d);
+                            let active = doc.lifetime(p).is_ok_and(|(c, d)| c <= phase && phase < d);
                             p.level == l && p.bay == bay && active && doc.component(&p.type_id).is_ok_and(|t| t.kind.is_opening() != attachment)
                         });
                     if hit {
@@ -396,7 +438,53 @@ pub(crate) fn list_groups(s: &Session) -> Value {
     }).collect::<Vec<_>>()})
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Rebase only resolved storey occurrences of the selected building. Definition and indexed
+/// placement handles keep their source identity; inactive occurrences resolve in their phase.
+pub(crate) fn basement_group_targets(doc: &Document, building: usize) -> Result<Vec<Vec<String>>> {
+    doc.groups
+        .iter()
+        .map(|group| {
+            group
+                .targets
+                .iter()
+                .map(|target| {
+                    let mut phases = std::iter::once(doc.active_index()).chain((0..doc.phases.len()).filter(|&p| p != doc.active_index()));
+                    let Some(mut entry) =
+                        phases.find_map(|phase| selected_at(doc, std::slice::from_ref(target), phase).ok().and_then(|mut v| v.pop()))
+                    else {
+                        return Ok(target.clone()); // Preserve already-stale or ambiguous references.
+                    };
+                    if entry.building != building {
+                        return Ok(target.clone());
+                    }
+                    let root = entry.original.id();
+                    let room_alias = matches!(entry.original, Item::Room(_)) && target.starts_with(&format!("{root}.space.L"));
+                    let occurrence = if matches!(entry.original, Item::Placement(_)) {
+                        entry.facade.as_ref().is_some_and(|id| target.starts_with(&format!("{id}.L")))
+                    } else {
+                        target.strip_prefix(&format!("{root}.L")).and_then(|v| v.parse::<usize>().ok()).is_some() || room_alias
+                    };
+                    if !occurrence {
+                        return Ok(target.clone());
+                    }
+                    let levels = entry
+                        .item
+                        .levels()
+                        .into_iter()
+                        .map(|level| level.checked_add(1).ok_or_else(|| invalid("group storey reference overflows")))
+                        .collect::<Result<Vec<_>>>()?;
+                    if room_alias {
+                        return Ok(format!("{root}.space.L{}", levels.first().copied().unwrap_or(0)));
+                    }
+                    entry.item.set_levels(levels);
+                    handle(doc, &entry)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupId {
     pub id: String,
@@ -408,7 +496,23 @@ pub(crate) fn remove_group(s: &mut Session, p: GroupId) -> Result<Value> {
     Ok(json!({"removed":p.id}))
 }
 
-fn remap_groups(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
+fn remap_references(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
+    let base = next.split_once(':').map(|(_, s)| s).or_else(|| next.rsplit_once(".L").map(|(s, _)| s)).unwrap_or(next);
+    if let Item::Stair(stair) = &entry.item
+        && let Some(building) = doc.buildings.get_mut(entry.building)
+    {
+        for entrance in &mut building.entrances {
+            for &level in &stair.levels {
+                if entrance.stair_at(level) == Some(entry.original.id()) {
+                    if entrance.stair.as_deref() == Some(base) {
+                        entrance.stair_by_level.remove(&level);
+                    } else {
+                        entrance.stair_by_level.insert(level, base.to_string());
+                    }
+                }
+            }
+        }
+    }
     if matches!(entry.item, Item::Placement(_)) {
         return;
     }
@@ -419,7 +523,6 @@ fn remap_groups(doc: &mut Document, entry: &Entry, next: &str, shared: bool) {
         Item::Placement(_) => "placement",
     };
     let all = format!("{kind}:{}", entry.original.id());
-    let base = next.split_once(':').map(|(_, s)| s).or_else(|| next.rsplit_once(".L").map(|(s, _)| s)).unwrap_or(next);
     let levels = entry.item.levels();
     for group in &mut doc.groups {
         let mut add = false;
@@ -556,10 +659,46 @@ pub(crate) fn move_elements(s: &mut Session, p: Move) -> Result<Value> {
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
         let next = put(&mut s.doc, entry, item, shared, false, false)?;
-        remap_groups(&mut s.doc, entry, &next, shared);
+        remap_references(&mut s.doc, entry, &next, shared);
         ids.push(next);
     }
     finish(s, ids)
+}
+
+/// Change one source/storey instance without nesting a journal entry. The outer command owns
+/// atomic validation; shared definitions split exactly as precise moves do, including groups.
+pub(crate) fn update_parameters(doc: &mut Document, target: &str, update: impl FnOnce(&mut Item) -> Result<()>) -> Result<String> {
+    let mut entries = selected(doc, &[target.to_string()])?;
+    let entry = entries.pop().ok_or_else(|| invalid("missing source selection"))?;
+    let mut item = entry.item.clone();
+    update(&mut item)?;
+    // Replacing a whole definition must keep its position: unnamed sibling definitions derive
+    // their displayed IDs from their source indices. Shared definitions stay in place when split.
+    if !matches!(item, Item::Placement(_)) && entry.original.levels().iter().all(|l| entry.item.levels().contains(l)) {
+        let b = doc.buildings.get_mut(entry.building).ok_or_else(|| invalid("missing building"))?;
+        let id = item.id().to_string();
+        let levels = item.levels();
+        match (&entry.original, item) {
+            (Item::Wall(old), Item::Wall(value)) => {
+                *b.interior_walls.iter_mut().find(|source| *source == old).ok_or_else(|| invalid("source wall changed"))? = value
+            }
+            (Item::Stair(old), Item::Stair(value)) => {
+                *b.stairs.iter_mut().find(|source| *source == old).ok_or_else(|| invalid("source stair changed"))? = value
+            }
+            (Item::Room(old), Item::Room(value)) => {
+                *b.rooms.iter_mut().find(|source| *source == old).ok_or_else(|| invalid("source room changed"))? = value
+            }
+            _ => return Err(invalid("source kind changed")),
+        }
+        let level = levels.first().copied().ok_or_else(|| invalid("missing source storey"))?;
+        let next = format!("{id}.L{level}");
+        remap_references(doc, &entry, &next, false);
+        return Ok(next);
+    }
+    let shared = remove(doc, &entry)?;
+    let next = put(doc, &entry, item, shared, false, false)?;
+    remap_references(doc, &entry, &next, shared);
+    Ok(next)
 }
 
 pub(crate) fn copy_elements(s: &mut Session, p: Copy) -> Result<Value> {
@@ -671,12 +810,25 @@ pub(crate) fn copy_to_levels(s: &mut Session, mut p: CopyToLevels) -> Result<Val
             }
             let next = put(&mut s.doc, &entry, item, true, false, true)?;
             for (replaced, shared) in replacements {
-                remap_groups(&mut s.doc, &replaced, &next, shared);
+                remap_references(&mut s.doc, &replaced, &next, shared);
             }
             ids.push(next);
         }
     }
+    for building in &mut s.doc.buildings {
+        prune_entrance_stairs(building);
+    }
     finish(s, ids)
+}
+
+/// Drop dangling associations without removing physical entrances or their unit registers.
+fn prune_entrance_stairs(b: &mut trigon_model::Building) {
+    for entrance in &mut b.entrances {
+        entrance.stair_by_level.retain(|level, id| b.stairs.iter().any(|s| &s.id == id && s.levels.contains(level)));
+        if entrance.stair.as_ref().is_some_and(|id| !b.stairs.iter().any(|s| &s.id == id)) {
+            entrance.stair = None;
+        }
+    }
 }
 
 pub(crate) fn delete(s: &mut Session, p: Selection) -> Result<Value> {
@@ -692,11 +844,7 @@ pub(crate) fn delete(s: &mut Session, p: Selection) -> Result<Value> {
     }
     s.doc.groups.retain(|g| !g.targets.is_empty());
     for b in &mut s.doc.buildings {
-        for entrance in &mut b.entrances {
-            if entrance.stair.as_ref().is_some_and(|id| !b.stairs.iter().any(|s| &s.id == id)) {
-                entrance.stair = None;
-            }
-        }
+        prune_entrance_stairs(b);
     }
     trigon_model::build(&s.doc)?;
     Ok(json!({"deleted":deleted}))
@@ -708,6 +856,64 @@ fn anchor_value((lo, hi): (f64, f64), anchor: Anchor) -> f64 {
         Anchor::Center => (lo + hi) / 2.0,
         Anchor::End => hi,
     }
+}
+
+/// Align nearly parallel walls rigidly, retaining door distances from A and run lengths.
+/// Unlike bounding-box alignment, both endpoints end on the same reference line/face.
+pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
+    let entries = selected(&s.doc, &p.targets)?;
+    let mut references = selected(&s.doc, std::slice::from_ref(&p.reference))?;
+    if references.len() != 1 {
+        return Err(invalid("wall alignment needs one reference wall"));
+    }
+    let reference = references.pop().ok_or_else(|| invalid("missing reference wall"))?;
+    let Item::Wall(wall) = &reference.item else { return Err(invalid("the alignment reference must be an interior wall")) };
+    for value in wall.a.into_iter().chain(wall.b) {
+        checked("reference coordinate", value, -1e8, 1e8)?;
+    }
+    checked("reference thickness", wall.thickness, 40.0, 1000.0)?;
+    let length = checked("reference wall length", (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]), 100.0, 200_000.0)?;
+    let t = [(wall.b[0] - wall.a[0]) / length, (wall.b[1] - wall.a[1]) / length];
+    let normal = [-t[1], t[0]];
+    let reference_offset = wall.a[0] * normal[0] + wall.a[1] * normal[1] + p.reference_face.sign() * wall.thickness / 2.0;
+    let mut changes = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let Item::Wall(wall) = &entry.item else { return Err(invalid("wall alignment targets must all be interior walls")) };
+        if entry.building == reference.building
+            && entry.original.id() == reference.original.id()
+            && wall.levels.iter().any(|level| reference.item.levels().contains(level))
+        {
+            return Err(invalid("the reference wall cannot also be a target on the same storey"));
+        }
+        for value in wall.a.into_iter().chain(wall.b) {
+            checked("target coordinate", value, -1e8, 1e8)?;
+        }
+        checked("target thickness", wall.thickness, 40.0, 1000.0)?;
+        let length = checked("target wall length", (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]), 100.0, 200_000.0)?;
+        let dot = ((wall.b[0] - wall.a[0]) * t[0] + (wall.b[1] - wall.a[1]) * t[1]) / length;
+        if dot.abs() < 15.0_f64.to_radians().cos() {
+            return Err(invalid("wall alignment needs directions within 15 degrees; use the wall properties to change other angles"));
+        }
+        let direction = if dot < 0.0 { -1.0 } else { 1.0 };
+        let target_offset = reference_offset - p.target_face.sign() * direction * wall.thickness / 2.0;
+        let mid = [(wall.a[0] + wall.b[0]) / 2.0, (wall.a[1] + wall.b[1]) / 2.0];
+        let shift = target_offset - mid[0] * normal[0] - mid[1] * normal[1];
+        let mid = [mid[0] + normal[0] * shift, mid[1] + normal[1] * shift];
+        let mut aligned = wall.clone();
+        for k in 0..2 {
+            aligned.a[k] = checked("aligned wall endpoint", mid[k] - direction * t[k] * length / 2.0, -1e8, 1e8)?;
+            aligned.b[k] = checked("aligned wall endpoint", mid[k] + direction * t[k] * length / 2.0, -1e8, 1e8)?;
+        }
+        changes.push(Item::Wall(aligned));
+    }
+    let mut ids = Vec::with_capacity(entries.len());
+    for (entry, item) in entries.iter().zip(changes) {
+        let shared = remove(&mut s.doc, entry)?;
+        let next = put(&mut s.doc, entry, item, shared, false, false)?;
+        remap_references(&mut s.doc, entry, &next, shared);
+        ids.push(next);
+    }
+    finish(s, ids)
 }
 
 pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {
@@ -766,7 +972,91 @@ pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {
     for (entry, item) in entries.iter().zip(changes) {
         let shared = remove(&mut s.doc, entry)?;
         let next = put(&mut s.doc, entry, item, shared, false, false)?;
-        remap_groups(&mut s.doc, entry, &next, shared);
+        remap_references(&mut s.doc, entry, &next, shared);
+        ids.push(next);
+    }
+    finish(s, ids)
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WallEndpoint {
+    /// Exact wall source selector or storey occurrence, never a nearest-ID guess.
+    pub target: String,
+    pub end: WallEnd,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WallEnd {
+    A,
+    B,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConnectWalls {
+    pub endpoints: Vec<WallEndpoint>,
+    /// Explicit common centre-line junction, site-local mm.
+    pub junction: [f64; 2],
+    /// Maximum displacement of each selected source endpoint, mm (0.001..300).
+    pub max_move_mm: f64,
+}
+
+pub(crate) fn connect_walls(s: &mut Session, mut p: ConnectWalls) -> Result<Value> {
+    checked("junction tolerance", p.max_move_mm, 0.001, 300.0)?;
+    for value in p.junction {
+        checked("junction coordinate", value, -1e8, 1e8)?;
+    }
+    if !(2..=16).contains(&p.endpoints.len()) {
+        return Err(invalid("connect 2 to 16 distinct wall endpoints"));
+    }
+    p.endpoints.sort_by(|a, b| a.target.cmp(&b.target));
+    if p.endpoints.iter().any(|e| e.target.starts_with("group:")) || p.endpoints.windows(2).any(|w| w[0].target == w[1].target) {
+        return Err(invalid("select distinct wall sources directly, not groups"));
+    }
+    let targets: Vec<_> = p.endpoints.iter().map(|e| e.target.clone()).collect();
+    let entries = selected(&s.doc, &targets)?;
+    let mut levels = None;
+    let mut changes = Vec::new();
+    for (entry, endpoint) in entries.iter().zip(&p.endpoints) {
+        let Item::Wall(wall) = &entry.item else {
+            return Err(invalid("junction targets must be interior walls"));
+        };
+        let scope = (entry.building, wall.levels.iter().copied().collect::<BTreeSet<_>>());
+        if levels.as_ref().is_some_and(|old| old != &scope) {
+            return Err(invalid("junction endpoints must belong to the same building and storeys"));
+        }
+        levels = Some(scope);
+        let at = match endpoint.end {
+            WallEnd::A => wall.a,
+            WallEnd::B => wall.b,
+        };
+        checked("junction endpoint movement", (at[0] - p.junction[0]).hypot(at[1] - p.junction[1]), 0.0, p.max_move_mm)?;
+        let mut next = wall.clone();
+        match endpoint.end {
+            WallEnd::A => next.a = p.junction,
+            WallEnd::B => next.b = p.junction,
+        };
+        let old_len = (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]);
+        let new_len = checked("connected wall length", (next.b[0] - next.a[0]).hypot(next.b[1] - next.a[1]), 100.0, 200_000.0)?;
+        let t = [(next.b[0] - next.a[0]) / new_len, (next.b[1] - next.a[1]) / new_len];
+        for (old, door) in wall.doors.iter().zip(&mut next.doors) {
+            let world = [wall.a[0] + (wall.b[0] - wall.a[0]) * old.at / old_len, wall.a[1] + (wall.b[1] - wall.a[1]) * old.at / old_len];
+            let d = [world[0] - next.a[0], world[1] - next.a[1]];
+            if (d[0] * t[1] - d[1] * t[0]).abs() > 0.001 {
+                return Err(invalid("junction would move a hosted door off its current world position; align the wall first"));
+            }
+            door.at = d[0] * t[0] + d[1] * t[1];
+        }
+        next.validate(s.doc.buildings[entry.building].storeys.len())?;
+        changes.push(Item::Wall(next));
+    }
+    let mut ids = Vec::new();
+    for (entry, item) in entries.iter().zip(changes) {
+        let shared = remove(&mut s.doc, entry)?;
+        let next = put(&mut s.doc, entry, item, shared, false, false)?;
+        remap_references(&mut s.doc, entry, &next, shared);
         ids.push(next);
     }
     finish(s, ids)

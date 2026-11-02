@@ -54,6 +54,9 @@ impl Ifc<'_> {
         for (key, group) in split::attachment_groups(wall) {
             match group.first() {
                 Some(e) if e.class == trigon_model::ElementClass::Stair => self.cellar_stair(e, &wall.frame, fl),
+                Some(e) if matches!(self.doc.component(&e.type_id).map(|ty| &ty.kind), Ok(ComponentKind::GuardRail { .. })) => {
+                    self.railing(e, &wall.frame, fl);
+                }
                 _ => self.balcony(&key, &group, &wall.frame, fl),
             }
         }
@@ -161,6 +164,14 @@ impl Ifc<'_> {
                 props.push(("Depth", Val::Length(*depth)));
                 props.push(("SlabThickness", Val::Length(*thickness)));
                 props.push(("RailingHeight", Val::Length(first.height)));
+            }
+            Some(ComponentKind::ShapedBalcony { depth, thickness, plan }) => {
+                props.push(("Depth", Val::Length(*depth)));
+                props.push(("SlabThickness", Val::Length(*thickness)));
+                props.push(("RailingHeight", Val::Length(first.height)));
+                if let Ok(value) = serde_json::to_string(plan) {
+                    props.push(("ParametricPlan", Val::Text(value)));
+                }
             }
             _ => {}
         }

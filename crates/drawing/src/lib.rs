@@ -135,12 +135,17 @@ pub fn page_image(path: &Path, page: u32) -> Result<Gray> {
         .into_iter()
         .max_by_key(|i| i.width.saturating_mul(i.height))
         .ok_or_else(|| DrawingError::Unsupported(format!("page {page} has no scanned image (vector drawings aren't read yet)")))?;
-    let filters = img.filters.clone().unwrap_or_default();
-    if filters.iter().map(String::as_str).ne(["DCTDecode"]) {
-        return Err(DrawingError::Unsupported(format!("page {page}: image compression {filters:?} (only JPEG scans are read so far)")));
-    }
-    if img.width <= 0 || img.height <= 0 || (img.width as u64) * (img.height as u64) > MAX_PIXELS {
+    if img.width <= 0 || img.height <= 0 || (img.width as u64).checked_mul(img.height as u64).is_none_or(|n| n > MAX_PIXELS) {
         return Err(DrawingError::Invalid(format!("page {page}: image of {} × {} px is out of range", img.width, img.height)));
+    }
+    let filters = img.filters.clone().unwrap_or_default();
+    if filters.iter().map(String::as_str).eq(["CCITTFaxDecode"]) {
+        return group4_image(&doc, &img, page);
+    }
+    if filters.iter().map(String::as_str).ne(["DCTDecode"]) {
+        return Err(DrawingError::Unsupported(format!(
+            "page {page}: image compression {filters:?} (supported: JPEG and CCITT Group 4 grayscale scans)"
+        )));
     }
     let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::Luma).set_max_width(65535).set_max_height(65535);
     let mut dec = zune_jpeg::JpegDecoder::new_with_options(zune_core::bytestream::ZCursor::new(img.content), opts);
@@ -151,6 +156,108 @@ pub fn page_image(path: &Path, page: u32) -> Result<Gray> {
         return Err(DrawingError::Pdf(format!("page {page}: decoded {} bytes for {w} × {h} px", data.len())));
     }
     Ok(Gray { width: w, height: h, data })
+}
+
+/// Decode the archive's original one-bit scan without resampling or a lossy conversion.
+fn group4_image(doc: &lopdf::Document, img: &lopdf::xobject::PdfImage<'_>, page: u32) -> Result<Gray> {
+    let invalid = |message: &str| DrawingError::Invalid(format!("page {page}: CCITT {message}"));
+    let unsupported = |message: &str| DrawingError::Unsupported(format!("page {page}: CCITT {message}"));
+    if img.bits_per_component != Some(1) || img.color_space.as_deref() != Some("DeviceGray") {
+        return Err(unsupported("requires 1-bit DeviceGray (indexed palettes and masks are not handled)"));
+    }
+    let width = u16::try_from(img.width).map_err(|_| invalid("width exceeds 65535 pixels"))?;
+    let height = u16::try_from(img.height).map_err(|_| invalid("height exceeds 65535 pixels"))?;
+    if img.content.is_empty() {
+        return Err(invalid("empty compressed data"));
+    }
+    let object = img.origin_dict.get(b"DecodeParms").map_err(|_| unsupported("Group 4 needs DecodeParms with K=-1"))?;
+    let (_, object) = doc.dereference(object).map_err(|_| invalid("unreadable decode parameters"))?;
+    let object = if let lopdf::Object::Array(a) = object {
+        if a.len() != 1 {
+            return Err(invalid("one filter requires one decode-parameter entry"));
+        }
+        a.first().ok_or_else(|| invalid("empty decode parameters"))?
+    } else {
+        object
+    };
+    let (_, object) = doc.dereference(object).map_err(|_| invalid("unreadable decode parameters"))?;
+    let parms = object.as_dict().map_err(|_| invalid("decode parameters must be a dictionary"))?;
+    let integer = |name: &[u8], default: i64| -> Result<i64> {
+        match parms.get(name) {
+            Ok(v) => v.as_i64().map_err(|_| invalid("non-integer decode parameter")),
+            Err(_) => Ok(default),
+        }
+    };
+    let boolean = |name: &[u8], default: bool| -> Result<bool> {
+        match parms.get(name) {
+            Ok(v) => v.as_bool().map_err(|_| invalid("non-boolean decode parameter")),
+            Err(_) => Ok(default),
+        }
+    };
+    if integer(b"K", 0)? >= 0 {
+        return Err(unsupported("only Group 4 (negative K) is supported"));
+    }
+    let rows = integer(b"Rows", 0)?;
+    if integer(b"Columns", 1728)? != img.width || (rows != 0 && rows != img.height) {
+        return Err(invalid("Columns/Rows differ from image dimensions"));
+    }
+    if boolean(b"EncodedByteAlign", false)? || boolean(b"EndOfLine", false)? {
+        return Err(unsupported("byte-aligned rows or end-of-line markers are not handled"));
+    }
+    let black_is_one = boolean(b"BlackIs1", false)?;
+    let reverse = match img.origin_dict.get(b"Decode") {
+        Err(_) => false,
+        Ok(value) => {
+            let (_, value) = doc.dereference(value).map_err(|_| invalid("unreadable Decode array"))?;
+            let values = value.as_array().map_err(|_| invalid("Decode must be [0,1] or [1,0]"))?;
+            let pair = values
+                .iter()
+                .map(lopdf::Object::as_float)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| invalid("non-numeric Decode array"))?;
+            match pair.as_slice() {
+                [0.0, 1.0] => false,
+                [1.0, 0.0] => true,
+                _ => return Err(unsupported("Decode must be [0,1] or [1,0]")),
+            }
+        }
+    };
+    let expected = usize::from(width) * usize::from(height);
+    let mut data = Vec::with_capacity(expected);
+    let pixel = |color| {
+        let black = color == fax::Color::Black;
+        if black ^ black_is_one ^ reverse { 0 } else { 255 }
+    };
+    if boolean(b"EndOfBlock", true)? {
+        // The codec accepts EOF as an end marker and pads trailing white rows. Require the
+        // PDF's default EOFB marker so a truncated stream cannot silently become white paper.
+        let tail = img.content.iter().rev().take(4).enumerate().fold(0_u32, |v, (i, b)| v | (u32::from(*b) << (i * 8)));
+        if img.content.len() < 3 || !(0..8).any(|padding| (tail >> padding) & 0x00ff_ffff == 0x001001) {
+            return Err(invalid("missing Group 4 end-of-block marker"));
+        }
+        if fax::decoder::decode_g4(img.content.iter().copied(), width, Some(height), |line| {
+            data.extend(fax::decoder::pels(line, width).map(pixel));
+        })
+        .is_none()
+        {
+            return Err(invalid("malformed Group 4 data"));
+        }
+    } else {
+        // With EndOfBlock=false the row count terminates the stream; require every row,
+        // rather than accepting the convenience decoder's white padding on early EOF.
+        let reader = img.content.iter().copied().map(Ok::<u8, std::convert::Infallible>);
+        let mut decoder = fax::decoder::Group4Decoder::new(reader, width).map_err(|_| invalid("unreadable Group 4 data"))?;
+        for _ in 0..height {
+            if decoder.advance().map_err(|_| invalid("malformed Group 4 row"))? == fax::decoder::DecodeStatus::End {
+                return Err(invalid("Group 4 data ended before the declared row count"));
+            }
+            data.extend(fax::decoder::pels(decoder.transition(), width).map(pixel));
+        }
+    }
+    if data.len() != expected {
+        return Err(invalid("decoded Group 4 dimensions differ from the image"));
+    }
+    Ok(Gray { width: u32::from(width), height: u32::from(height), data })
 }
 
 #[cfg(test)]
@@ -189,5 +296,88 @@ mod tests {
         assert!(page_image(&p, 1).is_err());
         assert!(page_image(&dir.join("missing.pdf"), 1).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+    fn fax_document(black_is_one: bool, reverse: bool) -> (lopdf::Document, lopdf::ObjectId, Vec<u8>) {
+        use lopdf::{Stream, dictionary};
+        let width = 13usize;
+        let height = 5usize;
+        let pixels: Vec<u8> = (0..width * height).map(|i| if (i / width + i % width).is_multiple_of(4) { 0 } else { 255 }).collect();
+        let mut encoder = fax::encoder::Encoder::new(fax::VecWriter::new());
+        for row in pixels.chunks(width) {
+            encoder.encode_line(row.iter().map(|p| if *p == 0 { fax::Color::Black } else { fax::Color::White }), width as u16).unwrap();
+        }
+        let encoded = encoder.finish().unwrap().finish();
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages = doc.new_object_id();
+        let mut image = dictionary! {"Type"=>"XObject","Subtype"=>"Image","Width"=>width as i64,"Height"=>height as i64,
+        "BitsPerComponent"=>1,"ColorSpace"=>"DeviceGray","Filter"=>"CCITTFaxDecode",
+        "DecodeParms"=>dictionary!{"K"=>-1,"Columns"=>width as i64,"Rows"=>height as i64,"BlackIs1"=>black_is_one}};
+        if reverse {
+            image.set("Decode", vec![1.into(), 0.into()]);
+        }
+        let image_id = doc.add_object(Stream::new(image, encoded));
+        let content = doc.add_object(Stream::new(dictionary! {}, b"q 13 0 0 5 0 0 cm /Scan Do Q".to_vec()));
+        let page = doc.add_object(dictionary! {"Type"=>"Page","Parent"=>pages,"MediaBox"=>vec![0.into(),0.into(),13.into(),5.into()],
+        "Resources"=>dictionary!{"XObject"=>dictionary!{"Scan"=>image_id}},"Contents"=>content});
+        doc.objects.insert(pages, dictionary! {"Type"=>"Pages","Kids"=>vec![page.into()],"Count"=>1}.into());
+        let catalog = doc.add_object(dictionary! {"Type"=>"Catalog","Pages"=>pages});
+        doc.trailer.set("Root", catalog);
+        (doc, image_id, pixels)
+    }
+
+    #[test]
+    fn ccitt_group4_pages_preserve_non_byte_aligned_pixels_and_pdf_polarity() {
+        for black_is_one in [false, true] {
+            for reverse in [false, true] {
+                let (mut doc, _, pixels) = fax_document(black_is_one, reverse);
+                let path = std::env::temp_dir().join(format!("trigon-fax-{}-{black_is_one}-{reverse}.pdf", std::process::id()));
+                doc.save(&path).unwrap();
+                let gray = page_image(&path, 1).unwrap();
+                assert_eq!((gray.width, gray.height), (13, 5));
+                let expected: Vec<_> = pixels.into_iter().map(|p| if black_is_one ^ reverse { 255 - p } else { p }).collect();
+                assert_eq!(gray.data, expected);
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn ccitt_hostile_dimensions_parameters_and_data_return_errors() {
+        for scenario in 0..10 {
+            let (mut doc, id, _) = fax_document(false, false);
+            let stream = doc.get_object_mut(id).unwrap().as_stream_mut().unwrap();
+            match scenario {
+                0 => stream.dict.set("Width", i64::MAX),
+                1 => stream.dict.set("Height", i64::MAX),
+                2 => stream.dict.get_mut(b"DecodeParms").unwrap().as_dict_mut().unwrap().set("Columns", 14),
+                3 => stream.dict.get_mut(b"DecodeParms").unwrap().as_dict_mut().unwrap().set("Rows", 6),
+                4 => stream.dict.get_mut(b"DecodeParms").unwrap().as_dict_mut().unwrap().set("K", 0),
+                5 => stream.dict.set("BitsPerComponent", 8),
+                6 => stream.dict.get_mut(b"DecodeParms").unwrap().as_dict_mut().unwrap().set("EncodedByteAlign", true),
+                7 => stream.dict.set("Decode", vec![0.into(), 0.into()]),
+                8 => stream.content.clear(),
+                _ => stream.content = vec![0],
+            }
+            let path = std::env::temp_dir().join(format!("trigon-fax-hostile-{}-{scenario}.pdf", std::process::id()));
+            doc.save(&path).unwrap();
+            let result = std::panic::catch_unwind(|| page_image(&path, 1));
+            assert!(result.is_ok(), "scenario {scenario} panicked");
+            assert!(result.unwrap().is_err(), "scenario {scenario} must be refused");
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn ccitt_accepts_single_filter_arrays_and_indirect_decode_parameters() {
+        let (mut doc, id, pixels) = fax_document(false, false);
+        let mut parms = doc.get_object(id).unwrap().as_stream().unwrap().dict.get(b"DecodeParms").unwrap().clone();
+        parms.as_dict_mut().unwrap().set("EndOfBlock", false);
+        let parms_id = doc.add_object(parms);
+        let stream = doc.get_object_mut(id).unwrap().as_stream_mut().unwrap();
+        stream.dict.set("Filter", vec![lopdf::Object::Name(b"CCITTFaxDecode".to_vec())]);
+        stream.dict.set("DecodeParms", vec![lopdf::Object::Reference(parms_id)]);
+        let path = std::env::temp_dir().join(format!("trigon-fax-indirect-{}.pdf", std::process::id()));
+        doc.save(&path).unwrap();
+        assert_eq!(page_image(&path, 1).unwrap().data, pixels);
+        std::fs::remove_file(path).unwrap();
     }
 }

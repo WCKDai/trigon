@@ -72,8 +72,19 @@ pub(crate) fn sheet(frame: &Frame<'_>, scene: &Scene, vp: &Viewport, clip: [f64;
 }
 
 fn stroke_attrs(s: &Stroke, cap: &str) -> String {
-    let dash = if s.dashed { format!(r#" stroke-dasharray="{:.2} {:.2}""#, px(2.0), px(1.0)) } else { String::new() };
-    let cap = if s.dashed { "butt" } else { cap };
+    use trigon_model::annotation::LinePattern;
+    let pattern = s.pattern();
+    let dash = match pattern {
+        LinePattern::Solid => String::new(),
+        LinePattern::Dashed => format!(r#" stroke-dasharray="{:.2} {:.2}""#, px(2.0), px(1.0)),
+        LinePattern::Dotted => format!(r#" stroke-dasharray="0 {:.2}""#, px(1.0)),
+        LinePattern::DashDot => format!(r#" stroke-dasharray="{:.2} {:.2} 0 {:.2}""#, px(2.0), px(1.0), px(1.0)),
+    };
+    let cap = match pattern {
+        LinePattern::Solid => cap,
+        LinePattern::Dashed => "butt",
+        _ => "round",
+    };
     format!(r#"stroke="{}" stroke-width="{:.3}" stroke-linecap="{cap}" stroke-linejoin="round"{dash}"#, hex(s.colour), px(s.pen))
 }
 
@@ -136,7 +147,6 @@ pub(crate) fn items(out: &mut String, scene: &Scene, vp: &Viewport) {
                 let fill = match p.fill {
                     Some(Fill::Solid(c)) => hex(c),
                     Some(Fill::Masonry) => "url(#masonry)".into(),
-                    Some(Fill::Dots) => "url(#stair)".into(),
                     None => "none".into(),
                 };
                 let stroke = match (p.stroke, p.fill) {
@@ -180,9 +190,19 @@ pub(crate) fn items(out: &mut String, scene: &Scene, vp: &Viewport) {
                 };
                 let baseline = if t.middle { r#" dominant-baseline="middle""# } else { "" };
                 let fill = if t.colour == LETTERING { String::new() } else { format!(r#" fill="{}""#, hex(t.colour)) };
+                let font = if t.style.is_default() {
+                    String::new()
+                } else {
+                    format!(
+                        r#" font-family="{}" font-weight="{}" font-style="{}""#,
+                        t.style.family.name(),
+                        if t.style.bold { "bold" } else { "normal" },
+                        if t.style.italic { "italic" } else { "normal" }
+                    )
+                };
                 let _ = writeln!(
                     out,
-                    r#"<text x="{:.2}" y="{:.2}" text-anchor="{anchor}"{baseline} font-size="{fs:.2}"{fill}{rotate}{halo}>{}</text>"#,
+                    r#"<text x="{:.2}" y="{:.2}" text-anchor="{anchor}"{baseline} font-size="{fs:.2}"{fill}{font}{rotate}{halo}>{}</text>"#,
                     at[0],
                     at[1],
                     escape(&t.text)

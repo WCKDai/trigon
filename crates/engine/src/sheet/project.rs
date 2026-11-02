@@ -12,6 +12,13 @@ use std::collections::HashMap;
 use trigon_model::mesh::Mesh;
 
 use super::cut::{self, Ring, Shape};
+use super::{Element, overlap};
+use crate::views::{DrawingElementRegion, DrawingElementSegment};
+
+mod ownership;
+use ownership::EdgeIndex;
+
+const MIN_INDEX_EDGES: usize = 1024;
 
 /// How a view looks at the model: drawing x along `t`, drawing y up (model z), depth along `d`
 /// (into the drawing, away from the viewer). `t` and `d` are horizontal unit vectors.
@@ -54,6 +61,7 @@ pub(crate) struct Source<'a> {
     /// Meshes in one group are welded together before edges are classified (the walls of a
     /// building, so a joint between two facades in line shows no line).
     pub(crate) group: usize,
+    pub(crate) element: Option<Element>,
 }
 
 /// A visible piece of a feature edge, in drawing mm.
@@ -64,8 +72,11 @@ pub(crate) struct Edge {
     pub(crate) class: Class,
     /// Depth at its middle, mm.
     pub(crate) depth: f64,
+    /// Endpoint depths, used to split primary/depth plan strokes at the exact range boundary.
+    pub(crate) end_depths: [f64; 2],
     /// Against the background on one side: part of the outline.
     pub(crate) outline: bool,
+    pub(crate) element_segments: Vec<DrawingElementSegment>,
 }
 
 /// A flat face seen from the front or behind: rings filled even-odd.
@@ -74,6 +85,8 @@ pub(crate) struct Face {
     pub(crate) rings: Vec<Ring>,
     pub(crate) class: Class,
     pub(crate) depth: f64,
+    pub(crate) element: Option<Element>,
+    pub(crate) depth_plane: [f64; 3],
 }
 
 /// What happens at the near end of the depth range.
@@ -93,6 +106,7 @@ pub(crate) struct Projection {
     pub(crate) faces: Vec<Face>,
     /// Triangles that can hide something.
     pub(crate) triangles: usize,
+    pub(crate) element_regions: Vec<DrawingElementRegion>,
 }
 
 /// Faces folding by less than this are one surface (cos 10°).
@@ -377,8 +391,13 @@ fn feature_edges(tris: &[([u32; 3], Option<P3>, Class)], points: &[P3]) -> Vec<(
     // Boundary candidates by the line they lie on: (along-line interval, normal, side into the face, class).
     let mut lines: HashMap<[i64; 6], (P3, P3, Vec<(f64, f64, P3, P3, Class)>)> = HashMap::new();
     let mut keys = Vec::new();
-    for ((a, b), f) in &faces {
-        let (Some(pa), Some(pb)) = (point(*a), point(*b)) else { continue };
+    // The first boundary piece selects the exact line frame. Stable welded-vertex order keeps
+    // equivalent floating-point frames independent of each HashMap's random iteration seed.
+    let mut face_keys: Vec<_> = faces.keys().copied().collect();
+    face_keys.sort_unstable();
+    for (a, b) in face_keys {
+        let Some(f) = faces.get(&(a, b)) else { continue };
+        let (Some(pa), Some(pb)) = (point(a), point(b)) else { continue };
         let mut normals: Vec<P3> = f.iter().filter_map(|(i, _)| tris.get(*i)?.1).collect();
         let class = f.first().and_then(|(i, _)| tris.get(*i)).map_or(Class::Wall, |t| t.2);
         if f.len() == 1 {
@@ -480,19 +499,25 @@ fn caps(shapes: &[Shape], depth: f64, occ: &mut Vec<Occluder>) {
 /// Projects `sources` seen through `look`, keeping depths in `range`; `near` says what happens
 /// at the near limit.
 pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), near: Near<'_>) -> Projection {
+    project_with_index::<true>(sources, look, range, near)
+}
+
+fn project_with_index<const INDEXED: bool>(sources: &[Source<'_>], look: &Look, range: (f64, f64), near: Near<'_>) -> Projection {
     let mut groups: Vec<usize> = sources.iter().map(|s| s.group).collect();
     groups.sort_unstable();
     groups.dedup();
     let mut occ: Vec<Occluder> = Vec::new();
-    let mut lines: Vec<(P3, P3, Class)> = Vec::new();
+    let mut lines: Vec<(P3, P3, Class, Vec<DrawingElementSegment>)> = Vec::new();
     // Clipped triangles per (group, class) for the fills: welded corners and the 3D normal.
     let mut fill_tris: Vec<(usize, Class, [P3; 3], P3)> = Vec::new();
     let mut cap_faces: Vec<Face> = Vec::new();
+    let mut element_regions = Vec::new();
     if let Near::Caps(shapes) = near {
         caps(shapes, range.0, &mut occ);
     }
     for g in groups {
         let mut near_segs = Vec::new();
+        let mut owned_edges: Vec<(usize, [P3; 2])> = Vec::new();
         let mut weld = Weld::new();
         let mut tris: Vec<([u32; 3], Option<P3>, Class)> = Vec::new();
         for (si, s) in sources.iter().enumerate().filter(|(_, s)| s.group == g) {
@@ -503,6 +528,9 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                     continue;
                 }
                 let (p0, p1, p2) = (p[0], p[1], p[2]);
+                if s.element.is_some() {
+                    owned_edges.extend([[p0, p1], [p1, p2], [p2, p0]].map(|segment| (si, segment)));
+                }
                 let n = unit(cross(sub(p1, p0), sub(p2, p0)));
                 tris.push(([weld.id(p0), weld.id(p1), weld.id(p2)], n, s.class));
                 let Some(n) = n else { continue };
@@ -517,6 +545,7 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
             }
             if matches!(near, Near::Cut) {
                 let at = range.0;
+                let start = near_segs.len();
                 cut::segments(
                     s.mesh,
                     &|p| {
@@ -525,9 +554,37 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                     },
                     &mut near_segs,
                 );
+                if s.element.is_some() {
+                    owned_edges.extend(near_segs[start..].iter().map(|segment| (si, segment.map(|point| [point[0], point[1], at]))));
+                    let rings = cut::chain(&near_segs[start..], 0.5, 5.0).closed;
+                    if let Some(element) = &s.element
+                        && !rings.is_empty()
+                    {
+                        element_regions.push(DrawingElementRegion {
+                            id: element.id.clone(),
+                            kind: element.kind,
+                            rings,
+                            depth_plane: Some([at, 0.0, 0.0]),
+                        });
+                    }
+                }
             }
         }
-        lines.extend(feature_edges(&tris, &weld.points));
+        let ownership = (INDEXED && owned_edges.len() >= MIN_INDEX_EDGES).then(|| EdgeIndex::new(&owned_edges));
+        let mut owned_candidates = Vec::new();
+        let mut attribution = |start: P3, end: P3| {
+            let exact = |(index, source): &(usize, [P3; 2])| {
+                let element = sources.get(*index)?.element.as_ref()?;
+                overlap([start, end], *source, 0.1).map(|segment| element.segment(segment.map(|point| [point[0], point[1]])))
+            };
+            if let Some(index) = &ownership {
+                index.query([start, end], &mut owned_candidates);
+                owned_candidates.iter().filter_map(|&k| owned_edges.get(k).and_then(exact)).collect::<Vec<_>>()
+            } else {
+                owned_edges.iter().filter_map(exact).collect::<Vec<_>>()
+            }
+        };
+        lines.extend(feature_edges(&tris, &weld.points).into_iter().map(|(start, end, class)| (start, end, class, attribution(start, end))));
         if !near_segs.is_empty() {
             // The cut through this group: its outline is drawn, its faces hide and are toned.
             let class = sources.iter().find(|s| s.group == g).map_or(Class::Wall, |s| s.class);
@@ -539,11 +596,12 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
                 let n = ring.len();
                 for k in 0..if closed { n } else { n.saturating_sub(1) } {
                     let (a, b) = (ring[k], ring[(k + 1) % n]);
-                    lines.push(([a[0], a[1], at], [b[0], b[1], at], class));
+                    let (start, end) = ([a[0], a[1], at], [b[0], b[1], at]);
+                    lines.push((start, end, class, attribution(start, end)));
                 }
             }
             caps(&shapes, at, &mut occ);
-            cap_faces.extend(shapes.into_iter().map(|rings| Face { rings, class, depth: at }));
+            cap_faces.extend(shapes.into_iter().map(|rings| Face { rings, class, depth: at, element: None, depth_plane: [at, 0.0, 0.0] }));
         }
     }
     let grid = Grid::new(&occ);
@@ -552,7 +610,7 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
     let mut round = 0_u32;
     let covered = |p: [f64; 2]| grid.at(p).iter().any(|&k| occ.get(k as usize).is_some_and(|o| o.contains(p)));
     let mut edges = Vec::new();
-    for (a, b, class) in lines {
+    for (a, b, class, elements) in lines {
         // Clip the edge to the depth range.
         let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
         let dd = b[2] - a[2];
@@ -604,13 +662,25 @@ pub(crate) fn project(sources: &[Source<'_>], look: &Look, range: (f64, f64), ne
             let m = p((s + e) / 2.0);
             let side = |k: f64| [m[0] + normal[0] * 2.0 * k, m[1] + normal[1] * 2.0 * k];
             let outline = !covered(side(1.0)) || !covered(side(-1.0));
-            edges.push(Edge { a: p(s), b: p(e), class, depth: pa[2] + (pb[2] - pa[2]) * (s + e) / 2.0, outline });
+            let element_segments = elements
+                .iter()
+                .filter_map(|element| overlap([p(s), p(e)], element.segment, 0.1).map(|segment| DrawingElementSegment { segment, ..element.clone() }))
+                .collect();
+            edges.push(Edge {
+                a: p(s),
+                b: p(e),
+                class,
+                depth: pa[2] + (pb[2] - pa[2]) * (s + e) / 2.0,
+                end_depths: [pa[2] + (pb[2] - pa[2]) * s, pa[2] + (pb[2] - pa[2]) * e],
+                outline,
+                element_segments,
+            });
         }
     }
     let mut faces = faces(&fill_tris, sources);
     // Caps are nearest of all.
     faces.extend(cap_faces);
-    Projection { edges, faces, triangles: occ.len() }
+    Projection { edges, faces, triangles: occ.len(), element_regions }
 }
 
 /// Merges coplanar neighbouring triangles of one source into faces, back to front.
@@ -699,7 +769,15 @@ fn faces(tris: &[(usize, Class, [P3; 3], P3)], sources: &[Source<'_>]) -> Vec<Fa
                 .collect();
             let rings = cut::chain(&segs, 0.01, 0.01).closed;
             if !rings.is_empty() {
-                out.push(Face { rings, class, depth: depth / area });
+                let plane =
+                    m.first().and_then(|index| Occluder::new(tris[list[*index]].2)).map_or([depth / area, 0.0, 0.0], |triangle| triangle.plane);
+                out.push(Face {
+                    rings,
+                    class,
+                    depth: depth / area,
+                    element: sources.get(key).and_then(|source| source.element.clone()),
+                    depth_plane: plane,
+                });
             }
         }
     }
@@ -727,10 +805,32 @@ mod tests {
         edges.iter().map(|e| (e.b[0] - e.a[0]).hypot(e.b[1] - e.a[1])).sum()
     }
 
+    fn export_faces(projection: &Projection) -> Vec<Face> {
+        // faces() enumerates HashMap boundary segments, so a raw ring has no fixed cycle
+        // origin. Match style::fills' existing writer normalization without changing any
+        // coordinates, face order, depth, plane, class or semantic owner.
+        projection.faces.iter().map(|face| Face { rings: cut::even_odd(&face.rings).into_iter().flatten().collect(), ..face.clone() }).collect()
+    }
+
+    #[test]
+    fn linear_face_contour_cycles_normalize_to_identical_export_shapes() {
+        let mesh = cuboid([0.0, 0.0, 0.0], [1000.0, 400.0, 2000.0]);
+        let sources = [Source { mesh: &mesh, class: Class::Wall, group: 0, element: None }];
+        let baseline = project_with_index::<false>(&sources, &north(), (-1e5, 1e5), Near::Cut);
+        let expected = format!("{:?}", export_faces(&baseline));
+        let mut raw = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let p = project_with_index::<false>(&sources, &north(), (-1e5, 1e5), Near::Cut);
+            raw.insert(format!("{:?}", p.faces));
+            assert_eq!(format!("{:?}", export_faces(&p)), expected);
+        }
+        eprintln!("Linear-reference raw contour variants across 32 repetitions: {}", raw.len());
+    }
+
     #[test]
     fn a_box_shows_its_outline_and_no_diagonals() {
         let m = cuboid([0.0, 0.0, 0.0], [4000.0, 3000.0, 2000.0]);
-        let p = project(&[Source { mesh: &m, class: Class::Wall, group: 0 }], &north(), (-1e5, 1e5), Near::Caps(&[]));
+        let p = project(&[Source { mesh: &m, class: Class::Wall, group: 0, element: None }], &north(), (-1e5, 1e5), Near::Caps(&[]));
         // Square-on, the front face's four edges; the back face's coincide and are hidden or
         // merged, the depth edges are points. No triangle diagonals.
         assert!(p.edges.iter().all(|e| (e.a[0] - e.b[0]).abs() < 1e-6 || (e.a[1] - e.b[1]).abs() < 1e-6), "no diagonals");
@@ -741,10 +841,73 @@ mod tests {
     }
 
     #[test]
+    fn indexed_large_groups_preserve_full_projection_and_exact_ownership() {
+        let mut meshes = [Mesh::default(), Mesh::default()];
+        for row in 0..12 {
+            for column in 0..12 {
+                let x = f64::from(column) * 220.0;
+                let z = f64::from(row) * 180.0;
+                let depth = f64::from(row % 3) * 40.0;
+                meshes[(row + column) as usize % 2].append(&cuboid([x, depth, z], [x + 180.0, depth + 20.0, z + 130.0]));
+            }
+        }
+        // Touching coplanar pieces join into longer lines with multiple source owners.
+        meshes[0].append(&cuboid([0.0, 200.0, 3000.0], [200.0, 220.0, 3200.0]));
+        meshes[1].append(&cuboid([200.0, 200.0, 3000.0], [400.0, 220.0, 3200.0]));
+        let sources = [
+            Source { mesh: &meshes[0], class: Class::Roof, group: 0, element: Some(Element::new("roof-a", crate::DrawingElementKind::Roof)) },
+            Source { mesh: &meshes[1], class: Class::Roof, group: 0, element: Some(Element::new("roof-b", crate::DrawingElementKind::Roof)) },
+        ];
+        assert!(sources.iter().map(|s| 3 * s.mesh.triangles.len()).sum::<usize>() >= MIN_INDEX_EDGES);
+        for angle in [0.0_f64, 0.31] {
+            let look = Look { origin: [0.0; 2], t: [angle.cos(), angle.sin()], d: [-angle.sin(), angle.cos()] };
+            for near_depth in [-1000.0, 30.0] {
+                let indexed = project_with_index::<true>(&sources, &look, (near_depth, 5000.0), Near::Cut);
+                let linear = project_with_index::<false>(&sources, &look, (near_depth, 5000.0), Near::Cut);
+                assert!(!indexed.edges.is_empty());
+                assert!(indexed.edges.iter().any(|e| !e.element_segments.is_empty()));
+                // Compare every coordinate, plane, class, outline and ownership segment,
+                // including ordering and duplicate records, without flooding failure logs.
+                assert_eq!(indexed.triangles, linear.triangles);
+                assert_eq!(indexed.edges.len(), linear.edges.len());
+                assert_eq!(indexed.faces.len(), linear.faces.len());
+                for (i, (a, b)) in indexed.edges.iter().zip(&linear.edges).enumerate() {
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "edge {i}, angle {angle}, near {near_depth}");
+                }
+                for (i, (a, b)) in export_faces(&indexed).iter().zip(export_faces(&linear)).enumerate() {
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "face {i}, angle {angle}, near {near_depth}");
+                }
+                assert_eq!(format!("{:?}", indexed.element_regions), format!("{:?}", linear.element_regions));
+                let render = |p: &Projection| {
+                    let mut scene = super::super::Scene::new(100.0);
+                    super::super::style::fills(&mut scene, p);
+                    super::super::style::edges(&mut scene, p);
+                    let vp = super::super::Viewport { x0: -200.0, y1: 2400.0, mm: 2.0 };
+                    let svg = super::super::svg::sheet(
+                        &super::super::svg::Frame { title: "Ownership regression", project: "Original fixture", caption: "", footer: "", note: None },
+                        &scene,
+                        &vp,
+                        [0.0, 0.0, 1600.0, 900.0],
+                    );
+                    let dxf = super::super::dxf::write(
+                        &scene,
+                        &super::super::dxf::TitleBlock { title: "Ownership regression", project: "Original fixture", caption: "", note: None },
+                    );
+                    (svg, dxf)
+                };
+                assert_eq!(render(&indexed), render(&linear), "export bytes must remain exact");
+            }
+        }
+    }
+
+    #[test]
     fn a_box_in_front_hides_the_edges_behind_it() {
         let back = cuboid([0.0, 5000.0, 0.0], [4000.0, 6000.0, 4000.0]);
         let front = cuboid([1000.0, 0.0, 0.0], [3000.0, 1000.0, 2000.0]);
-        let sources = [Source { mesh: &back, class: Class::Wall, group: 0 }, Source { mesh: &front, class: Class::Balcony, group: 1 }];
+        let sources = [
+            Source { mesh: &back, class: Class::Wall, group: 0, element: None },
+            Source { mesh: &front, class: Class::Balcony, group: 1, element: None },
+        ];
         let p = project(&sources, &north(), (-1e5, 1e5), Near::Caps(&[]));
         // The back box's bottom edge is hidden where the front box stands.
         let bottom: f64 =
@@ -764,7 +927,7 @@ mod tests {
         let a = cuboid([0.0, 0.0, 0.0], [2000.0, 400.0, 3000.0]);
         let b = cuboid([2000.0, 0.0, 0.0], [5000.0, 400.0, 3000.0]);
         let p = project(
-            &[Source { mesh: &a, class: Class::Wall, group: 7 }, Source { mesh: &b, class: Class::Wall, group: 7 }],
+            &[Source { mesh: &a, class: Class::Wall, group: 7, element: None }, Source { mesh: &b, class: Class::Wall, group: 7, element: None }],
             &north(),
             (-1e5, 1e5),
             Near::Caps(&[]),
@@ -774,12 +937,12 @@ mod tests {
         // Cut 200 mm into a box: its section is drawn even though no edge lies there, and the cut
         // face hides the back of the box.
         let deep = cuboid([0.0, 0.0, 0.0], [1000.0, 3000.0, 1000.0]);
-        let p = project(&[Source { mesh: &deep, class: Class::Wall, group: 0 }], &north(), (200.0, 1e5), Near::Cut);
+        let p = project(&[Source { mesh: &deep, class: Class::Wall, group: 0, element: None }], &north(), (200.0, 1e5), Near::Cut);
         assert!((total(&p.edges) - 4000.0).abs() < 1.0, "{}", total(&p.edges));
         assert!(p.faces.last().is_some_and(|f| f.depth == 200.0), "the cap is toned, nearest");
         // A section's poche hides what is behind it.
         let poche = vec![vec![vec![[-10.0, -10.0], [500.0, -10.0], [500.0, 1010.0], [-10.0, 1010.0]]]];
-        let p = project(&[Source { mesh: &deep, class: Class::Wall, group: 0 }], &north(), (200.0, 1e5), Near::Caps(&poche));
+        let p = project(&[Source { mesh: &deep, class: Class::Wall, group: 0, element: None }], &north(), (200.0, 1e5), Near::Caps(&poche));
         assert!((total(&p.edges) - 2000.0).abs() < 1.0, "only the back face's right half shows: {}", total(&p.edges));
     }
 
@@ -795,9 +958,35 @@ mod tests {
         let base = m.positions.len() as u32;
         m.positions.extend([p(0.0, 0.0), p(500.0, 0.0), p(1000.0, 0.0)]);
         m.triangles.push([base, base + 1, base + 2]);
-        let pr = project(&[Source { mesh: &m, class: Class::Wall, group: 0 }], &north(), (-1e5, 1e5), Near::Caps(&[]));
+        let pr = project(&[Source { mesh: &m, class: Class::Wall, group: 0, element: None }], &north(), (-1e5, 1e5), Near::Caps(&[]));
         assert!((total(&pr.edges) - 6000.0).abs() < 1.0, "only the outline: {}", total(&pr.edges));
         assert!(!pr.edges.iter().any(|e| (e.a[0] - 1000.0).abs() < 1e-6 && (e.b[0] - 1000.0).abs() < 1e-6), "no joint at x = 1 m");
+    }
+
+    #[test]
+    fn repeated_projection_keeps_identical_collinear_boundary_coordinates() {
+        // Shared sloping edges have equivalent line frames with slightly different floating
+        // arithmetic. Random hash iteration must not choose a different representative frame.
+        let mut mesh = Mesh::default();
+        for k in 0..8 {
+            let a = 300.05 + f64::from(k) * 1000.0;
+            let b = a + 1000.0;
+            mesh.quad([a, 1000.0, a / 3.0], [b, 1000.0, b / 3.0], [b, 1000.0, b / 3.0 + 500.0], [a, 1000.0, a / 3.0 + 500.0]);
+        }
+        let sources = [Source { mesh: &mesh, class: Class::Wall, group: 0, element: None }];
+        let coordinates = || {
+            let projection = project(&sources, &north(), (-1e5, 1e5), Near::Caps(&[]));
+            let mut edges: Vec<_> = projection.edges.into_iter().map(|e| if e.a <= e.b { [e.a, e.b] } else { [e.b, e.a] }).collect();
+            edges.sort_by(|a, b| {
+                a.iter().flatten().zip(b.iter().flatten()).map(|(a, b)| a.total_cmp(b)).find(|c| !c.is_eq()).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            edges
+        };
+        let expected = coordinates();
+        assert!(!expected.is_empty());
+        for _ in 0..32 {
+            assert_eq!(coordinates(), expected, "exact exported coordinates must not depend on hash seeds");
+        }
     }
 
     #[test]
@@ -809,10 +998,61 @@ mod tests {
         m.positions.push([1e300, 1.0, 2.0]);
         let n = m.positions.len() as u32;
         m.triangles.push([n - 1, n - 2, 3]);
-        let p = project(&[Source { mesh: &m, class: Class::Wall, group: 0 }], &north(), (-1e5, 1e5), Near::Cut);
+        let p = project(&[Source { mesh: &m, class: Class::Wall, group: 0, element: None }], &north(), (-1e5, 1e5), Near::Cut);
         assert!(!p.edges.is_empty());
         let empty = Mesh::default();
-        let p = project(&[Source { mesh: &empty, class: Class::Wall, group: 0 }], &north(), (f64::NAN, 1e5), Near::Cut);
+        let p = project(&[Source { mesh: &empty, class: Class::Wall, group: 0, element: None }], &north(), (f64::NAN, 1e5), Near::Cut);
         assert!(p.edges.is_empty() && p.faces.is_empty());
+    }
+
+    #[test]
+    fn visible_edge_ownership_respects_depth_and_hidden_pieces() {
+        use crate::views::DrawingElementKind;
+        let back = cuboid([0.0, 1000.0, 0.0], [3000.0, 1200.0, 3000.0]);
+        let front = cuboid([1000.0, 0.0, -100.0], [2000.0, 200.0, 4000.0]);
+        let sources = [
+            Source { mesh: &back, class: Class::Wall, group: 0, element: Some(Element::new("back", DrawingElementKind::FacadeWall)) },
+            Source { mesh: &front, class: Class::Frame, group: 1, element: Some(Element::new("front", DrawingElementKind::Opening)) },
+        ];
+        let projection = project(&sources, &north(), (-1000.0, 5000.0), Near::Caps(&[]));
+        let elements: Vec<_> = projection.edges.iter().flat_map(|edge| &edge.element_segments).collect();
+        assert!(elements.iter().any(|element| element.id == "back"));
+        assert!(elements.iter().any(|element| element.id == "front"));
+        assert!(elements.iter().filter(|element| element.id == "back").all(|element| {
+            let middle = (element.segment[0][0] + element.segment[1][0]) / 2.0;
+            !(1000.01..1999.99).contains(&middle)
+        }));
+        assert!(
+            projection
+                .edges
+                .iter()
+                .filter(|edge| edge.class == Class::Frame)
+                .flat_map(|edge| &edge.element_segments)
+                .all(|element| element.id == "front")
+        );
+    }
+
+    #[test]
+    fn welded_collinear_facades_keep_their_own_visible_spans() {
+        use crate::views::DrawingElementKind;
+        let left = cuboid([0.0, 0.0, 0.0], [1000.0, 200.0, 3000.0]);
+        let right = cuboid([1000.0, 0.0, 0.0], [2000.0, 200.0, 3000.0]);
+        let projection = project(
+            &[
+                Source { mesh: &left, class: Class::Wall, group: 7, element: Some(Element::new("left", DrawingElementKind::FacadeWall)) },
+                Source { mesh: &right, class: Class::Wall, group: 7, element: Some(Element::new("right", DrawingElementKind::FacadeWall)) },
+            ],
+            &north(),
+            (-1000.0, 5000.0),
+            Near::Caps(&[]),
+        );
+        let elements: Vec<_> = projection.edges.iter().flat_map(|edge| &edge.element_segments).collect();
+        assert!(elements.iter().any(|element| element.id == "left"));
+        assert!(elements.iter().any(|element| element.id == "right"));
+        for element in elements {
+            let middle = (element.segment[0][0] + element.segment[1][0]) / 2.0;
+            assert!(if element.id == "left" { middle <= 1000.0 } else { middle >= 1000.0 }, "{element:?}");
+            assert!(!element.segment.iter().all(|point| (point[0] - 1000.0).abs() < 1e-8));
+        }
     }
 }

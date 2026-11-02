@@ -4221,6 +4221,7 @@ dependencies = [
 name = "trigon-drawing"
 version = "0.1.0"
 dependencies = [
+ "fax",
  "lopdf",
  "thiserror 2.0.21",
  "zune-core",
@@ -4266,6 +4267,7 @@ dependencies = [
 name = "trigon-io"
 version = "0.1.0"
 dependencies = [
+ "png",
  "serde_json",
  "trigon-ifcread",
  "trigon-model",

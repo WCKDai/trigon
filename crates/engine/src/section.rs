@@ -15,10 +15,10 @@ use trigon_model::mesh::Material;
 use trigon_model::{Document, ModelError};
 
 use crate::Result;
-use crate::plan::write_output;
+use crate::sheet::Sheet;
 use crate::sheet::cut::{self, Shape};
 use crate::sheet::project::{Class, Look, Near, project};
-use crate::sheet::{Anchor, Fill, Layer, PAGE_MM, Rgb, Scene, Stroke, Text, Viewport, dxf, level_text, scale_text, style, svg};
+use crate::sheet::{Anchor, Fill, Layer, Rgb, Scene, Stroke, Text, Viewport, level_text, scale_text, style};
 
 /// Drawing area on the 1600 × 900 sheet, px: room at the sides for the level marks.
 const AREA: [f64; 4] = [230.0, 150.0, 1140.0, 640.0];
@@ -125,12 +125,26 @@ pub(crate) fn sheet(
     caption: &str,
     path: PathBuf,
 ) -> Result<Value> {
-    if title.len() > 200 || caption.len() > 500 {
-        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
-    }
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
     if !matches!(ext, "png" | "svg" | "pdf" | "dxf") {
         return Err(ModelError::Invalid("use .pdf, .png, .svg or .dxf for a section".into()).into());
+    }
+    scene(doc, line, flip, depth, view, title, caption, None)?.write(path)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scene(
+    doc: &Document,
+    line: [[f64; 2]; 2],
+    flip: bool,
+    depth: f64,
+    view: View,
+    title: &str,
+    caption: &str,
+    final_scale: Option<f64>,
+) -> Result<Sheet> {
+    if title.len() > 200 || caption.len() > 500 {
+        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
     }
     if line.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
         return Err(ModelError::Invalid("the cut line needs two finite site points".into()).into());
@@ -156,11 +170,26 @@ pub(crate) fn sheet(
     groups.dedup();
     let mut poche: Vec<(Poche, Vec<Shape>)> = Vec::new();
     let mut open: Vec<(Poche, Vec<[f64; 2]>)> = Vec::new();
+    let mut cut_elements = Vec::new();
+    let mut cut_regions = Vec::new();
     for g in groups {
         let mut segs = Vec::new();
         let mut kind = None;
         for p in parts.iter().filter(|p| p.source.group == g && p.role != style::Role::Seen) {
+            let start = segs.len();
             cut::segments(p.source.mesh, &|q| look.map(q), &mut segs);
+            if let Some(element) = &p.source.element {
+                cut_elements.extend(segs[start..].iter().map(|segment| element.segment(*segment)));
+                let rings = cut::chain(&segs[start..], 0.5, 5.0).closed;
+                if !rings.is_empty() {
+                    cut_regions.push(crate::views::DrawingElementRegion {
+                        id: element.id.clone(),
+                        kind: element.kind,
+                        rings,
+                        depth_plane: Some([0.0, 0.0, 0.0]),
+                    });
+                }
+            }
             kind.get_or_insert(Poche::of(p.source.class, p.material));
         }
         let Some(kind) = kind.filter(|_| !segs.is_empty()) else { continue };
@@ -185,14 +214,16 @@ pub(crate) fn sheet(
     ys.extend(all_poche.iter().flatten().flatten().map(|p| p[1]));
     ys.extend(projection.edges.iter().filter(|e| (0.0..=length).contains(&e.a[0])).flat_map(|e| [e.a[1], e.b[1]]));
     let (y0, y1) = ys.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), y| (lo.min(*y), hi.max(*y)));
-    let vp = Viewport::fit([0.0, y0, length, y1.max(y0 + 1000.0)], AREA);
-    let scale = vp.scale();
+    let mut vp = Viewport::fit([0.0, y0, length, y1.max(y0 + 1000.0)], AREA);
+    let mut scale = vp.scale();
     let mut scene = Scene::new(scale);
 
     // Tones beyond, minus what the cut covers.
     let cover = bbox(&all_poche);
     let mut beyond = Scene::new(scale);
     style::fills(&mut beyond, &projection);
+    scene.element_regions.extend(beyond.element_regions);
+    scene.element_regions.extend(cut_regions);
     for item in beyond.items {
         let crate::sheet::Item::Path(mut p) = item else { continue };
         let face = cut::even_odd(&p.rings);
@@ -211,11 +242,13 @@ pub(crate) fn sheet(
         let (layer, fill, pen) = kind.look();
         for shape in shapes {
             scene.polygon(layer, shape.clone(), fill, Some(Stroke::new(pen)));
+            scene.attribute_last(&cut_elements);
         }
     }
     for (kind, chain) in &open {
         let (layer, _, pen) = kind.look();
         scene.polyline(layer, chain.clone(), Stroke::new(pen));
+        scene.attribute_last(&cut_elements);
     }
     scene.clip([0.0, f64::MIN, length, f64::MAX]);
 
@@ -224,31 +257,132 @@ pub(crate) fn sheet(
         scene.line(Layer::Ground, [a, 0.0], [b, 0.0], Stroke::new(0.7));
     }
     // Levels: a dashed line across, a mark and the level at the right, the name at the left.
-    let s = scale;
     let mut levels: Vec<(f64, String)> = Vec::new();
-    if let (Some(mb), Some(b)) = (doc.buildings.first(), built.first()) {
+    let roof_levels = doc.buildings.iter().any(|b| b.attic_level().is_some());
+    let cuts_building = |b: &trigon_model::Building| {
+        crate::drawings::inside(&b.footprint, from)
+            || crate::drawings::inside(&b.footprint, to)
+            || b.footprint.iter().zip(b.footprint.iter().cycle().skip(1)).any(|(a, b)| {
+                let (a, b) = (look.map([a[0], a[1], 0.0]), look.map([b[0], b[1], 0.0]));
+                let delta = a[2] - b[2];
+                if delta.abs() < 1e-9 {
+                    return a[2].abs() < 1e-6 && a[0].max(b[0]) >= 0.0 && a[0].min(b[0]) <= length;
+                }
+                let t = a[2] / delta;
+                let along = a[0] + t * (b[0] - a[0]);
+                (0.0..=1.0).contains(&t) && (0.0..=length).contains(&along)
+            })
+    };
+    // Legacy sheets keep their first-building datums. Opt-in roof sections must identify
+    // the actual cut wing(s), whose roof floors can have different indices and elevations.
+    let level_buildings: Vec<_> = doc
+        .buildings
+        .iter()
+        .zip(&built)
+        .enumerate()
+        .filter(|(i, (b, _))| if roof_levels { cuts_building(b) } else { *i == 0 })
+        .map(|(_, pair)| pair)
+        .collect();
+    if let Some((mb, b)) = level_buildings.first() {
         let zero = b.storeys.get(mb.ground_level).map_or(0.0, |st| st.elevation);
-        levels.extend(b.storeys.iter().map(|st| (st.elevation, st.name.clone())));
+        for (mb, b) in &level_buildings {
+            let label = |name: &str| if level_buildings.len() > 1 { format!("{name} ({})", mb.name) } else { name.into() };
+            levels.extend(b.storeys.iter().map(|st| (st.elevation, label(&st.name))));
+            if let Some(top) = b.storeys.last() {
+                levels.push((top.elevation + top.height, label("Tagfod")));
+            }
+            if let Some(r) = &b.roof {
+                levels.push((r.ridge, label("Kip")));
+            }
+        }
         levels.push((0.0, "Terræn".into()));
-        if let Some(top) = b.storeys.last() {
-            levels.push((top.elevation + top.height, "Tagfod".into()));
-        }
-        if let Some(r) = &b.roof {
-            levels.push((r.ridge, "Kip".into()));
-        }
         levels.sort_by(|a, b| a.0.total_cmp(&b.0));
-        levels.dedup_by(|a, b| (a.0 - b.0).abs() < 1.0);
+        levels.dedup_by(|a, b| {
+            let same = (a.0 - b.0).abs() < 1.0;
+            if roof_levels && same && a.1 != b.1 {
+                b.1.push_str(" / ");
+                b.1.push_str(&a.1);
+            }
+            same
+        });
+        // Combined wing names can be much wider than the original fixed side margin.
+        // Reserve their actual bundled-font ink width without shrinking physical lettering.
+        // Existing layouts that already fit retain their viewport and exported bytes.
+        let labels: Vec<_> = levels
+            .iter()
+            .map(|(_, name)| {
+                let mut text = Text::new(Layer::Level, [0.0, 0.0], name.clone(), 2.6);
+                text.anchor = Anchor::End;
+                text.middle = false;
+                text
+            })
+            .collect();
+        let ink = crate::plan_output::text_ink_bounds(&labels)?;
+        let left = ink.iter().flatten().map(|b| 16.0 + (5.0 - b[0]) / crate::sheet::MM_PER_PX).fold(AREA[0], f64::max);
+        if vp.px([0.0, 0.0])[0] < left {
+            let width = AREA[0] + AREA[2] - left;
+            if width < 100.0 {
+                return Err(ModelError::Invalid("section level names leave no drawing space; shorten the building or storey names".into()).into());
+            }
+            vp = Viewport::fit([0.0, y0, length, y1.max(y0 + 1000.0)], [left, AREA[1], width, AREA[3]]);
+            scale = vp.scale();
+            scene.scale = scale;
+        }
+        // A fixed saved-view template is applied after this scene is generated.
+        // Use its real paper scale for datum spacing, not the temporary fit scale.
+        // Keep every witness at its exact Z and jog the annotation heads if needed.
+        let s = final_scale.unwrap_or(scale);
+        let baselines = if final_scale.is_some() {
+            trigon_model::checked("section lettering scale", s, 1.0, 1e7)?;
+            let values: Vec<_> = levels
+                .iter()
+                .map(|(z, _)| {
+                    let mut value = Text::new(Layer::Level, [0., 0.], level_text(z - zero), 2.6);
+                    value.anchor = Anchor::Start;
+                    value.middle = false;
+                    value
+                })
+                .collect();
+            let value_ink = crate::plan_output::text_ink_bounds(&values)?;
+            let mut ys: Vec<f64> = Vec::new();
+            let mut previous_top = f64::NEG_INFINITY;
+            for (k, (z, _)) in levels.iter().enumerate() {
+                let bounds = [ink[k], value_ink[k]].into_iter().flatten();
+                let (low, high) = bounds.fold((0.0_f64, 0.0_f64), |(lo, hi), b| (lo.min(b[1]), hi.max(b[3])));
+                let mut y = z + 0.8 * s;
+                y = y.max(previous_top + 0.75 * s - low * s);
+                if let Some(prev) = ys.last() {
+                    y = y.max(prev + 3.0 * s);
+                }
+                previous_top = y + high * s;
+                ys.push(y);
+            }
+            Some(ys)
+        } else {
+            None
+        };
         for (k, (z, name)) in levels.iter().enumerate() {
             let (x0, x1) = (-3.0 * s, length + 3.0 * s);
             let dashed = Stroke { dashed: true, ..Stroke::new(0.18) };
             scene.line(Layer::Level, [x0, *z], [x1, *z], dashed);
             // Mark and lettering above the line, or below it when the next level up is too close.
             let crowded = levels.get(k + 1).is_some_and(|(next, _)| next - z < 4.0 * s);
-            let (up, y) = if crowded { (-1.0, z - 3.2 * s) } else { (1.0, z + 0.8 * s) };
+            let (up, y) = if let Some(ys) = &baselines {
+                (1.0, ys[k])
+            } else if crowded {
+                (-1.0, z - 3.2 * s)
+            } else {
+                (1.0, z + 0.8 * s)
+            };
+            let head_z = if baselines.is_some() { y - 0.8 * s } else { *z };
             let m = length + 7.0 * s;
+            if (head_z - z).abs() > 1e-6 {
+                scene.polyline(Layer::Level, vec![[x1, *z], [length + 5.0 * s, *z], [m, head_z]], Stroke::new(0.18));
+                scene.polyline(Layer::Level, vec![[x0, *z], [-4.0 * s, head_z], [-4.5 * s, head_z]], Stroke::new(0.18));
+            }
             scene.polygon(
                 Layer::Level,
-                vec![vec![[m, *z], [m + 1.3 * s, *z + 2.2 * s * up], [m - 1.3 * s, *z + 2.2 * s * up]]],
+                vec![vec![[m, head_z], [m + 1.3 * s, head_z + 2.2 * s * up], [m - 1.3 * s, head_z + 2.2 * s * up]]],
                 Some(Fill::Solid([0x1a, 0x1a, 0x1a])),
                 None,
             );
@@ -263,10 +397,9 @@ pub(crate) fn sheet(
         }
     }
 
-    let project_name = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
+    let project_name = level_buildings.first().map(|(b, _)| b.name.as_str()).unwrap_or_default();
     let cut_area: f64 = all_poche.iter().flatten().map(|r| cut::area2(r)).sum::<f64>() / 2.0;
-    let mut result = json!({
-        "written": path,
+    let metrics = json!({
         "scale": scale_text(scale),
         "mm_per_px": vp.mm,
         "looking": if flip { "right of from → to" } else { "left of from → to" },
@@ -276,29 +409,14 @@ pub(crate) fn sheet(
         "lines": projection.edges.len(),
         "levels": levels.len(),
     });
-    let bytes = match ext {
-        "dxf" => {
-            let text = dxf::write(&scene, &dxf::TitleBlock { title, project: project_name, caption, note: None });
-            result["dxf"] = dxf::summary(&text);
-            dxf::bytes(&text)
-        }
-        _ => {
-            let page = svg::sheet(
-                &svg::Frame { title, project: project_name, caption, footer: title, note: None },
-                &scene,
-                &vp,
-                [0.0, 120.0, 1600.0, 700.0],
-            );
-            match ext {
-                "pdf" => crate::plan_output::pdf(std::slice::from_ref(&page), PAGE_MM)?,
-                "png" => crate::plan_output::png(&page)?,
-                _ => page.into_bytes(),
-            }
-        }
-    };
-    write_output(&path, &bytes)?;
-    if ext == "png" {
-        result["image_path"] = json!(path);
-    }
-    Ok(result)
+    Ok(Sheet {
+        scene,
+        vp,
+        clip: [0.0, 120.0, 1600.0, 700.0],
+        title: title.into(),
+        project: project_name.into(),
+        caption: caption.into(),
+        note: None,
+        metrics,
+    })
 }

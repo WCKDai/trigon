@@ -49,11 +49,32 @@ watch the agent work: every command it runs lands in your window, in the activit
 agent's name, with parameters, result and duration) and in the model, where what it changed glows
 for a few seconds.
 
-The Project browser opens floor plans, 3D cuts and facades. Properties provides precise move,
+Studio uses the Trigon orange identity, graphite controls and warm drawing paper. The **Model**
+workspace's Project browser opens floor plans, 3D cuts and facades. Properties provides precise move,
 copy, align, storey-copy and delete tools; saved selection groups run as one undoable batch.
-Families browses and edits component types and creates parameter variants. The Templates menu
-saves reusable projects and starts detached copies. See [precise editing](docs/editing.md) for
+**Families** browses and edits component types and creates parameter variants. The project menu
+beside the Trigon mark saves reusable templates and starts detached copies. **Document** opens
+saved plans, elevations and sections with precise annotation picking and snapping; see
+[saved drawings](docs/annotations.md). See [precise editing](docs/editing.md) for
 the shared commands, coordinate conventions and current boundaries.
+
+The 3D workspace and 2D views share one model. Pick a wall, opening, stair, room, balcony, roof or
+slab to edit its source properties; dimensional markers provide drag edits with one Undo step.
+Saved annotations support font families/styles and filled regions. See
+[coordinated authoring](docs/coordinated-authoring.md) for supported edits and current limits.
+
+Reusable component libraries use local `.trigonlib` files. `types.export` saves a selection and
+`types.import` loads it; explicit replacement updates every linked instance in one undoable batch.
+See [component libraries](docs/component-libraries.md) and the original `libraries/balconies.trigonlib` starter pack.
+
+Studio's **Schedules** workspace and `schedule.openings` list the built windows and doors with their model IDs, storeys, types,
+dimensions, phase status and lining areas. It includes interior/cellar doors and explicitly
+excludes loggia facade-hole areas from the totals. `schedule.export` saves the inventory as
+CSV or JSON. See [opening schedules](docs/schedules.md).
+
+Masonry uses physical-scale brick courses in Studio and self-contained GLB exports, with original
+colour and joint-relief maps. `facade.set_finish` supports explicit yellow and red brick as well
+as render; finish changes preserve geometry and are undoable. See [materials](docs/materials.md).
 
 ```sh
 cargo build --release -p trigon-studio -p trigon
@@ -85,7 +106,10 @@ In Studio:
 - **3D**: drag to orbit, Shift-drag or right-drag to pan, scroll or pinch to zoom at the pointer,
   double-click or F to fit. "Up to level" cuts the model 1.2 m above a floor. Click an element to
   see its id, type and properties.
-- **Plan**: the level's plan sheet, as `plan.sheet` draws it; drag to pan, scroll to zoom.
+- **Plan and saved drawings**: click visible wall, window or door lines to select the same element
+  used by 3D and Properties; drag to pan and scroll to zoom. The orange outline follows the
+  selected linework. **Edit elements** switches a saved drawing to the model editing tools;
+  annotation tools retain their own selection. See [drawing picking](docs/drawing-picking.md).
 - **Activity**: newest first; click an entry for its full JSON. Undo and Redo (⌘Z, ⇧⌘Z) apply to
   your changes and the agent's alike.
 - **Commands…** (⌘K): search every command, edit its parameters (prefilled from its schema) and
@@ -109,6 +133,7 @@ you can read. See [`docs/control-protocol.md`](docs/control-protocol.md).
 | Cellar stairs | `building.set_cellar_stairs`: outdoor stairs down to the basement (kældernedgange) read off the basement plan: a pit along a facade between retaining walls with a kerb and railing, a straight flight along the wall, and a door into the basement |
 | Components | Loggias (`loggia`: the facade opened from the sill, glazed door and window set back between brick returns under a soffit, with a rail across), windows with top lights (`top_light`), glazed white stair, shop and balcony doors, door + window units (`door_window`: door width and side, window over a panel), casement windows (1–3 sashes), fixed window, entrance door, French door, French balcony, cantilever balcony; define your own with `types.define` |
 | Export | IFC4 as building elements for Revit and Vectorworks: layered walls with axes, wall types and joins, openings with typed windows and doors, floor slabs with stair openings, the roof, stairs of flights and landings, rooms as spaces, balconies as assemblies, colours and presentation layers, georeferenced with `IfcMapConversion` ([docs/ifc-export.md](docs/ifc-export.md), sample: [examples/sample-building.ifc](examples/sample-building.ifc)); and glTF 2.0. `export.gltf cut_level` makes a 3D plan cut (cut views): everything above `cut_mm` over that storey's floor is left out and the walls are closed at the cut |
+| Opening schedules | `schedule.openings` returns a deterministic, read-only inventory of actual built windows and doors, including occurrence dimensions and IFC-compatible outer-lining areas, with building/storey/phase filters; loggia areas are explicitly excluded ([contract](docs/schedules.md)) |
 | Drawings | `drawing.add` links a page of a scanned archive PDF (JPEG scans, read with lopdf + zune-jpeg); `drawing.view` shows it with a labelled pixel grid; `drawing.register_facade` ties a drawn elevation to a facade; `evidence.facade_image {drawing}` straightens it with the model drawn over it, like the photos. Only links are stored, never the scans |
 | Phases | Revit-style: `phase.set` (e.g. 1938 → 2026 → forslag), `phase.activate`; every placement is created in a phase and may be demolished in a later one. `facade.place` in a later phase demolishes what stood in the slot instead of deleting it; `facade.demolish` (openings close the wall). Views take `phase` + `filter` (complete, demolition, new, all): overlays colour existing magenta, new green, demolished red; glTF draws demolished translucent red; IFC carries Pset_*Common.Status (EXISTING, NEW, DEMOLISH) |
 | Balconies | Balconies are attachments (no opening): `balcony_slab` for existing ones and `steel_balcony` for the MinAltan stålaltan (UPE 160 frame, sunken Cumaru/fibre-concrete/composite/bamboo deck, Frederiksberg/Nørrebro/Vesterbro/Østerbro railing, galvanised/white/anthracite, optional hardwood handrail, matt-glass screens, tie rods) |

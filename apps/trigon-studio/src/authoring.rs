@@ -13,6 +13,8 @@ pub enum Tab {
     #[default]
     Project,
     Families,
+    Drawings,
+    Schedules,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -44,6 +46,8 @@ pub struct Authoring {
     align_mode: usize,
     coordinate: f64,
     reference: String,
+    wall_reference_face: usize,
+    wall_target_face: usize,
     line: [[f64; 2]; 2],
     group_id: String,
     group_name: String,
@@ -52,6 +56,10 @@ pub struct Authoring {
     kind: Value,
     facade: String,
     bay_count: usize,
+    library_import_path: String,
+    library_export_path: String,
+    library_replace: bool,
+    library_selected_only: bool,
 }
 
 impl Default for Authoring {
@@ -70,6 +78,8 @@ impl Default for Authoring {
             align_mode: 0,
             coordinate: 0.0,
             reference: String::new(),
+            wall_reference_face: 0,
+            wall_target_face: 0,
             line: [[0.0, 0.0], [1000.0, 0.0]],
             group_id: "selection".into(),
             group_name: "Selection group".into(),
@@ -78,6 +88,10 @@ impl Default for Authoring {
             kind: Value::Null,
             facade: String::new(),
             bay_count: 5,
+            library_import_path: String::new(),
+            library_export_path: "out/components.trigonlib".into(),
+            library_replace: false,
+            library_selected_only: true,
         }
     }
 }
@@ -102,7 +116,8 @@ impl Authoring {
         self.tab = Tab::Families;
     }
 
-    pub fn library(&mut self, ui: &mut egui::Ui, doc: &Document) {
+    pub fn library(&mut self, ui: &mut egui::Ui, doc: &Document) -> Option<Run> {
+        let mut run = None;
         ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Find a family or type").desired_width(f32::INFINITY));
         let search = self.search.to_lowercase();
         theme::eyebrow(ui, "COMPONENT TYPES");
@@ -117,15 +132,124 @@ impl Authoring {
             }
         }
         ui.add_space(8.0);
-        ui.weak("Select a type to edit its parameters or create a variant.");
+        ui.weak("Select a shared type to edit all referencing instances, or duplicate it as a new type.");
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Portable component libraries").id_salt("portable-libraries").show(ui, |ui| {
+            ui.weak("Local snapshots with a lowercase .trigonlib extension · no account required. Imported definitions become shared project types.");
+            ui.label("Import library");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.library_import_path)
+                    .char_limit(4096)
+                    .hint_text("path/to/components.trigonlib")
+                    .desired_width(f32::INFINITY),
+            );
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if ui.button("Browse library…").clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("Trigon component library", &["trigonlib"]).pick_file()
+            {
+                self.library_import_path = path.to_string_lossy().into_owned();
+            }
+            ui.checkbox(&mut self.library_replace, "Replace matching type IDs globally");
+            if self.library_replace {
+                ui.colored_label(theme::ACCENT, "Replacement updates every referencing instance. Explicit instance overrides remain local.");
+            }
+            let supported = trigon_engine::commands().iter().any(|c| c.id == "types.import");
+            if ui.add_enabled(supported && self.import_library().is_some(), egui::Button::new("Import shared types")).clicked() {
+                run = self.import_library();
+            }
+            if !supported {
+                ui.weak("Import requires the matching portable-library engine commands.");
+            }
+            ui.separator();
+            ui.label("Export library");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.library_export_path)
+                    .char_limit(4096)
+                    .hint_text("out/components.trigonlib")
+                    .desired_width(f32::INFINITY),
+            );
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if ui.button("Choose export file…").clicked()
+                && let Some(path) =
+                    rfd::FileDialog::new().add_filter("Trigon component library", &["trigonlib"]).set_file_name("components.trigonlib").save_file()
+            {
+                self.library_export_path = path.to_string_lossy().into_owned();
+            }
+            ui.checkbox(&mut self.library_selected_only, "Selected type only");
+            if self.library_selected_only {
+                ui.weak(self.draft.as_ref().map_or("Choose a type to export", |t| t.id.as_str()));
+            } else {
+                ui.weak(format!("All {} shared project types", doc.types.len()));
+            }
+            let supported = trigon_engine::commands().iter().any(|c| c.id == "types.export");
+            if ui
+                .add_enabled(supported && !doc.types.is_empty() && self.export_library().is_some(), egui::Button::new("Export type library"))
+                .clicked()
+            {
+                run = self.export_library();
+            }
+            if !supported {
+                ui.weak("Export requires the matching portable-library engine commands.");
+            }
+        });
+        run
     }
 
-    fn selected(&self, current: Option<&Element>) -> Vec<String> {
+    fn library_path(path: &str) -> Option<&str> {
+        let path = path.trim();
+        (!path.is_empty()
+            && path.len() <= 4096
+            && !path.chars().any(char::is_control)
+            && !path.contains("://")
+            && std::path::Path::new(path).extension().and_then(|s| s.to_str()) == Some("trigonlib"))
+        .then_some(path)
+    }
+    fn import_library(&self) -> Option<Run> {
+        Some(Run { command: "types.import", params: json!({"path":Self::library_path(&self.library_import_path)?,"replace":self.library_replace}) })
+    }
+    fn export_library(&self) -> Option<Run> {
+        let mut params = json!({"path":Self::library_path(&self.library_export_path)?});
+        if self.library_selected_only {
+            params["ids"] = json!([self.draft.as_ref()?.id]);
+        }
+        Some(Run { command: "types.export", params })
+    }
+
+    pub(crate) fn selected(&self, current: Option<&Element>) -> Vec<String> {
         if self.targets.trim().is_empty() {
             current.map(|e| vec![e.id.clone()]).unwrap_or_default()
         } else {
             self.targets.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).map(str::to_string).collect()
         }
+    }
+
+    fn align_walls(&self, targets: &[String]) -> Option<Run> {
+        let reference = self.reference.trim();
+        if reference.is_empty() || targets.is_empty() || targets.iter().any(|id| id == reference) {
+            return None;
+        }
+        let faces = ["center", "left", "right"];
+        Some(Run {
+            command: "edit.align_walls",
+            params: json!({"targets":targets,"reference":reference,
+            "reference_face":faces[self.wall_reference_face],"target_face":faces[self.wall_target_face]}),
+        })
+    }
+
+    pub fn ribbon(&mut self, ui: &mut egui::Ui) {
+        for (tool, label) in
+            [(Tool::Move, "Move"), (Tool::Copy, "Copy"), (Tool::Align, "Align"), (Tool::Levels, "To levels"), (Tool::Delete, "Delete")]
+        {
+            ui.selectable_value(&mut self.tool, tool, label);
+        }
+    }
+
+    pub(crate) fn command_controls_first(&self) -> bool {
+        self.tab != Tab::Families && self.tool != Tool::Move
+    }
+
+    pub(crate) fn wall_alignment_active(&self) -> bool {
+        self.tool == Tool::Align && self.align_mode == 3
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, doc: &Document, current: Option<&Element>, level: usize) -> Option<Run> {
@@ -204,13 +328,13 @@ impl Authoring {
             Tool::Align => {
                 let axes = ["x", "y", "u", "z"];
                 let anchors = ["start", "center", "end"];
-                let modes = ["Coordinate", "Reference element", "Plan line"];
+                let modes = ["Coordinate", "Reference element", "Plan line", "Wall line / face"];
                 egui::ComboBox::from_id_salt("align-mode").selected_text(modes[self.align_mode]).show_ui(ui, |ui| {
                     for (i, label) in modes.iter().enumerate() {
                         ui.selectable_value(&mut self.align_mode, i, *label);
                     }
                 });
-                if self.align_mode != 2 {
+                if self.align_mode < 2 {
                     ui.horizontal(|ui| {
                         egui::ComboBox::from_id_salt("align-axis").width(60.0).selected_text(axes[self.axis].to_uppercase()).show_ui(ui, |ui| {
                             for (i, a) in axes.iter().enumerate() {
@@ -238,7 +362,7 @@ impl Authoring {
                     1 => {
                         ui.add(egui::TextEdit::singleline(&mut self.reference).hint_text("Reference element id"));
                     }
-                    _ => {
+                    2 => {
                         egui::Grid::new("align-line").show(ui, |ui| {
                             field(ui, "Start X", &mut self.line[0][0]);
                             field(ui, "Start Y", &mut self.line[0][1]);
@@ -246,8 +370,30 @@ impl Authoring {
                             field(ui, "End Y", &mut self.line[1][1]);
                         });
                     }
+                    _ => {
+                        ui.label("Pick the reference wall, capture it, then pick the wall to align.");
+                        if ui.add_enabled(current.is_some_and(|e|e.kind == "interior wall"),egui::Button::new("Use picked wall as reference")).clicked()
+                            && let Some(wall)=current {
+                            self.reference=wall.id.clone();
+                        }
+                        ui.add(egui::TextEdit::singleline(&mut self.reference).hint_text("Reference wall id").char_limit(512));
+                        let labels=["Centreline","Left face","Right face"];
+                        for (name,id,selected) in [("Reference", "wall-reference-face", &mut self.wall_reference_face),
+                            ("Target", "wall-target-face", &mut self.wall_target_face)] {
+                            ui.horizontal(|ui| {
+                                ui.label(name);
+                                egui::ComboBox::from_id_salt(id).selected_text(labels[*selected]).show_ui(ui,|ui| {
+                                    for (index,label) in labels.iter().enumerate() { ui.selectable_value(selected,index,*label); }
+                                });
+                            });
+                        }
+                        ui.weak("Left/right follow each wall's start-to-end direction. Aligns walls within 15°, keeping lengths and door positions along the wall.");
+                    }
                 }
-                if ui.button("Align selection").clicked() {
+                if self.align_mode == 3 {
+                    let alignment=self.align_walls(&targets);
+                    if ui.add_enabled(alignment.is_some(),egui::Button::new("Align wall selection")).clicked() { run=alignment; }
+                } else if ui.button("Align selection").clicked() {
                     let mut params = json!({"targets":targets,"anchor":anchors[self.anchor]});
                     if self.align_mode == 2 {
                         params["line"] = json!(self.line);
@@ -264,7 +410,11 @@ impl Authoring {
             }
             Tool::Levels => {
                 ui.label("Destination storeys");
-                if let Some(b) = doc.buildings.first() {
+                let building = current
+                    .and_then(|e| e.props.iter().find(|(k, _)| *k == "building"))
+                    .and_then(|(_, id)| doc.buildings.iter().find(|b| b.id == *id))
+                    .or_else(|| doc.buildings.first());
+                if let Some(b) = building {
                     for (i, storey) in b.storeys.iter().enumerate() {
                         let mut selected = self.levels.contains(&i);
                         if ui.checkbox(&mut selected, &storey.name).changed() {
@@ -335,6 +485,10 @@ impl Authoring {
         let mut run = None;
         theme::eyebrow(ui, &family_name(draft).to_uppercase());
         ui.heading(&draft.name);
+        egui::Frame::new().fill(theme::CHROME).inner_margin(8.0).corner_radius(3).show(ui, |ui| {
+            theme::eyebrow(ui, "SHARED TYPE · PROJECT-WIDE");
+            ui.label("Sizes, materials and colors apply to every instance using this type. Explicit instance overrides stay local.");
+        });
         if ui.button("Duplicate as new type").clicked() {
             let base = draft.id.clone();
             for n in 1..=10_000 {
@@ -415,7 +569,7 @@ impl Authoring {
         if ui
             .add_sized(
                 [ui.available_width(), 30.0],
-                egui::Button::new(if exists { "Update type and its instances" } else { "Create component type" }),
+                egui::Button::new(if exists { "Update shared type and its instances" } else { "Create component type" }),
             )
             .clicked()
         {
@@ -447,5 +601,84 @@ impl Authoring {
             run = Some(Run { command: "facade.place", params: json!({"facade":self.facade,"type":draft.id,"levels":[level]}) });
         }
         run
+    }
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+    #[test]
+    fn wall_alignment_form_keeps_the_captured_reference_separate_from_the_picked_target() {
+        let mut form = Authoring::default();
+        assert!(form.align_walls(&["target.L1".into()]).is_none());
+        form.reference = "reference.L1".into();
+        assert!(form.align_walls(&["reference.L1".into()]).is_none());
+        form.wall_reference_face = 1;
+        form.wall_target_face = 2;
+        let run = form.align_walls(&["target.L1".into()]).unwrap();
+        assert_eq!(run.command, "edit.align_walls");
+        assert_eq!(run.params, json!({"reference":"reference.L1","targets":["target.L1"],"reference_face":"left","target_face":"right"}));
+        assert!(run.params.get("axis").is_none(), "wall face alignment must not fall back to bounding-box translation");
+    }
+
+    #[test]
+    fn shared_type_scope_stays_readable_in_a_narrow_properties_column() {
+        let doc = Document::default();
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.first().unwrap());
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(340.0, 1500.0))), ..Default::default() },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    form.family_editor(ui, &doc, 0);
+                });
+            },
+        );
+        output.textures_delta.clear();
+        fn scope(shapes: &[egui::Shape]) -> Vec<(String, egui::Rect)> {
+            shapes
+                .iter()
+                .flat_map(|shape| match shape {
+                    egui::Shape::Text(t) => vec![(t.galley.text().to_string(), egui::Rect::from_min_size(t.pos, t.galley.size()))],
+                    egui::Shape::Vec(v) => scope(v),
+                    _ => Vec::new(),
+                })
+                .collect()
+        }
+        let labels = scope(&output.shapes.into_iter().map(|s| s.shape).collect::<Vec<_>>());
+        let banner = labels.iter().find(|(s, _)| s.contains("Explicit instance overrides stay local")).unwrap();
+        assert!(banner.1.right() <= 340.0 && banner.1.left() >= 0.0, "scope text must wrap inside the properties column");
+        assert!(labels.iter().any(|(s, _)| s == "SHARED TYPE · PROJECT-WIDE"));
+    }
+
+    #[test]
+    fn portable_library_actions_preserve_global_replace_opt_in_and_selected_type_filter() {
+        let doc = Document::default();
+        let mut form = Authoring::default();
+        assert!(form.import_library().is_none());
+        form.library_import_path = "/tmp/Æøå library.trigonlib".into();
+        let import = form.import_library().unwrap();
+        assert_eq!(import.command, "types.import");
+        assert_eq!(import.params["replace"], false);
+        form.library_replace = true;
+        assert_eq!(form.import_library().unwrap().params["replace"], true);
+        assert!(form.export_library().is_none(), "selected-only export needs a selected shared type");
+        form.choose_type(doc.types.first().unwrap());
+        let export = form.export_library().unwrap();
+        assert_eq!(export.command, "types.export");
+        assert_eq!(export.params["ids"], json!([doc.types[0].id]));
+        form.library_selected_only = false;
+        assert!(form.export_library().unwrap().params.get("ids").is_none());
+        for invalid in
+            ["", "library.json", "library.TRIGONLIB", "library.TrigonLib", "bad\nname.trigonlib", "https://example.invalid/library.trigonlib"]
+        {
+            form.library_import_path = invalid.into();
+            form.library_export_path = invalid.into();
+            assert!(form.import_library().is_none(), "Import must not enable a path the engine rejects: {invalid:?}");
+            assert!(form.export_library().is_none(), "Export must not enable a path the engine rejects: {invalid:?}");
+        }
+        assert_eq!(doc, Document::default(), "form choices never mutate type definitions or instances");
     }
 }

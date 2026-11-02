@@ -7,7 +7,11 @@ use trigon_model::build::{Built, ElementClass, Status};
 use trigon_model::mesh::{Material, Mesh};
 
 use super::project::{Class, Projection, Source};
-use super::{Fill, INK, Layer, Rgb, Scene, Stroke, thinner};
+use super::{Element, Fill, INK, Layer, Rgb, Scene, Stroke, thinner};
+use crate::views::DrawingElementKind;
+
+#[cfg(test)]
+mod attribution_tests;
 
 /// What an element's part is drawn as.
 pub(crate) fn class_of(element: ElementClass, m: Material) -> Class {
@@ -39,8 +43,8 @@ pub(crate) struct Part<'a> {
     pub(crate) role: Role,
 }
 
-fn part(mesh: &Mesh, class: Class, group: usize, material: Material, role: Role) -> Part<'_> {
-    Part { source: Source { mesh, class, group }, material, role }
+fn part(mesh: &Mesh, class: Class, group: usize, material: Material, role: Role, element: Option<Element>) -> Part<'_> {
+    Part { source: Source { mesh, class, group, element }, material, role }
 }
 
 /// The meshes of the buildings as a view shows them. A facade wall is seen as one surface and
@@ -56,42 +60,102 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
     };
     for b in built {
         let walls = next();
-        for w in &b.walls {
-            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, Role::Seen));
+        for w in b.exterior_walls() {
+            let element = Element::new(&w.id, DrawingElementKind::FacadeWall);
+            let gable = b.roof.iter().any(|r| r.gable_walls.iter().any(|g| g.front.id == w.id));
+            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, if gable { Role::Both } else { Role::Seen }, Some(element.clone())));
             for seg in &w.segments {
-                out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut));
+                out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut, Some(element.clone())));
             }
-            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both));
+            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both, Some(element)));
             for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
                 if e.status == Status::Demolished {
                     continue;
                 }
                 for (m, mesh) in &e.parts {
-                    out.push(part(mesh, class_of(e.class, *m), next(), *m, Role::Both));
+                    let kind = match e.class {
+                        ElementClass::Window | ElementClass::Door => DrawingElementKind::Opening,
+                        ElementClass::Railing => DrawingElementKind::Railing,
+                        ElementClass::BalconySlab => DrawingElementKind::Balcony,
+                        ElementClass::Stair => DrawingElementKind::Stair,
+                    };
+                    let element = Some(Element::new(&e.id, kind));
+                    out.push(part(mesh, class_of(e.class, *m), next(), *m, Role::Both, element));
                 }
             }
         }
         if let Some(r) = &b.roof {
-            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both));
-            out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both));
-            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both));
+            for light in &r.rooflights {
+                let element = Some(Element::new(&light.id, DrawingElementKind::Opening));
+                for (material, mesh) in &light.fill.parts {
+                    out.push(part(mesh, class_of(light.fill.class, *material), next(), *material, Role::Both, element.clone()));
+                }
+                out.push(part(
+                    &light.flashing,
+                    Class::Roof,
+                    next(),
+                    Material::Steel,
+                    Role::Both,
+                    Some(Element::new(&format!("{}.flashing", light.id), DrawingElementKind::Roof)),
+                ));
+            }
+            let element = Some(Element::new(&r.id, DrawingElementKind::Roof));
+            out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both, element.clone()));
+            if r.gable_parts.is_empty() {
+                out.push(part(&r.gables, Class::Wall, walls, Material::Wall, Role::Both, element.clone()));
+            } else {
+                for (material, mesh) in &r.gable_parts {
+                    out.push(part(mesh, Class::Wall, walls, *material, Role::Both, element.clone()));
+                }
+            }
+            for (material, mesh) in &r.covering {
+                out.push(part(mesh, Class::Roof, next(), *material, Role::Both, element.clone()));
+            }
+            out.push(part(&r.gutters, Class::Roof, next(), Material::Steel, Role::Both, element));
+            for d in &r.dormers {
+                out.push(part(
+                    &d.roof,
+                    Class::Roof,
+                    next(),
+                    Material::Steel,
+                    Role::Both,
+                    Some(Element::new(&format!("{}.roof", d.id), DrawingElementKind::Roof)),
+                ));
+                out.push(part(
+                    &d.cheeks,
+                    Class::Wall,
+                    next(),
+                    Material::Steel,
+                    Role::Both,
+                    Some(Element::new(&format!("{}.cheeks", d.id), DrawingElementKind::FacadeWall)),
+                ));
+            }
         }
         if inside {
             for s in &b.slabs {
-                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both));
+                let kind = if s.kind == trigon_model::SlabKind::Roof { DrawingElementKind::Roof } else { DrawingElementKind::Slab };
+                out.push(part(&s.mesh, Class::Slab, next(), Material::Slab, Role::Both, Some(Element::new(&s.id, kind))));
             }
             for iw in &b.interior {
                 let class = if iw.load_bearing { Class::Wall } else { Class::Partition };
-                out.push(part(&iw.mesh, class, next(), Material::Plaster, Role::Both));
+                out.push(part(&iw.mesh, class, next(), Material::Plaster, Role::Both, Some(Element::new(&iw.id, DrawingElementKind::InteriorWall))));
                 for d in iw.doors.iter().filter(|d| d.status != Status::Demolished) {
                     for (m, mesh) in &d.fill.parts {
-                        out.push(part(mesh, class_of(d.fill.class, *m), next(), *m, Role::Both));
+                        out.push(part(
+                            mesh,
+                            class_of(d.fill.class, *m),
+                            next(),
+                            *m,
+                            Role::Both,
+                            Some(Element::new(&d.fill.id, DrawingElementKind::Opening)),
+                        ));
                     }
                 }
             }
             for st in &b.stairs {
-                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both));
-                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both));
+                let element = Some(Element::new(&st.id, DrawingElementKind::Stair));
+                out.push(part(&st.mesh, Class::Stair, next(), Material::Slab, Role::Both, element.clone()));
+                out.push(part(&st.railing, Class::Railing, next(), Material::Railing, Role::Both, element));
             }
         }
     }
@@ -160,7 +224,16 @@ fn towards_white(c: Rgb, k: f64) -> Rgb {
 /// The projection's faces (back to front) as tonal fills, each face's rings oriented (outlines
 /// counter-clockwise, holes clockwise) so neighbouring faces of one tone can be filled as one.
 pub(crate) fn fills(scene: &mut Scene, p: &Projection) {
+    scene.element_regions.extend(p.element_regions.iter().cloned());
     for f in &p.faces {
+        if let Some(element) = &f.element {
+            scene.element_regions.push(crate::views::DrawingElementRegion {
+                id: element.id.clone(),
+                kind: element.kind,
+                rings: f.rings.clone(),
+                depth_plane: Some(f.depth_plane),
+            });
+        }
         let Some(c) = tone(f.class) else { continue };
         let c = towards_white(c, [0.0, 0.45, 0.7][band(f.depth)]);
         let rings: Vec<Vec<[f64; 2]>> = super::cut::even_odd(&f.rings).into_iter().flatten().collect();
@@ -171,6 +244,11 @@ pub(crate) fn fills(scene: &mut Scene, p: &Projection) {
 /// The projection's visible edges: heavier on the outline, lighter and thinner further back. Where
 /// pieces of edges lie on one line they are merged, the heaviest winning, so nothing is drawn twice.
 pub(crate) fn edges(scene: &mut Scene, p: &Projection) {
+    #[cfg(test)]
+    if attribution_tests::USE_FULL_SCAN.with(std::cell::Cell::get) {
+        attribution_tests::full_scan_edges(scene, p);
+        return;
+    }
     let mut styled: Vec<([f64; 2], [f64; 2], Layer, Stroke)> = Vec::with_capacity(p.edges.len());
     for e in &p.edges {
         let b = band(e.depth);
@@ -179,10 +257,125 @@ pub(crate) fn edges(scene: &mut Scene, p: &Projection) {
         let b = if e.class == Class::Railing { (b + 1).min(2) } else { b };
         let colour = [INK, [0x60, 0x60, 0x60], [0x96, 0x96, 0x96]][b];
         let pen = if e.class == Class::Railing { base } else { thinner(base, b) };
-        styled.push((e.a, e.b, layer(e.class), Stroke { pen, colour, dashed: false }));
+        styled.push((e.a, e.b, layer(e.class), Stroke { pen, colour, dashed: false, pattern: Default::default() }));
     }
+    let elements: Vec<_> = p.edges.iter().flat_map(|edge| edge.element_segments.iter().cloned()).collect();
+    // Small views keep the original scan; larger views pay for one temporary bounds tree.
+    let index = (elements.len() >= 256).then(|| OwnershipIndex::new(&elements));
+    let mut candidates = Vec::new();
     for (a, b, layer, stroke) in merge(styled) {
         scene.line(layer, a, b, stroke);
+        if let Some(index) = &index {
+            index.query([a, b], &mut candidates);
+            scene.attribute_last_from(candidates.iter().map(|&i| &elements[i]));
+        } else {
+            scene.attribute_last(&elements);
+        }
+    }
+}
+
+// Index only drawing ownership: geometry, merge and the exact 0.5 mm overlap predicate stay
+// unchanged. A bounds tree avoids angle quantization and cell replication for tiny, diagonal
+// and very long segments. Each valid source is stored once; traversal depth is logarithmic.
+#[derive(Clone, Copy)]
+struct OwnerBounds {
+    lo: [f64; 2],
+    hi: [f64; 2],
+}
+
+impl OwnerBounds {
+    fn segment(segment: [[f64; 2]; 2]) -> Option<Self> {
+        // These are the exact predicate's existing coordinate limits. Invalid sources can
+        // never own any line, and invalid drawn lines can never acquire ownership.
+        if segment.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
+            return None;
+        }
+        Some(Self {
+            lo: std::array::from_fn(|axis| segment[0][axis].min(segment[1][axis])),
+            hi: std::array::from_fn(|axis| segment[0][axis].max(segment[1][axis])),
+        })
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self { lo: std::array::from_fn(|axis| self.lo[axis].min(other.lo[axis])), hi: std::array::from_fn(|axis| self.hi[axis].max(other.hi[axis])) }
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        (0..2).all(|axis| self.lo[axis] <= other.hi[axis] && other.lo[axis] <= self.hi[axis])
+    }
+}
+
+struct OwnerNode {
+    bounds: OwnerBounds,
+    range: std::ops::Range<usize>,
+    children: Option<[usize; 2]>,
+}
+
+struct OwnershipIndex {
+    items: Vec<(OwnerBounds, usize)>,
+    nodes: Vec<OwnerNode>,
+    source_count: usize,
+}
+
+impl OwnershipIndex {
+    fn new(sources: &[crate::views::DrawingElementSegment]) -> Self {
+        let mut index = Self {
+            items: sources.iter().enumerate().filter_map(|(i, s)| OwnerBounds::segment(s.segment).map(|bounds| (bounds, i))).collect(),
+            nodes: Vec::new(),
+            source_count: sources.len(),
+        };
+        Self::build(&mut index.items, 0, &mut index.nodes);
+        index
+    }
+
+    fn build(items: &mut [(OwnerBounds, usize)], offset: usize, nodes: &mut Vec<OwnerNode>) -> Option<usize> {
+        let bounds = items.iter().map(|item| item.0).reduce(OwnerBounds::union)?;
+        let node = nodes.len();
+        nodes.push(OwnerNode { bounds, range: offset..offset + items.len(), children: None });
+        if items.len() > 16 {
+            let axis = usize::from(bounds.hi[1] - bounds.lo[1] > bounds.hi[0] - bounds.lo[0]);
+            let middle = items.len() / 2;
+            items.select_nth_unstable_by(middle, |(a, ai), (b, bi)| (a.lo[axis] + a.hi[axis]).total_cmp(&(b.lo[axis] + b.hi[axis])).then(ai.cmp(bi)));
+            let (left, right) = items.split_at_mut(middle);
+            if let (Some(left), Some(right)) = (Self::build(left, offset, nodes), Self::build(right, offset + middle, nodes)) {
+                nodes[node].children = Some([left, right]);
+            }
+        }
+        Some(node)
+    }
+
+    fn query(&self, segment: [[f64; 2]; 2], out: &mut Vec<usize>) {
+        out.clear();
+        let Some(mut bounds) = OwnerBounds::segment(segment) else { return };
+        // `overlap` first rejects disjoint AABBs at 0.5 + 1e-7 mm. This wider margin also
+        // covers rounding when expanding the other box near +/-1e8 mm. No direction test:
+        // even a short perpendicular source can pass the existing endpoint-distance test.
+        for axis in 0..2 {
+            bounds.lo[axis] -= 0.5 + 1e-6;
+            bounds.hi[axis] += 0.5 + 1e-6;
+        }
+        if !self.nodes.is_empty() {
+            self.visit(0, bounds, out);
+        }
+        // Preserve original records, including duplicate owners/spans. Dense queries fall
+        // back to the full ordered scan rather than sorting almost every source per line.
+        if out.len() > self.source_count / 2 {
+            out.clear();
+            out.extend(0..self.source_count);
+        } else {
+            out.sort_unstable();
+        }
+    }
+
+    fn visit(&self, node: usize, bounds: OwnerBounds, out: &mut Vec<usize>) {
+        let Some(node) = self.nodes.get(node).filter(|node| node.bounds.overlaps(bounds)) else { return };
+        if let Some(children) = node.children {
+            for child in children {
+                self.visit(child, bounds, out);
+            }
+        } else {
+            out.extend(self.items[node.range.clone()].iter().filter(|item| item.0.overlaps(bounds)).map(|item| item.1));
+        }
     }
 }
 

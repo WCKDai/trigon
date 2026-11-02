@@ -15,3 +15,6 @@ lopdf = { version = "0.46", default-features = false }
 # JPEG decoding of scanned pages (MIT OR Apache-2.0 OR Zlib).
 zune-jpeg = "0.5"
 zune-core = "0.5"
+
+# Native CCITT Group 4 archival scans (MIT; already locked through the image stack).
+fax = "0.2.7"

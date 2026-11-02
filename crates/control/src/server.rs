@@ -24,6 +24,8 @@ pub const MAX_LINE: usize = 16 * 1024 * 1024;
 pub const MAX_BAD_LINES: usize = 8;
 /// Connections served at once, so a flood cannot spawn threads without end.
 pub const MAX_CONNECTIONS: usize = 16;
+/// Independent bounded refusal drains; silent refused sockets cannot stop new accepts.
+const MAX_REFUSAL_DRAINS: usize = 4;
 /// Requests waiting for the app at once.
 pub const MAX_QUEUE: usize = 64;
 /// How long a request waits for the app's reply before it is answered `running`.
@@ -150,6 +152,7 @@ struct Shared {
     waker: Waker,
     presence: Arc<Presence>,
     open: AtomicUsize,
+    refusals: AtomicUsize,
     connections: AtomicU64,
     options: Options,
 }
@@ -176,8 +179,16 @@ impl Server {
         let (tx, rx) = sync_channel(MAX_QUEUE);
         let presence = Arc::new(Presence::default());
         presence.epoch();
-        let shared =
-            Arc::new(Shared { token, tx, waker, presence: presence.clone(), open: AtomicUsize::new(0), connections: AtomicU64::new(0), options });
+        let shared = Arc::new(Shared {
+            token,
+            tx,
+            waker,
+            presence: presence.clone(),
+            open: AtomicUsize::new(0),
+            refusals: AtomicUsize::new(0),
+            connections: AtomicU64::new(0),
+            options,
+        });
         std::thread::Builder::new().name("trigon-control".into()).spawn(move || accept(listener, shared))?;
         Ok(Server { rx, port: addr.port(), presence })
     }
@@ -214,8 +225,14 @@ fn accept(listener: TcpListener, shared: Arc<Shared>) {
     for stream in listener.incoming().flatten() {
         if shared.open.fetch_add(1, Ordering::Relaxed) >= shared.options.max_connections {
             shared.open.fetch_sub(1, Ordering::Relaxed);
-            let mut refused = stream;
-            let _ = writeln!(refused, "{}", json!({"ok": false, "error": "too many connections"}));
+            if let Some(permit) = RefusalPermit::acquire(&shared) {
+                // Dropping the closure on a spawn failure also releases the permit.
+                let _ = std::thread::Builder::new().name("trigon-control-refused".into()).spawn(move || {
+                    let _permit = permit;
+                    drain_refused(stream);
+                });
+            }
+            // No drain permit: close the excess socket; never spawn an unbounded worker.
             continue;
         }
         let shared2 = shared.clone();
@@ -225,6 +242,47 @@ fn accept(listener: TcpListener, shared: Arc<Shared>) {
         });
         if spawned.is_err() {
             shared.open.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct RefusalPermit(Arc<Shared>);
+impl RefusalPermit {
+    fn acquire(shared: &Arc<Shared>) -> Option<Self> {
+        let mut active = shared.refusals.load(Ordering::Relaxed);
+        loop {
+            if active >= MAX_REFUSAL_DRAINS {
+                return None;
+            }
+            match shared.refusals.compare_exchange_weak(active, active + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Self(shared.clone())),
+                Err(next) => active = next,
+            }
+        }
+    }
+}
+impl Drop for RefusalPermit {
+    fn drop(&mut self) {
+        self.0.refusals.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn drain_refused(mut refused: TcpStream) {
+    let _ = refused.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = writeln!(refused, "{}", json!({"ok":false,"error":"too many connections"}));
+    let _ = refused.shutdown(Shutdown::Write);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut left = 64 * 1024;
+    let mut buffer = [0_u8; 4096];
+    while left > 0 {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() || refused.set_read_timeout(Some(wait)).is_err() {
+            break;
+        }
+        let limit = left.min(buffer.len());
+        match refused.read(&mut buffer[..limit]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => left -= n,
         }
     }
 }

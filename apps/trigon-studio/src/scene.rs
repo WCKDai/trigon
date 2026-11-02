@@ -5,16 +5,16 @@
 //! Coordinates are metres relative to [`Scene::origin`] (site mm), so f32 keeps sub-millimetre
 //! precision; Z is up as in the model.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use trigon_model::build::Status;
 use trigon_model::{Built, BuiltElement, Material, Mesh, SlabKind};
 
-/// Floats per triangle vertex: position (3), normal (3), linear RGBA (4).
-pub const VERTEX_FLOATS: usize = 10;
+/// Floats per triangle vertex: position (3), normal (3), linear RGBA (4), masonry UV/enable (3).
+pub const VERTEX_FLOATS: usize = 13;
 /// Floats per edge-quad vertex: both ends (3 + 3), along (0 or 1), side (-1 or 1).
 pub const EDGE_FLOATS: usize = 8;
 /// Two faces meeting at more than this angle draw an edge between them.
@@ -51,6 +51,7 @@ pub struct Level {
     pub name: String,
     /// Floor level, site mm.
     pub elevation: f64,
+    /// Full-storey floor-to-floor height; on a marked roof level, knee wall only.
     pub height: f64,
 }
 
@@ -69,12 +70,15 @@ pub struct Scene {
     pub tri_element: Vec<u32>,
     pub bounds: Option<([f32; 3], [f32; 3])>,
     pub levels: Vec<Level>,
+    /// Site additions inherit the exact display policy selected by from_built.
+    phases: bool,
 }
 
 /// A part of an element: its mesh and colour.
 struct Part<'a> {
     mesh: &'a Mesh,
     rgba: [f32; 4],
+    material: Material,
 }
 
 fn status_rgba(m: Material, status: Status, phases: bool) -> [f32; 4] {
@@ -138,6 +142,7 @@ impl Builder {
             for c in part.rgba {
                 c.to_bits().hash(&mut hasher);
             }
+            part.material.hash(&mut hasher);
             let translucent = part.rgba[3] < 0.999;
             let start = if translucent { self.clear.len() } else { self.opaque.len() } / VERTEX_FLOATS;
             for t in &m.triangles {
@@ -152,11 +157,19 @@ impl Builder {
                 }
                 let (pa, pb, pc) = (self.local(*a), self.local(*b), self.local(*c));
                 let n = normal(pa, pb, pc);
+                // Texture coordinates stay anchored to original site millimetres, independent of
+                // camera movement and the scene origin used for f32 rendering precision.
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let surface_normal = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]];
                 let out = if translucent { &mut self.clear } else { &mut self.opaque };
-                for p in [pa, pb, pc] {
+                for (p, source) in [pa, pb, pc].into_iter().zip([a, b, c]) {
                     out.extend_from_slice(&p);
                     out.extend_from_slice(&n);
                     out.extend_from_slice(&part.rgba);
+                    let uv = part.material.masonry_uv(*source, surface_normal);
+                    let [u, v] = uv.unwrap_or([0.0; 2]);
+                    out.extend_from_slice(&[u, v, if uv.is_some() && !translucent { 1.0 } else { 0.0 }]);
                     for (k, v) in p.iter().enumerate() {
                         lo[k] = lo[k].min(*v);
                         hi[k] = hi[k].max(*v);
@@ -198,7 +211,7 @@ impl Builder {
         }
     }
 
-    fn finish(mut self, levels: Vec<Level>) -> Scene {
+    fn finish(mut self, levels: Vec<Level>, phases: bool) -> Scene {
         let opaque = (self.opaque.len() / VERTEX_FLOATS) as u32;
         for (e, (o, c)) in self.elements.iter_mut().zip(self.raw) {
             e.ranges = o.into_iter().chain(c.into_iter().map(|r| r.start + opaque..r.end + opaque)).collect();
@@ -208,7 +221,7 @@ impl Builder {
         vertices.extend_from_slice(&self.clear);
         let mut tri_element = self.opaque_tris;
         tri_element.extend_from_slice(&self.clear_tris);
-        Scene { origin: self.origin, vertices, opaque, edges: self.edges, elements: self.elements, tri_element, bounds, levels }
+        Scene { origin: self.origin, vertices, opaque, edges: self.edges, elements: self.elements, tri_element, bounds, levels, phases }
     }
 }
 
@@ -222,7 +235,8 @@ fn normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
 
 /// The edges worth drawing: borders (one face) and creases (faces meeting at more than
 /// `crease_deg`, either winding), never the diagonals of a triangulated flat face. Vertices are
-/// welded on a fine grid first, since the model's meshes repeat corners per face.
+/// welded on a fine grid first, since the model's meshes repeat corners per face. Collinear
+/// unmatched sides are split at their endpoints, so T junctions do not expose flat-face seams.
 pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg: f64) -> Vec<([f64; 3], [f64; 3])> {
     let mut weld: HashMap<[i64; 3], u32> = HashMap::new();
     let mut points: Vec<[f64; 3]> = Vec::new();
@@ -264,6 +278,7 @@ pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg:
     sides.sort_unstable();
     let cos = crease_deg.to_radians().cos();
     let mut out = Vec::new();
+    let mut borders = Vec::new();
     let mut i = 0;
     while i < sides.len() {
         let (p, q, f0) = sides[i];
@@ -272,7 +287,10 @@ pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg:
             j += 1;
         }
         let keep = match j - i {
-            1 => true,
+            1 => {
+                borders.push((p, q, f0));
+                false
+            }
             2 => {
                 let (n0, n1) = (faces[f0 as usize], faces[sides[i + 1].2 as usize]);
                 (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).abs() < cos
@@ -283,6 +301,101 @@ pub fn feature_edges(positions: &[[f64; 3]], triangles: &[[u32; 3]], crease_deg:
             out.push((points[p as usize], points[q as usize]));
         }
         i = j;
+    }
+    out.extend(border_edges(&points, &faces, &borders, cos));
+    out
+}
+
+/// Resolve only unmatched sides; the usual shared-edge path above remains unchanged. A coarse
+/// line key finds candidates, followed by a strict collinearity check. Sweeping endpoint events
+/// compares the adjacent face normals on each interval without scanning every edge pair.
+fn border_edges(points: &[[f64; 3]], faces: &[[f64; 3]], borders: &[(u32, u32, u32)], cos: f64) -> Vec<([f64; 3], [f64; 3])> {
+    let mut out = Vec::new();
+    let Some(origin) = points.first() else { return out };
+    let mut lines: BTreeMap<[i64; 5], Vec<(u32, u32, u32)>> = BTreeMap::new();
+    for &(p, q, face) in borders {
+        let (a, b) = (points[p as usize], points[q as usize]);
+        let delta: [f64; 3] = std::array::from_fn(|axis| b[axis] - a[axis]);
+        let axis = (0..3).max_by(|&a, &b| delta[a].abs().total_cmp(&delta[b].abs())).unwrap_or(0);
+        let other = [(axis + 1) % 3, (axis + 2) % 3];
+        let slope = other.map(|k| delta[k] / delta[axis]);
+        let offset: [f64; 2] = std::array::from_fn(|k| a[other[k]] - origin[other[k]] - slope[k] * (a[axis] - origin[axis]));
+        if delta[axis].abs() <= 1e-9 || !slope.iter().chain(&offset).all(|v| v.is_finite()) {
+            out.push((a, b));
+            continue;
+        }
+        let key = [
+            axis as i64,
+            (slope[0] * 1e8).round() as i64,
+            (slope[1] * 1e8).round() as i64,
+            (offset[0] * 1e3).round() as i64,
+            (offset[1] * 1e3).round() as i64,
+        ];
+        lines.entry(key).or_default().push((p, q, face));
+    }
+    for (key, group) in lines {
+        let Some(&(p, q, _)) = group.first() else { continue };
+        let axis = key[0] as usize;
+        let (a, b) = (points[p as usize], points[q as usize]);
+        let collinear = |p: [f64; 3]| {
+            (0..3).filter(|&k| k != axis).all(|k| {
+                let predicted = a[k] + (b[k] - a[k]) / (b[axis] - a[axis]) * (p[axis] - a[axis]);
+                (predicted - p[k]).abs() <= 1e-6
+            })
+        };
+        if group.len() == 1 || group.iter().any(|&(p, q, _)| !collinear(points[p as usize]) || !collinear(points[q as usize])) {
+            out.extend(group.iter().map(|&(p, q, _)| (points[p as usize], points[q as usize])));
+            continue;
+        }
+        let mut events = Vec::with_capacity(group.len() * 2);
+        for (index, &(p, q, _)) in group.iter().enumerate() {
+            let (lo, hi) = if points[p as usize][axis] <= points[q as usize][axis] { (p, q) } else { (q, p) };
+            events.push((points[lo as usize][axis], lo, index, true));
+            events.push((points[hi as usize][axis], hi, index, false));
+        }
+        events.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let mut active: BTreeSet<usize> = BTreeSet::new();
+        let mut previous = None;
+        let mut run: Option<(u32, u32)> = None;
+        let mut i = 0;
+        while i < events.len() {
+            let (coordinate, point, _, _) = events[i];
+            if let Some(from) = previous {
+                let keep = match active.len() {
+                    0 => false,
+                    2 => match (active.first(), active.last()) {
+                        (Some(&first), Some(&last)) => {
+                            let (n0, n1) = (faces[group[first].2 as usize], faces[group[last].2 as usize]);
+                            (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).abs() < cos
+                        }
+                        _ => false,
+                    },
+                    _ => true,
+                };
+                if keep {
+                    if let Some((_, end)) = &mut run {
+                        *end = point;
+                    } else {
+                        run = Some((from, point));
+                    }
+                } else if let Some((p, q)) = run.take() {
+                    out.push((points[p as usize], points[q as usize]));
+                }
+            }
+            while i < events.len() && (events[i].0 - coordinate).abs() <= 1e-7 {
+                let (_, _, edge, start) = events[i];
+                if start {
+                    active.insert(edge);
+                } else {
+                    active.remove(&edge);
+                }
+                i += 1;
+            }
+            previous = Some(point);
+        }
+        if let Some((p, q)) = run {
+            out.push((points[p as usize], points[q as usize]));
+        }
     }
     out
 }
@@ -310,13 +423,34 @@ impl Scene {
             hi: [f32::MIN; 3],
         };
         let mut levels = Vec::new();
+        let roof_levels = built.iter().any(|b| b.storeys.iter().any(|s| s.roof_level));
         for building in built {
-            if levels.is_empty() {
-                levels = building.storeys.iter().map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }).collect();
+            if let Some(terrain) = &building.terrain {
+                b.add(
+                    "site.terrain",
+                    "terrain",
+                    None,
+                    vec![("units", "site-local mm; site datum".into())],
+                    false,
+                    &[Part { mesh: terrain, rgba: Material::Ground.rgba(), material: Material::Ground }],
+                );
             }
-            for w in &building.walls {
+            if levels.is_empty() || roof_levels {
+                let count = levels.len();
+                levels.extend(building.storeys.iter().skip(count).map(|s| Level { name: s.name.clone(), elevation: s.elevation, height: s.height }));
+            }
+            for w in building.exterior_walls() {
                 let first = b.elements.len();
                 let length = w.frame.length;
+                let mut parts = vec![
+                    Part { mesh: &w.mesh, rgba: w.finish.rgba(), material: w.finish },
+                    Part { mesh: &w.plinth, rgba: Material::Plinth.rgba(), material: Material::Plinth },
+                ];
+                if w.trim_parts.is_empty() {
+                    parts.push(Part { mesh: &w.trim, rgba: Material::Render.rgba(), material: Material::Render });
+                } else {
+                    parts.extend(w.trim_parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
+                }
                 b.add(
                     &w.id,
                     "wall",
@@ -331,20 +465,18 @@ impl Scene {
                         ("bearing", format!("{:.0}°", w.frame.bearing())),
                     ],
                     true,
-                    &[
-                        Part { mesh: &w.mesh, rgba: w.finish.rgba() },
-                        Part { mesh: &w.plinth, rgba: Material::Plinth.rgba() },
-                        Part { mesh: &w.trim, rgba: Material::Render.rgba() },
-                    ],
+                    &parts,
                 );
                 let elements = w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments);
                 for e in elements {
-                    let parts: Vec<Part<'_>> = e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases) }).collect();
+                    let parts: Vec<Part<'_>> =
+                        e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases), material: *m }).collect();
                     b.add(
                         &e.id,
                         element_kind(e),
                         Some(e.level),
                         vec![
+                            ("building", building.building_id.clone()),
                             ("type", e.type_id.clone()),
                             ("name", e.name.clone()),
                             ("facade", w.id.clone()),
@@ -359,7 +491,9 @@ impl Scene {
                 b.facing(first, w.frame.n);
             }
             for s in &building.slabs {
+                let roof_floor = building.storeys.get(s.level).is_some_and(|s| s.roof_level);
                 let (kind, m) = match s.kind {
+                    SlabKind::Floor if roof_floor => ("roof floor slab", Material::Slab),
                     SlabKind::Floor => ("floor slab", Material::Slab),
                     SlabKind::Roof => ("roof slab", Material::Roof),
                 };
@@ -368,24 +502,66 @@ impl Scene {
                     &s.id,
                     kind,
                     Some(s.level),
-                    vec![("thickness", mm(s.thickness)), ("underside", mm(s.z_bottom)), ("area", format!("{:.1} m²", area / 1e6))],
+                    vec![
+                        ("thickness", mm(s.thickness)),
+                        ("underside", mm(s.z_bottom)),
+                        (if roof_floor { "slab footprint (not room area)" } else { "area" }, format!("{:.1} m²", area / 1e6)),
+                    ],
                     true,
-                    &[Part { mesh: &s.mesh, rgba: m.rgba() }],
+                    &[Part { mesh: &s.mesh, rgba: m.rgba(), material: m }],
                 );
             }
             if let Some(r) = &building.roof {
+                let mut parts = vec![
+                    Part { mesh: &r.cover, rgba: Material::Roof.rgba(), material: Material::Roof },
+                    Part { mesh: &r.gutters, rgba: Material::Steel.rgba(), material: Material::Steel },
+                ];
+                if r.gable_parts.is_empty() {
+                    parts.insert(1, Part { mesh: &r.gables, rgba: Material::Wall.rgba(), material: Material::Wall });
+                } else {
+                    parts.extend(r.gable_parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
+                }
+                parts.extend(r.covering.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }));
                 b.add(
                     &r.id,
                     "roof",
                     None,
                     vec![("eaves", mm(r.eaves)), ("ridge", mm(r.ridge)), ("pitch", format!("{:.1}°", r.pitch_deg))],
                     true,
-                    &[
-                        Part { mesh: &r.cover, rgba: Material::Roof.rgba() },
-                        Part { mesh: &r.gables, rgba: Material::Wall.rgba() },
-                        Part { mesh: &r.gutters, rgba: Material::Steel.rgba() },
-                    ],
+                    &parts,
                 );
+                for light in &r.rooflights {
+                    let parts: Vec<_> =
+                        light.fill.parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }).collect();
+                    b.add(
+                        &light.id,
+                        "rooflight",
+                        Some(light.fill.level),
+                        vec![("width", mm(light.fill.width)), ("slope-plane height", mm(light.fill.height))],
+                        true,
+                        &parts,
+                    );
+                    b.add(
+                        &format!("{}.flashing", light.id),
+                        "rooflight flashing",
+                        Some(light.fill.level),
+                        Vec::new(),
+                        true,
+                        &[Part { mesh: &light.flashing, rgba: Material::Steel.rgba(), material: Material::Steel }],
+                    );
+                }
+                for d in &r.dormers {
+                    for (suffix, kind, mesh) in [("roof", "dormer roof", &d.roof), ("cheeks", "dormer cheeks", &d.cheeks)] {
+                        b.add(
+                            &format!("{}.{suffix}", d.id),
+                            kind,
+                            None,
+                            Vec::new(),
+                            true,
+                            &[Part { mesh, rgba: Material::Steel.rgba(), material: Material::Steel }],
+                        );
+                    }
+                }
             }
             for iw in &building.interior {
                 let len = (iw.outline[1][0] - iw.outline[0][0]).hypot(iw.outline[1][1] - iw.outline[0][1]);
@@ -400,12 +576,28 @@ impl Scene {
                         ("from", mm(iw.z_bottom)),
                     ],
                     false,
-                    &[Part { mesh: &iw.mesh, rgba: if iw.load_bearing { BEARING } else { PARTITION } }],
+                    &[Part { mesh: &iw.mesh, rgba: if iw.load_bearing { BEARING } else { PARTITION }, material: Material::Plaster }],
                 );
                 for door in &iw.doors {
                     let e = &door.fill;
-                    let parts: Vec<Part<'_>> = e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases) }).collect();
-                    b.add(&e.id, "door", Some(e.level), vec![("host", iw.id.clone()), ("width", mm(e.width))], false, &parts);
+                    let parts: Vec<Part<'_>> =
+                        e.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, e.status, phases), material: *m }).collect();
+                    b.add(
+                        &e.id,
+                        "door",
+                        Some(e.level),
+                        vec![
+                            ("building", building.building_id.clone()),
+                            ("type", e.type_id.clone()),
+                            ("name", e.name.clone()),
+                            ("host", iw.id.clone()),
+                            ("width", mm(e.width)),
+                            ("height", mm(e.height)),
+                            ("phase status", e.status.name().to_string()),
+                        ],
+                        false,
+                        &parts,
+                    );
                 }
             }
             for st in &building.stairs {
@@ -415,11 +607,126 @@ impl Scene {
                     Some(st.level),
                     vec![("layout", format!("{:?}", st.kind)), ("winding", if st.winding { "yes" } else { "no" }.to_string())],
                     false,
-                    &[Part { mesh: &st.mesh, rgba: Material::Sill.rgba() }, Part { mesh: &st.railing, rgba: Material::Railing.rgba() }],
+                    &[
+                        Part { mesh: &st.mesh, rgba: Material::Sill.rgba(), material: Material::Sill },
+                        Part { mesh: &st.railing, rgba: Material::Railing.rgba(), material: Material::Railing },
+                    ],
                 );
             }
         }
-        b.finish(levels)
+        b.finish(levels, phases)
+    }
+
+    /// Add independent site geometry without changing the building-scene API or source IDs.
+    pub fn with_site(mut self, site: &[trigon_model::site::BuiltSiteObject]) -> Self {
+        if site.is_empty() {
+            return self;
+        }
+        let phases = self.phases;
+        let opaque = self.opaque;
+        let clear = self.vertices.split_off(opaque as usize * VERTEX_FLOATS);
+        let clear_tris = self.tri_element.split_off(opaque as usize / 3);
+        let raw = self
+            .elements
+            .iter()
+            .map(|e| {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                for r in &e.ranges {
+                    if r.end <= opaque {
+                        a.push(r.clone());
+                    } else {
+                        b.push(r.start - opaque..r.end - opaque);
+                    }
+                }
+                (a, b)
+            })
+            .collect();
+        let (lo, hi) = self.bounds.unwrap_or(([f32::MAX; 3], [f32::MIN; 3]));
+        let mut builder = Builder {
+            origin: self.origin,
+            opaque: self.vertices,
+            clear,
+            opaque_tris: self.tri_element,
+            clear_tris,
+            edges: self.edges,
+            elements: self.elements,
+            raw,
+            lo,
+            hi,
+        };
+        for o in site {
+            let parts: Vec<_> = o.parts.iter().map(|(m, mesh)| Part { mesh, rgba: status_rgba(*m, o.status, phases), material: *m }).collect();
+            builder.add(
+                &o.id,
+                o.class.name(),
+                None,
+                vec![("name", o.name.clone()), ("intent", format!("{:?}", o.intent).to_lowercase()), ("phase status", o.status.name().into())],
+                false,
+                &parts,
+            );
+        }
+        builder.finish(self.levels, phases)
+    }
+
+    /// Rooms are semantic spaces, not opaque boxes. Invisible floor polygons let a room be
+    /// picked in a cut view; only its selection overlay colours the space.
+    pub fn with_rooms(mut self, doc: &trigon_model::Document) -> Self {
+        for building in &doc.buildings {
+            for (room_index, room) in building.rooms.iter().enumerate() {
+                for level in &room.levels {
+                    let Some(storey) = building.storeys.get(*level) else { continue };
+                    let mut mesh = Mesh::default();
+                    if !mesh.polygon(&room.polygon, &[], |p| [p[0], p[1], storey.elevation + 0.5]) {
+                        continue;
+                    }
+                    let index = self.elements.len() as u32;
+                    let start = self.vertices.len() / VERTEX_FLOATS;
+                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    let mut fingerprint = DefaultHasher::new();
+                    room.name.hash(&mut fingerprint);
+                    for triangle in &mesh.triangles {
+                        let [Some(a), Some(b), Some(c)] = triangle.map(|i| mesh.positions.get(i as usize)) else { continue };
+                        for source in [a, b, c] {
+                            let position = std::array::from_fn::<_, 3, _>(|axis| ((source[axis] - self.origin[axis]) / 1000.0) as f32);
+                            self.vertices.extend_from_slice(&position);
+                            self.vertices.extend_from_slice(&[0.0, 0.0, 1.0]);
+                            self.vertices.extend_from_slice(&[0.0; 7]);
+                            for axis in 0..3 {
+                                source[axis].to_bits().hash(&mut fingerprint);
+                                lo[axis] = lo[axis].min(position[axis]);
+                                hi[axis] = hi[axis].max(position[axis]);
+                            }
+                        }
+                        self.tri_element.push(index);
+                    }
+                    let end = self.vertices.len() / VERTEX_FLOATS;
+                    if start == end {
+                        continue;
+                    }
+                    let id = trigon_engine::room_element_id(building, room_index, *level);
+                    self.elements.push(Element {
+                        id,
+                        kind: "room",
+                        level: Some(*level),
+                        props: vec![
+                            ("building", building.id.clone()),
+                            ("name", room.name.clone()),
+                            ("area", format!("{:.2} m²", polygon_area(&room.polygon) / 1e6)),
+                        ],
+                        ranges: std::iter::once(start as u32..end as u32).collect(),
+                        fingerprint: fingerprint.finish(),
+                        host: false,
+                        bounds: Some((lo, hi)),
+                        facing: None,
+                    });
+                    self.bounds = Some(self.bounds.map_or((lo, hi), |(a, b)| {
+                        (std::array::from_fn(|axis| a[axis].min(lo[axis])), std::array::from_fn(|axis| b[axis].max(hi[axis])))
+                    }));
+                }
+            }
+        }
+        self
     }
 
     pub fn triangle_count(&self) -> usize {
@@ -466,6 +773,7 @@ impl Scene {
                     out.extend_from_slice(&[v[0] + shift[0], v[1] + shift[1], v[2] + shift[2]]);
                     out.extend_from_slice(&v[3..6]);
                     out.extend_from_slice(&rgba);
+                    out.extend_from_slice(&v[10..]);
                 }
             }
         }
@@ -480,6 +788,17 @@ impl Scene {
     /// The element with this id, if any.
     pub fn find(&self, id: &str) -> Option<usize> {
         self.elements.iter().position(|e| e.id == id)
+    }
+
+    /// Semantic ids are not unique in every phase view. Never silently choose an occurrence.
+    pub fn find_unique(&self, id: &str) -> Option<usize> {
+        let mut matches = self.elements.iter().enumerate().filter(|(_, e)| e.id == id);
+        let (index, _) = matches.next()?;
+        matches.next().is_none().then_some(index)
+    }
+
+    pub fn ambiguous(&self, id: &str) -> bool {
+        self.elements.iter().filter(|e| e.id == id).take(2).count() > 1
     }
 
     /// Element keys (ids, made unique) and fingerprints.
@@ -558,6 +877,24 @@ mod tests {
     use super::*;
     use trigon_model::{Building, Document, build};
 
+    #[test]
+    fn attic_level_labels_and_floor_properties_do_not_claim_room_height_or_area() {
+        let mut doc = Document::default();
+        let mut building = Building::new("b", "Roof floor", &[[0., 0.], [12000., 0.], [12000., 10000.], [0., 10000.]], 3, 3400.).unwrap();
+        building.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":35})).unwrap();
+        building.set_attic(Some(9450.), Some("3. sal / tagkvist")).unwrap();
+        doc.buildings
+            .push(Building::new("context", "Lower context", &[[20000., 0.], [22000., 0.], [22000., 2000.], [20000., 2000.]], 1, 3000.).unwrap());
+        doc.buildings.push(building);
+        let scene = Scene::from_built(&build(&doc).unwrap(), false);
+        assert_eq!(scene.levels[3].name, "3. sal / tagkvist");
+        assert_eq!(scene.levels[3].elevation, 9450.);
+        let floor = scene.elements.iter().find(|e| e.id == "b.attic").unwrap();
+        assert_eq!(floor.level, Some(3));
+        assert_eq!(floor.kind, "roof floor slab");
+        assert!(floor.props.iter().any(|(key, _)| *key == "slab footprint (not room area)"));
+    }
+
     fn cube() -> Mesh {
         let mut m = Mesh::default();
         let lo = [[0.0, 0.0, 0.0], [1000.0, 0.0, 0.0], [1000.0, 1000.0, 0.0], [0.0, 1000.0, 0.0]];
@@ -581,6 +918,92 @@ mod tests {
         // The second triangle turned over: still coplanar, still no diagonal.
         m.triangles[1] = [m.triangles[1][0], m.triangles[1][2], m.triangles[1][1]];
         assert_eq!(feature_edges(&m.positions, &m.triangles, CREASE_DEG).len(), 4);
+    }
+
+    #[test]
+    fn coplanar_t_junctions_do_not_draw_internal_seams_even_rotated_or_reversed() {
+        for (angle, offset) in [
+            (0_f64, [0.; 3]),
+            (17.950685409018618_f64.to_radians(), [1e6, -2e6, 3000.]),
+            (57.34404001940922_f64.to_radians(), [1e6, -2e6, 3000.]),
+            (31_f64.to_radians(), [1e6, -2e6, 3000.]),
+            (45_f64.to_radians(), [1e6, -2e6, 3000.]),
+        ] {
+            let (s, c) = angle.sin_cos();
+            let at = |[x, y]: [f64; 2]| [offset[0] + c * x - s * y, offset[1] + s * x + c * y, offset[2] + x * 0.2 + y * 0.1];
+            let mut m = Mesh::default();
+            for [x0, y0, x1, y1] in [[0., 0., 4000., 2000.], [0., 2000., 2000., 4000.], [2000., 2000., 4000., 4000.]] {
+                m.quad(at([x0, y0]), at([x1, y0]), at([x1, y1]), at([x0, y1]));
+            }
+            for triangle in m.triangles.iter_mut().step_by(2) {
+                triangle.swap(1, 2);
+            }
+            let edges = feature_edges(&m.positions, &m.triangles, CREASE_DEG);
+            let xy = |p: [f64; 3]| [c * (p[0] - offset[0]) + s * (p[1] - offset[1]), -s * (p[0] - offset[0]) + c * (p[1] - offset[1])];
+            for &(a, b) in &edges {
+                let (a, b) = (xy(a), xy(b));
+                assert!(
+                    (0..2).any(|axis| [0., 4000.].iter().any(|v| (a[axis] - v).abs() < 1e-6 && (b[axis] - v).abs() < 1e-6)),
+                    "a triangulation seam crosses the flat face: {a:?} to {b:?}"
+                );
+            }
+            let distance = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+            let expected = 2. * distance(at([0., 0.]), at([4000., 0.])) + 2. * distance(at([0., 0.]), at([0., 4000.]));
+            let perimeter: f64 = edges.iter().map(|&(a, b)| distance(a, b)).sum();
+            assert!((perimeter - expected).abs() < 1e-6, "the visible outer border remains complete");
+        }
+    }
+
+    #[test]
+    fn aligned_window_sills_keep_reveal_edges_without_lines_across_solid_brickwork() {
+        let mut d = doc();
+        let facade = &mut d.buildings[0].facades[0];
+        facade.bays = vec![1500., 4500., 7500.];
+        for bay in 0..3 {
+            facade.placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":bay,"type":"window.casement.2"})).unwrap());
+        }
+        let built = build(&d).unwrap();
+        let mesh = &built[0].walls[0].mesh;
+        let sill_edges: Vec<_> = feature_edges(&mesh.positions, &mesh.triangles, CREASE_DEG)
+            .into_iter()
+            .filter(|(a, b)| [a, b].iter().all(|p| p[1].abs() < 1e-6 && (p[2] - 850.).abs() < 1e-6))
+            .collect();
+        for &(a, b) in &sill_edges {
+            let (lo, hi) = (a[0].min(b[0]), a[0].max(b[0]));
+            assert!(
+                [1500., 4500., 7500.].iter().any(|centre| lo >= centre - 600. - 1e-6 && hi <= centre + 600. + 1e-6),
+                "a false sill seam crosses the brickwork: {a:?} to {b:?}"
+            );
+        }
+        let length: f64 = sill_edges.iter().map(|(a, b)| (b[0] - a[0]).abs()).sum();
+        assert!((length - 3600.).abs() < 1e-6, "all three real sill/reveal creases must remain");
+    }
+
+    #[test]
+    fn a_t_junction_on_a_real_fold_keeps_one_complete_crease() {
+        let mut m = Mesh::default();
+        m.quad([0., 0., 0.], [4000., 0., 0.], [4000., 2000., 0.], [0., 2000., 0.]);
+        for [x0, x1] in [[0., 2000.], [2000., 4000.]] {
+            m.quad([x0, 2000., 0.], [x1, 2000., 0.], [x1, 2000., 2000.], [x0, 2000., 2000.]);
+        }
+        let edges = feature_edges(&m.positions, &m.triangles, CREASE_DEG);
+        let crease: f64 = edges
+            .iter()
+            .filter(|(a, b)| [a, b].iter().all(|p| (p[1] - 2000.).abs() < 1e-6 && p[2].abs() < 1e-6))
+            .map(|(a, b)| (a[0] - b[0]).abs())
+            .sum();
+        assert!((crease - 4000.).abs() < 1e-6, "the sharp fold stays visible without duplicate outlines");
+    }
+
+    #[test]
+    fn collinear_borders_never_fill_a_real_gap() {
+        let mut m = Mesh::default();
+        for [x0, x1] in [[0., 1000.], [1500., 2500.]] {
+            m.quad([x0, 0., 0.], [x1, 0., 0.], [x1, 1000., 0.], [x0, 1000., 0.]);
+        }
+        let edges = feature_edges(&m.positions, &m.triangles, CREASE_DEG);
+        assert_eq!(edges.len(), 8);
+        assert!(edges.iter().all(|(a, b)| !(a[0].min(b[0]) < 1250. && a[0].max(b[0]) > 1250.)));
     }
 
     #[test]
@@ -609,6 +1032,73 @@ mod tests {
     }
 
     #[test]
+    fn terrain_uses_the_shared_source_mesh_in_the_headless_scene() {
+        let mut d = doc();
+        d.terrain = Some(trigon_model::terrain::Terrain {
+            origin: [-5000., -5000.],
+            spacing_mm: [20000., 20000.],
+            heights_mm: vec![vec![0., 100.], vec![200., 300.]],
+            source: None,
+            attribution: None,
+        });
+        let built = build(&d).unwrap();
+        let scene = Scene::from_built(&built, false);
+        let element = &scene.elements[scene.find_unique("site.terrain").unwrap()];
+        assert_eq!(element.kind, "terrain");
+        assert!(!element.ranges.is_empty());
+        assert_eq!(scene.elements.iter().filter(|e| e.id == "site.terrain").count(), 1);
+        let without = Scene::from_built(&build(&doc()).unwrap(), false);
+        assert_eq!(scene.elements.len(), without.elements.len() + 1);
+    }
+
+    #[test]
+    fn rooms_are_pickable_floor_spaces_without_idle_edges_or_opaque_boxes() {
+        let mut d = doc();
+        d.buildings[0].rooms.push(trigon_model::doc::Room {
+            id: "living".into(),
+            levels: vec![0],
+            name: "Living".into(),
+            polygon: vec![[1000.0, 1000.0], [5000.0, 1000.0], [5000.0, 5000.0], [1000.0, 5000.0]],
+        });
+        let built = build(&d).unwrap();
+        let plain = Scene::from_built(&built, false);
+        let edges = plain.edges.clone();
+        let opaque = plain.opaque;
+        let scene = plain.with_rooms(&d);
+        let room = scene.find_unique("living.space.L0").unwrap();
+        assert_eq!(scene.edges, edges);
+        assert_eq!(scene.opaque, opaque);
+        let local = |p: [f64; 3]| std::array::from_fn(|axis| ((p[axis] - scene.origin[axis]) / 1000.0) as f32);
+        assert_eq!(scene.pick(local([2000.0, 2000.0, 1000.0]), [0.0, 0.0, -1.0], scene.clip_z(0)), Some(room));
+        for range in &scene.elements[room].ranges {
+            assert!(
+                scene.vertices[range.start as usize * VERTEX_FLOATS..range.end as usize * VERTEX_FLOATS]
+                    .as_chunks::<VERTEX_FLOATS>()
+                    .0
+                    .iter()
+                    .all(|v| v[9] == 0.0)
+            );
+        }
+        assert!(!scene.overlay(&[room], [1.0, 0.4, 0.0, 0.4], [0.0; 3]).is_empty());
+    }
+
+    #[test]
+    fn coloured_facade_bands_reach_vertices_without_drawing_duplicate_trim() {
+        let mut d = doc();
+        d.buildings[0].facades[0].bands = serde_json::from_value(serde_json::json!([
+            {"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0}
+        ]))
+        .unwrap();
+        let white = Scene::from_built(&build(&d).unwrap(), false);
+        d.buildings[0].facades[0].bands[0].finish = Some(trigon_model::WallFinish::RenderTerracotta);
+        let coloured = Scene::from_built(&build(&d).unwrap(), false);
+        assert_eq!(white.vertices.len(), coloured.vertices.len());
+        assert_ne!(white.elements[0].fingerprint, coloured.elements[0].fingerprint);
+        let rgba = Material::RenderTerracotta.rgba();
+        assert!(coloured.vertices.as_chunks::<VERTEX_FLOATS>().0.iter().any(|v| v[6..10] == rgba && v[12] == 0.0));
+    }
+
+    #[test]
     fn facade_finishes_and_plinths_reach_the_viewport() {
         let mut d = doc();
         let original = Scene::from_built(&build(&d).unwrap(), false);
@@ -618,6 +1108,49 @@ mod tests {
         d.buildings[0].finish = trigon_model::doc::WallFinish::Render;
         let rendered = Scene::from_built(&build(&d).unwrap(), false);
         assert_ne!(plinth.elements[0].fingerprint, rendered.elements[0].fingerprint, "the facade finish must be visible");
+    }
+
+    #[test]
+    fn masonry_uvs_stay_at_site_scale_when_scene_origin_changes_and_overlays_keep_the_vertex_layout() {
+        let mut d = doc();
+        d.buildings[0].finish = trigon_model::doc::WallFinish::YellowBrick;
+        let a = Scene::from_built(&build(&d).unwrap(), false);
+        d.buildings
+            .push(Building::new("annex", "Annex", &[[100000.0, 0.0], [109000.0, 0.0], [109000.0, 8000.0], [100000.0, 8000.0]], 1, 3000.0).unwrap());
+        let b = Scene::from_built(&build(&d).unwrap(), false);
+        assert_ne!(a.origin, b.origin);
+        let uvs = |scene: &Scene, id: &str| {
+            let element = &scene.elements[scene.find(id).unwrap()];
+            element
+                .ranges
+                .iter()
+                .flat_map(|range| {
+                    scene.vertices[range.start as usize * VERTEX_FLOATS..range.end as usize * VERTEX_FLOATS]
+                        .as_chunks::<VERTEX_FLOATS>()
+                        .0
+                        .iter()
+                        .map(|vertex| [vertex[10], vertex[11], vertex[12]])
+                })
+                .collect::<Vec<_>>()
+        };
+        let wall = uvs(&a, "b1.f1");
+        assert!(!wall.is_empty());
+        assert!(wall.iter().all(|uv| uv.iter().all(|value| value.is_finite()) && uv[2] == 1.0));
+        assert_eq!(wall, uvs(&b, "b1.f1"));
+        let overlay = a.overlay(&[a.find("b1.f1").unwrap()], [1.0, 0.5, 0.0, 0.6], [3.0, 0.0, 0.0]);
+        let overlay_uvs: Vec<_> = overlay.as_chunks::<VERTEX_FLOATS>().0.iter().map(|vertex| [vertex[10], vertex[11], vertex[12]]).collect();
+        assert_eq!(overlay_uvs, wall);
+        for element in a.elements.iter().filter(|e| !matches!(e.kind, "wall")) {
+            for range in &element.ranges {
+                assert!(
+                    a.vertices[range.start as usize * VERTEX_FLOATS..range.end as usize * VERTEX_FLOATS]
+                        .as_chunks::<VERTEX_FLOATS>()
+                        .0
+                        .iter()
+                        .all(|vertex| vertex[12] == 0.0)
+                );
+            }
+        }
     }
 
     #[test]
@@ -705,5 +1238,53 @@ mod tests {
         assert!(s.overlay(&[usize::MAX], [1.0; 4], [0.0; 3]).is_empty());
         let moved = s.overlay(&[0], [1.0; 4], [1.0, 2.0, 3.0]);
         assert_eq!([moved[0] - o[0], moved[1] - o[1], moved[2] - o[2]], [1.0, 2.0, 3.0]);
+    }
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::*;
+    #[test]
+    fn independent_site_meshes_are_pickable_and_keep_existing_opaque_and_glass_ranges() {
+        let source: trigon_model::Document = serde_json::from_str(include_str!("../../../crates/model/tests/fixtures/courtyard.trigon")).unwrap();
+        let site = trigon_model::site::build(&source, trigon_model::build::View::latest(&source), None).unwrap();
+        let mut doc = trigon_model::Document::default();
+        let mut building = trigon_model::Building::new("b1", "Synthetic", &[[0., 0.], [9000., 0.], [9000., 8000.], [0., 8000.]], 2, 3000.).unwrap();
+        building.facades[0].bays = vec![4500.];
+        building.facades[0].placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":0,"type":"window.fixed"})).unwrap());
+        doc.buildings.push(building);
+        let base = Scene::from_built(&trigon_model::build(&doc).unwrap(), false);
+        assert!(base.opaque < (base.vertices.len() / VERTEX_FLOATS) as u32);
+        let joined = base.clone().with_site(&site);
+        assert_eq!(joined.origin, base.origin);
+        assert_eq!(&joined.vertices[..base.opaque as usize * VERTEX_FLOATS], &base.vertices[..base.opaque as usize * VERTEX_FLOATS]);
+        assert_eq!(&joined.vertices[joined.opaque as usize * VERTEX_FLOATS..], &base.vertices[base.opaque as usize * VERTEX_FLOATS..]);
+        for e in &base.elements {
+            let after = &joined.elements[joined.find_unique(&e.id).unwrap()];
+            assert_eq!(e.fingerprint, after.fingerprint);
+        }
+        for e in &joined.elements {
+            for r in &e.ranges {
+                assert!(r.end as usize <= joined.vertices.len() / VERTEX_FLOATS);
+            }
+        }
+        for phases in [false, true] {
+            let view = Scene::from_built(&[], phases).with_site(&site);
+            let tree = &view.elements[view.find_unique("site.tree").unwrap()];
+            let offset = tree.ranges[0].start as usize * VERTEX_FLOATS;
+            let color = &view.vertices[offset + 6..offset + 10];
+            if phases {
+                assert_ne!(color, Material::Bark.rgba());
+            } else {
+                assert_eq!(color, Material::Bark.rgba());
+            }
+        }
+        for scene in [joined, Scene::default().with_site(&site)] {
+            let ray =
+                [(-5000. - scene.origin[0]) as f32 / 1000., (-4000. - scene.origin[1]) as f32 / 1000., (10000. - scene.origin[2]) as f32 / 1000.];
+            let hit = scene.pick(ray, [0., 0., -1.], None).unwrap();
+            assert_eq!(scene.elements[hit].id, "site.tree");
+            assert_eq!(scene.elements[hit].level, None);
+        }
     }
 }

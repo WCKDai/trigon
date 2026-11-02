@@ -105,6 +105,10 @@ pub trait Provider: Send {
     fn geocode(&self, query: &str) -> Result<Address>;
     fn footprint(&self, at: &Address) -> Result<Footprint>;
     fn heights(&self, ring_utm: &[[f64; 2]]) -> Result<Heights>;
+    /// DTM samples (DVR90 metres), south-to-north rows and west-to-east columns.
+    fn terrain(&self, _origin_utm: [f64; 2], _spacing_m: [f64; 2], _columns: u32, _rows: u32) -> Result<Vec<Vec<f64>>> {
+        Err(DataError::Unavailable("no terrain grid provider configured".into()))
+    }
     fn photos(&self, at_utm: [f64; 2]) -> Result<Vec<Photo>>;
     /// BBR data for a building id; `Ok(None)` when no register is configured.
     fn register(&self, bbr_id: &str) -> Result<Option<Register>>;
@@ -612,6 +616,26 @@ impl Provider for Live {
         })
     }
 
+    fn terrain(&self, origin: [f64; 2], spacing: [f64; 2], columns: u32, rows: u32) -> Result<Vec<Vec<f64>>> {
+        if !(2..=65).contains(&columns)
+            || !(2..=65).contains(&rows)
+            || origin.iter().any(|v| !v.is_finite() || !(0.0..=1e7).contains(v))
+            || spacing.iter().any(|v| !v.is_finite() || !(0.1..=200.0).contains(v))
+        {
+            return Err(DataError::BadResponse("invalid terrain grid request".into()));
+        }
+        // WCS pixels are sampled at their centres. Pad half a cell to put those centres
+        // at the requested model nodes; GeoTIFF's first row is north, the model's is south.
+        let bbox = [
+            origin[0] - spacing[0] / 2.0,
+            origin[1] - spacing[1] / 2.0,
+            origin[0] + (f64::from(columns) - 0.5) * spacing[0],
+            origin[1] + (f64::from(rows) - 0.5) * spacing[1],
+        ];
+        let samples = self.dhm("dhm_terraen", bbox, (columns, rows))?;
+        terrain_rows(&samples, columns, rows)
+    }
+
     fn photos(&self, at: [f64; 2]) -> Result<Vec<Photo>> {
         let token = self.token()?;
         let bbox = format!("{},{},{},{}", at[0] - 2.0, at[1] - 2.0, at[0] + 2.0, at[1] + 2.0);
@@ -636,8 +660,29 @@ impl Provider for Live {
     }
 }
 
+/// GeoTIFF scanlines start in the north; model height-grid rows start in the south.
+fn terrain_rows(samples: &[f32], columns: u32, rows: u32) -> Result<Vec<Vec<f64>>> {
+    if !(2..=65).contains(&columns)
+        || !(2..=65).contains(&rows)
+        || samples.len() != columns as usize * rows as usize
+        || samples.iter().any(|v| !v.is_finite() || !(-50.0..=500.0).contains(v))
+    {
+        return Err(DataError::BadResponse("Danmarks Højdemodel terrain contains missing or invalid samples".into()));
+    }
+    Ok(samples.chunks(columns as usize).rev().map(|row| row.iter().map(|v| f64::from(*v)).collect()).collect())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terrain_raster_rows_are_reversed_and_missing_data_is_never_invented() {
+        assert_eq!(super::terrain_rows(&[30., 31., 20., 21., 10., 11.], 2, 3).unwrap(), vec![vec![10., 11.], vec![20., 21.], vec![30., 31.]]);
+        for samples in [vec![], vec![0.; 3], vec![f32::NAN; 4], vec![-9999.; 4]] {
+            assert!(super::terrain_rows(&samples, 2, 2).is_err());
+        }
+        assert!(super::terrain_rows(&[], 0, 0).is_err());
+    }
+
     use super::*;
 
     #[test]

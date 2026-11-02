@@ -15,10 +15,12 @@ use crate::app::{Mode, SHOT_WAIT, Shot, ShotTarget, StudioApp, filter_name, pars
 #[derive(Debug, Default, PartialEq)]
 pub struct ViewRequest {
     pub mode: Option<Mode>,
+    pub drawing: Option<String>,
     /// `Some(None)`: the whole model in 3D.
     pub level: Option<Option<usize>>,
     pub phase: Option<usize>,
     pub filter: Option<trigon_model::build::PhaseFilter>,
+    pub phase_colors: Option<bool>,
     pub fit: bool,
     pub focus: Option<String>,
 }
@@ -40,8 +42,14 @@ pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result
         None => None,
         Some("3d") => Some(Mode::ThreeD),
         Some("plan") => Some(Mode::Plan),
-        Some(other) => return Err(format!("ui.view: mode {other}: use 3d or plan")),
+        Some("drawing") => Some(Mode::Drawing),
+        Some(other) => return Err(format!("ui.view: mode {other}: use 3d, plan or drawing")),
     };
+    let drawing = opt_str(p, "drawing")?.map(str::to_string);
+    if let Some(id) = &drawing {
+        trigon_model::annotation::identifier(id).map_err(|e| format!("ui.view: {e}"))?;
+    }
+    let mode = mode.or(drawing.as_ref().map(|_| Mode::Drawing));
     let level = match p.get("level") {
         None => None,
         Some(Value::Null) => Some(None),
@@ -58,13 +66,19 @@ pub fn parse_view(p: &Value, levels: usize, phase_index: &dyn Fn(&str) -> Result
         None => None,
         Some(f) => Some(parse_filter(f).ok_or_else(|| format!("ui.view: filter {f}: use complete, demolition, new or all"))?),
     };
+    let phase_colors = match opt_str(p, "appearance")? {
+        None => None,
+        Some("materials") => Some(false),
+        Some("phases") => Some(true),
+        Some(_) => return Err("ui.view: appearance must be materials or phases".into()),
+    };
     let fit = match p.get("fit") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err("ui.view: `fit` must be true or false".into()),
     };
     let focus = opt_str(p, "focus")?.map(str::to_string);
-    Ok(ViewRequest { mode, level, phase, filter, fit, focus })
+    Ok(ViewRequest { mode, drawing, level, phase, filter, phase_colors, fit, focus })
 }
 
 /// Longest queue of synthetic input.
@@ -81,7 +95,7 @@ fn modifiers(p: &Value) -> egui::Modifiers {
     }
 }
 
-/// `ui.click {x, y, button?, double?, shift?…}` (window points) or `ui.key {key, command?, shift?…}`:
+/// `ui.click`, `ui.drag` (window points), or `ui.key`:
 /// the egui events a real click or key press makes.
 pub fn parse_input(method: &str, p: &Value) -> Result<Vec<egui::Event>, String> {
     let m = modifiers(p);
@@ -90,6 +104,33 @@ pub fn parse_input(method: &str, p: &Value) -> Result<Vec<egui::Event>, String> 
         let key = egui::Key::from_name(name).ok_or_else(|| format!("ui.key: unknown key {}", name.chars().take(32).collect::<String>()))?;
         let ev = |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: m };
         return Ok(vec![ev(true), ev(false)]);
+    }
+    if method == "ui.drag" {
+        let point = |key: &str| -> Result<egui::Pos2, String> {
+            let values = p
+                .get(key)
+                .and_then(Value::as_array)
+                .filter(|v| v.len() == 2)
+                .ok_or_else(|| format!("ui.drag: `{key}` must be [x,y] in window points"))?;
+            let coord = |v: &Value| v.as_f64().filter(|v| v.is_finite() && (0.0..=20_000.0).contains(v)).map(|v| v as f32);
+            match (coord(&values[0]), coord(&values[1])) {
+                (Some(x), Some(y)) => Ok(egui::pos2(x, y)),
+                _ => Err(format!("ui.drag: `{key}` coordinates must be between 0 and 20000")),
+            }
+        };
+        let from = point("from")?;
+        let to = point("to")?;
+        let steps = match p.get("steps") {
+            None => 8,
+            Some(v) => v.as_u64().filter(|n| (1..=60).contains(n)).ok_or("ui.drag: `steps` must be an integer from 1 to 60")? as usize,
+        };
+        let press = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: m };
+        let mut events = vec![egui::Event::PointerMoved(from), press(from, true)];
+        for step in 1..=steps {
+            events.push(egui::Event::PointerMoved(from + (to - from) * (step as f32 / steps as f32)));
+        }
+        events.push(press(to, false));
+        return Ok(events);
     }
     let coord = |k: &str| p.get(k).and_then(Value::as_f64).filter(|v| v.is_finite() && (0.0..=20_000.0).contains(v)).map(|v| v as f32);
     let (Some(x), Some(y)) = (coord("x"), coord("y")) else {
@@ -169,8 +210,11 @@ impl StudioApp {
                 let who = Who::Agent(self.agent_name(connection));
                 self.run(who, &id, p)
             }),
-            "ui.view" => self.ui_view(&params),
-            "ui.click" | "ui.key" => parse_input(&method, &params).and_then(|events| {
+            "ui.view" => self.ui_view(&params).map(|mut view| {
+                view["window_focused"] = json!(ctx.input(|i| i.viewport().focused));
+                view
+            }),
+            "ui.click" | "ui.key" | "ui.drag" => parse_input(&method, &params).and_then(|events| {
                 if self.synthetic.len() + events.len() > 4 * MAX_SYNTHETIC {
                     return Err("busy: earlier input is still being delivered; send it again shortly".into());
                 }
@@ -190,6 +234,12 @@ impl StudioApp {
                 };
                 let path = params.get("path").and_then(Value::as_str).map(str::to_string);
                 let raise = params.get("raise").and_then(Value::as_bool).unwrap_or(false);
+                // An unfocused window can still report itself as unoccluded. Honour explicit
+                // raising in that case too; handle drags intentionally cancel without focus.
+                if raise && matches!(target, ShotTarget::Window) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 // Answered once the view shows the latest change (serve_shots).
                 self.shots.push(Shot { responder, target, path, deadline: Instant::now() + SHOT_WAIT, requested: false, raise });
                 ctx.request_repaint();
@@ -204,27 +254,47 @@ impl StudioApp {
 
     /// `ui.view`: checked whole, then applied.
     fn ui_view(&mut self, p: &Value) -> Result<Value, String> {
-        let levels = self.session.doc.buildings.first().map_or(0, |b| b.storeys.len());
+        let levels = self.levels().len();
         let doc = &self.session.doc;
         let req = parse_view(p, levels, &|id| doc.phase_index(id).map_err(|e| e.to_string()))?;
+        let drawing = req.drawing.as_deref().unwrap_or(&self.drawing);
+        if req.mode == Some(Mode::Drawing) || req.drawing.is_some() {
+            doc.views
+                .iter()
+                .find(|v| v.id == drawing)
+                .ok_or_else(|| format!("ui.view: no drawing {drawing}"))?
+                .validate_source(doc)
+                .map_err(|e| format!("ui.view: {e}"))?;
+        }
+        if req.mode.unwrap_or(self.mode) == Mode::Drawing && req.focus.is_some() {
+            return Err("ui.view: use focus in 3D, or drawing to open a saved drawing".into());
+        }
         let focus = match &req.focus {
             Some(id) => Some(self.scene.find(id).ok_or_else(|| format!("ui.view: no element {id} in the view"))?),
             None => None,
         };
         let phase = req.phase.unwrap_or(self.phase);
         let filter = req.filter.unwrap_or(self.filter);
-        let phase_changed = phase != self.phase || filter != self.filter;
-        let before = (self.mode, self.level, self.plan_level);
+        let phase_colors = req.phase_colors.unwrap_or(self.phase_colors);
+        let phase_changed = phase != self.phase || filter != self.filter || phase_colors != self.phase_colors;
+        let before = (self.mode, self.level, self.plan_level, self.drawing.clone());
         self.mode = req.mode.unwrap_or(self.mode);
+        if let Some(id) = req.drawing {
+            self.drawing = id;
+        }
+        if req.mode == Some(Mode::Drawing) {
+            self.show_drawing_properties();
+        }
         self.phase = phase;
         self.filter = filter;
+        self.phase_colors = phase_colors;
         if let Some(l) = req.level {
             self.level = l;
             if let Some(l) = l {
                 self.plan_level = l;
             }
         }
-        if phase_changed || before != (self.mode, self.level, self.plan_level) {
+        if phase_changed || before != (self.mode, self.level, self.plan_level, self.drawing.clone()) {
             self.view_changed(phase_changed);
         }
         if req.fit {
@@ -237,15 +307,19 @@ impl StudioApp {
     }
 
     pub(crate) fn view_state(&self) -> Value {
-        let b = self.session.doc.buildings.first();
         json!({
             "mode": self.mode.name(),
             "level": self.level,
             "plan_level": self.plan_level,
-            "levels": b.map(|b| b.storeys.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()).unwrap_or_default(),
+            "drawing": if self.mode==Mode::Drawing {Some(&self.drawing)} else {None},
+            "drawing_raster": self.plan.diagnostics(),
+            "drawing_mapping": if self.mode!=Mode::ThreeD && !self.drawing_plan() {self.viewport_rect.filter(|r|self.plan.ready(*r,self.ppp)).and_then(|r|self.plan.screen_mapping(r))} else {None},
+            "drawings": self.session.doc.views.iter().map(|v|(&v.id,&v.name)).collect::<Vec<_>>(),
+            "levels": self.levels(),
             "phase": self.session.doc.phases.get(self.phase).map(|p| p.id.as_str()),
             "phases": self.session.doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             "filter": filter_name(self.filter),
+            "appearance": if self.phase_colors { "phases" } else { "materials" },
             "selection": self.selection.and_then(|i| self.scene.elements.get(i)).map(|e| e.id.as_str()),
             "camera": {
                 "target_m": self.camera.target,
@@ -255,6 +329,10 @@ impl StudioApp {
             },
             "model_box_m": self.scene.bounds,
             "window_hidden": self.window_hidden,
+            "viewport_window_points": self.viewport_rect.map(|r|[r.left(),r.top(),r.width(),r.height()]),
+            "handles": self.viewport_rect.map(|rect|self.projected_handles(rect).into_iter().filter_map(|handle|{
+                handle.mapping.screen(0.0).filter(|point|rect.contains(*point)).map(|point|json!({"key":handle.handle.key,"label":handle.handle.label,"point":[point.x,point.y],"value_mm":handle.handle.value}))
+            }).collect::<Vec<_>>()).unwrap_or_default(),
         })
     }
 
@@ -264,7 +342,7 @@ impl StudioApp {
         if self.shots.is_empty() {
             return;
         }
-        let ready = !self.building() && !(self.mode == Mode::Plan && self.drawing_plan());
+        let ready = !self.building() && !(self.mode != Mode::ThreeD && self.drawing_plan());
         let now = Instant::now();
         let mut keep = Vec::new();
         for mut shot in std::mem::take(&mut self.shots) {
@@ -293,7 +371,9 @@ impl StudioApp {
                     keep.push(shot);
                 }
                 ShotTarget::Window => {
-                    if self.mode == Mode::Plan && self.plan.error.is_none() && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
+                    if self.mode != Mode::ThreeD
+                        && self.plan.error.is_none()
+                        && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
                     {
                         keep.push(shot);
                         continue;
@@ -321,7 +401,7 @@ impl StudioApp {
                 let rs = self.render_state.clone().ok_or("no GPU renderer: the 3D view is unavailable")?;
                 self.capture_3d(&rs, size, ppp)
             }
-            Mode::Plan => {
+            Mode::Plan | Mode::Drawing => {
                 let img = self.plan.snapshot(rect, ppp).ok_or("the plan is not drawn yet")?;
                 let size = [img.size[0] as u32, img.size[1] as u32];
                 Ok((size, crate::render::png(size, img.as_raw())?))
@@ -362,6 +442,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn appearance_control_is_explicit_checked_and_optional() {
+        let phase = |_: &str| Ok(0);
+        for (value, expected) in [("materials", false), ("phases", true)] {
+            assert_eq!(parse_view(&json!({"appearance": value}), 1, &phase).unwrap().phase_colors, Some(expected));
+        }
+        for value in [json!(true), json!(23), json!("green")] {
+            assert!(parse_view(&json!({"appearance":value}), 1, &phase).is_err());
+        }
+    }
+
+    #[test]
     fn halving_averages_blocks() {
         let rgba = [[0u8, 0, 0, 255], [255, 255, 255, 255], [255, 255, 255, 255], [0, 0, 0, 255]].concat();
         let (size, out) = halve([2, 2], &rgba);
@@ -384,6 +475,10 @@ mod tests {
         let ok =
             parse_view(&json!({"mode": "plan", "level": 2, "phase": "2026", "filter": "all", "fit": true, "focus": "b1.f3"}), 6, &phases).unwrap();
         assert_eq!(ok.mode, Some(Mode::Plan));
+        let drawing = parse_view(&json!({"mode":"drawing","drawing":"section-a"}), 6, &phases).unwrap();
+        assert_eq!((drawing.mode, drawing.drawing.as_deref()), (Some(Mode::Drawing), Some("section-a")));
+        assert_eq!(parse_view(&json!({"drawing":"facade-b1.f1"}), 6, &phases).unwrap().mode, Some(Mode::Drawing));
+        assert!(parse_view(&json!({"drawing":"../invalid"}), 6, &phases).is_err());
         assert_eq!((ok.level, ok.phase, ok.fit, ok.focus.as_deref()), (Some(Some(2)), Some(1), true, Some("b1.f3")));
         assert_eq!(parse_view(&json!(null), 6, &phases).unwrap(), ViewRequest::default());
         assert_eq!(parse_view(&json!({"level": null}), 6, &phases).unwrap().level, Some(None));
@@ -429,6 +524,27 @@ mod tests {
             ("ui.key", json!({"key": 5})),
         ] {
             assert!(parse_input(m, &bad).is_err(), "{m} {bad}");
+        }
+    }
+
+    #[test]
+    fn drag_input_is_complete_bounded_and_releases_at_the_last_position() {
+        let events = parse_input("ui.drag", &json!({"from":[10,20],"to":[110,220],"steps":4,"shift":true})).unwrap();
+        assert_eq!(events.len(), 7);
+        assert!(matches!(events[1],egui::Event::PointerButton{pos,pressed:true,modifiers,..} if pos==egui::pos2(10.0,20.0) && modifiers.shift));
+        assert!(matches!(events[5],egui::Event::PointerMoved(pos) if pos==egui::pos2(110.0,220.0)));
+        assert!(matches!(events[6],egui::Event::PointerButton{pos,pressed:false,..} if pos==egui::pos2(110.0,220.0)));
+        assert!(parse_input("ui.drag", &json!({"from":[0,0],"to":[20000,20000],"steps":60})).unwrap().len() <= MAX_SYNTHETIC);
+        for bad in [
+            json!({}),
+            json!({"from":[0,0],"to":[1]}),
+            json!({"from":[-1,0],"to":[1,1]}),
+            json!({"from":[0,0],"to":[f64::MAX,1]}),
+            json!({"from":[0,0],"to":[1,1],"steps":0}),
+            json!({"from":[0,0],"to":[1,1],"steps":61}),
+            json!({"from":[0,0],"to":[1,1],"steps":1.5}),
+        ] {
+            assert!(parse_input("ui.drag", &bad).is_err(), "{bad}");
         }
     }
 

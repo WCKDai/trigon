@@ -4,3 +4,4 @@
 
 pub mod glb;
 pub mod ifc;
+mod masonry_texture;

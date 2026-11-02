@@ -128,6 +128,14 @@ pub fn regularize(
             return Err(ModelError::Invalid("wall cleanup needs finite nonzero wall segments and 1 to 256 storeys per wall".into()));
         }
         checked("wall thickness", w.thickness, 1.0, 5000.0)?;
+        if w.doors.len() > 50 {
+            return Err(ModelError::Invalid("at most 50 doors in one wall".into()));
+        }
+        for door in &w.doors {
+            checked("door position", door.at, 0.0, distance(w.a, w.b))?;
+            checked("door width", door.width, 300.0, 4000.0)?;
+            checked("door height", door.height, 1000.0, 4000.0)?;
+        }
     }
     if tolerance_mm == 0.0 {
         return Ok(walls.to_vec());
@@ -230,6 +238,10 @@ pub fn regularize(
             if w.axis.is_some()
                 && previous.group == w.group
                 && previous.wall.load_bearing == w.wall.load_bearing
+                // Keep hosted door identities and their source wall; merging would retire that
+                // host and its per-wall door indices. Door-free measured fragments still merge.
+                && previous.wall.doors.is_empty()
+                && w.wall.doors.is_empty()
                 && (previous.wall.thickness - w.wall.thickness).abs() <= thickness_limit
                 && w.lo <= previous.hi + merge_gap + EPS
                 && (w.lo <= previous.hi || inside_or_on(inner, gap_midpoint))
@@ -341,7 +353,27 @@ pub fn regularize(
             }
         }
     }
-    Ok(merged.into_iter().map(|w| w.wall).collect())
+    merged
+        .into_iter()
+        .map(|w| {
+            let mut wall = w.wall;
+            if !wall.doors.is_empty() {
+                let old = sub(w.original[1], w.original[0]);
+                let old_length = distance(w.original[0], w.original[1]);
+                let new = sub(wall.b, wall.a);
+                let new_length = checked("regularized wall length", distance(wall.a, wall.b), 1.0, 1e10)?;
+                let direction = [new[0] / new_length, new[1] / new_length];
+                for door in &mut wall.doors {
+                    let centre = [w.original[0][0] + old[0] * door.at / old_length, w.original[0][1] + old[1] * door.at / old_length];
+                    let projected = checked("regularized door position", dot(sub(centre, wall.a), direction), 0.0, new_length)?;
+                    if (projected - door.at).abs() > EPS {
+                        door.at = projected;
+                    }
+                }
+            }
+            Ok(wall)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -358,6 +390,61 @@ mod tests {
 
     fn close(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-7, "{a} != {b}");
+    }
+
+    #[test]
+    fn explicit_doors_are_not_lost_when_collinear_fragments_are_candidates_for_merging() {
+        let mut a = wall("a", [0., 0.], [2500., 0.]);
+        a.doors.push(crate::doc::WallDoor { at: 1000., width: 700., height: 2100. });
+        let mut b = wall("b", [2550., 0.], [5000., 0.]);
+        b.doors.push(crate::doc::WallDoor { at: 1200., width: 800., height: 2200. });
+        let out = clean(&[a.clone(), b.clone()]);
+        assert_eq!(out.iter().map(|w| w.doors.len()).sum::<usize>(), 2, "cleanup must preserve both explicit door definitions");
+        for input in [a, b] {
+            let preserved = out.iter().find(|w| w.id == input.id).unwrap();
+            assert_eq!(preserved.doors, input.doors);
+        }
+    }
+
+    #[test]
+    fn explicit_door_positions_follow_their_world_projection_when_a_wall_start_is_extended() {
+        for reversed in [false, true] {
+            let mut a = wall("a", [80., 0.], [2000., 0.]);
+            if reversed {
+                std::mem::swap(&mut a.a, &mut a.b);
+            }
+            a.doors.push(crate::doc::WallDoor { at: 800., width: 700., height: 2100. });
+            let before = a.a[0] + if reversed { -800. } else { 800. };
+            let out = clean(&[a, wall("cross", [0., -1000.], [0., 1000.])]);
+            let a = out.iter().find(|w| w.id == "a").unwrap();
+            close(a.a[0].min(a.b[0]), 50.);
+            let after = a.a[0] + if reversed { -a.doors[0].at } else { a.doors[0].at };
+            close(after, before);
+            assert_eq!(a.doors[0].width, 700.);
+            assert_eq!(a.doors[0].height, 2100.);
+            assert_eq!(clean(&out), out, "door remapping must be idempotent");
+        }
+    }
+
+    #[test]
+    fn explicit_hostile_door_parameters_are_refused_before_projection() {
+        let source = crate::doc::WallDoor { at: 800., width: 700., height: 2100. };
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -1.] {
+            for field in 0..3 {
+                let mut door = source.clone();
+                match field {
+                    0 => door.at = value,
+                    1 => door.width = value,
+                    _ => door.height = value,
+                }
+                let mut a = wall("a", [0., 0.], [2000., 0.]);
+                a.doors.push(door);
+                assert!(regularize(&[a], &[0.], 100., 3., &[]).is_err());
+            }
+        }
+        let mut a = wall("a", [0., 0.], [2000., 0.]);
+        a.doors = vec![source; 51];
+        assert!(regularize(&[a], &[0.], 100., 3., &[]).is_err());
     }
 
     #[test]

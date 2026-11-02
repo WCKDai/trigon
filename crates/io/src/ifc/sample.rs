@@ -90,10 +90,14 @@ pub fn document() -> Result<Document> {
         pitch_deg: 40.0,
         gables: vec![id(1), id(4)],
         straighten_mm: 1200.0,
+        eave_facades: None,
         overhang_mm: 300.0,
         verge_mm: 100.0,
         thickness_mm: 250.0,
         gutters: true,
+        drainage: None,
+        dormers: Vec::new(),
+        rooflights: Vec::new(),
     };
     b.plinth = Some(Plinth { height: 500.0, projection: 30.0 });
     // A rendered courtyard side, and rendered bands at the floors of the street front.
@@ -101,7 +105,7 @@ pub fn document() -> Result<Document> {
         f.finish = Some(WallFinish::Render);
     }
     if let Some(f) = b.facades.get_mut(0) {
-        f.bands = vec![Band { levels: vec![1, 2], bottom: -300.0, top: 100.0, projection: 40.0 }];
+        f.bands = vec![Band { levels: vec![1, 2], bottom: -300.0, top: 100.0, projection: 40.0, finish: None }];
     }
     let bays: [Vec<f64>; 5] = [
         trigon_model::build::even_bays(18000.0, 5, 900.0),

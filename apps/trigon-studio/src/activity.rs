@@ -191,7 +191,14 @@ impl Feed {
                                         parts.push(format!("removed {}", list(&c.removed)));
                                     }
                                     if parts.is_empty() {
-                                        parts.push("no visible change".into());
+                                        parts.push(
+                                            if e.command.starts_with("annotation.") || e.command.starts_with("view.") {
+                                                "drawing updated"
+                                            } else {
+                                                "no visible change"
+                                            }
+                                            .into(),
+                                        );
                                     }
                                     ui.label(egui::RichText::new(parts.join("; ")).small().color(egui::Color32::from_rgb(200, 130, 20)));
                                 }

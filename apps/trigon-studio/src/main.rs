@@ -8,10 +8,14 @@ mod app;
 mod authoring;
 mod camera;
 mod control;
+mod drafting;
+mod drawing_raster;
 mod palette;
 mod plan_view;
+mod properties;
 mod render;
 mod scene;
+mod schedules;
 mod theme;
 mod worker;
 

@@ -1,0 +1,371 @@
+use crate::{Session, commands};
+use serde_json::json;
+use trigon_model::{Building, build};
+
+fn session() -> Session {
+    let mut s = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+    s.doc
+        .buildings
+        .push(Building::new("b", "Original family gallery", &[[0.0, 0.0], [42000.0, 0.0], [42000.0, 10000.0], [0.0, 10000.0]], 2, 3500.0).unwrap());
+    s
+}
+
+#[test]
+fn shared_type_replacement_validates_dormer_consumers_and_preserves_exact_undo() {
+    let mut s = session();
+    s.execute("types.install_copenhagen", json!({})).unwrap();
+    let flat = s.doc.clone();
+    s.execute(
+        "building.set_roof",
+        json!({"kind":"mansard","thickness_mm":220,"dormers":[{
+            "id":"shared-type","facade":"b.f1","u_mm":10500,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200
+        }]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let bytes = trigon_io::glb::write(&build(&before).unwrap(), &[]);
+    let mut replacement = s.doc.component("dk.window.dannebrog").unwrap().clone();
+    replacement.kind = trigon_model::ComponentKind::PanelDoor { leaves: 1, panel_columns: 1, panel_rows: 3, glazed_rows: 0 };
+    replacement.validate().unwrap();
+    let error = s.execute("types.define", serde_json::to_value(&replacement).unwrap()).unwrap_err();
+    assert!(error.to_string().contains("dormer"), "the invalid consumer must be explained: {error}");
+    assert_eq!(s.doc, before);
+    assert_eq!(trigon_io::glb::write(&build(&s.doc).unwrap(), &[]), bytes);
+    let mut compatible = before.component("dk.window.dannebrog").unwrap().clone();
+    match &mut compatible.kind {
+        trigon_model::ComponentKind::HistoricWindow { lights, .. } => *lights = 3,
+        _ => panic!("fixture must use the historic window family"),
+    }
+    s.execute("types.define", serde_json::to_value(compatible).unwrap()).unwrap();
+    assert_ne!(trigon_io::glb::write(&build(&s.doc).unwrap(), &[]), bytes);
+    assert!(s.undo());
+    assert_eq!(s.doc, before);
+    assert_eq!(trigon_io::glb::write(&build(&s.doc).unwrap(), &[]), bytes);
+    assert!(s.undo(), "the rejected replacement must not add a history entry");
+    assert_eq!(s.doc, flat);
+}
+
+#[test]
+fn mansard_roofs_reject_explicit_unsupported_drainage_without_losing_sources_or_history() {
+    let mut s = session();
+    let initial = s.doc.clone();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","count":8})).unwrap();
+    let before = s.doc.clone();
+    let drainage = json!({"gutter_width_mm":160,"downpipes":[{"id":"pipe","facade":"b.f1","along_mm":5000,
+        "diameter_mm":80,"wall_offset_mm":100,"bottom_mm":150,"shoe_mm":200}]});
+    for specification in [drainage, json!({"gutter_width_mm":1e300})] {
+        let error = s.execute("building.set_roof", json!({"kind":"mansard","gutters":true,"drainage":specification})).unwrap_err();
+        assert!(error.to_string().contains("drainage"), "unsupported data must be explained: {error}");
+        assert_eq!(s.doc, before);
+    }
+    assert!(s.undo(), "the previous successful command must remain the next Undo entry");
+    assert_eq!(s.doc, initial);
+    assert!(!s.undo(), "rejected roof data must not create history entries");
+}
+
+#[test]
+fn terrain_and_site_objects_cannot_claim_the_same_pick_and_export_identity() {
+    let terrain = json!({"origin":[-40000,-40000],"spacing_mm":[10000,10000],"heights_mm":[[0,0],[0,0]]});
+    let object = json!({"id":"site.terrain","name":"Existing tree","intent":"existing",
+        "geometry":{"kind":"tree","position_mm":[-35000,-35000,0],"height_mm":4500,"crown_radius_mm":1500,"trunk_radius_mm":100}});
+    let mut grid_first = session();
+    grid_first.execute("site.set_terrain", json!({"terrain":terrain})).unwrap();
+    let grid = grid_first.doc.clone();
+    assert!(grid_first.execute("site.add", json!({"object":object})).is_err(), "two visible sources must not share site.terrain");
+    assert_eq!(grid_first.doc, grid);
+    assert!(grid_first.undo());
+    assert!(grid_first.doc.terrain.is_none());
+
+    let mut object_first = session();
+    object_first.execute("site.add", json!({"object":object})).unwrap();
+    let old_document = object_first.doc.clone();
+    assert!(build(&old_document).is_ok(), "existing site.terrain object IDs remain valid without a terrain grid");
+    assert!(object_first.execute("site.set_terrain", json!({"terrain":terrain})).is_err());
+    assert_eq!(object_first.doc, old_document);
+    assert_eq!(object_first.execute("element.get", json!({"id":"site.terrain"})).unwrap()["kind"], "tree");
+    object_first.execute("site.delete", json!({"id":"site.terrain"})).unwrap();
+    object_first.execute("site.set_terrain", json!({"terrain":terrain})).unwrap();
+    assert_eq!(object_first.execute("element.get", json!({"id":"site.terrain"})).unwrap()["kind"], "terrain");
+}
+
+#[test]
+fn roof_covering_is_typed_parametric_and_exactly_undoable() {
+    let mut s = session();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","count":8})).unwrap();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[1],"bays":[2]})).unwrap();
+    s.execute("building.set_roof", json!({"kind":"mansard","thickness_mm":220})).unwrap();
+    let bare = trigon_io::glb::write(&build(&s.doc).unwrap(), &[]);
+    let schedule = s.execute("schedule.openings", json!({})).unwrap();
+    s.execute("element.set", json!({"id":"b.roof","properties":{"covering":{"lower":{"material":"slate"},"upper":{"material":"felt"}}}})).unwrap();
+    assert_eq!(s.execute("schedule.openings", json!({})).unwrap(), schedule);
+    let covered = s.doc.clone();
+    let mesh = build(&s.doc).unwrap();
+    let bytes = trigon_io::glb::write(&mesh, &[]);
+    assert!(bytes.len() > bare.len());
+    s.execute("element.set", json!({"id":"b.roof","properties":{"covering":null}})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, covered);
+    assert_eq!(build(&s.doc).unwrap(), mesh);
+    assert!(s.execute("element.set", json!({"id":"b.roof","properties":{"covering":{"lower":{"material":"slate","width_mm":1e300}}}})).is_err());
+    assert_eq!(s.doc, covered);
+}
+
+#[test]
+fn mansard_gable_render_material_follows_the_host_facade_finish() {
+    let mut s = session();
+    s.execute("facade.set_finish", json!({"finish":"yellow_brick"})).unwrap();
+    s.execute("building.set_roof", json!({"kind":"mansard","thickness_mm":220,"gables":["b.f2","b.f4"]})).unwrap();
+    let bytes = trigon_io::glb::write(&build(&s.doc).unwrap(), &[]);
+    let len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let glb: serde_json::Value = serde_json::from_slice(&bytes[20..20 + len]).unwrap();
+    let node = glb["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "b.roof").unwrap();
+    let mesh = node["mesh"].as_u64().unwrap() as usize;
+    let names = glb["meshes"][mesh]["primitives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| glb["materials"][p["material"].as_u64().unwrap() as usize]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"brick_yellow"), "the gable must render in the explicitly assigned yellow brick: {names:?}");
+    assert!(!names.contains(&"wall"), "an opt-in mansard gable must not silently use the old generic red wall material");
+}
+
+#[test]
+fn mansard_dormers_cut_real_roof_voids_and_keep_shared_edits_atomic() {
+    let mut s = session();
+    s.execute("types.install_copenhagen", json!({})).unwrap();
+    let params = json!({"kind":"mansard","thickness_mm":220,"overhang_mm":250,"dormers":[{"id":"street-1","facade":"b.f1","u_mm":10500,"window_type":"dk.window.dannebrog","width_mm":1100,"height_mm":1200}]});
+    s.execute("building.set_roof", params).unwrap();
+    let before = s.doc.clone();
+    let original = build(&s.doc).unwrap();
+    let schedule = s.execute("schedule.openings", json!({})).unwrap();
+    assert_eq!(schedule["totals"]["windows"], 1);
+    let record = s.execute("element.get", json!({"id":"b.dormer.street-1.window"})).unwrap();
+    assert_eq!(record["editable"], true);
+    s.execute("element.set", json!({"id":"b.dormer.street-1.window","properties":{"width_mm":1200}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), original);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    for bad in
+        [json!({"id":"b.dormer.street-1.window","properties":{"width_mm":1e300}}), json!({"id":"b.dormer.street-1.window","properties":{"u_mm":100}})]
+    {
+        assert!(s.execute("element.set", bad).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn shaped_balcony_is_a_separate_undoable_attachment_with_a_portable_outline() {
+    let mut s = session();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","count":8})).unwrap();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"window.casement.2","levels":[1],"bays":[2]})).unwrap();
+    s.execute("types.define",json!({"id":"original.bowed","name":"Original bowed balcony","width":3000,"height":1100,"sill":0,"kind":{"family":"shaped_balcony","depth":1500,"thickness":180,"plan":{"shape":"bowed","return_fraction":0.35}}})).unwrap();
+    s.execute("view.define", json!({"id":"plan","name":"Original balcony plan","kind":{"view":"plan","level":1}})).unwrap();
+    let before = s.doc.clone();
+    let opening_before = build(&s.doc).unwrap()[0].walls[0].openings.clone();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"original.bowed","levels":[1],"bays":[2]})).unwrap();
+    let built = build(&s.doc).unwrap();
+    let wall = &built[0].walls[0];
+    assert_eq!(wall.openings, opening_before, "adding a balcony must not change the host opening");
+    assert_eq!(wall.attachments.len(), 2, "slab and railing have separate source-derived identities");
+    let centre = s.doc.buildings[0].facades[0].bays[2];
+    assert!(
+        s.execute("view.pick", json!({"id":"plan","point":[centre,-750],"tolerance_mm":0})).unwrap()["hit"]["id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with(".slab"))
+    );
+    assert_eq!(
+        s.execute("view.pick", json!({"id":"plan","point":[centre-1450.0,-1450],"tolerance_mm":0})).unwrap()["hit"],
+        serde_json::Value::Null,
+        "empty corner outside a bowed slab must stay empty"
+    );
+    let text = trigon_io::ifc::write(&s.doc, &built, "original-bowed.ifc", "2026-01-01T00:00:00");
+    assert!(text.contains("IFCELEMENTASSEMBLY"));
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        assert!(read.failures.is_empty(), "{:?}", read.failures);
+    }
+    let placed = s.doc.clone();
+    s.execute("element.set", json!({"id":wall.attachments[0].id,"properties":{"depth_mm":1800}})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, placed);
+    s.execute("element.set", json!({"id":wall.attachments[0].id,"properties":{"balcony_plan":{"shape":"chamfered","corner_mm":300}}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), built);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, placed);
+    assert!(s.execute("element.set", json!({"id":wall.attachments[0].id,"properties":{"balcony_plan":{"shape":"polygon","points":[]}}})).is_err());
+    assert_eq!(s.doc, placed);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn mansard_roof_is_opt_in_parametric_atomic_and_exactly_undoable() {
+    let mut s = session();
+    let original = s.doc.clone();
+    let params =
+        json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gutters":true});
+    s.execute("building.set_roof", params.clone()).unwrap();
+    assert_eq!(s.doc.buildings[0].roof, serde_json::from_value(json!({"kind":"mansard","lower_pitch_deg":68,"upper_pitch_deg":25,"break_run_mm":1300,"thickness_mm":220,"overhang_mm":250,"gutters":true})).unwrap());
+    let before = s.doc.clone();
+    let built_before = build(&s.doc).unwrap();
+    let r = built_before[0].roof.as_ref().unwrap();
+    let expected =
+        s.doc.buildings[0].height() + 1300.0 * 68f64.to_radians().tan() + 3700.0 * 25f64.to_radians().tan() + 220.0 / 25f64.to_radians().cos();
+    assert!((r.ridge - expected).abs() < 0.01);
+    let record = s.execute("element.get", json!({"id":"b.roof"})).unwrap();
+    assert!(record.to_string().contains("lower_pitch_deg"));
+    s.execute("element.set", json!({"id":"b.roof","properties":{"break_run_mm":1500}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), built_before);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(build(&s.doc).unwrap(), built_before);
+    for bad in [
+        json!({"kind":"mansard","lower_pitch_deg":10,"upper_pitch_deg":60}),
+        json!({"kind":"mansard","break_run_mm":10000}),
+        json!({"kind":"mansard","upper_pitch_deg":1e300}),
+        json!({"kind":"pitched","pitch_deg":35,"break_run_mm":1300}),
+        json!({"kind":"mansard","ridge":20000}),
+    ] {
+        assert!(s.execute("building.set_roof", bad).is_err());
+        assert_eq!(s.doc, before);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, original);
+}
+
+#[test]
+fn copenhagen_library_is_explicit_atomic_and_undoable() {
+    let mut s = session();
+    let before = s.doc.clone();
+    let spec = commands().iter().find(|c| c.id == "types.install_copenhagen").unwrap();
+    assert!(spec.mutates && spec.journaled);
+    let result = s.execute("types.install_copenhagen", json!({})).unwrap();
+    assert_eq!(result["installed"].as_array().unwrap().len(), 11);
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+    assert_eq!(s.doc, before);
+    s.doc.types.push(trigon_model::ComponentType {
+        id: "dk.window.dannebrog".into(),
+        name: "Owner customised".into(),
+        width: 800.0,
+        height: 1400.0,
+        sill: 800.0,
+        kind: trigon_model::ComponentKind::FixedWindow,
+    });
+    let before = s.doc.clone();
+    assert!(s.execute("types.install_copenhagen", json!({})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn curved_family_exchange_quantities_and_exact_edit_undo_agree() {
+    let mut s = session();
+    s.execute("types.install_copenhagen", json!({})).unwrap();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","count":12})).unwrap();
+    for (i, ty) in trigon_model::component::copenhagen_types().iter().enumerate() {
+        s.execute("facade.place", json!({"facade":"b.f1","type":ty.id,"levels":[0],"bays":[i]})).unwrap();
+    }
+    let built = build(&s.doc).unwrap();
+    let round = built[0].walls[0].openings.iter().find(|o| o.fill.type_id == "dk.window.round").unwrap();
+    let area = trigon_model::doc::polygon_area(&round.profile) / 1e6;
+    let schedule = s.execute("schedule.openings", json!({})).unwrap();
+    let row = schedule["rows"].as_array().unwrap().iter().find(|r| r["type_id"] == "dk.window.round").unwrap();
+    assert!((row["area_m2"].as_f64().unwrap() - area).abs() < 1e-9);
+    let text = trigon_io::ifc::write(&s.doc, &built, "original-family-gallery.ifc", "2026-01-01T00:00:00");
+    assert!(text.contains("IFCARBITRARYCLOSEDPROFILEDEF"));
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        assert!(read.failures.is_empty(), "{:?}", read.failures);
+        let source = trigon_io::ifc::model_shapes(&s.doc, &built);
+        for opening in &built[0].walls[0].openings {
+            let id = trigon_io::ifc::guid(&format!("trigon:{}", opening.fill.id));
+            let actual = read.elements.iter().find(|e| e.global_id == id).unwrap();
+            let expected = source.iter().find(|(id, _)| id == &opening.fill.id).unwrap().1.bounds().unwrap();
+            assert!(trigon_ifcread::bounds_deviation(expected, actual.mesh.bounds().unwrap()) < 0.01);
+        }
+    }
+    let before = s.doc.clone();
+    let built_before = build(&s.doc).unwrap();
+    let target = built_before[0].walls[0].openings[5].fill.id.clone();
+    s.execute("element.set", json!({"id":target,"properties":{"width_mm":1300,"height_mm":2100}})).unwrap();
+    assert_ne!(build(&s.doc).unwrap(), built_before);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(build(&s.doc).unwrap(), built_before);
+    for bad in [
+        json!({"id":target,"properties":{"width_mm":1e300}}),
+        json!({"id":target,"properties":{"kind":{"family":"historic_window","shape":{"kind":"segmental","rise_mm":-1},"lights":u32::MAX}}}),
+    ] {
+        assert!(s.execute("element.set", bad).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn terrain_is_an_explicit_atomic_undoable_source_and_portable_mesh() {
+    let mut s = session();
+    let before = s.doc.clone();
+    s.execute("site.set_terrain", json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[65000,30000],"heights_mm":[[0,100],[200,300]]}})).unwrap();
+    let bytes = trigon_io::glb::write(&build(&s.doc).unwrap(), &[]);
+    assert!(bytes.windows(b"site.terrain".len()).any(|w| w == b"site.terrain"));
+    let valid = s.doc.clone();
+    assert!(s.execute("site.set_terrain", json!({})).is_err());
+    assert_eq!(s.doc, valid);
+    for heights in [json!([]), json!([[0, 0]]), json!([[0, 0], [0]]), json!([[0, 0], [0, 1e300]])] {
+        assert!(s.execute("site.set_terrain", json!({"terrain":{"origin":[0,0],"spacing_mm":[1000,1000],"heights_mm":heights}})).is_err());
+        assert_eq!(s.doc, valid);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn fbx_export_is_read_only_and_refuses_document_supplied_executables() {
+    let mut s = session();
+    let before = s.doc.clone();
+    let spec = commands().iter().find(|c| c.id == "export.fbx").unwrap();
+    assert!(!spec.mutates && !spec.journaled);
+    for bad in [
+        json!({"path":"wrong.txt"}),
+        json!({"path":"out/never.fbx","blender":"/untrusted/program"}),
+        json!({"path":"out/never.fbx","filter":"invalid"}),
+    ] {
+        let error = s.execute("export.fbx", bad).unwrap_err();
+        assert!(!matches!(error, crate::EngineError::Internal(_)));
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn terrain_removal_is_required_explicitly_and_described_as_nullable() {
+    fn nullable(v: &serde_json::Value, root: &serde_json::Value) -> bool {
+        if v["type"] == "null" || v["type"].as_array().is_some_and(|a| a.iter().any(|t| t == "null")) {
+            return true;
+        }
+        if let Some(reference) = v["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
+            return root.pointer(reference).is_some_and(|s| nullable(s, root));
+        }
+        ["anyOf", "oneOf"].iter().any(|key| v[key].as_array().is_some_and(|a| a.iter().any(|s| nullable(s, root))))
+    }
+    let schema = commands().iter().find(|c| c.id == "site.set_terrain").unwrap().params_schema();
+    assert!(schema["required"].as_array().unwrap().iter().any(|x| x == "terrain"));
+    assert!(nullable(&schema["properties"]["terrain"], &schema), "explicit null removal must be accepted by the command schema");
+    let mut s = session();
+    s.execute("site.set_terrain", json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[65000,30000],"heights_mm":[[0,0],[0,0]]}})).unwrap();
+    let before = s.doc.clone();
+    s.execute("site.set_terrain", json!({"terrain":null})).unwrap();
+    assert!(s.doc.terrain.is_none());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn displayed_terrain_has_read_only_source_properties_in_the_shared_authoring_api() {
+    let mut s = session();
+    s.execute("site.set_terrain", json!({"terrain":{"origin":[-10000,-10000],"spacing_mm":[65000,30000],"heights_mm":[[0,0],[0,0]]}})).unwrap();
+    let before = s.doc.clone();
+    let p = s.execute("element.get", json!({"id":"site.terrain"})).unwrap();
+    assert_eq!(p["kind"], "terrain");
+    assert_eq!(p["editable"], false);
+    assert!(s.execute("element.set", json!({"id":"site.terrain","properties":{"width_mm":1234}})).is_err());
+    assert_eq!(s.doc, before);
+}
