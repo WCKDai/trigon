@@ -206,6 +206,14 @@ Adjacent-storey elements participate when inside the range; objects outside top/
 Floor and room picking retains source IDs. Mesh ranges show actual stair meshes instead of legacy
 symbolic tread/door-swing/label conventions. Leaving range unset retains the legacy plan symbols.
 
+When a shared level index contains both full storeys and an explicit attic, an unset range keeps
+the full-storey symbols, including stair arrivals from below. Each attic contributes an actual
+mesh cut relative to its own floor in the same site frame. Adding a lower attic therefore does
+not change another wing's tread symbols or stair selection. Ground site objects appear once,
+independent of building order. This composition does not introduce cross-building mesh occlusion
+for intersecting footprints. Explicit ranges continue to cut all buildings together using their
+existing shared horizontal planes. Roof-clipped interiors and habitable roof areas remain unsupported.
+
 
 ## Shared component libraries in Studio
 

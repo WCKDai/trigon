@@ -151,15 +151,25 @@ pub(crate) fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&t
         .collect()
 }
 
-/// The storey's cut as primitives in site mm.
+/// Mixed plans include site geometry once when a full-storey source is at ground level.
+/// Legacy plans keep their established first-building convention.
+fn includes_site(doc: &Document, level: usize) -> bool {
+    if doc.buildings.iter().any(|b| b.attic_level() == Some(level)) {
+        doc.buildings.iter().any(|b| b.ground_level == level && b.storeys.get(level).is_some_and(|s| !s.roof_level))
+    } else {
+        level == doc.buildings.first().map_or(0, |b| b.ground_level)
+    }
+}
+
+/// Full-storey symbolic cuts in site mm. Roof levels are composed from actual meshes instead.
 fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result<(Vec<Prim>, String, BTreeMap<usize, Element>)> {
-    if !doc.buildings.iter().any(|b| b.storeys.get(level).is_some()) {
+    if !doc.buildings.iter().any(|b| b.storeys.get(level).is_some_and(|s| !s.roof_level)) {
         return Err(ModelError::Invalid(format!("level {level} doesn't exist")).into());
     }
     let mut prims = Vec::new();
     let mut elements = BTreeMap::new();
     let mut title = String::new();
-    if level == doc.buildings.first().map_or(0, |b| b.ground_level) {
+    if includes_site(doc, level) {
         let mut site = trigon_model::site::build(doc, view, None)?;
         // Areas under furniture and canopies. The outlines here are the actual parametric
         // footprints, so selection never invents an opening or a building identity.
@@ -178,7 +188,9 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             prims.push(Prim::Site { pts: o.footprint, fill: color });
         }
     }
-    let built = build_view(doc, view)?;
+    // Validate/build the complete document before selecting presentation sources. Global
+    // component, site and terrain context must not depend on a filtered Document clone.
+    let built: Vec<_> = build_view(doc, view)?.into_iter().filter(|b| b.storeys.get(level).is_some_and(|s| !s.roof_level)).collect();
     for b in &built {
         let Some(storey) = b.storeys.get(level) else { continue };
         title = format!("{} — {}", b.name, storey.name);
@@ -476,7 +488,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         }
     }
     // Outdoor cellar stairs: cut in the basement, seen from above on the ground storey.
-    for b in doc.buildings.iter().filter(|b| b.storeys.get(level).is_some()) {
+    for b in doc.buildings.iter().filter(|b| b.storeys.get(level).is_some_and(|s| !s.roof_level)) {
         if level != 0 && level != b.ground_level {
             continue;
         }
@@ -531,7 +543,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             }
         }
     }
-    for b in doc.buildings.iter().filter(|b| b.storeys.get(level).is_some()) {
+    for b in doc.buildings.iter().filter(|b| b.storeys.get(level).is_some_and(|s| !s.roof_level)) {
         let visible = visible_stairs(b, level);
         for st in &visible {
             let start = prims.len();
@@ -839,7 +851,7 @@ impl Label {
 
 fn plan_extents(doc: &Document, level: usize, view: View) -> Result<Vec<[f64; 2]>> {
     let mut points: Vec<_> = doc.buildings.iter().filter(|b| b.storeys.get(level).is_some()).flat_map(|b| b.footprint.iter().copied()).collect();
-    if level == doc.buildings.first().map_or(0, |b| b.ground_level) {
+    if includes_site(doc, level) {
         for o in trigon_model::site::build(doc, view, None)? {
             points.extend(o.footprint);
         }
@@ -931,13 +943,16 @@ pub(crate) fn project_name(doc: &Document, level: usize) -> String {
 }
 
 fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: Option<&[[f64; 2]]>, caption: &str) -> Result<PlanSheet> {
-    if doc.buildings.iter().any(|b| b.attic_level() == Some(level)) {
-        if rotation != 0.0 || region.is_some() {
-            return Err(ModelError::Invalid(
-                "roof floor plans use actual mesh cuts; use a saved plan view/template for crops; rotation is unsupported".into(),
-            )
-            .into());
-        }
+    let has_roof_floor = doc.buildings.iter().any(|b| b.attic_level() == Some(level));
+    if has_roof_floor && (rotation != 0.0 || region.is_some()) {
+        return Err(ModelError::Invalid(
+            "roof floor plans use actual mesh cuts; use a saved plan view/template for crops; rotation is unsupported".into(),
+        )
+        .into());
+    }
+    // Keep the existing actual-cut route when this index has only roof floors. In a mixed
+    // sheet, full storeys retain their plan symbols, including stair arrivals from below.
+    if has_roof_floor && !doc.buildings.iter().any(|b| b.storeys.get(level).is_some_and(|s| !s.roof_level)) {
         let sheet = crate::plan_range::sheet(doc, level, view, Default::default())?;
         let caption = if caption.is_empty() { sheet.project.clone() } else { caption.into() };
         let note = Some(match sheet.note {
@@ -1129,7 +1144,26 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         t.clearance = l.clearance.clone();
         sc.text(t);
     }
-    let note = crowded.then(|| format!("Altaner: {}", sizes.iter().map(|(t, n)| format!("{n} stk. {t}")).collect::<Vec<_>>().join(", ")));
+    let mut notes = Vec::new();
+    if crowded {
+        notes.push(format!("Altaner: {}", sizes.iter().map(|(t, n)| format!("{n} stk. {t}")).collect::<Vec<_>>().join(", ")));
+    }
+    if has_roof_floor {
+        // Both scenes use site mm. Keep the shared frame/scale and append only each roof
+        // building's geometry, cut relative to its own floor, with original source ownership.
+        for building in doc.buildings.iter().filter(|b| b.attic_level() == Some(level)) {
+            let mut roof = crate::plan_range::sheet_for_building(doc, level, view, Default::default(), &building.id)?;
+            sc.items.append(&mut roof.scene.items);
+            sc.element_regions.append(&mut roof.scene.element_regions);
+            if let Some(note) = roof.note
+                && !notes.contains(&note)
+            {
+                notes.push(note);
+            }
+        }
+        notes.push("Roof-clipped interiors and habitable areas unsupported".into());
+    }
+    let note = (!notes.is_empty()).then(|| notes.join(" · "));
     Ok(PlanSheet { scene: sc, vp, clip, floor, project, caption, note })
 }
 
@@ -1323,6 +1357,281 @@ pub(crate) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mixed_plan_fixture() -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        for (command, params) in [
+            (
+                "building.add",
+                json!({"id":"main","name":"Public main","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":2,"storey_height_mm":3000}),
+            ),
+            (
+                "interior.add_stairs",
+                json!({"building":"main","stairs":[{"id":"main-stair","levels":[0],"kind":"u_turn","outline":[[3000,2000],[6000,2000],[6000,4200],[3000,4200]],"rounded":false,"landing":1100,"well":200}]}),
+            ),
+            ("view.define", json!({"id":"mixed","name":"Public plan","kind":{"view":"plan","level":1}})),
+            ("view.configure", json!({"id":"mixed","template":{"name":"Fixed","sizing":{"mode":"fixed","denominator":100,"centre":[11500,4000]}}})),
+        ] {
+            s.execute(command, params).unwrap();
+        }
+        s
+    }
+
+    fn mixed_plan_add_roof_neighbour(s: &mut Session) {
+        for (command, params) in [
+            (
+                "building.add",
+                json!({"id":"rear","name":"Public lower neighbour","footprint":[[15000,0],[23000,0],[23000,8000],[15000,8000]],"storeys":1,"storey_height_mm":3000}),
+            ),
+            ("building.set_roof", json!({"building":"rear","kind":"pitched","pitch_deg":35})),
+            ("building.set_attic", json!({"building":"rear","floor":2250})),
+        ] {
+            s.execute(command, params).unwrap();
+        }
+    }
+
+    fn mixed_plan_owned_paths(scene: &Scene, owns: impl Fn(&str) -> bool) -> Vec<crate::sheet::Path> {
+        scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::sheet::Item::Path(path) if path.element_segments.iter().any(|source| owns(&source.id)) => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixed_no_range_plans_preserve_full_storey_stair_arrivals_and_picking() {
+        let mut s = mixed_plan_fixture();
+        let original_main = s.doc.buildings[0].clone();
+        assert_eq!(original_main.stairs[0].levels, vec![0], "there is no invented outgoing flight on selected level 1");
+        let before = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+        let paths = mixed_plan_owned_paths(&before.scene, |id| id == "main-stair.L0");
+        let regions: Vec<_> = before.scene.element_regions.iter().filter(|region| region.id == "main-stair.L0").cloned().collect();
+        let symbol = trigon_model::stair::symbol(&original_main.stairs[0], original_main.storeys[0].height).unwrap();
+        assert_eq!(symbol.treads.len(), 14);
+        for (a, b) in &symbol.treads {
+            assert!(
+                paths.iter().any(|path| path.rings == vec![vec![*a, *b]] && path.stroke.is_some_and(|stroke| stroke.pen == 0.13 && !stroke.dashed))
+            );
+        }
+        mixed_plan_add_roof_neighbour(&mut s);
+        assert_eq!(s.doc.buildings[0], original_main);
+        for reverse in [false, true] {
+            if reverse {
+                s.doc.buildings.swap(0, 1);
+            }
+            let source = s.doc.clone();
+            let after = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            assert_eq!(after.scene.scale, 100.0);
+            assert_eq!(
+                mixed_plan_owned_paths(&after.scene, |id| id == "main-stair.L0"),
+                paths,
+                "an unrelated attic must not replace a full-storey arrival symbol with depth-clipped mesh fragments"
+            );
+            assert_eq!(after.scene.element_regions.iter().filter(|region| region.id == "main-stair.L0").cloned().collect::<Vec<_>>(), regions);
+            let drawing = crate::drawing_view(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            for point in [[4000.0, 2100.0], [4500.0, 3100.0]] {
+                assert_eq!(drawing.pick_element(point, 2.0).unwrap().id, "main-stair.L0");
+            }
+            assert_eq!(s.doc, source, "rendering and picking never change source geometry or history");
+        }
+    }
+
+    #[test]
+    fn mixed_no_range_roof_components_match_their_single_building_actual_cut() {
+        let mut s = mixed_plan_fixture();
+        mixed_plan_add_roof_neighbour(&mut s);
+        // This public fixture has no terrain, site objects, cross-building references or annotations.
+        // Its independent single-building counterpart is safe as a test oracle; production keeps
+        // the complete Document as validation/build context.
+        let mut roof_only = s.doc.clone();
+        roof_only.buildings.retain(|b| b.id == "rear");
+        let mut reference = crate::plan_range::sheet(&roof_only, 1, View::latest(&roof_only), Default::default()).unwrap();
+        assert_eq!(reference.metrics["floor_mm"], 2250.0);
+        let only = drawing_sheet(&roof_only, 1, View::latest(&roof_only)).unwrap();
+        assert_eq!(only.scene.items, reference.scene.items, "single-building roof plans keep their existing actual-cut route");
+        let template = s.doc.views[0].template.as_ref().unwrap();
+        let bounds = reference.scene.bounds();
+        crate::view_config::prepare(&mut reference, template, bounds);
+        crate::view_config::finish(&mut reference, template);
+        let expected = mixed_plan_owned_paths(&reference.scene, |id| id.starts_with("rear."));
+        assert!(!expected.is_empty());
+        assert!(
+            expected.iter().any(|path| path.layer == Layer::Roof && path.fill == Some(Fill::Solid([235; 3]))),
+            "actual roof material cut styles remain present"
+        );
+        for reverse in [false, true] {
+            if reverse {
+                s.doc.buildings.swap(0, 1);
+            }
+            let original = s.doc.clone();
+            let combined = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            assert_eq!(
+                mixed_plan_owned_paths(&combined.scene, |id| id.starts_with("rear.")),
+                expected,
+                "the attic is cut at its own floor, independent of the first building's datum; fill, stroke and ownership survive composition"
+            );
+            let preview = crate::drawing_view(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            for owned in &expected {
+                for source in &owned.element_segments {
+                    let point = [(source.segment[0][0] + source.segment[1][0]) / 2.0, (source.segment[0][1] + source.segment[1][1]) / 2.0];
+                    assert!(
+                        preview.pick_element(point, 0.01).is_some_and(|hit| hit.id.starts_with("rear.")),
+                        "visible attic boundaries retain real owners"
+                    );
+                }
+            }
+            assert_eq!(s.doc, original);
+        }
+    }
+
+    #[test]
+    fn explicit_plan_ranges_remain_whole_view_actual_mesh_cuts() {
+        let mut s = mixed_plan_fixture();
+        mixed_plan_add_roof_neighbour(&mut s);
+        let symbolic = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+        s.execute("view.configure", json!({"id":"mixed","template":{"name":"Explicit mesh range","range":{"top_mm":2300,"cut_mm":1200,"bottom_mm":0,"depth_mm":-1000},"sizing":{"mode":"fixed","denominator":100,"centre":[11500,4000]}}})).unwrap();
+        let original = s.doc.clone();
+        let ranged = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+        let template = s.doc.views[0].template.as_ref().unwrap();
+        let mut expected = crate::plan_range::sheet(&s.doc, 1, View::latest(&s.doc), template.range.unwrap()).unwrap();
+        let bounds = expected.scene.bounds();
+        crate::view_config::prepare(&mut expected, template, bounds);
+        crate::view_config::paper_clearances(&mut expected).unwrap();
+        crate::view_config::finish(&mut expected, template);
+        assert_eq!(ranged.scene.items, expected.scene.items, "Some(range) must still project all building meshes together");
+        assert_eq!(ranged.scene.scale, expected.scene.scale);
+        assert_ne!(
+            mixed_plan_owned_paths(&symbolic.scene, |id| id == "main-stair.L0"),
+            mixed_plan_owned_paths(&ranged.scene, |id| id == "main-stair.L0")
+        );
+        assert_eq!(s.doc, original);
+    }
+
+    #[test]
+    fn mixed_no_range_plans_preserve_phase_filters_and_full_storey_opening_owners() {
+        use trigon_model::build::PhaseFilter;
+        let mut s = mixed_plan_fixture();
+        s.execute("facade.set_bays", json!({"facade":"main.f1","count":2})).unwrap();
+        s.execute("facade.place", json!({"facade":"main.f1","type":"window.casement.2","levels":[1],"bays":[0],"height":900,"sill":600})).unwrap();
+        s.doc.phases.push(trigon_model::doc::Phase { id: "proposal".into(), name: "Proposal".into() });
+        s.doc.active_phase = Some("proposal".into());
+        let old = &mut s.doc.buildings[0].facades[0].placements[0];
+        old.demolished = Some("proposal".into());
+        let mut new = old.clone();
+        new.bay = 1;
+        new.created = Some("proposal".into());
+        new.demolished = None;
+        s.doc.buildings[0].facades[0].placements.push(new);
+        let cases = [
+            (PhaseFilter::Complete, false, true),
+            (PhaseFilter::All, true, true),
+            (PhaseFilter::Demolition, true, false),
+            (PhaseFilter::New, false, true),
+        ];
+        let before: Vec<_> = cases
+            .iter()
+            .map(|(filter, _, _)| {
+                mixed_plan_owned_paths(&crate::views::sheet(&s.doc, "mixed", View { phase: 1, filter: *filter }).unwrap().scene, |id| {
+                    id.starts_with("main.f1.L1.B")
+                })
+            })
+            .collect();
+        mixed_plan_add_roof_neighbour(&mut s);
+        let original = s.doc.clone();
+        for ((filter, old_visible, new_visible), baseline) in cases.into_iter().zip(before) {
+            let view = View { phase: 1, filter };
+            let actual = crate::views::sheet(&s.doc, "mixed", view).unwrap();
+            assert_eq!(
+                mixed_plan_owned_paths(&actual.scene, |id| id.starts_with("main.f1.L1.B")),
+                baseline,
+                "{filter:?}: retain prior opening geometry, material styling and source ownership"
+            );
+            let preview = crate::drawing_view(&s.doc, "mixed", view).unwrap();
+            for (id, visible) in [("main.f1.L1.B0", old_visible), ("main.f1.L1.B1", new_visible)] {
+                let edge = preview.element_segments.iter().find(|edge| edge.id == id);
+                assert_eq!(edge.is_some(), visible, "{filter:?}: {id}");
+                if let Some(edge) = edge {
+                    let point = [(edge.segment[0][0] + edge.segment[1][0]) / 2.0, (edge.segment[0][1] + edge.segment[1][1]) / 2.0];
+                    assert_eq!(preview.pick_element(point, 0.01).unwrap().id, id);
+                }
+            }
+        }
+        assert_eq!(s.doc, original);
+    }
+
+    #[test]
+    fn mixed_no_range_plans_keep_default_hidden_and_no_room_invariants_at_final_scale() {
+        for with_room in [false, true] {
+            let mut s = mixed_plan_fixture();
+            if with_room {
+                s.execute("interior.add_rooms", json!({"building":"main","rooms":[{"id":"main-room","name":"Room","levels":[1],"polygon":[[7500,1500],[11500,1500],[11500,6500],[7500,6500]]}]})).unwrap();
+            }
+            mixed_plan_add_roof_neighbour(&mut s);
+            let hidden = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            assert!(!hidden.scene.items.iter().any(|item| matches!(item, crate::sheet::Item::Text(text) if text.source.as_ref().is_some_and(|source| matches!(source.role, "room_name" | "room_area")))));
+            assert_eq!(hidden.scene.element_regions.iter().any(|region| region.kind == DrawingElementKind::Room), with_room);
+            for denominator in [50.0, 100.0, 200.0] {
+                s.execute("view.configure", json!({"id":"mixed","template":{"name":"Room tags","room_labels":"name_and_area","sizing":{"mode":"fixed","denominator":denominator,"centre":[11500,4000]}}})).unwrap();
+                let source = s.doc.clone();
+                let sheet = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+                assert_eq!(sheet.scene.scale, denominator);
+                let tags: Vec<_> = sheet
+                    .scene
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        crate::sheet::Item::Text(text) if text.source.as_ref().is_some_and(|source| source.id == "main-room.space.L1") => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(tags.len(), if with_room { 2 } else { 0 });
+                assert!(tags.iter().all(|text| text.size == 2.5), "text keeps its paper-mm size after scene composition and final template scale");
+                assert_eq!(s.doc, source);
+            }
+            let source = s.doc.clone();
+            assert!(s.execute("interior.add_rooms", json!({"building":"rear","rooms":[{"id":"unsupported","name":"Unsupported roof room","levels":[1],"polygon":[[16000,1000],[22000,1000],[22000,7000],[16000,7000]]}]})).is_err());
+            assert_eq!(s.doc, source, "roof-room rejection remains atomic; no habitable quantities are invented");
+        }
+    }
+
+    #[test]
+    fn mixed_no_range_plans_do_not_duplicate_site_or_include_buildings_without_the_level() {
+        let mut s = mixed_plan_fixture();
+        s.execute("building.add_basement", json!({"building":"main","floor":-2500})).unwrap();
+        s.execute("view.define", json!({"id":"mixed","name":"Public ground plan","kind":{"view":"plan","level":1}})).unwrap();
+        s.execute(
+            "view.configure",
+            json!({"id":"mixed","template":{"name":"Fixed","sizing":{"mode":"fixed","denominator":100,"centre":[11500,4000]}}}),
+        )
+        .unwrap();
+        s.execute("site.add", json!({"object":{"id":"site.paving","name":"Public paving","intent":"existing","geometry":{"kind":"ground","polygon":[[-3000,-3000],[-1000,-3000],[-1000,-1000],[-3000,-1000]],"elevation_mm":0,"thickness_mm":100,"surface":"paving"}}})).unwrap();
+        let before = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+        let site = mixed_plan_owned_paths(&before.scene, |id| id == "site.paving");
+        assert_eq!(site.len(), 1);
+        mixed_plan_add_roof_neighbour(&mut s);
+        s.execute("building.add", json!({"id":"short","name":"No selected storey","footprint":[[24000,0],[26000,0],[26000,5000],[24000,5000]],"storeys":1,"storey_height_mm":5000})).unwrap();
+        for reverse in [false, true] {
+            if reverse {
+                s.doc.buildings.swap(0, 1);
+            }
+            let source = s.doc.clone();
+            let after = crate::views::sheet(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            assert_eq!(
+                mixed_plan_owned_paths(&after.scene, |id| id == "site.paving"),
+                site,
+                "the whole-sheet symbolic route owns site footprints exactly once, independent of building order"
+            );
+            assert!(mixed_plan_owned_paths(&after.scene, |id| id.starts_with("short.")).is_empty());
+            assert!(!after.scene.element_regions.iter().any(|region| region.id.starts_with("short.")));
+            let preview = crate::drawing_view(&s.doc, "mixed", View::latest(&s.doc)).unwrap();
+            assert_eq!(preview.pick_element([-2000.0, -2000.0], 1.0).unwrap().id, "site.paving");
+            assert!(preview.pick_element([25000.0, 2500.0], 1.0).is_none());
+            assert_eq!(s.doc, source);
+        }
+    }
 
     #[test]
     fn round_opening_plan_cuts_and_picking_follow_the_actual_profile() {

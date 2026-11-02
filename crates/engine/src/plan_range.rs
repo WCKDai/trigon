@@ -10,15 +10,29 @@ use trigon_model::mesh::{Material, Mesh};
 use trigon_model::{Document, ModelError};
 
 pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange) -> Result<Sheet> {
+    sheet_scoped(doc, level, phase, range, None)
+}
+
+/// One building's actual plan geometry, for composition with symbolic full-storey plans.
+/// The complete document remains the validation/build context; site objects are added only by
+/// the owning whole-sheet path, never once per building.
+pub(crate) fn sheet_for_building(doc: &Document, level: usize, phase: View, range: PlanRange, building: &str) -> Result<Sheet> {
+    sheet_scoped(doc, level, phase, range, Some(building))
+}
+
+fn sheet_scoped(doc: &Document, level: usize, phase: View, range: PlanRange, building: Option<&str>) -> Result<Sheet> {
     range.validate()?;
-    let built = build_view(doc, phase)?;
+    let mut built = build_view(doc, phase)?;
+    if let Some(id) = building {
+        built.retain(|b| b.building_id == id);
+    }
     let first =
         built.iter().find(|b| b.storeys.get(level).is_some()).ok_or_else(|| ModelError::Invalid(format!("plan level {level} does not exist")))?;
     let storey = first.storeys.get(level).ok_or_else(|| ModelError::Invalid(format!("plan level {level} does not exist")))?;
     let floor = storey.elevation;
     let (top, plane, bottom, depth) = (floor + range.top_mm, floor + range.cut_mm, floor + range.bottom_mm, floor + range.depth_mm);
     let ground = doc.buildings.iter().find(|b| b.id == first.building_id).map_or(0, |b| b.ground_level);
-    let site = if level == ground { trigon_model::site::build(doc, phase, None)? } else { Vec::new() };
+    let site = if building.is_none() && level == ground { trigon_model::site::build(doc, phase, None)? } else { Vec::new() };
     let mut parts = style::parts(&built, true);
     let mut group = parts.iter().map(|p| p.source.group).max().unwrap_or(0);
     for object in site.iter().filter(|o| o.status != trigon_model::build::Status::Demolished) {
@@ -111,14 +125,14 @@ pub(crate) fn sheet(doc: &Document, level: usize, phase: View, range: PlanRange)
         scene.line(style::layer(e.class), e.a, e.b, Stroke { colour: [130; 3], dashed: true, ..Stroke::new(0.13) });
         scene.attribute_last(&e.element_segments);
     }
-    for building in &doc.buildings {
-        let Some(storey) = building.storeys.get(level) else { continue };
+    for source in doc.buildings.iter().filter(|b| building.is_none_or(|id| b.id == id)) {
+        let Some(storey) = source.storeys.get(level) else { continue };
         if storey.elevation < depth || storey.elevation > plane {
             continue;
         }
-        for (index, room) in building.rooms.iter().enumerate().filter(|(_, r)| r.levels.contains(&level)) {
+        for (index, room) in source.rooms.iter().enumerate().filter(|(_, r)| r.levels.contains(&level)) {
             scene.element_regions.push(DrawingElementRegion {
-                id: crate::room_element_id(building, index, level),
+                id: crate::room_element_id(source, index, level),
                 kind: crate::DrawingElementKind::Room,
                 rings: vec![room.polygon.clone()],
                 depth_plane: Some([-storey.elevation, 0.0, 0.0]),
