@@ -3,8 +3,10 @@
 Studio retains exact engine vector geometry for picking, snapping and handle projection. Display
 pixels are a current-generation cache, transformed immediately during pan/zoom. A pending raster
 for a different pan position must not suspend those interactions. A changed document still waits
-for its own generation before interaction. Completed obsolete/superseded raster images are dropped
-before `tex.set`; only the latest matching image can cause a texture upload.
+for its own generation before interaction. Completions require the current drawing generation,
+base tree and SVG source identity, screen detail, pen bucket and raster resolution. A completed
+pan image can cross a cache-grid boundary while remaining usable if it still covers the whole
+viewport and refresh reserve; other obsolete images are dropped before `tex.set`.
 
 Raster regions include bounded overscan on a 128-pixel grid. Resolution uses upward 1/8-octave
 buckets, normally at or above screen resolution, so small pointer increments share a cached raster.
@@ -12,6 +14,11 @@ Each side remains capped at 4096 pixels; very large Retina viewports can use a l
 resolution to respect that memory budget. View snapshots rasterize the exact viewport separately.
 Model geometry, model-to-screen transforms, picking tolerance and export paper weights do not
 use the display cache key. The raster worker coalesces requests; the UI coalesces completed images.
+An uploaded, CPU-pending or in-flight image can serve a changed grid key only while it retains
+one full 128-pixel overscan tile plus a filtering pixel on each changed grid axis. Leaving that
+reserve requests a replacement before the image edge becomes visible. Unchanged grid axes
+remain usable with their original margin. Collapsed viewports queue no raster work; restoring a
+positive viewport resumes preparation. No extra image or texture cache slots are added.
 
 ## Repeatable CPU profile
 
@@ -44,6 +51,17 @@ These counters and timings describe a serial CPU workload. They are not native F
 upload timing, GPU performance, or end-to-end model rebuild measurements. Native/GPU QA must
 measure frame pacing and actual upload costs separately. The profile is intended for repeated
 before/after runs on the same machine and input, not a cross-machine speed ranking.
+
+A later coverage-reuse comparison (2026-11-02, same fixture and release profile, 2 pixels per
+window point, five warm repetitions per build, macOS arm64/Rust 1.99.1) reduced pan demands
+from two rasters to one and zoom demands from nine to six. Plan-pan median CPU work was
+22.20 → 12.16 ms (empirical p95 25.18 → 16.32 ms); elevation-pan median was 294.81 → 147.70 ms
+(p95 295.52 → 153.00 ms). Plan-zoom median was 145.68 → 97.46 ms, and elevation zoom
+1690.53 → 1125.85 ms. These are serialized request-policy measurements using preset trees;
+the cost of a necessary render and native frame pacing are separate measurements. The cache
+keeps current source/style/resolution checks and its 4096-pixel bound. A deterministic scheduler
+regression also replays continuous 40-point/s panning with 890 ms raster latency, checking full
+visible coverage, refresh headroom and acceptance of still-covering completions across grid changes.
 
 `ui.view` exposes `drawing_raster` counters and last allocation/render/conversion/texture-enqueue
 CPU timings for native profiling. The texture enqueue timer measures the UI call, not GPU upload
