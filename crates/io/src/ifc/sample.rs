@@ -180,6 +180,8 @@ pub fn document() -> Result<Document> {
         rounded: false,
         winders: None,
         turn_depths: None,
+        turn_chamfer: None,
+        boundary: None,
     }];
     b.rooms = vec![
         room("butik", &[0], "Butik", 480.0, 480.0, 17520.0, 4880.0),

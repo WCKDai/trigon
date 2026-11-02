@@ -181,7 +181,7 @@ impl Item {
                 let n = [-dy / len * w.thickness / 2.0, dx / len * w.thickness / 2.0];
                 [w.a, w.b].into_iter().flat_map(|p| [[p[0] + n[0], p[1] + n[1]], [p[0] - n[0], p[1] - n[1]]]).collect()
             }
-            Self::Stair(s) => s.outline.clone(),
+            Self::Stair(s) => s.boundary.as_ref().unwrap_or(&s.outline).clone(),
             Self::Room(r) => r.polygon.clone(),
             Self::Placement(_) => Vec::new(),
         }
@@ -204,6 +204,11 @@ impl Item {
             Self::Stair(s) => {
                 for p in &mut s.outline {
                     shift(p)?;
+                }
+                if let Some(boundary) = &mut s.boundary {
+                    for p in boundary {
+                        shift(p)?;
+                    }
                 }
             }
             Self::Room(r) => {

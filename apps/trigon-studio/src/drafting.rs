@@ -190,9 +190,7 @@ impl Drafting {
             if ui
                 .add_enabled(
                     !doc.buildings.is_empty() && !doc.views.iter().any(|v| v.id == self.view_id),
-                    egui::Button::new(egui::RichText::new("Create drawing").color(egui::Color32::WHITE))
-                        .fill(theme::ACCENT)
-                        .stroke(egui::Stroke::NONE),
+                    egui::Button::new(egui::RichText::new("Create drawing").color(theme::CHROME)).fill(theme::ACCENT).stroke(egui::Stroke::NONE),
                 )
                 .clicked()
             {

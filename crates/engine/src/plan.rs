@@ -571,21 +571,8 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             for k in 1..sym.walk.len() {
                 prims.push(line(sym.walk[k - 1], sym.walk[k], 7.0, true));
             }
-            // Arrowhead at the start of the walking line, pointing up the first flight.
-            if let [w0, w1, ..] = sym.walk.as_slice() {
-                let (dx, dy) = (w1[0] - w0[0], w1[1] - w0[1]);
-                let l = (dx * dx + dy * dy).sqrt().max(1.0);
-                let (ux, uy) = (dx / l, dy / l);
-                // A narrow quarter turn's first segment can be only 300 mm. The arrow must
-                // stop at its corner rather than continue across the next flight's treads.
-                let lead = 450.0_f64.min(l);
-                let tip = [w0[0] + ux * lead, w0[1] + uy * lead];
-                for side in [-1.0, 1.0] {
-                    let base = [tip[0] - ux * 180.0 - uy * 90.0 * side, tip[1] - uy * 180.0 + ux * 90.0 * side];
-                    prims.push(line(base, tip, 9.0, false));
-                }
-                let dot = [w0[0] + ux * 60.0, w0[1] + uy * 60.0];
-                prims.push(line([dot[0] - 40.0, dot[1]], [dot[0] + 40.0, dot[1]], 70.0, false));
+            for (a, b, width) in &sym.markings {
+                prims.push(line(*a, *b, *width, false));
             }
             for index in start..prims.len() {
                 elements.insert(index, owner.clone());

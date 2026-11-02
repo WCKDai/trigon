@@ -30,6 +30,27 @@ outline changes currently use validated JSON coordinate fields. Roofs, rooms and
 have property editing, but do not yet have point-by-point drag grips. This is an initial authoring
 workflow, with further constraint, joining and modelling tools still to build.
 
+Stairs can use an optional `boundary` polygon in site-local millimetres to fit the complete clear
+enclosure, including a concave window recess. The source `outline` remains the flight rectangle;
+`landing_mm` gives the turn envelope. Set these together when fitting a larger enclosure. Actual
+step and landing solids, tread lines and floor openings share the fitted polygon. Clear
+`turn_chamfer_mm` in that same fit command; the two explicit boundary definitions are mutually
+exclusive. An entrance
+landing outside that polygon remains part of the floor. The boundary must have 3–64 unclosed,
+non-crossing corners, retain the walking line, complete arrow strokes and railing, and leave
+each step connected.
+
+`element.set` exposes the nullable `boundary` through the same Properties browser and MCP. Moves
+translate it with the stair; width, length and landing edits scale the corresponding local frame
+regions. An explicitly supplied boundary uses its supplied coordinates. Rounded/chamfer controls
+are read-only while a fitted boundary is present; clear `boundary` first to use those controls.
+The fit establishes geometry, not evidence of a surveyed stair: check sill, headroom, hardware,
+rise and going separately. Older documents omit this optional field and keep their previous
+geometry and native bytes. A document containing it requires a supporting Trigon reader; older
+strict readers reject the new field.
+The Rust `stair::Symbol` also exposes `markings` (arrow/start strokes with model-space widths),
+used by the plan renderer and fitted-boundary validation. Its legacy coordinates are preserved.
+
 Historical, demolished and ambiguous same-ID phase occurrences are read-only. Rebuilds and
 failed results invalidate cached properties and handles; a stale drag cannot modify a newer
 selection. Geometry validation may reject a value within a field's numeric range, for example

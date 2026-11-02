@@ -9,6 +9,41 @@ Presentation plans retain the model's stair treads, landing outlines and directi
 the same source stair, including rounded turns and winders; drawing a plan does not change its
 geometry. A pale background replaces the former dotted shaft-only presentation.
 
+Non-rounded U-turn stairs can set `turn_chamfer: [run_cut_mm, across_cut_mm]` on the
+stair definition. These symmetric corner cuts describe an evidenced bevel at the far turning
+head. They affect the plan outline, winding treads, physical steps and floor opening together;
+they do not clip away a stair/wall collision only in the drawing. Both distances must leave at
+least 1 mm of the side/back edges, and winding heads must retain the inner well. Studio/MCP
+expose the same optional pair as `element.set` property `turn_chamfer_mm`; `null` restores the
+rectangular head. This adds an optional public Rust `Stair` field: struct literals need
+`turn_chamfer: None`. Old files and absent-field serialization remain unchanged. Older strict
+readers reject this new field, so keep a separate pre-edit copy when using those versions.
+
+Automatic U-turn tread counts reserve the turning risers and final floor riser before
+dividing the remaining straight treads between the flights. Explicit measured `tread` values
+retain their counts. Plans, 3D, railings and IFC quantities share this calculation.
+
+Use `precision.audit` to find visible stair openings intersecting the joined wall material,
+including arrivals from below. Fit the complete source stair to the clear enclosure; leave
+additional clearance for the printed stroke. For example, 25 mm in the model allows the
+0.18 mm outline at 1:100 to remain inside the wall faces, including its corner joins. This
+margin must increase at smaller drawing scales. The audit measures model footprints against
+the 1000 mm wall cut, not printed ink or full-height accessibility clearance.
+
+`view.audit {"id":"plan","check_wall_overlap":true}` also compares each visible glyph halo
+box with the saved plan's actual wall-material regions. `text_over_wall` findings include the
+label's provenance, wall ID, overlap area in drawing mm² and read-only inspection commands.
+Door/shaft voids are preserved; the selected storey's wall geometry is used. Rotated text is
+measured at the final printed scale. These are conservative box intersections requiring review,
+not pixel-level glyph tests. Wall strokes and other model lines are excluded. This optional
+check is plan-only; omitting it retains the existing direct audit behavior. Drawing actions in
+`precision.preview` enable it for plans, so a misplaced label gets feedback before applying it.
+Neither command moves, clips or suppresses the label in response to a finding.
+If the wall comparison exceeds its fixed budget, clipping and text-overlap findings are retained.
+`wall_overlap_check` then reports `status: "unverified"` and its error; the overall status is
+`needs_review`, including when the lettering checks found no collisions. A successful drawing
+render does not establish that this optional wall comparison completed.
+
 Saved plan templates can enable live room tags with `room_labels: "area"` or `"name_and_area"`
 through `view.configure` (also in Studio's view-template panel). Tags use the selected storey's
 room definitions, so a name or polygon edit updates the name and calculated square metres.

@@ -117,7 +117,7 @@ impl Sheet {
     }
 }
 
-/// The 1600 × 900 px sheet prints as 338.67 × 190.5 mm (96 dpi).
+/// The 1600 × 900 px sheet prints as 338.67 × 190.5 mm (120 dpi).
 pub(crate) const PAGE_MM: [f64; 2] = [338.666_666_7, 190.5];
 pub(crate) const MM_PER_PX: f64 = PAGE_MM[0] / 1600.0;
 
