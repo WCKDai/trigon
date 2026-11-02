@@ -57,6 +57,9 @@ including groups whose facade placements are inactive in the current phase. Sour
 handles retain their identities. Saved plan levels and registered underlay levels advance
 automatically in a single-building project; their templates and annotations keep their site frame.
 Already-stale or ambiguous group references remain available for inspection.
+Stale saved plans remain loadable for repair, but an insertion refuses atomically if advancing
+one would exceed the native format's structural limits. For example, level 999 cannot advance
+to 1000. The refusal preserves the document, history and pending Redo.
 
 Plans currently use project-wide level indices. If multiple buildings already share saved or
 registered plans, an insertion requires `remap_global_plan_levels`: `true` advances all those

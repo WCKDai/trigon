@@ -218,6 +218,21 @@ mod tests {
     }
 
     #[test]
+    fn basement_preserves_structural_validity_of_stale_plan_references() {
+        let mut s = roof_reference_session();
+        s.doc.views[0].kind = trigon_model::annotation::DrawingViewKind::Plan { level: 999 };
+        trigon_model::annotation::validate_document(&s.doc).unwrap();
+        // Stale source references remain loadable for repair. A successful rebase must
+        // still produce a structurally readable native file, and refusal must retain Redo.
+        s.execute("annotation.move_label", json!({"id":"roof-note","delta":[100,0]})).unwrap();
+        let edited = bytes(&s);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_atomic(&mut s, "building.add_basement", json!({"floor":-2500}));
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(bytes(&s), edited);
+    }
+
+    #[test]
     fn basement_refuses_overflowing_external_plan_references_atomically() {
         let mut s = roof_reference_session();
         s.doc.views[0].kind = trigon_model::annotation::DrawingViewKind::Plan { level: usize::MAX };

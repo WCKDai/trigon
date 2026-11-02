@@ -580,6 +580,9 @@ static COMMANDS: &[CommandSpec] = &[
             for (group, targets) in s.doc.groups.iter_mut().zip(groups) {
                 group.targets = targets;
             }
+            // Stale plans may be loaded for repair, but rebasing must not produce a
+            // structurally invalid native file. The outer command rolls back on refusal.
+            trigon_model::annotation::validate_document(&s.doc)?;
             Ok(info(&s.doc))
         },
     },
