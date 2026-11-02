@@ -6,7 +6,11 @@ use eframe::egui;
 use serde_json::{Value, json};
 use trigon_model::{ComponentType, Document};
 
-use crate::{scene::Element, theme};
+use crate::{
+    icons::{self, Icon},
+    scene::Element,
+    theme,
+};
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Tab {
@@ -237,11 +241,17 @@ impl Authoring {
     }
 
     pub fn ribbon(&mut self, ui: &mut egui::Ui) {
-        for (tool, label) in
-            [(Tool::Move, "Move"), (Tool::Copy, "Copy"), (Tool::Align, "Align"), (Tool::Levels, "To levels"), (Tool::Delete, "Delete")]
-        {
-            ui.selectable_value(&mut self.tool, tool, label);
+        for (tool, icon, label) in [
+            (Tool::Move, Icon::Move, "Move"),
+            (Tool::Copy, Icon::Copy, "Copy"),
+            (Tool::Align, Icon::Align, "Align"),
+            (Tool::Levels, Icon::Levels, "To levels"),
+        ] {
+            if icons::button(ui, icon, label, self.tool == tool).clicked() {
+                self.tool = tool;
+            }
         }
+        ui.selectable_value(&mut self.tool, Tool::Delete, "Delete");
     }
 
     pub(crate) fn command_controls_first(&self) -> bool {

@@ -22,6 +22,14 @@ struct Job {
     key: Key,
 }
 
+/// Navigation belongs to a drawing tab, independently of its current raster generation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Navigation {
+    centre: [f32; 2],
+    zoom: f32,
+    fitted: bool,
+}
+
 pub struct PlanView {
     tree: Option<(u64, Arc<usvg::Tree>)>,
     display_trees: Vec<Arc<usvg::Tree>>,
@@ -42,6 +50,16 @@ pub struct PlanView {
 }
 
 impl PlanView {
+    pub(crate) fn navigation(&self) -> Navigation {
+        Navigation { centre: self.centre, zoom: self.zoom, fitted: self.fitted }
+    }
+
+    pub(crate) fn restore_navigation(&mut self, navigation: Navigation) {
+        self.centre = navigation.centre;
+        self.zoom = navigation.zoom;
+        self.fitted = navigation.fitted;
+    }
+
     pub fn new(ctx: egui::Context) -> PlanView {
         let (jobs, rx) = channel::<Job>();
         let (tx, done) = channel();

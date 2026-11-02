@@ -102,6 +102,14 @@ impl Palette {
         self.focus_search = true;
     }
 
+    pub fn show_query(&mut self, query: &str) {
+        self.query = query.trim().to_string();
+        self.selected = None;
+        self.params.clear();
+        self.outcome = None;
+        self.show();
+    }
+
     /// The result of the last run, shown under the editor.
     pub fn set_outcome(&mut self, r: Result<String, String>) {
         self.outcome = Some(r);
@@ -198,6 +206,20 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_search_cannot_run_a_previous_command_or_reuse_its_parameters() {
+        let mut palette = Palette::default();
+        palette.select("edit.delete");
+        palette.params = r#"{"targets":["previous-selection"]}"#.into();
+        palette.set_outcome(Ok("Previous operation".into()));
+        palette.show_query("roof");
+        assert!(palette.open);
+        assert_eq!(palette.query, "roof");
+        assert!(palette.selected.is_none(), "a contextual search must not leave the previous destructive command runnable");
+        assert!(palette.params.is_empty());
+        assert!(palette.outcome.is_none());
+    }
 
     #[test]
     fn every_command_gets_parameters_that_parse_as_an_object() {

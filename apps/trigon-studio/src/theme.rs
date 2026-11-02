@@ -70,32 +70,9 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
 }
 
-/// Original Trigon identity: nine separated triangular tiles, drawn as crisp native paths.
+/// Owner-supplied gradient identity, preserving the original SVG proportions.
 pub fn mark(ui: &mut egui::Ui, width: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, width * 0.84), egui::Sense::hover());
-    let tiles = [
-        [[3.0, 0.0], [2.0, 1.0], [4.0, 1.0]],
-        [[2.0, 1.0], [1.0, 2.0], [3.0, 2.0]],
-        [[2.0, 1.0], [4.0, 1.0], [3.0, 2.0]],
-        [[4.0, 1.0], [3.0, 2.0], [5.0, 2.0]],
-        [[1.0, 2.0], [0.0, 3.0], [2.0, 3.0]],
-        [[1.0, 2.0], [3.0, 2.0], [2.0, 3.0]],
-        [[3.0, 2.0], [2.0, 3.0], [4.0, 3.0]],
-        [[3.0, 2.0], [5.0, 2.0], [4.0, 3.0]],
-        [[5.0, 2.0], [4.0, 3.0], [6.0, 3.0]],
-    ];
-    for triangle in tiles {
-        let centre = [(triangle[0][0] + triangle[1][0] + triangle[2][0]) / 3.0, (triangle[0][1] + triangle[1][1] + triangle[2][1]) / 3.0];
-        let points = triangle
-            .iter()
-            .map(|p| {
-                let x = centre[0] + (p[0] - centre[0]) * 0.90;
-                let y = centre[1] + (p[1] - centre[1]) * 0.90;
-                egui::pos2(rect.left() + x / 6.0 * rect.width(), rect.top() + y / 3.0 * rect.height())
-            })
-            .collect();
-        ui.painter().add(egui::Shape::convex_polygon(points, ACCENT, egui::Stroke::NONE));
-    }
+    crate::icons::show(ui, crate::icons::Icon::Logo, width);
 }
 
 /// Compact wordmark in the Studio UI's semibold family.

@@ -330,6 +330,7 @@ impl StudioApp {
             "model_box_m": self.scene.bounds,
             "window_hidden": self.window_hidden,
             "viewport_window_points": self.viewport_rect.map(|r|[r.left(),r.top(),r.width(),r.height()]),
+            "project_browser_window_points": self.browser_rect.map(|r|[r.left(),r.top(),r.width(),r.height()]),
             "handles": self.viewport_rect.map(|rect|self.projected_handles(rect).into_iter().filter_map(|handle|{
                 handle.mapping.screen(0.0).filter(|point|rect.contains(*point)).map(|point|json!({"key":handle.handle.key,"label":handle.handle.label,"point":[point.x,point.y],"value_mm":handle.handle.value}))
             }).collect::<Vec<_>>()).unwrap_or_default(),

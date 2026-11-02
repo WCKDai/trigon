@@ -109,6 +109,10 @@ to operate one through the same input path as a pointer, then read the refreshed
 Handle drags cancel on lost focus; an explicitly requested window screenshot with `raise: true`
 requests focus even if the window reports that it is already unoccluded.
 
+`project_browser_window_points: [x,y,width,height]` reports the visible browser scroll
+region in the stacked left dock, or null before its first layout. Like viewport
+coordinates, it changes when the window or dock is resized; read it again before input.
+
 ## Example
 
 ```text

@@ -10,6 +10,7 @@ mod camera;
 mod control;
 mod drafting;
 mod drawing_raster;
+mod icons;
 mod palette;
 mod plan_view;
 mod properties;
