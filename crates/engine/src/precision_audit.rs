@@ -220,6 +220,30 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
                         }
                         solids.push((segment.id.clone(), wall.id.clone(), vec![start.0, b, inner_b, start.1]));
                     }
+                    let shown = crate::plan::visible_stairs(source, level);
+                    work = work.saturating_add(shown.len().saturating_mul(solids.len()));
+                    if work > 2_000_000 {
+                        return Err(ModelError::Invalid("audit comparison budget exceeded; select fewer storeys".into()).into());
+                    }
+                    for stair in shown {
+                        let Ok(ring) = trigon_model::stair::opening(stair) else { continue };
+                        let departure = if stair.levels.contains(&level) { level } else { level.saturating_sub(1) };
+                        let index = source.stairs.iter().position(|s| std::ptr::eq(s, stair)).unwrap_or(0);
+                        let root = if stair.id.is_empty() { format!("{}.stair{index}", source.id) } else { stair.id.clone() };
+                        let id = format!("{root}.L{departure}");
+                        let mut overlaps = std::collections::BTreeMap::<(&str, &str), f64>::new();
+                        for (wall_id, source_id, poly) in &solids {
+                            if poly.len() >= 3 && trigon_model::doc::polygon_area(poly) > 1e-6 {
+                                *overlaps.entry((wall_id, source_id)).or_default() += intersection_area(&ring, poly);
+                            }
+                        }
+                        for ((wall_id, source_id), area) in overlaps.into_iter().filter(|(_, area)| *area > 1.0) {
+                            findings.push(json!({"kind":"stair_wall_overlap","building":source.id,"level":level,
+                                "id":id,"departure_level":departure,"wall_id":wall_id,"opening_overlap_mm2":area,"review_required":true,
+                                "inspect_commands":[{"command":"element.get","params":{"id":id}},
+                                    {"command":"element.get","params":{"id":source_id}}]}));
+                        }
+                    }
                     for wall in &walls {
                         for (end, cap) in [("a", [wall.outline[0], wall.outline[3]]), ("b", [wall.outline[1], wall.outline[2]])] {
                             for host in &walls {
@@ -296,7 +320,7 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         "wall_instances_inspected":inspected,"gap_tolerance_mm":p.gap_tolerance_mm,"angle_tolerance_deg":p.angle_tolerance_deg,"expected_joint_angles_deg":p.expected_joint_angles_deg,"alignment_tolerance_mm":p.alignment_tolerance_mm,"joint_radius_mm":p.joint_radius_mm,"findings":findings,
         "total_findings":total,"finding_counts":counts,"truncated":total>p.max_results,
         "mutation_workflow":["precision.preview","precision.apply"],
-        "scope":"latest phase; 1000 mm plan cut; nearest material at each interior wall end and caps wholly inside recorded door voids; near-parallel wall overlaps and end-to-end run deviations; overlapping visible/departing stair openings",
+        "scope":"latest phase; 1000 mm plan cut; nearest material at each interior wall end and caps wholly inside recorded door voids; near-parallel wall overlaps and end-to-end run deviations; overlapping visible/departing stair openings and visible stair openings intersecting wall material",
         "limitations":["Intentional gaps and adjacent-storey stair overlaps need source review; findings are not automatic repairs.","No structural, accessibility, survey or complete clash certification."]}))
 }
 
@@ -413,6 +437,51 @@ fn segment_polygon(cap: [[f64; 2]; 2], poly: &[[f64; 2]]) -> (f64, [f64; 2], [f6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stair_turns_intruding_into_wall_material_are_reported_without_changing_the_document() {
+        for rotation in [0.0_f64, 37.25, -118.0] {
+            for (start, expected_wall, expected_area) in
+                [(1000.0, "", 0.0), (1400.0, "", 0.0), (1450.0, "host.L0", 60000.0), (8200.0, "b.f2.L0", 120000.0)]
+            {
+                let (sin, cos) = rotation.to_radians().sin_cos();
+                let transform = |[x, y]: [f64; 2]| [150000.0 + x * cos - y * sin, -270000.0 + x * sin + y * cos];
+                let outline = [[0.0, 0.0], [10000.0, 0.0], [10000.0, 6000.0], [0.0, 6000.0]].map(transform);
+                let mut b = trigon_model::Building::new("b", "Stair enclosure", &outline, 2, 3060.0).unwrap();
+                b.interior_walls = serde_json::from_value(json!([
+                    {"id":"host","levels":[0],"a":transform([3000.0,1000.0]),"b":transform([3000.0,5000.0]),"thickness":200.0}
+                ]))
+                .unwrap();
+                b.stairs = serde_json::from_value(json!([{
+                    "id":"core","levels":[0],"outline":[transform([start,2000.0]),transform([start+1000.0,2000.0]),
+                        transform([start+1000.0,3200.0]),transform([start,3200.0])],
+                    "kind":"u_turn","landing":500.0,"rounded":false,"winders":8
+                }]))
+                .unwrap();
+                let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+                s.doc.buildings.push(b);
+                let before = s.doc.clone();
+                let report = s.execute("precision.audit", json!({"building":"b","levels":[0]})).unwrap();
+                let hits: Vec<_> = report["findings"].as_array().unwrap().iter().filter(|f| f["kind"] == "stair_wall_overlap").collect();
+                assert_eq!(hits.len(), usize::from(expected_area > 0.0), "rotation={rotation}, start={start}: {report}");
+                if let Some(hit) = hits.first() {
+                    assert_eq!(hit["id"], "core.L0");
+                    assert_eq!(hit["wall_id"], expected_wall);
+                    assert!((hit["opening_overlap_mm2"].as_f64().unwrap() - expected_area).abs() < 0.01, "{hit}");
+                    for inspect in hit["inspect_commands"].as_array().unwrap() {
+                        s.execute(inspect["command"].as_str().unwrap(), inspect["params"].clone()).unwrap();
+                    }
+                }
+                assert_eq!(s.doc, before);
+                assert!(!s.dirty);
+                assert!(s.undo.is_empty() && s.redo.is_empty());
+                // The receiving floor has no host wall, so it must not inherit the lower clash.
+                let upper = s.execute("precision.audit", json!({"building":"b","levels":[1]})).unwrap();
+                let upper_hits: Vec<_> = upper["findings"].as_array().unwrap().iter().filter(|f| f["kind"] == "stair_wall_overlap").collect();
+                assert_eq!(upper_hits.len(), usize::from(start == 8200.0), "{upper}");
+            }
+        }
+    }
 
     #[test]
     fn wall_ends_inside_door_voids_report_actionable_source_conflicts() {

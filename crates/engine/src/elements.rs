@@ -484,6 +484,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                 number("landing_mm", "Landing parameter (null = automatic)", json!(source.landing), "mm", 300.0, frame.width * 2.0),
                 number("well_mm", "Well parameter (null = automatic)", json!(source.well), "mm", 0.0, frame.width / 3.0),
                 field("rounded", "Rounded turn", source.rounded, true),
+                field("turn_chamfer_mm", "Turn corner cuts: run/across (null = rectangular)", json!(source.turn_chamfer), true),
                 choice(
                     "stair_kind",
                     "Stair kind",
@@ -1099,6 +1100,13 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "landing_mm" => stair.landing = if value.is_null() { None } else { Some(numeric(key, value)?) },
                         "well_mm" => stair.well = if value.is_null() { None } else { Some(numeric(key, value)?) },
                         "rounded" => stair.rounded = boolean(key, value)?,
+                        "turn_chamfer_mm" => {
+                            stair.turn_chamfer = if value.is_null() {
+                                None
+                            } else {
+                                Some(serde_json::from_value(value.clone()).map_err(|_| invalid("turn_chamfer_mm needs two distances in mm"))?)
+                            };
+                        }
                         "stair_kind" => stair.kind = serde_json::from_value(value.clone()).map_err(|_| invalid("unknown stair kind"))?,
                         _ => return Err(invalid("unknown stair property")),
                     }
@@ -1778,6 +1786,33 @@ mod tests {
         assert_eq!(serde_json::to_vec(&s.doc).unwrap(), before);
         s.execute("edit.redo", json!({})).unwrap();
         assert_eq!(serde_json::to_vec(&s.doc).unwrap(), after);
+    }
+
+    #[test]
+    fn stair_chamfer_property_is_storey_scoped_atomic_and_exactly_undoable() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let before_mesh = trigon_model::build(&s.doc).unwrap();
+        let id = update(&mut s, "stairs.L1", json!({"turn_chamfer_mm":[250.0,350.0]}));
+        assert_eq!(property(&descriptor(&mut s, &id), "turn_chamfer_mm"), json!([250.0, 350.0]));
+        assert_eq!(property(&descriptor(&mut s, "stairs.L0"), "turn_chamfer_mm"), Value::Null);
+        let after = s.doc.clone();
+        let after_mesh = trigon_model::build(&s.doc).unwrap();
+        assert_ne!(before_mesh, after_mesh);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), before_mesh);
+        let redo = s.redo.len();
+        for value in [json!([2000, 350]), json!([250, 1000]), json!([0, 350]), json!([250]), json!("bevel")] {
+            assert!(s.execute("element.set", json!({"id":"stairs.L1","properties":{"turn_chamfer_mm":value}})).is_err());
+            assert_eq!(s.doc, before);
+            assert_eq!(s.redo.len(), redo);
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after);
+        assert_eq!(trigon_model::build(&s.doc).unwrap(), after_mesh);
+        update(&mut s, &id, json!({"turn_chamfer_mm":null}));
+        assert_eq!(property(&descriptor(&mut s, &id), "turn_chamfer_mm"), Value::Null);
     }
 
     #[test]

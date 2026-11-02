@@ -118,6 +118,12 @@ A zero-change or overly large (>4096 changed fields) preview is refused; split t
   transitions. These are design criteria for review, not constraints applied to the model.
 - Overlapping stair symbols/departing sources, duplicate source IDs and model build failures.
   Adjacent-storey stair overlap can be intentional; departure levels are reported separately.
+- Visible stair openings intersecting actual joined interior/facade wall material (>1 mm²).
+  `stair_wall_overlap` supplies the displayed storey, departing stair occurrence, wall ID,
+  `opening_overlap_mm2` and read-only inspection commands for both sources. Repeated wall
+  pieces are aggregated by wall ID. Receiving symbols are checked against the receiving
+  storey's walls. A buildable stair can still collide with its enclosure; these findings are
+  not automatically repaired or hidden by clipping the drawing.
 
 Select `building` and/or `levels` to narrow the audit. Numeric thresholds are checked; bounded
 comparison budgets reject excessive scopes. `total_findings` and `truncated` distinguish a

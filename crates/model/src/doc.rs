@@ -620,6 +620,10 @@ pub struct Stair {
     /// Depths of the two quarter turns beyond the straight flight, mm; defaults to flight width.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_depths: Option<[f64; 2]>,
+    /// Symmetric bevels at the two outer U-turn corners: cut along the run, then across it,
+    /// in mm. Only for non-rounded U-turn stairs; absent preserves rectangular turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_chamfer: Option<[f64; 2]>,
 }
 
 fn yes() -> bool {

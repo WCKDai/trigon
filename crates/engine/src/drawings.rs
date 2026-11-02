@@ -534,6 +534,7 @@ pub(crate) fn trace_walls(
                 rounded: true,
                 winders: None,
                 turn_depths: None,
+                turn_chamfer: None,
             });
         }
         for t in done {
@@ -868,6 +869,7 @@ pub(crate) fn fit_stair(s: &mut Session, name: &str, level: usize, rough: [[f64;
             rounded: true,
             winders: None,
             turn_depths: None,
+            turn_chamfer: None,
         };
         return Ok(StairFit {
             stair,
@@ -984,6 +986,7 @@ pub(crate) fn fit_stair(s: &mut Session, name: &str, level: usize, rough: [[f64;
         rounded: true,
         winders: None,
         turn_depths: None,
+        turn_chamfer: None,
     };
     let lines_across = ap.iter().map(|&j| (((j as f64) - m) * px_mm, across[j])).collect();
     Ok(StairFit {
