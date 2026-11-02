@@ -4,6 +4,7 @@
 //! intersection of the adjoining roof planes, preserving their pitch on oblique gables too.
 
 pub mod drainage;
+mod eave_cut;
 pub(crate) mod halfhip;
 pub mod opening;
 pub use opening::Rooflight;
@@ -99,6 +100,15 @@ pub struct HalfHip {
     pub drop_mm: f64,
 }
 
+/// Explicit two-cut plumb source. The distinct kind makes older readers refuse the
+/// feature rather than silently discard its fascia depth. Only one wrapper is allowed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TwoCutPlumb {
+    pub fascia_depth_mm: f64,
+    pub roof: Box<Roof>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Roof {
@@ -188,12 +198,73 @@ pub enum Roof {
         #[serde(flatten)]
         parameters: Mansard,
     },
+    /// A vertical fascia followed by a horizontal return on a built-up pitched roof.
+    TwoCutPlumb(TwoCutPlumb),
 }
 
 impl Roof {
+    /// The original source roof under at most one explicit eave-cut wrapper.
+    pub fn base(&self) -> &Self {
+        match self {
+            Self::TwoCutPlumb(cut) => &cut.roof,
+            _ => self,
+        }
+    }
+
+    /// Mutable original source, retaining the explicit eave-cut parameters.
+    pub fn base_mut(&mut self) -> &mut Self {
+        match self {
+            Self::TwoCutPlumb(cut) => &mut cut.roof,
+            _ => self,
+        }
+    }
+
+    pub fn fascia_depth(&self) -> Option<f64> {
+        match self {
+            Self::TwoCutPlumb(cut) => Some(cut.fascia_depth_mm),
+            _ => None,
+        }
+    }
+
+    /// Validate the opt-in contract before any source consumers inspect the base roof.
+    pub fn validate_eave_cut(&self) -> Result<()> {
+        self.fascia_toe_offset().map(|_| ())
+    }
+
+    /// Height of the fascia toe above the legacy eave soffit, if explicitly cut.
+    pub(crate) fn fascia_toe_offset(&self) -> Result<Option<f64>> {
+        let Self::TwoCutPlumb(cut) = self else { return Ok(None) };
+        let (pitch, overhang, thickness) = match cut.roof.as_ref() {
+            Self::Pitched { pitch_deg, overhang_mm, thickness_mm, .. } | Self::HalfHipped { pitch_deg, overhang_mm, thickness_mm, .. } => {
+                (*pitch_deg, *overhang_mm, *thickness_mm)
+            }
+            _ => {
+                return Err(ModelError::Invalid(
+                    "Two Cut–Plumb needs one built-up pitched or half-hipped source roof; nested cuts, flat and mansard roofs are unsupported".into(),
+                ));
+            }
+        };
+        eave_cut::datum(pitch, overhang, thickness, cut.fascia_depth_mm).map(Some)
+    }
+
+    /// Set or remove the cut without replacing its base roof parameters or identities.
+    pub fn with_two_cut_plumb(self, depth: Option<f64>) -> Result<Self> {
+        self.validate_eave_cut()?;
+        let roof = match self {
+            Self::TwoCutPlumb(cut) => *cut.roof,
+            other => other,
+        };
+        let result = match depth {
+            Some(fascia_depth_mm) => Self::TwoCutPlumb(TwoCutPlumb { fascia_depth_mm, roof: Box::new(roof) }),
+            None => roof,
+        };
+        result.validate_eave_cut()?;
+        Ok(result)
+    }
+
     /// Explicit clipped-gable sources, empty for other roof kinds.
     pub fn half_hips(&self) -> &[HalfHip] {
-        match self {
+        match self.base() {
             Self::HalfHipped { half_hips, .. } => half_hips,
             _ => &[],
         }
@@ -202,6 +273,7 @@ impl Roof {
     /// An empty list restores the pitched kind. Building-specific host checks run in build().
     pub fn with_half_hips(self, half_hips: Vec<HalfHip>) -> Result<Self> {
         match self {
+            Self::TwoCutPlumb(cut) => cut.roof.with_half_hips(half_hips)?.with_two_cut_plumb(Some(cut.fascia_depth_mm)),
             Self::Pitched {
                 pitch_deg,
                 gables,
@@ -264,32 +336,36 @@ impl Roof {
         }
     }
     pub fn rooflights(&self) -> &[Rooflight] {
-        match self {
+        match self.base() {
             Self::Flat => &[],
             Self::Pitched { rooflights, .. } | Self::HalfHipped { rooflights, .. } => rooflights,
             Self::Mansard { parameters } => &parameters.rooflights,
+            Self::TwoCutPlumb(_) => &[],
         }
     }
     pub fn rooflights_mut(&mut self) -> Option<&mut Vec<Rooflight>> {
-        match self {
+        match self.base_mut() {
             Self::Flat => None,
             Self::Pitched { rooflights, .. } | Self::HalfHipped { rooflights, .. } => Some(rooflights),
             Self::Mansard { parameters } => Some(&mut parameters.rooflights),
+            Self::TwoCutPlumb(_) => None,
         }
     }
     pub fn dormers(&self) -> &[Dormer] {
-        match self {
+        match self.base() {
             Self::Flat => &[],
             Self::Pitched { dormers, .. } | Self::HalfHipped { dormers, .. } => dormers,
             Self::Mansard { parameters } => &parameters.dormers,
+            Self::TwoCutPlumb(_) => &[],
         }
     }
 
     pub fn dormers_mut(&mut self) -> Option<&mut Vec<Dormer>> {
-        match self {
+        match self.base_mut() {
             Self::Flat => None,
             Self::Pitched { dormers, .. } | Self::HalfHipped { dormers, .. } => Some(dormers),
             Self::Mansard { parameters } => Some(&mut parameters.dormers),
+            Self::TwoCutPlumb(_) => None,
         }
     }
 }
@@ -644,11 +720,24 @@ pub(crate) fn pitched_with_caps(
     b: &Buildup,
     caps: &[(usize, f64)],
 ) -> Result<PitchedRoof> {
+    pitched_with_eave_cut(outline, eaves, pitch_deg, gable_edges, b, caps, None)
+}
+
+pub(crate) fn pitched_with_eave_cut(
+    outline: &[[f64; 2]],
+    eaves: f64,
+    pitch_deg: f64,
+    gable_edges: &[usize],
+    b: &Buildup,
+    caps: &[(usize, f64)],
+    fascia_depth: Option<f64>,
+) -> Result<PitchedRoof> {
     let mut base = pitched(outline, eaves, pitch_deg, gable_edges)?;
     let planes = halfhip::planes(outline, eaves, pitch_deg, gable_edges, b, caps, &base)?;
     let overhang = crate::checked("roof overhang", b.overhang, 0.0, 2000.0)?;
     let verge = crate::checked("roof verge", b.verge, 0.0, 1500.0)?;
     let thickness = crate::checked("roof thickness", b.thickness, 0.0, 1000.0)?;
+    let fascia_offset = fascia_depth.map(|d| eave_cut::datum(pitch_deg, overhang, thickness, d)).transpose()?;
     if overhang == 0.0 && verge == 0.0 && thickness == 0.0 && !b.gutters {
         return Ok(base);
     }
@@ -674,7 +763,9 @@ pub(crate) fn pitched_with_caps(
     }
     let lift = thickness / pitch_deg.to_radians().cos();
     let mut cover = Mesh::default();
-    if thickness > 0.0 {
+    if let Some(offset) = fascia_offset {
+        cover = eave_cut::shell(&under.cover, lift, low + offset)?;
+    } else if thickness > 0.0 {
         // Top surface, soffit (facing down) and the boards round the edge (vertical).
         let mut top = under.cover.clone();
         for p in &mut top.positions {
@@ -700,7 +791,11 @@ pub(crate) fn pitched_with_caps(
             let (w, d) = GUTTER;
             // Counter-clockwise seen from above: outside the fascia first, then back along it.
             let ring = |z: f64| [fr.point(0.0, -w, z), fr.point(fr.length, -w, z), fr.point(fr.length, 0.0, z), fr.point(0.0, 0.0, z)];
-            let (lo, hi) = (ring(low - d / 2.0), ring(low + d / 2.0));
+            let (bottom, top) = match fascia_offset {
+                Some(offset) => (low + offset - d, low + offset),
+                None => (low - d / 2.0, low + d / 2.0),
+            };
+            let (lo, hi) = (ring(bottom), ring(top));
             gutters.hexahedron(lo, hi);
         }
     }

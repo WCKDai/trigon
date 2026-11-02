@@ -164,7 +164,7 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, dormers: &[B
             ComponentKind::FixedWindow => (1, 0., false),
             _ => return Err(ModelError::Invalid("rooflight fill requires a rectangular Window or FixedWindow family".into())),
         };
-        let finish = match &b.roof {
+        let finish = match b.roof.base() {
             crate::Roof::Mansard { parameters: p } => {
                 p.covering.as_ref().map(|c| c.offset(top.0[1].atan().to_degrees(), p.lower_pitch_deg, p.upper_pitch_deg)).transpose()?.unwrap_or(0.)
             }

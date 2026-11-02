@@ -196,7 +196,7 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
     let mut built = Vec::new();
     for spec in specs {
         spec.validate()?;
-        if spec.multi_plane && !matches!(b.roof, crate::Roof::Pitched { .. } | crate::Roof::HalfHipped { .. }) {
+        if spec.multi_plane && !matches!(b.roof.base(), crate::Roof::Pitched { .. } | crate::Roof::HalfHipped { .. }) {
             return Err(ModelError::Invalid(
                 "multi_plane dormers currently require a pitched hip host; mansard slope breaks remain unsupported".into(),
             ));
@@ -278,7 +278,7 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         if top.0[1] < slope + 0.1 {
             return Err(ModelError::Invalid("dormer host roof must be steeper than its shed roof".into()));
         }
-        let finished = if let crate::Roof::Mansard { parameters } = &b.roof {
+        let finished = if let crate::Roof::Mansard { parameters } = b.roof.base() {
             match &parameters.covering {
                 Some(covering) => {
                     covering.offset(top.0[1].atan().to_degrees(), parameters.lower_pitch_deg, parameters.upper_pitch_deg)?
@@ -433,7 +433,7 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         let profile = crate::profile::opening(&ty.kind, rect);
         let mut segment = crate::walls::segment_profiles(&face, &wall_id, &span, std::slice::from_ref(&profile))
             .ok_or_else(|| ModelError::Invalid("dormer front could not be triangulated".into()))?;
-        if spec.yaw_deg != 0.0 || matches!(&b.roof, crate::Roof::Pitched { eave_facades: Some(_), .. } | crate::Roof::HalfHipped { .. }) {
+        if spec.yaw_deg != 0.0 || matches!(b.roof.base(), crate::Roof::Pitched { eave_facades: Some(_), .. } | crate::Roof::HalfHipped { .. }) {
             // The wall polygon overlay quantizes its output; caps/reveals use the exact
             // inputs. Restore those known stations within the existing numerical EPS so
             // both sides share identical vertices, including at fractional host elevations.

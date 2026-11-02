@@ -602,6 +602,7 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
 }
 
 fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) -> Result<Built> {
+    b.roof.validate_eave_cut()?;
     b.validate_attic()?;
     if b.floor_thicknesses.len() > b.storeys.len() {
         return Err(ModelError::Invalid("floor thicknesses must refer to existing storeys".into()));
@@ -811,7 +812,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     continue;
                 }
                 let bearing_cap = (z1 - h).abs() < 1e-6
-                    && matches!(&b.roof, crate::Roof::Pitched { drainage: Some(_), gables, .. } | crate::Roof::HalfHipped { drainage: Some(_), gables, .. } if !gables.contains(&f.id));
+                    && matches!(b.roof.base(), crate::Roof::Pitched { drainage, gables, .. } | crate::Roof::HalfHipped { drainage, gables, .. }
+                        if (drainage.is_some() || b.roof.fascia_depth().is_some()) && !gables.contains(&f.id));
                 let mut piece = facing_piece(
                     &fr,
                     f,
@@ -924,7 +926,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
     }
     let top_level = levels.saturating_sub(1);
     let top_inner = inners.get(top_level).cloned().unwrap_or_default();
-    let roof = match &b.roof {
+    let roof = match b.roof.base() {
         _ if above(h - b.ceiling_thickness(top_level)) => None,
         crate::roof::Roof::Flat => {
             let (outline, holes) = slab_shape(&b.footprint, openings(top_level)?)?;
@@ -959,7 +961,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     holes,
                 });
             }
-            let selected = match &b.roof {
+            let selected = match b.roof.base() {
                 crate::Roof::Pitched { eave_facades, .. } | crate::Roof::HalfHipped { eave_facades, .. } => eave_facades.as_deref(),
                 _ => None,
             };
@@ -991,8 +993,10 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 }
             }
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
-            let (mut r, pitch_deg, compound) = match &b.roof {
-                crate::Roof::Pitched { pitch_deg, .. } => (crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?, *pitch_deg, false),
+            let (mut r, pitch_deg, compound) = match b.roof.base() {
+                crate::Roof::Pitched { pitch_deg, .. } => {
+                    (crate::roof::pitched_with_eave_cut(&outline, h, *pitch_deg, &edges, &buildup, &[], b.roof.fascia_depth())?, *pitch_deg, false)
+                }
                 crate::Roof::HalfHipped { pitch_deg, half_hips, .. } => {
                     if half_hips.is_empty() || half_hips.len() > 2 {
                         return Err(ModelError::Invalid("half-hipped roof requires one or two explicit source gable caps".into()));
@@ -1007,21 +1011,24 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                             Ok((edges[index], cap.drop_mm))
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    (crate::roof::pitched_with_caps(&outline, h, *pitch_deg, &edges, &buildup, &caps)?, *pitch_deg, false)
+                    (crate::roof::pitched_with_eave_cut(&outline, h, *pitch_deg, &edges, &buildup, &caps, b.roof.fascia_depth())?, *pitch_deg, false)
                 }
                 crate::Roof::Mansard { parameters } => (crate::roof::mansard(&outline, h, &edges, parameters)?, parameters.lower_pitch_deg, true),
-                crate::Roof::Flat => return Err(ModelError::Invalid("a sloping roof configuration is required".into())),
+                crate::Roof::Flat | crate::Roof::TwoCutPlumb(_) => {
+                    return Err(ModelError::Invalid("a sloping roof configuration is required".into()));
+                }
             };
             let mut drain_parts = Vec::new();
-            if let crate::Roof::Pitched { drainage: Some(d), .. } | crate::Roof::HalfHipped { drainage: Some(d), .. } = &b.roof {
+            if let crate::Roof::Pitched { drainage: Some(d), .. } | crate::Roof::HalfHipped { drainage: Some(d), .. } = b.roof.base() {
                 if !gutters {
                     return Err(ModelError::Invalid("detailed drainage requires gutters".into()));
                 }
                 let out = inner_ring_by(&outline, |k| if edges.contains(&k) { -*verge_mm } else { -*overhang_mm });
+                let drain_height = h + b.roof.fascia_toe_offset()?.unwrap_or(0.0);
                 drain_parts = if selected.is_some() {
-                    crate::roof::drainage::build_selected(b, &kept, &out, h, *overhang_mm, pitch_deg, &edges, d)?
+                    crate::roof::drainage::build_selected(b, &kept, &out, drain_height, *overhang_mm, pitch_deg, &edges, d)?
                 } else {
-                    crate::roof::drainage::build(b, &kept, &out, h, *overhang_mm, pitch_deg, &edges, d)?
+                    crate::roof::drainage::build(b, &kept, &out, drain_height, *overhang_mm, pitch_deg, &edges, d)?
                 };
                 r.gutters = Mesh::default();
                 for part in &drain_parts {
@@ -1053,7 +1060,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     mesh.triangles.push([base, base + 1, base + 2]);
                 }
             }
-            let covering = if let crate::Roof::Mansard { parameters } = &b.roof {
+            let covering = if let crate::Roof::Mansard { parameters } = b.roof.base() {
                 match &parameters.covering {
                     Some(spec) => crate::roof::covering(&r.cover, parameters.lower_pitch_deg, parameters.upper_pitch_deg, spec)?,
                     None => Vec::new(),
@@ -1079,6 +1086,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 rooflights,
             })
         }
+        crate::Roof::TwoCutPlumb(_) => return Err(ModelError::Invalid("nested roof cuts are unsupported".into())),
     };
     // Interior walls, storey by storey, joined to each other and to that storey's facade face.
     let mut interior = Vec::new();
@@ -1132,15 +1140,18 @@ const PLINTH_FOOT: f64 = 300.0;
 /// Its declared height remains the height at the wall; projection consumes height at tan(pitch).
 /// Moving only the upper face preserves a closed solid and all opening edges/material ownership.
 fn seat_cornice(piece: &mut Mesh, b: &Building, f: &Facade, fr: &FacadeFrame, top: f64) -> Result<()> {
-    let (crate::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, drainage: Some(_), .. }
-    | crate::Roof::HalfHipped { pitch_deg, gables, straighten_mm, overhang_mm, drainage: Some(_), .. }) = &b.roof
+    let (crate::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, drainage, .. }
+    | crate::Roof::HalfHipped { pitch_deg, gables, straighten_mm, overhang_mm, drainage, .. }) = b.roof.base()
     else {
         return Ok(());
     };
+    if drainage.is_none() && b.roof.fascia_depth().is_none() {
+        return Ok(());
+    }
     if (top - b.height()).abs() > 1e-6 || gables.contains(&f.id) {
         return Ok(());
     }
-    if let crate::Roof::Pitched { eave_facades: Some(ids), .. } | crate::Roof::HalfHipped { eave_facades: Some(ids), .. } = &b.roof {
+    if let crate::Roof::Pitched { eave_facades: Some(ids), .. } | crate::Roof::HalfHipped { eave_facades: Some(ids), .. } = b.roof.base() {
         let (owners, _) = crate::roof::selected_eave_outline(b, ids)?;
         if !owners.contains(&f.edge) {
             return Err(ModelError::Invalid(format!(
@@ -1156,9 +1167,21 @@ fn seat_cornice(piece: &mut Mesh, b: &Building, f: &Facade, fr: &FacadeFrame, to
     }
     let rise = crate::checked("cornice roof pitch", *pitch_deg, 5.0, 75.0)?.to_radians().tan();
     let overhang = crate::checked("cornice roof overhang", *overhang_mm, 0.0, 2000.0)?;
+    let fascia_offset = b.roof.fascia_toe_offset()?;
     for p in &mut piece.positions {
         let outward = ((p[0] - fr.origin[0]) * fr.n[0] + (p[1] - fr.origin[1]) * fr.n[1]).max(0.0);
         let soffit = top - outward * rise;
+        if let Some(offset) = fascia_offset
+            && top - overhang * rise + offset > soffit + 1e-6
+        {
+            return Err(ModelError::Invalid(format!(
+                "{}: Two Cut–Plumb {:.6} mm fascia needs overhang >= {:.6} mm to support its {:.6} mm cornice projection; supplied {overhang:.6} mm",
+                f.id,
+                b.roof.fascia_depth().unwrap_or(0.0),
+                offset / rise + outward,
+                outward
+            )));
+        }
         if outward > overhang + 1e-6 {
             return Err(ModelError::Invalid("a roof-bearing cornice projection must fit under the roof overhang".into()));
         }

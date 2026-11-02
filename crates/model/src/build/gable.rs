@@ -28,7 +28,7 @@ pub(super) fn validate_request(b: &Building, f: &Facade, p: &Placement, ty: &Com
     if !candidate(b, p.level, rect) {
         return Ok(false);
     }
-    let crate::Roof::HalfHipped { gables, .. } = &b.roof else { return Ok(false) };
+    let crate::Roof::HalfHipped { gables, .. } = b.roof.base() else { return Ok(false) };
     let slot = format!("{} level {} bay {}", f.id, p.level, p.bay);
     if !gables.contains(&f.id) {
         return Err(ModelError::Invalid(format!("{slot}: above-eaves windows require an explicit source gable")));
@@ -167,7 +167,7 @@ fn remove_legacy(gables: &mut Mesh, fr: &FacadeFrame, source: &str) -> Result<()
 }
 
 pub(super) fn build(doc: &Document, b: &Building, view: View, cut: Option<f64>, cover: &Mesh, legacy: &mut Mesh) -> Result<Vec<BuiltGable>> {
-    if !matches!(b.roof, crate::Roof::HalfHipped { .. }) {
+    if !matches!(b.roof.base(), crate::Roof::HalfHipped { .. }) {
         return Ok(Vec::new());
     }
     let Some(level) = b.attic_level() else { return Ok(Vec::new()) };

@@ -340,10 +340,10 @@ pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
 /// Declared normal thickness, not a guessed face-pair extrusion thickness.
 pub(super) fn source_roof_thickness(doc: &Document, b: &Built) -> Option<f64> {
     let source = doc.buildings.iter().find(|source| source.id == b.building_id)?;
-    let thickness = match &source.roof {
+    let thickness = match source.roof.base() {
         trigon_model::Roof::Pitched { thickness_mm, .. } | trigon_model::Roof::HalfHipped { thickness_mm, .. } => *thickness_mm,
         trigon_model::Roof::Mansard { parameters } => parameters.thickness_mm,
-        trigon_model::Roof::Flat => return None,
+        trigon_model::Roof::Flat | trigon_model::Roof::TwoCutPlumb(_) => return None,
     };
     (thickness.is_finite() && thickness <= 1000. && (thickness * 1e6).round() > 0.).then_some(thickness)
 }
@@ -357,7 +357,10 @@ pub(super) fn opening_shell(doc: &Document, b: &Built) -> bool {
     b.roof.as_ref().is_some_and(|r| {
         !r.rooflights.is_empty()
             || (!r.dormers.is_empty() && source_roof_thickness(doc, b).is_some())
-            || doc.buildings.iter().any(|source| source.id == b.building_id && !source.roof.half_hips().is_empty())
+            || doc
+                .buildings
+                .iter()
+                .any(|source| source.id == b.building_id && (!source.roof.half_hips().is_empty() || source.roof.fascia_depth().is_some()))
     }) || doc.buildings.iter().find(|source| source.id == b.building_id).is_some_and(|source| source.roof.dormers().iter().any(|d| d.multi_plane))
 }
 
