@@ -344,6 +344,12 @@ impl StudioApp {
             return;
         }
         let ready = !self.building() && !(self.mode != Mode::ThreeD && self.drawing_plan());
+        if ready && self.mode != Mode::ThreeD {
+            // Logic continues while the native window is hidden and no egui pass runs.
+            // Progress CPU-only preparation here; PlanView::ui alone uploads textures.
+            let rect = self.viewport_rect.unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)));
+            self.plan.prepare(rect, self.ppp);
+        }
         let now = Instant::now();
         let mut keep = Vec::new();
         for mut shot in std::mem::take(&mut self.shots) {
@@ -359,7 +365,10 @@ impl StudioApp {
                 ShotTarget::Viewport => {
                     if self.mode != Mode::ThreeD
                         && self.plan.error.is_none()
-                        && !self.viewport_rect.is_some_and(|rect| self.plan.snapshot_ready(rect, self.ppp))
+                        && !self.plan.snapshot_ready(
+                            self.viewport_rect.unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                            self.ppp,
+                        )
                     {
                         keep.push(shot);
                         continue;
@@ -381,7 +390,10 @@ impl StudioApp {
                 ShotTarget::Window => {
                     if self.mode != Mode::ThreeD
                         && self.plan.error.is_none()
-                        && !self.viewport_rect.is_some_and(|rect| self.plan.snapshot_ready(rect, self.ppp))
+                        && !self.plan.snapshot_ready(
+                            self.viewport_rect.unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                            self.ppp,
+                        )
                     {
                         keep.push(shot);
                         continue;

@@ -2382,6 +2382,127 @@ mod tests {
         schedules::resolve_row(&app.scene, row).unwrap()
     }
 
+    /// Exercise the actual control screenshot queue using a synthetic loopback request.
+    /// No discovery files or real credentials are read, and no egui pass runs here.
+    fn hidden_viewport_capture(app: &mut StudioApp, ctx: &egui::Context) -> serde_json::Value {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "synthetic-drawing-screenshot-test".repeat(2);
+        let server = Server::start_with(
+            listener,
+            token.clone(),
+            Arc::new(|| {}),
+            trigon_control::Options { reply_wait: Duration::from_secs(4), ..Default::default() },
+        )
+        .unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            writeln!(stream, "{}", json!({"id":1,"method":"ui.screenshot","params":{"target":"viewport"},"token":token})).unwrap();
+            stream.flush().unwrap();
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply).unwrap();
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()
+        });
+        let request = server.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.handle_request(request, ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.shots.is_empty() && Instant::now() < deadline {
+            app.poll_worker();
+            app.serve_shots(ctx);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.shots.is_empty(), "hidden drawing screenshots must finish through logic/control work without an egui pass");
+        let reply = client.join().unwrap();
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(app.plan.diagnostics()["uploads"], 0, "offscreen preparation must not enqueue GPU texture uploads");
+        reply
+    }
+
+    fn hidden_drawing_fixture(app: &mut StudioApp, request: DrawingRequest) {
+        app.window_hidden = true;
+        app.viewport_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 220.0)));
+        app.ppp = 1.0;
+        app.generation += 1;
+        app.plan_wanted = app.generation;
+        let done = crate::worker::run(&Job {
+            generation: app.generation,
+            doc: Arc::new(app.session.doc.clone()),
+            view: app.view(),
+            want_scene: false,
+            phase_colors: false,
+            drawing: Some(request),
+        });
+        app.apply_done(done);
+        assert!(!app.building() && !app.drawing_plan());
+    }
+
+    #[test]
+    fn hidden_plan_viewport_screenshot_progresses_without_a_ui_frame() {
+        let mut app = app(false);
+        app.mode = Mode::Plan;
+        app.plan_level = 0;
+        hidden_drawing_fixture(&mut app, DrawingRequest::Plan(0));
+        let ctx = egui::Context::default();
+        let reply = hidden_viewport_capture(&mut app, &ctx);
+        assert_eq!(reply["result"]["width"], 320);
+        assert_eq!(reply["result"]["height"], 220);
+        assert!(app.window_hidden);
+        assert!(app.plan.snapshot_ready(app.viewport_rect.unwrap(), 1.0));
+    }
+
+    #[test]
+    fn hidden_saved_drawing_and_refit_prepare_the_matching_style_without_ui() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"hidden-upper","name":"Hidden upper","kind":{"view":"plan","level":1}})).unwrap();
+        app.mode = Mode::Drawing;
+        app.drawing = "hidden-upper".into();
+        hidden_drawing_fixture(&mut app, DrawingRequest::Saved("hidden-upper".into()));
+        let ctx = egui::Context::default();
+        hidden_viewport_capture(&mut app, &ctx);
+        let first = app.plan.diagnostics()["stroke_zoom_bucket"].clone();
+        app.viewport_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 440.0)));
+        app.fit();
+        let reply = hidden_viewport_capture(&mut app, &ctx);
+        assert_eq!(reply["result"]["width"], 640);
+        assert_eq!(reply["result"]["height"], 440);
+        assert_ne!(app.plan.diagnostics()["stroke_zoom_bucket"], first, "hidden refit changes its logical pen bucket");
+        assert!(app.window_hidden);
+    }
+
+    #[test]
+    fn optional_screen_style_failure_does_not_block_edits_but_drawing_failure_does() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        app.mode = Mode::Plan;
+        app.plan_level = 0;
+        hidden_drawing_fixture(&mut app, DrawingRequest::Plan(0));
+        let mut done = crate::worker::run(&Job {
+            generation: app.generation,
+            doc: Arc::new(app.session.doc.clone()),
+            view: app.view(),
+            want_scene: false,
+            phase_colors: false,
+            drawing: Some(DrawingRequest::Plan(0)),
+        });
+        let drawing = done.drawing.as_mut().unwrap().1.as_mut().unwrap();
+        // Keep the already parsed engine base and exact pick/snap metadata, but reject the
+        // optional screen source. A failure here cannot become a model-editing lock.
+        drawing.display_svgs = [Arc::from("<svg>"), Arc::from("<svg>"), Arc::from("<svg>")];
+        app.apply_done(done);
+        let ctx = egui::Context::default();
+        hidden_viewport_capture(&mut app, &ctx);
+        assert!(app.plan.error.is_none());
+        assert!(app.plan.diagnostics()["last_style_warning"].as_str().unwrap().contains("using paper pens"));
+        assert!(app.edit_block_reason().is_none());
+        app.plan.fail("synthetic drawing generation failure".into());
+        assert!(app.edit_block_reason().is_some(), "genuine drawing errors retain the editing guard");
+        assert!(!app.plan.snapshot_ready(app.viewport_rect.unwrap(), 1.0));
+    }
+
     #[test]
     fn local_metadata_and_precision_review_share_the_real_command_path() {
         let mut app = app(false);

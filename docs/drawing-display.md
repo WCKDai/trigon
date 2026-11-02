@@ -86,7 +86,20 @@ while new styling is pending; picking continues against exact current-generation
 
 Viewport and window screenshot requests wait for the current source and stroke bucket. The
 viewport snapshot reuses the worker's styled tree and renders the exact current viewport.
+Screenshot servicing progresses CPU raster preparation from the logic callback even when the
+window is minimized or occluded and no egui pass runs. One accepted CPU image/tree may wait for
+the next visible pass; only that pass allocates or updates its texture. Hidden captures therefore
+do not accumulate GPU texture deltas. Source, generation, LOD and pen-bucket checks apply to the
+pending image as well as the visible image. Before any visible viewport exists, offscreen drawing
+captures use the existing 1280 × 800 logical-point fallback.
+
+If only the optional stroke adapter or styled-source parse fails, the worker caches the already
+parsed base tree and renders its original paper pens. `last_style_warning` makes that fallback
+explicit without marking the model/drawing failed or disabling edits. Invalid raster cameras and
+genuine model/drawing generation failures retain their error and editing-guard behavior.
+
 `drawing_raster` diagnostics expose `logical_zoom`, `stroke_zoom_bucket`,
-`shown_stroke_zoom_bucket`, `last_style_ms`, and `last_style_cache_hit`; these are CPU/display
-feedback, not GPU timing or a model accuracy claim. The new preparation cost needs native
+`shown_stroke_zoom_bucket`, `prepared_stroke_zoom_bucket`, `pending_rasters`, `last_style_ms`,
+`last_style_cache_hit`, and `last_style_warning`; these are CPU/display feedback, not GPU timing
+or a model accuracy claim. The new preparation cost needs native
 measurement; the historical CPU profile above does not establish an adaptive-rendering speedup.
