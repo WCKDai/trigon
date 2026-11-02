@@ -192,7 +192,6 @@ pub struct StudioApp {
     status: Option<(String, bool)>,
     title: String,
     /// Where Open and Save as… go on systems without native dialogs here.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     path_text: String,
 }
 
@@ -293,7 +292,6 @@ impl StudioApp {
             allow_close: false,
             status: None,
             title: String::new(),
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             path_text: String::new(),
         }
     }
@@ -1040,9 +1038,12 @@ impl StudioApp {
     }
 
     fn view_controls(&mut self, ui: &mut egui::Ui) {
+        if !matches!(ui.ctx().os(), egui::os::OperatingSystem::Mac | egui::os::OperatingSystem::Windows) {
+            // Keep the file-path fallback out of the wrapping view controls: its
+            // text-edit width otherwise expands the canvas after a narrow resize.
+            ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(ui.available_width()));
+        }
         ui.horizontal_wrapped(|ui| {
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(180.0));
             let before = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone(), self.phase_colors);
             ui.selectable_value(&mut self.mode, Mode::ThreeD, "3D");
             ui.selectable_value(&mut self.mode, Mode::Plan, "Plan");
@@ -2112,25 +2113,28 @@ mod tests {
 
     #[test]
     fn stacked_workspace_keeps_a_usable_canvas_at_minimum_and_reference_sizes() {
-        let mut app = app(false);
-        app.authoring.tab = Tab::Project;
-        let document = app.session.doc.clone();
-        let ctx = egui::Context::default();
-        theme::apply(&ctx);
-        for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1600.0, 1076.0), egui::vec2(820.0, 520.0)] {
-            let mut output = ctx
-                .run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
-                    app.workspace_ui(ui)
-                });
-            output.textures_delta.clear();
-            let canvas = app.viewport_rect.unwrap();
-            assert!(app.browser_rect.unwrap().height() >= 100.0, "project browser must remain usable at {size:?}: {:?}", app.browser_rect);
-            assert!(app.browser_rect.unwrap().bottom() <= size.y, "browser must remain inside the resized window");
-            assert!(canvas.width() >= 450.0 && canvas.height() >= 100.0, "unusable canvas at {size:?}: {canvas:?}");
-            assert!(canvas.right() <= size.x + 1.0 && canvas.bottom() <= size.y + 1.0, "canvas leaves the window");
-            assert_eq!(app.session.doc, document);
+        for os in [egui::os::OperatingSystem::Mac, egui::os::OperatingSystem::Windows, egui::os::OperatingSystem::Nix] {
+            let mut app = app(false);
+            app.authoring.tab = Tab::Project;
+            let document = app.session.doc.clone();
+            let ctx = egui::Context::default();
+            ctx.set_os(os);
+            theme::apply(&ctx);
+            for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1600.0, 1076.0), egui::vec2(820.0, 520.0)] {
+                let mut output = ctx
+                    .run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
+                        app.workspace_ui(ui)
+                    });
+                output.textures_delta.clear();
+                let canvas = app.viewport_rect.unwrap();
+                assert!(app.browser_rect.unwrap().height() >= 100.0, "project browser must remain usable at {size:?}: {:?}", app.browser_rect);
+                assert!(app.browser_rect.unwrap().bottom() <= size.y, "browser must remain inside the resized window");
+                assert!(canvas.width() >= 450.0 && canvas.height() >= 100.0, "unusable canvas at {size:?}: {canvas:?}");
+                assert!(canvas.right() <= size.x + 1.0 && canvas.bottom() <= size.y + 1.0, "canvas leaves {os:?} window {size:?}: {canvas:?}");
+                assert_eq!(app.session.doc, document);
+            }
+            ctx.data_mut(|data| data.clear());
         }
-        ctx.data_mut(|data| data.clear());
     }
 
     #[test]
