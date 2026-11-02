@@ -18,6 +18,10 @@ with at least 50 mm of normal build-up. Hip and slope crossings, overlapping roo
 dormer intersections, duplicate IDs and hostile parameters are rejected. The limit is 64
 rooflights per building and 64 source footprint corners.
 
+Support and carving are restricted to the selected top and underside planes. The opposite
+slope stays intact even when it overlaps the aperture in a steep roof's normal projection;
+coverage tolerances and hip/slope-break rejection remain unchanged.
+
 The stable built IDs are `building.rooflight.local-id`, with `.opening` and `.flashing`
 children. `element.get` and `element.set` expose the source placement and family parameters
 from any of these parts. Studio selection and Properties use those commands. Opening

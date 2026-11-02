@@ -156,7 +156,7 @@ fn conform(mesh: &Mesh, fr: &FacadeFrame, lines: &[([f64; 2], [f64; 2])]) -> Mes
 /// boundary vertices into incident triangles; it cannot fill a hole or reverse a face.
 /// Clipping an already clipped shell can split a shared source edge outside the
 /// current aperture, so checking just the new aperture's lines is insufficient.
-fn conform_shared_edges(mesh: &Mesh) -> Mesh {
+pub(super) fn conform_shared_edges(mesh: &Mesh) -> Mesh {
     use std::collections::BTreeMap;
     let key = |p: [f64; 3]| p.map(|v| (v * 1e6).round() as i64);
     let edge = |a: [i64; 3], b: [i64; 3]| if a < b { ((a, b), 1_i64) } else { ((b, a), -1_i64) };

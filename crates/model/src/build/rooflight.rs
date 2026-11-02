@@ -45,6 +45,24 @@ fn flashing(fr: &RooflightFrame, w: f64, h: f64, width: f64, finish: f64, stand:
     }
     mesh
 }
+
+/// Partition by the actual source planes before rotating into the window frame.
+/// A steep roof's remote slope can overlap this frame in projection, but belongs to
+/// another material layer and must participate in neither support checks nor carving.
+fn host_skins(mesh: &Mesh, fr: &FacadeFrame, top: dormer::Plane, bottom: dormer::Plane) -> (Mesh, Mesh) {
+    let (mut skins, mut rest) = (Mesh::default(), Mesh::default());
+    for tri in &mesh.triangles {
+        let points = tri.map(|i| mesh.positions.get(i as usize).copied().unwrap_or_default());
+        let local = points.map(|p| dormer::local(fr, p));
+        let on = |plane: dormer::Plane| local.iter().all(|p| (p[2] - plane.z(p[0], p[1])).abs() <= 1e-6);
+        let target = if on(top) || on(bottom) { &mut skins } else { &mut rest };
+        let offset = target.positions.len() as u32;
+        target.positions.extend(points);
+        target.triangles.push([offset, offset + 1, offset + 2]);
+    }
+    (skins, rest)
+}
+
 pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, dormers: &[BuiltDormer]) -> Result<Vec<BuiltRooflight>> {
     use super::dormer::{Plane, plane};
     use super::roof_opening as cut;
@@ -91,9 +109,9 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, dormers: &[B
         let normal = [-top.0[1] * up[0], -top.0[1] * up[1], 1. / scale];
         let origin = fr.point(spec.u_mm - spec.width_mm / 2., spec.run_mm, top.z(spec.u_mm - spec.width_mm / 2., spec.run_mm));
         let frame = RooflightFrame { origin, x: [fr.t[0], fr.t[1], 0.], up, normal };
-        let host = frame.mesh(&original, false);
         let outer = cut::rect(-spec.flashing_mm, spec.width_mm + spec.flashing_mm, -spec.flashing_mm, spec.height_mm + spec.flashing_mm);
-        let bottom = plane(&host, &identity, [spec.width_mm / 2., spec.height_mm / 2.], false).map_err(|e| {
+        let centre = [spec.u_mm, spec.run_mm + spec.height_mm / (2. * scale)];
+        let bottom = plane(&original, &fr, centre, false).map_err(|e| {
             ModelError::Invalid(format!(
                 "rooflight {} on {} at u={:.6} mm, run={:.6} mm: missing underside at slope-plane centre ({:.6}, {:.6}) mm; {e}",
                 spec.id,
@@ -104,7 +122,9 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, dormers: &[B
                 spec.height_mm / 2.
             ))
         })?;
-        let thickness = -bottom.z(spec.width_mm / 2., spec.height_mm / 2.);
+        let thickness = (top.z(centre[0], centre[1]) - bottom.z(centre[0], centre[1])) / scale;
+        let (skins, _) = host_skins(&original, &fr, top, bottom);
+        let host = frame.mesh(&skins, false);
         checked_host(&spec.id, thickness, cut::limits(&host, &identity, &outer, true)?, cut::limits(&host, &identity, &outer, false)?)?;
         let footprint: Vec<_> = outer
             .iter()
@@ -163,8 +183,13 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, dormers: &[B
         let id = format!("{}.rooflight.{}", b.id, spec.id);
         let opening_id = format!("{id}.opening");
         let aperture = cut::rect(0., ty.width, 0., ty.height);
-        let local_cover = frame.mesh(cover, false);
-        *cover = frame.mesh(&cut::cut(&local_cover, &host, &identity, &aperture)?, true);
+        let (skins, untouched) = host_skins(cover, &fr, top, bottom);
+        let local_cover = frame.mesh(&skins, false);
+        let mut opened = frame.mesh(&cut::cut(&local_cover, &host, &identity, &aperture)?, true);
+        opened.append(&untouched);
+        // Carving can subdivide shared source edges outside the aperture. Reconcile
+        // against the untouched shell too, without adding material or reversing faces.
+        *cover = cut::conform_shared_edges(&opened);
         let opening = frame.mesh(&cut::prism(&identity, &aperture, Plane([0., 0., -thickness]), Plane([0., 0., finish + 2.]))?, true);
         let fill = BuiltElement {
             id: id.clone(),
@@ -201,6 +226,77 @@ fn checked_host(id: &str, thickness: f64, top: (f64, f64), bottom: (f64, f64)) -
 mod tests {
     use super::*;
     use crate::build::dormer::tests::closed;
+
+    fn normal_hits(mesh: &Mesh, frame: &RooflightFrame, q: [f64; 2]) -> Vec<f64> {
+        let mut hits = Vec::new();
+        for tri in &mesh.triangles {
+            let [a, b, c] = tri.map(|i| frame.local(mesh.positions[i as usize]));
+            let det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            if det.abs() < 1e-8 {
+                continue;
+            }
+            let s = ((q[0] - a[0]) * (c[1] - a[1]) - (q[1] - a[1]) * (c[0] - a[0])) / det;
+            let t = ((b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0])) / det;
+            if s >= -1e-9 && t >= -1e-9 && s + t <= 1. + 1e-9 {
+                hits.push(a[2] + s * (b[2] - a[2]) + t * (c[2] - a[2]));
+            }
+        }
+        hits.sort_by(f64::total_cmp);
+        hits.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+        hits
+    }
+
+    #[test]
+    fn rooflight_host_layer_excludes_the_remote_slope_on_steep_roofs() {
+        for pitch in [60., 75., 30., 46.] {
+            for rotation in [0.0_f64, 37.25, -118.] {
+                for facade in ["b.f1", "b.f3"] {
+                    let (sin, cos) = rotation.to_radians().sin_cos();
+                    let outline = [[0., 0.], [24000., 0.], [24000., 12000.], [0., 12000.]]
+                        .map(|[x, y]| [150000. + x * cos - y * sin, -270000. + x * sin + y * cos]);
+                    let mut b = Building::new("b", "Public steep rooflight", &outline, 3, 3400.).unwrap();
+                    b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched", "pitch_deg":pitch,
+                        "thickness_mm":220, "gables":["b.f2","b.f4"], "straighten_mm":0}))
+                    .unwrap();
+                    let mut doc = Document::default();
+                    doc.buildings.push(b);
+                    let original = crate::build(&doc).unwrap();
+                    doc.buildings[0].roof.rooflights_mut().unwrap().push(
+                        serde_json::from_value(serde_json::json!({
+                        "id":"light", "facade":facade, "u_mm":10000, "run_mm":3000,
+                        "window_type":"window.casement.2", "width_mm":800, "height_mm":1000,
+                        "stand_off_mm":100, "flashing_mm":100}))
+                        .unwrap(),
+                    );
+                    let built = crate::build(&doc).unwrap_or_else(|error| panic!("pitch={pitch}, rotation={rotation}, facade={facade}: {error}"));
+                    let roof = built[0].roof.as_ref().unwrap();
+                    closed(&roof.cover);
+                    let light = &roof.rooflights[0];
+                    closed(&light.opening);
+                    closed(&light.flashing);
+                    let before = &original[0].roof.as_ref().unwrap().cover;
+                    for q in [[2., 2.], [400., 500.], [798., 998.]] {
+                        let old = normal_hits(before, &light.frame, q);
+                        let new = normal_hits(&roof.cover, &light.frame, q);
+                        let selected = |v: f64| (-221. ..=1.).contains(&v);
+                        assert_eq!(old.iter().filter(|&&z| selected(z)).count(), 2);
+                        assert!(new.iter().all(|&z| !selected(z)), "selected roof skins must have a real through-void");
+                        let remote: Vec<_> = old.into_iter().filter(|&z| !selected(z)).collect();
+                        assert_eq!(remote.len(), new.len(), "the opposite roof slope must not acquire a ghost opening");
+                        for (a, b) in remote.into_iter().zip(new) {
+                            assert!((a - b).abs() < 1e-5, "remote skin changed from {a} to {b}");
+                        }
+                    }
+                    let adjacent = normal_hits(&roof.cover, &light.frame, [-60., 500.]);
+                    assert!(adjacent.iter().any(|z| z.abs() < 1e-5));
+                    assert!(adjacent.iter().any(|z| (z + 220.).abs() < 1e-5));
+                    for (_, glass) in light.fill.parts.iter().filter(|(m, _)| *m == Material::Glass) {
+                        assert!(glass.positions.iter().all(|&p| light.frame.local(p)[2] > 20.));
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn invalid_hip_outside_thin_and_hostless_rooflights_are_rejected_with_feedback() {
         let mut b = Building::new("b", "Invalid host checks", &[[0., 0.], [24000., 0.], [24000., 12000.], [0., 12000.]], 3, 3400.).unwrap();
