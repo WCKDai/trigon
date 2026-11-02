@@ -4,6 +4,7 @@
 //! intersection of the adjoining roof planes, preserving their pitch on oblique gables too.
 
 pub mod drainage;
+mod halfhip;
 pub mod opening;
 pub use opening::Rooflight;
 
@@ -89,6 +90,15 @@ impl Dormer {
     }
 }
 
+/// An end cap at an existing source gable. The drop is below the original underside
+/// gable tip at the wall line; the main eaves and remaining ridge stay fixed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HalfHip {
+    pub facade: String,
+    pub drop_mm: f64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Roof {
@@ -133,6 +143,46 @@ pub enum Roof {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         rooflights: Vec<Rooflight>,
     },
+    /// A single-pitch gable roof with one or two explicit clipped end caps.
+    /// This distinct source kind makes unsupported older readers refuse the file.
+    HalfHipped {
+        /// Explicit clipped ends; the existing pitch also defines each end cap.
+        half_hips: Vec<HalfHip>,
+        pitch_deg: f64,
+        #[serde(default)]
+        gables: Vec<String>,
+        /// Steps in the facades up to this deep (mm) don't get their own roof faces: the eave runs
+        /// straight along the outer corners (a stepped street facade under one roof plane).
+        #[serde(default = "default_steps")]
+        straighten_mm: f64,
+        /// Optional ordered source facade lines. Adjacent lines determine each eave corner;
+        /// overrides straightening without changing the footprint. None retains legacy bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eave_facades: Option<Vec<String>>,
+        /// How far the roof runs past the walls at the eaves, mm (0: it stops at the wall line).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        overhang_mm: f64,
+        /// How far it runs past the gable walls (the verge), mm.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        verge_mm: f64,
+        /// The roof's build-up (rafters, battens, tiles) measured square to the roof, mm (0: a
+        /// surface with no thickness). It rests on the walls: its underside meets the outer wall
+        /// line at the eaves height.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        thickness_mm: f64,
+        /// Gutters along the eaves.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        gutters: bool,
+        /// Optional detailed channels and explicit downpipes. Missing keeps legacy geometry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drainage: Option<drainage::Drainage>,
+        /// Shed dormers; explicit multi_plane intent can follow adjoining pitched hip planes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dormers: Vec<Dormer>,
+        /// Optional inclined roof windows; omission/empty preserves legacy source and geometry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rooflights: Vec<Rooflight>,
+    },
     /// Two continuous roof pitches with a shared hip/ridge skeleton and a real slope break.
     Mansard {
         #[serde(flatten)]
@@ -141,24 +191,96 @@ pub enum Roof {
 }
 
 impl Roof {
+    /// Explicit clipped-gable sources, empty for other roof kinds.
+    pub fn half_hips(&self) -> &[HalfHip] {
+        match self {
+            Self::HalfHipped { half_hips, .. } => half_hips,
+            _ => &[],
+        }
+    }
+    /// Change only the single-pitch end-cap intent, preserving all other source parameters.
+    /// An empty list restores the pitched kind. Building-specific host checks run in build().
+    pub fn with_half_hips(self, half_hips: Vec<HalfHip>) -> Result<Self> {
+        match self {
+            Self::Pitched {
+                pitch_deg,
+                gables,
+                straighten_mm,
+                eave_facades,
+                overhang_mm,
+                verge_mm,
+                thickness_mm,
+                gutters,
+                drainage,
+                dormers,
+                rooflights,
+            }
+            | Self::HalfHipped {
+                pitch_deg,
+                gables,
+                straighten_mm,
+                eave_facades,
+                overhang_mm,
+                verge_mm,
+                thickness_mm,
+                gutters,
+                drainage,
+                dormers,
+                rooflights,
+                ..
+            } => {
+                if half_hips.is_empty() {
+                    Ok(Self::Pitched {
+                        pitch_deg,
+                        gables,
+                        straighten_mm,
+                        eave_facades,
+                        overhang_mm,
+                        verge_mm,
+                        thickness_mm,
+                        gutters,
+                        drainage,
+                        dormers,
+                        rooflights,
+                    })
+                } else {
+                    Ok(Self::HalfHipped {
+                        pitch_deg,
+                        gables,
+                        straighten_mm,
+                        eave_facades,
+                        overhang_mm,
+                        verge_mm,
+                        thickness_mm,
+                        gutters,
+                        drainage,
+                        dormers,
+                        rooflights,
+                        half_hips,
+                    })
+                }
+            }
+            _ => Err(ModelError::Invalid("clipped gables require an existing single-pitch roof".into())),
+        }
+    }
     pub fn rooflights(&self) -> &[Rooflight] {
         match self {
             Self::Flat => &[],
-            Self::Pitched { rooflights, .. } => rooflights,
+            Self::Pitched { rooflights, .. } | Self::HalfHipped { rooflights, .. } => rooflights,
             Self::Mansard { parameters } => &parameters.rooflights,
         }
     }
     pub fn rooflights_mut(&mut self) -> Option<&mut Vec<Rooflight>> {
         match self {
             Self::Flat => None,
-            Self::Pitched { rooflights, .. } => Some(rooflights),
+            Self::Pitched { rooflights, .. } | Self::HalfHipped { rooflights, .. } => Some(rooflights),
             Self::Mansard { parameters } => Some(&mut parameters.rooflights),
         }
     }
     pub fn dormers(&self) -> &[Dormer] {
         match self {
             Self::Flat => &[],
-            Self::Pitched { dormers, .. } => dormers,
+            Self::Pitched { dormers, .. } | Self::HalfHipped { dormers, .. } => dormers,
             Self::Mansard { parameters } => &parameters.dormers,
         }
     }
@@ -166,7 +288,7 @@ impl Roof {
     pub fn dormers_mut(&mut self) -> Option<&mut Vec<Dormer>> {
         match self {
             Self::Flat => None,
-            Self::Pitched { dormers, .. } => Some(dormers),
+            Self::Pitched { dormers, .. } | Self::HalfHipped { dormers, .. } => Some(dormers),
             Self::Mansard { parameters } => Some(&mut parameters.dormers),
         }
     }
@@ -511,7 +633,19 @@ pub fn pitched(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edges: &[
 /// overhang (eaves) and verge (gables), given a thickness with fascia, soffit and verge boards,
 /// and gutters along the eaves. The gable triangles stay in the gable walls.
 pub fn pitched_with(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edges: &[usize], b: &Buildup) -> Result<PitchedRoof> {
-    let base = pitched(outline, eaves, pitch_deg, gable_edges)?;
+    pitched_with_caps(outline, eaves, pitch_deg, gable_edges, b, &[])
+}
+
+pub(crate) fn pitched_with_caps(
+    outline: &[[f64; 2]],
+    eaves: f64,
+    pitch_deg: f64,
+    gable_edges: &[usize],
+    b: &Buildup,
+    caps: &[(usize, f64)],
+) -> Result<PitchedRoof> {
+    let mut base = pitched(outline, eaves, pitch_deg, gable_edges)?;
+    let planes = halfhip::planes(outline, eaves, pitch_deg, gable_edges, b, caps, &base)?;
     let overhang = crate::checked("roof overhang", b.overhang, 0.0, 2000.0)?;
     let verge = crate::checked("roof verge", b.verge, 0.0, 1500.0)?;
     let thickness = crate::checked("roof thickness", b.thickness, 0.0, 1000.0)?;
@@ -527,7 +661,17 @@ pub fn pitched_with(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edge
         return Err(ModelError::Invalid("the roof outline could not be carried out past the walls".into()));
     }
     let low = eaves - overhang * rise;
-    let under = pitched(&out, low, pitch_deg, gable_edges)?;
+    let mut under = pitched(&out, low, pitch_deg, gable_edges)?;
+    for plane in &planes {
+        if out.iter().any(|p| plane.height([p[0], p[1], low]) < low - 1e-6) {
+            return Err(ModelError::Invalid("half-hip cap would lower an extended side-eave corner".into()));
+        }
+        under.cover = halfhip::lower(&under.cover, *plane)?;
+        base.gables = halfhip::clip_gables(&base.gables, *plane)?;
+    }
+    if !planes.is_empty() {
+        halfhip::remaining_ridge(&under.cover, &out, low, pitch_deg, gable_edges)?;
+    }
     let lift = thickness / pitch_deg.to_radians().cos();
     let mut cover = Mesh::default();
     if thickness > 0.0 {
@@ -559,6 +703,9 @@ pub fn pitched_with(outline: &[[f64; 2]], eaves: f64, pitch_deg: f64, gable_edge
             let (lo, hi) = (ring(low - d / 2.0), ring(low + d / 2.0));
             gutters.hexahedron(lo, hi);
         }
+    }
+    if !planes.is_empty() {
+        halfhip::closed(&cover)?;
     }
     let ridge = cover.positions.iter().map(|p| p[2]).fold(eaves, f64::max);
     Ok(PitchedRoof { cover, gutters, gables: base.gables, ridge, max_depth: base.max_depth })
@@ -614,6 +761,69 @@ mod tests {
     use super::*;
 
     const WING: [[f64; 2]; 4] = [[0.0, 0.0], [30000.0, 0.0], [30000.0, 12000.0], [0.0, 12000.0]];
+
+    #[test]
+    fn half_hip_retains_the_original_sloping_ridge_on_a_tapered_wing() {
+        let outline = [[0., 0.], [30000., 0.], [32000., 12010.], [-600., 12000.]];
+        let caps = [(3, 1200.)];
+        let result =
+            pitched_with_caps(&outline, 9000., 45., &[1, 3], &Buildup { overhang: 180., verge: 135., thickness: 200., gutters: false }, &caps)
+                .unwrap();
+        assert!(!result.cover.is_empty());
+        let before = pitched_with(&outline, 9000., 45., &[1, 3], &Buildup { overhang: 180., verge: 135., thickness: 200., gutters: false }).unwrap();
+        assert!(result.ridge <= before.ridge + 1e-6);
+        assert!(result.ridge > 14900.);
+    }
+
+    #[test]
+    fn half_hipped_source_clips_the_gable_and_preserves_eaves_and_ridge() {
+        for rotation in [0.0_f64, 31.0, -118.0] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let outline = WING.map(|[x, y]| [142000. + x * cos - y * sin, -270000. + x * sin + y * cos]);
+            let mut doc = crate::Document::default();
+            let mut building = crate::Building::new("b", "Public clipped gable", &outline, 3, 3000.).unwrap();
+            let mut source = serde_json::json!({"kind":"pitched","pitch_deg":45.,"gables":["b.f2","b.f4"],"straighten_mm":0.,"overhang_mm":180.,"verge_mm":135.,"thickness_mm":200.,"gutters":true});
+            building.roof = serde_json::from_value(source.clone()).unwrap();
+            doc.buildings.push(building);
+            let baseline = crate::build(&doc).unwrap();
+            source["kind"] = serde_json::json!("half_hipped");
+            source["half_hips"] = serde_json::json!([{"facade":"b.f4","drop_mm":1200.}]);
+            doc.buildings[0].roof = serde_json::from_value(source).unwrap();
+            let built = crate::build(&doc).unwrap();
+            assert_eq!(built[0].walls, baseline[0].walls);
+            let (roof, original) = (built[0].roof.as_ref().unwrap(), baseline[0].roof.as_ref().unwrap());
+            assert_eq!(roof.eaves, original.eaves);
+            assert!((roof.ridge - original.ridge).abs() < 1e-6);
+            assert!(!roof.compound, "a clipped gable is not a mansard");
+            assert_eq!(roof.gutters, original.gutters);
+            let frame = crate::build::FacadeFrame::new(outline[3], outline[0]).unwrap();
+            let gable_peak = roof
+                .gables
+                .positions
+                .iter()
+                .filter(|p| ((p[0] - frame.origin[0]) * frame.n[0] + (p[1] - frame.origin[1]) * frame.n[1]).abs() < 1e-5)
+                .map(|p| p[2])
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!((gable_peak - 13800.).abs() < 1e-5, "{gable_peak}");
+            let mut edges = std::collections::BTreeMap::<_, (u32, i32)>::new();
+            for t in &roof.cover.triangles {
+                let keys = t.map(|i| roof.cover.positions[i as usize].map(|v| (v * 1e6).round() as i64));
+                for k in 0..3 {
+                    let (a, b) = (keys[k], keys[(k + 1) % 3]);
+                    let e = edges.entry((a.min(b), a.max(b))).or_default();
+                    e.0 += 1;
+                    e.1 += if a < b { 1 } else { -1 };
+                }
+            }
+            assert!(
+                edges.values().all(|v| *v == (2, 0)),
+                "half-hip shell has open, doubled or inward seams: {:?}",
+                edges.iter().find(|(_, v)| **v != (2, 0))
+            );
+            let roundtrip: crate::Document = serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert_eq!(doc, roundtrip);
+        }
+    }
 
     #[test]
     fn hipped_roof_on_a_wing() {

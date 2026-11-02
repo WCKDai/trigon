@@ -341,7 +341,7 @@ pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
 pub(super) fn source_roof_thickness(doc: &Document, b: &Built) -> Option<f64> {
     let source = doc.buildings.iter().find(|source| source.id == b.building_id)?;
     let thickness = match &source.roof {
-        trigon_model::Roof::Pitched { thickness_mm, .. } => *thickness_mm,
+        trigon_model::Roof::Pitched { thickness_mm, .. } | trigon_model::Roof::HalfHipped { thickness_mm, .. } => *thickness_mm,
         trigon_model::Roof::Mansard { parameters } => parameters.thickness_mm,
         trigon_model::Roof::Flat => return None,
     };
@@ -353,8 +353,12 @@ pub(super) fn source_roof_thickness(doc: &Document, b: &Built) -> Option<f64> {
 /// Solid certification is separate: the writer reports an unsupported actual shell as
 /// unverified and omits its quantities, rather than manufacturing replacement material.
 pub(super) fn opening_shell(doc: &Document, b: &Built) -> bool {
-    b.roof.as_ref().is_some_and(|r| !r.rooflights.is_empty() || (!r.dormers.is_empty() && source_roof_thickness(doc, b).is_some()))
-        || doc.buildings.iter().find(|source| source.id == b.building_id).is_some_and(|source| source.roof.dormers().iter().any(|d| d.multi_plane))
+    // Clipped gable roofs also need their actual mitred shell when they have no openings.
+    b.roof.as_ref().is_some_and(|r| {
+        !r.rooflights.is_empty()
+            || (!r.dormers.is_empty() && source_roof_thickness(doc, b).is_some())
+            || doc.buildings.iter().any(|source| source.id == b.building_id && !source.roof.half_hips().is_empty())
+    }) || doc.buildings.iter().find(|source| source.id == b.building_id).is_some_and(|source| source.roof.dormers().iter().any(|d| d.multi_plane))
 }
 
 /// A roof plane's frame: z up its normal, x level along the plane.

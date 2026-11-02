@@ -646,7 +646,8 @@ static COMMANDS: &[CommandSpec] = &[
                   the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
                   gable (wing ends, walls against neighbours). A pitched roof can carry on past the walls (`overhang_mm` at the \
                   eaves, `verge_mm` at the gables), have a build-up (`thickness_mm`, with fascia, soffit and verge boards) and \
-                  `gutters`. `source` records where the values came from.",
+                  `gutters`. Kind half_hipped adds explicit half_hips source-gable caps on a convex four-edge wing. \
+                  `source` records where the values came from.",
         mutates: true,
         journaled: true,
         schema: schema::<SetRoof>,
@@ -2188,12 +2189,14 @@ struct AddBasement {
     attribution: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SetRoof {
+pub(crate) struct SetRoof {
     building: Option<String>,
-    /// flat, pitched or mansard.
+    /// flat, pitched, half_hipped or mansard.
     kind: String,
+    /// Explicit clipped gable ends; requires kind half_hipped and one or two existing gables.
+    half_hips: Option<Vec<trigon_model::roof::HalfHip>>,
     /// Roof pitch in degrees.
     pitch_deg: Option<f64>,
     /// Mansard lower slope (default 68°).
@@ -2593,7 +2596,13 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 }
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
-fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+pub(crate) fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+    if p.half_hips.is_some() && p.kind != "half_hipped" {
+        return Err(ModelError::Invalid("half_hips requires kind half_hipped".into()).into());
+    }
+    if p.kind == "half_hipped" && p.half_hips.as_ref().is_none_or(Vec::is_empty) {
+        return Err(ModelError::Invalid("half_hipped requires explicit half_hips source gables and drops".into()).into());
+    }
     if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.covering.is_some()) {
         return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg, break_run_mm and covering require kind mansard".into()).into());
     }
@@ -2603,7 +2612,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
     let b = s.doc.building_mut(p.building.as_deref())?;
     let roof = match p.kind.as_str() {
         "flat" => trigon_model::Roof::Flat,
-        "pitched" => {
+        "pitched" | "half_hipped" => {
             let gables = p.gables.unwrap_or_default();
             for g in &gables {
                 b.facade(g)?;
@@ -2622,7 +2631,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
                 }
             };
-            trigon_model::Roof::Pitched {
+            let roof = trigon_model::Roof::Pitched {
                 pitch_deg: pitch,
                 gables,
                 straighten_mm: p.straighten_mm.unwrap_or(1200.0),
@@ -2634,7 +2643,8 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 drainage: p.drainage,
                 dormers: p.dormers.unwrap_or_default(),
                 rooflights: p.rooflights.unwrap_or_default(),
-            }
+            };
+            if p.kind == "half_hipped" { roof.with_half_hips(p.half_hips.unwrap_or_default())? } else { roof }
         }
         "mansard" => {
             if p.drainage.is_some() {
@@ -2662,7 +2672,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 },
             }
         }
-        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat, pitched or mansard")).into()),
+        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat, pitched, half_hipped or mansard")).into()),
     };
     b.roof = roof;
     if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {

@@ -315,7 +315,10 @@ impl Ifc<'_> {
             catalog::pitched_roof((thickness * 10.0).round() / 10.0)
         };
         let placed = self.w.place(Some(fl.at(top)), fl.at(top).frame);
-        let kind = if r.compound {
+        let half_hipped = self.doc.buildings.iter().any(|source| source.id == b.building_id && !source.roof.half_hips().is_empty());
+        let kind = if half_hipped {
+            ".HIPPED_GABLE_ROOF."
+        } else if r.compound {
             ".MANSARD_ROOF."
         } else if r.gables.is_empty() {
             ".HIP_ROOF."
@@ -348,7 +351,9 @@ impl Ifc<'_> {
             placed.id,
             string(&r.id)
         ));
-        let reference = if r.compound {
+        let reference = if half_hipped {
+            "Original half-hipped shell - illustrative build-up"
+        } else if r.compound {
             "Original mansard shell - illustrative build-up; covering is separate"
         } else if exact_openings {
             "Original pitched shell with exact parametric roof openings - illustrative build-up"

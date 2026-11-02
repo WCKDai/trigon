@@ -803,8 +803,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 if !(z1 - z0 >= 10.0) || above(z0) {
                     continue;
                 }
-                let bearing_cap =
-                    (z1 - h).abs() < 1e-6 && matches!(&b.roof, crate::Roof::Pitched { drainage: Some(_), gables, .. } if !gables.contains(&f.id));
+                let bearing_cap = (z1 - h).abs() < 1e-6
+                    && matches!(&b.roof, crate::Roof::Pitched { drainage: Some(_), gables, .. } | crate::Roof::HalfHipped { drainage: Some(_), gables, .. } if !gables.contains(&f.id));
                 let mut piece = facing_piece(
                     &fr,
                     f,
@@ -934,6 +934,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             None
         }
         crate::roof::Roof::Pitched { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. }
+        | crate::roof::Roof::HalfHipped { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. }
         | crate::roof::Roof::Mansard {
             parameters: crate::roof::Mansard { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. },
         } => {
@@ -952,7 +953,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 });
             }
             let selected = match &b.roof {
-                crate::Roof::Pitched { eave_facades, .. } => eave_facades.as_deref(),
+                crate::Roof::Pitched { eave_facades, .. } | crate::Roof::HalfHipped { eave_facades, .. } => eave_facades.as_deref(),
                 _ => None,
             };
             let (kept, outline) = if let Some(ids) = selected {
@@ -985,11 +986,27 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
             let buildup = crate::roof::Buildup { overhang: *overhang_mm, verge: *verge_mm, thickness: *thickness_mm, gutters: *gutters };
             let (mut r, pitch_deg, compound) = match &b.roof {
                 crate::Roof::Pitched { pitch_deg, .. } => (crate::roof::pitched_with(&outline, h, *pitch_deg, &edges, &buildup)?, *pitch_deg, false),
+                crate::Roof::HalfHipped { pitch_deg, half_hips, .. } => {
+                    if half_hips.is_empty() || half_hips.len() > 2 {
+                        return Err(ModelError::Invalid("half-hipped roof requires one or two explicit source gable caps".into()));
+                    }
+                    let caps = half_hips
+                        .iter()
+                        .map(|cap| {
+                            let index = gables
+                                .iter()
+                                .position(|id| id == &cap.facade)
+                                .ok_or_else(|| ModelError::Invalid(format!("half-hip {} is not an existing source gable", cap.facade)))?;
+                            Ok((edges[index], cap.drop_mm))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    (crate::roof::pitched_with_caps(&outline, h, *pitch_deg, &edges, &buildup, &caps)?, *pitch_deg, false)
+                }
                 crate::Roof::Mansard { parameters } => (crate::roof::mansard(&outline, h, &edges, parameters)?, parameters.lower_pitch_deg, true),
                 crate::Roof::Flat => return Err(ModelError::Invalid("a sloping roof configuration is required".into())),
             };
             let mut drain_parts = Vec::new();
-            if let crate::Roof::Pitched { drainage: Some(d), .. } = &b.roof {
+            if let crate::Roof::Pitched { drainage: Some(d), .. } | crate::Roof::HalfHipped { drainage: Some(d), .. } = &b.roof {
                 if !gutters {
                     return Err(ModelError::Invalid("detailed drainage requires gutters".into()));
                 }
@@ -1104,13 +1121,15 @@ const PLINTH_FOOT: f64 = 300.0;
 /// Its declared height remains the height at the wall; projection consumes height at tan(pitch).
 /// Moving only the upper face preserves a closed solid and all opening edges/material ownership.
 fn seat_cornice(piece: &mut Mesh, b: &Building, f: &Facade, fr: &FacadeFrame, top: f64) -> Result<()> {
-    let crate::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, drainage: Some(_), .. } = &b.roof else {
+    let (crate::Roof::Pitched { pitch_deg, gables, straighten_mm, overhang_mm, drainage: Some(_), .. }
+    | crate::Roof::HalfHipped { pitch_deg, gables, straighten_mm, overhang_mm, drainage: Some(_), .. }) = &b.roof
+    else {
         return Ok(());
     };
     if (top - b.height()).abs() > 1e-6 || gables.contains(&f.id) {
         return Ok(());
     }
-    if let crate::Roof::Pitched { eave_facades: Some(ids), .. } = &b.roof {
+    if let crate::Roof::Pitched { eave_facades: Some(ids), .. } | crate::Roof::HalfHipped { eave_facades: Some(ids), .. } = &b.roof {
         let (owners, _) = crate::roof::selected_eave_outline(b, ids)?;
         if !owners.contains(&f.edge) {
             return Err(ModelError::Invalid(format!(

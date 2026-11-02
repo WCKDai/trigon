@@ -675,9 +675,10 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
         match building.roof {
             trigon_model::Roof::Flat => "flat",
             trigon_model::Roof::Pitched { .. } => "pitched",
+            trigon_model::Roof::HalfHipped { .. } => "half_hipped",
             trigon_model::Roof::Mansard { .. } => "mansard",
         },
-        json!(["flat", "pitched", "mansard"]),
+        json!(["flat", "pitched", "half_hipped", "mansard"]),
     )];
     match &building.roof {
         trigon_model::roof::Roof::Flat => {
@@ -695,6 +696,20 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
             drainage,
             dormers,
             rooflights,
+        }
+        | trigon_model::Roof::HalfHipped {
+            pitch_deg,
+            gables,
+            straighten_mm,
+            eave_facades,
+            overhang_mm,
+            verge_mm,
+            thickness_mm,
+            gutters,
+            drainage,
+            dormers,
+            rooflights,
+            ..
         } => {
             properties.extend([
                 number("pitch_deg", "Roof pitch", *pitch_deg, "deg", 5.0, 75.0),
@@ -708,6 +723,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("drainage", "Optional drainage detail / explicit downpipes", json!(drainage), true),
                 field("dormers", "Parametric roof dormers", json!(dormers), true),
                 field("rooflights", "Parametric inclined roof windows", json!(rooflights), true),
+                field("half_hips", "Explicit clipped gable caps (drop below original underside tip)", json!(building.roof.half_hips()), true),
             ]);
         }
         trigon_model::Roof::Mansard { parameters: p } => {
@@ -1216,6 +1232,9 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             if let Some(kind) = properties.get("roof_kind") {
                 match kind.as_str() {
                     Some("flat") => b.roof = trigon_model::roof::Roof::Flat,
+                    Some("pitched") if matches!(b.roof, trigon_model::Roof::HalfHipped { .. }) => {
+                        b.roof = b.roof.clone().with_half_hips(Vec::new())?;
+                    }
                     Some("pitched") if !matches!(b.roof, trigon_model::roof::Roof::Pitched { .. }) => {
                         b.roof = trigon_model::roof::Roof::Pitched {
                             pitch_deg: 35.0,
@@ -1232,6 +1251,16 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         }
                     }
                     Some("pitched") => {}
+                    Some("half_hipped") if !matches!(b.roof, trigon_model::Roof::HalfHipped { .. }) => {
+                        let caps: Vec<trigon_model::roof::HalfHip> =
+                            serde_json::from_value(properties.get("half_hips").cloned().unwrap_or(Value::Null))
+                                .map_err(|_| invalid("half_hipped requires explicit half_hips source gables and drops"))?;
+                        if caps.is_empty() {
+                            return Err(invalid("half_hipped requires one or two explicit clipped gable caps"));
+                        }
+                        b.roof = b.roof.clone().with_half_hips(caps)?;
+                    }
+                    Some("half_hipped") => {}
                     Some("mansard") if !matches!(b.roof, trigon_model::Roof::Mansard { .. }) => {
                         b.roof = trigon_model::Roof::Mansard { parameters: trigon_model::roof::Mansard::default() };
                     }
@@ -1241,6 +1270,11 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             }
             for (key, value) in properties {
                 if key == "roof_kind" {
+                    continue;
+                }
+                if key == "half_hips" {
+                    let caps = serde_json::from_value(value.clone()).map_err(|_| invalid("half_hips requires typed source facade/drop records"))?;
+                    b.roof = b.roof.clone().with_half_hips(caps)?;
                     continue;
                 }
                 match &mut b.roof {
@@ -1263,6 +1297,20 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         drainage,
                         dormers,
                         rooflights,
+                    }
+                    | trigon_model::Roof::HalfHipped {
+                        pitch_deg,
+                        gables,
+                        straighten_mm,
+                        eave_facades,
+                        overhang_mm,
+                        verge_mm,
+                        thickness_mm,
+                        gutters,
+                        drainage,
+                        dormers,
+                        rooflights,
+                        ..
                     } => match key.as_str() {
                         "pitch_deg" => *pitch_deg = numeric(key, value)?,
                         "gables" => {

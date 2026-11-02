@@ -5,6 +5,29 @@ use trigon_model::{Document, Mesh};
 use super::*;
 use crate::ifc::{guid, part21, write};
 
+#[test]
+fn unopened_half_hip_exports_the_actual_shell_type_and_clipped_gable() {
+    let mut doc = Document::default();
+    let mut b =
+        trigon_model::Building::new("b", "Public clipped gable", &[[0., 0.], [30000., 0.], [30000., 12000.], [0., 12000.]], 3, 3000.).unwrap();
+    b.roof=serde_json::from_value(serde_json::json!({"kind":"half_hipped","pitch_deg":45,"gables":["b.f2","b.f4"],"half_hips":[{"facade":"b.f4","drop_mm":1200}],"thickness_mm":200,"overhang_mm":180,"verge_mm":135})).unwrap();
+    doc.buildings.push(b);
+    let built = trigon_model::build(&doc).unwrap();
+    assert!(split::opening_shell(&doc, &built[0]), "a bare clipped gable still requires its real solid");
+    let roof = built[0].roof.as_ref().unwrap();
+    assert!(roof_shell_quantities(&roof.cover, &Frame::plan([0.; 3], [1., 0.]).unwrap()).is_some());
+    let text = write(&doc, &built, "halfhip.ifc", "2026-01-01T00:00:00");
+    let occurrence = text.lines().find(|l| l.contains("=IFCROOF(")).unwrap();
+    assert!(occurrence.contains(".HIPPED_GABLE_ROOF."));
+    assert!(text.lines().any(|l| l.contains("=IFCROOFTYPE(") && l.contains(".HIPPED_GABLE_ROOF.")));
+    assert!(text.contains("Trigon_RoofQuantities"));
+    assert!(!text.lines().any(|l| l.contains("=IFCSLAB(") && l.contains("b.roof.face")));
+    let shapes = split::model_shapes(&doc, &built);
+    let (_, gable) = shapes.iter().find(|(id, _)| id == "b.f4.gable").unwrap();
+    assert!((gable.positions.iter().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max) - 13800.).abs() < 1e-6);
+    assert!(text.lines().any(|l| l.contains("=IFCWALL(") && l.contains("'b.f4.gable'")));
+}
+
 // Analytic, public fixtures: no surveyed geometry. The second triangle loses a corner to
 // clean_ring's 0.01 mm weld even though its cap is larger than 1 mm².
 fn fragment(long_thin: bool, built_up: bool) -> split::RoofPiece {

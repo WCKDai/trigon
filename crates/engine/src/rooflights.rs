@@ -53,6 +53,64 @@ mod tests {
     }
 
     #[test]
+    fn clipped_roof_properties_preserve_sources_and_exact_atomic_history() {
+        let mut s = session();
+        s.execute(
+            "building.set_roof",
+            json!({"kind":"pitched","pitch_deg":45,"gables":["b.f2","b.f4"],"thickness_mm":200,"overhang_mm":180,"verge_mm":135,"gutters":true}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let action = json!({"command":"element.set","params":{"id":"b.roof","properties":{"half_hips":[{"facade":"b.f4","drop_mm":1200}]}}});
+        let p = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":p["action"],"preview_token":p["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        assert_eq!(s.doc.buildings[0].roof.clone().with_half_hips(Vec::new()).unwrap(), before.buildings[0].roof);
+        assert_eq!(s.execute("element.get", json!({"id":"b.roof"})).unwrap()["kind"], "roof");
+        let accepted = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        for caps in [
+            json!([]),
+            json!([{"facade":"absent","drop_mm":1200}]),
+            json!([{"facade":"b.f4","drop_mm":0}]),
+            json!([{"facade":"b.f4","drop_mm":6000}]),
+        ] {
+            assert!(
+                s.execute(
+                    "building.set_roof",
+                    json!({"kind":"half_hipped","pitch_deg":45,"gables":["b.f2","b.f4"],"thickness_mm":200,"half_hips":caps})
+                )
+                .is_err()
+            );
+            assert_eq!(s.doc, before);
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        let roundtrip: trigon_model::Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(roundtrip, s.doc);
+        let mut replay = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        for entry in &s.doc.journal {
+            replay.execute(&entry.command, entry.params.clone()).unwrap();
+        }
+        assert_eq!(s.doc, replay.doc);
+        let mut params = serde_json::to_value(&s.doc.buildings[0].roof).unwrap();
+        params["building"] = json!("b");
+        params["source"] = json!("Public synthetic cap, nominal 1200 mm drop");
+        let action = json!({"command":"building.set_roof","params":params});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, accepted);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.len(), accepted.journal.len() + 1);
+        assert_eq!(s.doc.buildings[0].evidence.last().unwrap().source, "Public synthetic cap, nominal 1200 mm drop");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+    }
+
+    #[test]
     fn returned_rooflight_opening_id_resolves_to_its_editable_source() {
         let mut s = session();
         let added = s.execute("rooflight.add", json!({"rooflight":spec()})).unwrap();
