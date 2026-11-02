@@ -15,8 +15,10 @@ room definitions, so a name or polygon edit updates the name and calculated squa
 Text stays 2.5 mm high on paper. Actual bundled-font glyph bounds must fit the room clearance and
 visible crop, with 0.75 mm of paper clearance and no overlap with visible stair symbols. A long
 name falls back to area alone, and a crowded area tag is omitted. Blank names display only their
-area. The inscribed-clearance test remains conservative for irregular rooms. Explicit view ranges show tags only when the cut crosses that
-room's storey volume. Clicking a tag's room area picks its exact source room.
+area. The inscribed-clearance test remains conservative for irregular rooms. Tags follow room
+areas present in the generated plan; fitting a label cannot restore a room excluded by its actual
+range or crop. Ranged plans retain the shared horizontal planes described below. Clicking a
+tag's room area picks its exact source room.
 
 The default is `"hidden"`, omitted from serialized templates, preserving existing view output.
 The public Rust `DrawingTemplate` adds `room_labels` and the `RoomLabels` enum; exhaustive

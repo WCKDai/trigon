@@ -196,6 +196,10 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
         .collect();
     let mut candidates = Vec::new();
     let mut texts = Vec::new();
+    // Geometry already decides which room areas exist at the actual cut and crop.
+    // Tags must not restore an omitted room when buildings have unequal floor elevations.
+    let visible_rooms: std::collections::BTreeSet<_> =
+        sheet.scene.element_regions.iter().filter(|region| region.kind == crate::DrawingElementKind::Room).map(|region| region.id.as_str()).collect();
     for building in &doc.buildings {
         let Some(storey) = building.storeys.get(level) else { continue };
         // Another building's roof level must not suppress this building's full-storey tags.
@@ -204,17 +208,21 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
             continue;
         }
         for (index, room) in building.rooms.iter().enumerate().filter(|(_, room)| room.levels.contains(&level)) {
+            let id = crate::room_element_id(building, index, level);
+            if !visible_rooms.contains(id.as_str()) {
+                continue;
+            }
             let Some((at, clearance)) = crate::plan::room_label_anchor(&room.polygon) else { continue };
             let area = format!("{:.1} m²", trigon_model::doc::polygon_area(&room.polygon) / 1e6);
             texts.push(Text::new(Layer::Annotation, at, area, size));
             texts.push(Text::new(Layer::Annotation, at, &room.name, size));
-            candidates.push((building, storey, index, room, at, clearance));
+            candidates.push((id, room, at, clearance));
         }
     }
     // Shape once with the same bundled fonts, anchoring and physical size as export.
     let ink = crate::plan_output::text_ink_bounds(&texts)?;
     let mut count = 0;
-    for ((building, storey, index, room, at, clearance), [area_ink, name_ink]) in candidates.into_iter().zip(ink.as_chunks::<2>().0) {
+    for ((id, room, at, clearance), [area_ink, name_ink]) in candidates.into_iter().zip(ink.as_chunks::<2>().0) {
         let fits = |with_name: bool| {
             let Some(mut box_mm) = *area_ink else { return false };
             if with_name {
@@ -241,7 +249,6 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
         if !named && !fits(false) {
             continue;
         }
-        let id = crate::room_element_id(building, index, level);
         if named {
             let mut text = Text::new(Layer::Annotation, [at[0], at[1] + 1.75 * scale], &room.name, size);
             text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_name" });
@@ -250,16 +257,8 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
         let area_at = if named { [at[0], at[1] - 1.75 * scale] } else { at };
         let area = format!("{:.1} m²", trigon_model::doc::polygon_area(&room.polygon) / 1e6);
         let mut text = Text::new(Layer::Annotation, area_at, area, size);
-        text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_area" });
+        text.source = Some(crate::sheet::TextSource { kind: "element", id, role: "room_area" });
         sheet.scene.items.push(Item::Text(text));
-        if !sheet.scene.element_regions.iter().any(|region| region.id == id) {
-            sheet.scene.element_regions.push(crate::DrawingElementRegion {
-                id,
-                kind: crate::DrawingElementKind::Room,
-                rings: vec![room.polygon.clone()],
-                depth_plane: template.range.map(|range| [-storey.elevation - range.cut_mm, 0.0, 0.0]),
-            });
-        }
         count += 1;
     }
     sheet.metrics["room_labels"] = json!(template.room_labels);
@@ -610,6 +609,47 @@ mod room_label_tests {
         .unwrap();
         let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
         assert_eq!(sheet.metrics["room_tags_drawn"], 0);
+    }
+
+    #[test]
+    fn room_tags_cannot_reintroduce_rooms_excluded_by_an_unequal_floor_range() {
+        let mut s = session();
+        let mut high =
+            trigon_model::Building::new("high", "High floor", &[[15000., 0.], [27000., 0.], [27000., 8000.], [15000., 8000.]], 1, 3000.).unwrap();
+        high.set_levels(&[4000.], 7000.).unwrap();
+        high.rooms.push(trigon_model::Room {
+            id: "high-room".into(),
+            name: "High room".into(),
+            levels: vec![0],
+            polygon: vec![[16000., 1000.], [23000., 1000.], [23000., 5000.], [16000., 5000.]],
+        });
+        s.doc.buildings.push(high);
+        for mode in ["hidden", "area", "name_and_area"] {
+            s.execute(
+                "view.configure",
+                json!({"id":"plan","template":{"name":"Horizontal range","room_labels":mode,
+                "sizing":{"mode":"fixed","denominator":100,"centre":[13500,4000]},
+                "range":{"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300}}}),
+            )
+            .unwrap();
+            let before = s.doc.clone();
+            let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+            assert!(
+                !sheet
+                    .scene
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Item::Text(text) if text.source.as_ref().is_some_and(|source| source.id == "high-room.space.L0"))),
+                "a room 4000..7000 mm high cannot appear in the -300..3000 mm plan range, mode={mode}"
+            );
+            let preview = crate::drawing_view(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+            assert!(!preview.element_regions.iter().any(|room| room.id == "high-room.space.L0"));
+            assert!(preview.pick_element([19500., 3000.], 1.).is_none(), "label fitting cannot create an invisible room pick target");
+            if mode != "hidden" {
+                assert_eq!(sheet.metrics["room_tags_drawn"], 1);
+            }
+            assert_eq!(s.doc, before);
+        }
     }
 
     #[test]
