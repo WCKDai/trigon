@@ -17,8 +17,8 @@ python3 tools/benchmark-workflow.py --out out/bim-benchmark/workflow-profile
 The runner refuses an existing output directory. Each trial must pass real picking,
 exact edit/Undo and schedule restoration, and both IFC readers. Plan, facade,
 section, GLB and schedule hashes must match across trials. Failure stops a passing
-performance claim. Raw logs, verified exports, binary hash, revision, dirty-tree
-state, OS/architecture, median, nearest-rank p95, range and MAD stay with the results.
+performance claim. Raw logs, verified exports, binary hash, checkout context,
+OS/architecture, median, nearest-rank p95, range and MAD stay with the results.
 Record the CPU model, RAM, power mode and competing workloads separately before
 using these data for a comparison. Five trials give weak tail estimates.
 
@@ -30,6 +30,15 @@ separate acceptance conditions. Do not compare this full workflow with a cached
 redraw time or another product's unrelated benchmark.
 
 ## Equivalent user-run trials
+
+The default executable follows Cargo's platform naming, including `.exe` on Windows.
+Report schema `trigon-benchmark/2` separates `checkout_context` from the selected
+executable. `binary_path` and `binary_sha256` identify the actual program. Its source
+revision, dirty state and profile remain `null` with `binary_provenance: unverified`;
+the script cannot establish them from the checkout, filename or hash. Pair a result
+with independently recorded build commands and source evidence before attributing it
+to a revision/profile. Existing version-1 reports are retained as historical evidence;
+their revision/profile fields alone do not prove executable provenance.
 
 Use the same physical machine, public fixture and units. Freeze phase/filter,
 cut/depth range, physical scale, crop, detail, visible objects, fonts and output

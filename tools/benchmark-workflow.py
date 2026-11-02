@@ -16,11 +16,16 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def default_binary(system):
+    filename = "drawing-workflow.exe" if system == "Windows" else "drawing-workflow"
+    return Path("target/release/examples") / filename
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("out/bim-benchmark/workflow-profile"))
     parser.add_argument("--trials", type=int, default=5)
-    parser.add_argument("--binary", type=Path, default=Path("target/release/examples/drawing-workflow"))
+    parser.add_argument("--binary", type=Path, default=default_binary(platform.system()))
     args = parser.parse_args()
     if not 5 <= args.trials <= 100:
         parser.error("use between 5 and 100 measured trials")
@@ -34,11 +39,17 @@ def main():
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     tracked_dirty = bool(subprocess.check_output(["git", "diff", "HEAD", "--name-only"], cwd=root))
     report = {
+        "schema": "trigon-benchmark/2",
         "metric": "offline_complete_workflow_wall_ms",
         "scope": "Process launch, model, three views in SVG/PNG/PDF/DXF, exact edit/Undo, schedule, native/GLB/IFC export and two IFC readers",
         "not_measured": ["native UI input/GPU presentation", "peak RSS/VRAM", "competitor speed", "human correction time", "cold disk"],
-        "revision": revision, "tracked_dirty": tracked_dirty,
-        "binary_sha256": digest(binary), "profile": "release (caller-built)",
+        # Checkout metadata cannot attest to an independently selected executable.
+        # Keep the old source/profile keys explicitly unknown rather than inventing
+        # an association, including when --binary selects another build or program.
+        "revision": None, "tracked_dirty": None, "profile": None,
+        "checkout_context": {"revision": revision, "tracked_dirty": tracked_dirty},
+        "binary_path": str(binary), "binary_sha256": digest(binary),
+        "binary_provenance": {"status": "unverified", "reason": "Executable hash recorded; no verified build-to-source/profile association supplied."},
         "environment": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version()},
         "warmups": 1, "trials": [], "status": "RUNNING",
     }
