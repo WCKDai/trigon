@@ -124,6 +124,13 @@ comparison budgets reject excessive scopes. `total_findings` and `truncated` dis
 complete report from its capped output. `no_findings_in_scope` is not a survey, structural,
 accessibility or exhaustive clash certificate. Annotation collisions are a separate view check.
 
+`wall_end_in_door_opening` identifies an interior wall end whose entire cap lies inside a
+recorded door void at the 1000 mm plan cut. It supplies the wall, host and opening IDs,
+clearance to the nearest jamb, and read-only inspection commands. A cap touching a fixed
+jamb is excluded. Buildable geometry can still contain this source conflict; the finding
+requires review of the drawing and door placement before any repair. The audit does not
+close an opening, move a wall or certify a structural connection.
+
 `view.audit` shapes lettering with the bundled SVG fonts at the final physical scale. It returns
 rotated ink/halo corners, visible polygons, clipping, actual displayed text and unrounded
 measurement values. Saved annotations and generated room/balcony labels retain their exact

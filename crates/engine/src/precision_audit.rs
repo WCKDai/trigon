@@ -222,6 +222,47 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
                     }
                     for wall in &walls {
                         for (end, cap) in [("a", [wall.outline[0], wall.outline[3]]), ("b", [wall.outline[1], wall.outline[2]])] {
+                            for host in &walls {
+                                if host.id == wall.id {
+                                    continue;
+                                }
+                                let local = cap.map(|point| {
+                                    let delta = [point[0] - host.frame.origin[0], point[1] - host.frame.origin[1]];
+                                    [
+                                        delta[0] * host.frame.t[0] + delta[1] * host.frame.t[1],
+                                        -delta[0] * host.frame.n[0] - delta[1] * host.frame.n[1],
+                                    ]
+                                });
+                                let (low, high) = (local[0][0].min(local[1][0]), local[0][0].max(local[1][0]));
+                                if local[0][1].max(local[1][1]) < -p.gap_tolerance_mm
+                                    || local[0][1].min(local[1][1]) > host.thickness + p.gap_tolerance_mm
+                                {
+                                    continue;
+                                }
+                                let cut = model.storeys[level].elevation + 1000.;
+                                for door in &host.doors {
+                                    if door.rect.v0 > cut || door.rect.v1 < cut {
+                                        continue;
+                                    }
+                                    let span = if door.profile.is_empty() {
+                                        Some((door.rect.u0, door.rect.u1))
+                                    } else {
+                                        trigon_model::profile::width_at(&door.profile, cut)
+                                    };
+                                    let Some((u0, u1)) = span else { continue };
+                                    let clearance = (low - u0).min(u1 - high);
+                                    // A cap touching a fixed jamb still has material support.
+                                    // Report only ends wholly inside the recorded door void.
+                                    if clearance > 0.001 {
+                                        findings.push(json!({"kind":"wall_end_in_door_opening","building":source.id,"level":level,
+                                            "id":wall.id,"end":end,"host_id":host.id,"opening_id":door.fill.id,
+                                            "cap":cap,"opening_span_mm":[u0,u1],"jamb_clearance_mm":clearance,"review_required":true,
+                                            "inspect_commands":[{"command":"element.get","params":{"id":wall.id}},
+                                                {"command":"element.get","params":{"id":host.id}},
+                                                {"command":"element.get","params":{"id":door.fill.id}}]}));
+                                    }
+                                }
+                            }
                             let mut nearest: Option<(f64, &str, &str, [f64; 2], [f64; 2])> = None;
                             for (id, source_id, poly) in &solids {
                                 if id == &wall.id || poly.len() < 3 || trigon_model::doc::polygon_area(poly) < 1e-6 {
@@ -255,7 +296,7 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         "wall_instances_inspected":inspected,"gap_tolerance_mm":p.gap_tolerance_mm,"angle_tolerance_deg":p.angle_tolerance_deg,"expected_joint_angles_deg":p.expected_joint_angles_deg,"alignment_tolerance_mm":p.alignment_tolerance_mm,"joint_radius_mm":p.joint_radius_mm,"findings":findings,
         "total_findings":total,"finding_counts":counts,"truncated":total>p.max_results,
         "mutation_workflow":["precision.preview","precision.apply"],
-        "scope":"latest phase; 1000 mm plan cut; nearest material at each interior wall end; near-parallel wall overlaps and end-to-end run deviations; overlapping visible/departing stair openings",
+        "scope":"latest phase; 1000 mm plan cut; nearest material at each interior wall end and caps wholly inside recorded door voids; near-parallel wall overlaps and end-to-end run deviations; overlapping visible/departing stair openings",
         "limitations":["Intentional gaps and adjacent-storey stair overlaps need source review; findings are not automatic repairs.","No structural, accessibility, survey or complete clash certification."]}))
 }
 
@@ -372,6 +413,39 @@ fn segment_polygon(cap: [[f64; 2]; 2], poly: &[[f64; 2]]) -> (f64, [f64; 2], [f6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_ends_inside_door_voids_report_actionable_source_conflicts() {
+        for rotation in [0.0_f64, 37.25, -118.] {
+            for (x, host_level, with_door, expected) in [(5000., 0, true, 1), (5425., 0, true, 0), (5000., 1, true, 0), (5000., 0, false, 0)] {
+                let (sin, cos) = rotation.to_radians().sin_cos();
+                let transform = |[x, y]: [f64; 2]| [150000. + x * cos - y * sin, -270000. + x * sin + y * cos];
+                let outline = [[0., 0.], [12000., 0.], [12000., 10000.], [0., 10000.]].map(transform);
+                let mut b = trigon_model::Building::new("b", "Public door junction", &outline, 2, 3000.).unwrap();
+                b.interior_walls = serde_json::from_value(json!([
+                    {"id":"host","levels":[host_level],"a":transform([1000.,5000.]),"b":transform([9000.,5000.]),"thickness":240.,"doors":if with_door {json!([{"at":4000.,"width":900.,"height":2100.}])} else {json!([])}},
+                    {"id":"branch","levels":[0],"a":transform([x,5000.]),"b":transform([x,7500.]),"thickness":100.}
+                ])).unwrap();
+                let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+                s.doc.buildings.push(b);
+                let before = s.doc.clone();
+                let report = s.execute("precision.audit", json!({"building":"b","levels":[0]})).unwrap();
+                assert_eq!(report["geometry_valid"], true);
+                assert_eq!(s.doc, before);
+                let conflicts: Vec<_> = report["findings"].as_array().unwrap().iter().filter(|f| f["kind"] == "wall_end_in_door_opening").collect();
+                assert_eq!(conflicts.len(), expected, "rotation={rotation}, x={x}, host_level={host_level}, with_door={with_door}: {report}");
+                if let Some(conflict) = conflicts.first() {
+                    assert_eq!(conflict["id"], "branch.L0");
+                    assert_eq!(conflict["host_id"], "host.L0");
+                    assert!(conflict["jamb_clearance_mm"].as_f64().unwrap() > 399.);
+                    assert_eq!(conflict["review_required"], true);
+                    for inspect in conflict["inspect_commands"].as_array().unwrap() {
+                        s.execute(inspect["command"].as_str().unwrap(), inspect["params"].clone()).unwrap();
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn shared_collinear_wall_ends_do_not_report_generated_material_overlap() {
