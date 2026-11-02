@@ -43,6 +43,7 @@ enum Source {
     Slab(usize, usize, bool),
     Roof(usize),
     Dormer(usize, usize),
+    Rooflight(usize, usize),
     Building(usize),
 }
 
@@ -546,6 +547,39 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
         }
         if let Some(roof) = &model.roof {
             result.push(roof_record(building, bi, &roof.id, None)?);
+            for (ri, light) in roof.rooflights.iter().enumerate() {
+                let Some(spec) = building.roof.rooflights().get(ri) else { continue };
+                let properties = vec![
+                    field("source_id", "Stable source id", spec.id.clone(), false),
+                    field("host_roof", "Host roof", roof.id.clone(), false),
+                    field("facade", "Source facade", spec.facade.clone(), true),
+                    number("u_mm", "Centre along source facade", spec.u_mm, "mm", 0., 1e8),
+                    number("run_mm", "Horizontal inward run to lower frame edge", spec.run_mm, "mm", 0., 1e8),
+                    number("yaw_deg", "Rotation about +Z from source facade", spec.yaw_deg, "deg", -45., 45.),
+                    number("width_mm", "Frame width in roof plane", spec.width_mm, "mm", 300., 3000.),
+                    number("height_mm", "Frame height along roof slope", spec.height_mm, "mm", 400., 2400.),
+                    number("stand_off_mm", "Normal stand-off above finished roof", spec.stand_off_mm, "mm", 100., 300.),
+                    number("flashing_mm", "Flashing width", spec.flashing_mm, "mm", 40., 300.),
+                    field("window_type", "Rectangular window family", spec.window_type.clone(), true),
+                    field("opening_area_m2", "Nominal opening area", spec.width_mm * spec.height_mm / 1e6, false),
+                ];
+                let handles = vec![
+                    handle("width_mm", "Roof-plane width", light.frame.origin, light.frame.x, spec.width_mm, [300., 3000.], 1.),
+                    handle("height_mm", "Height along roof slope", light.frame.origin, light.frame.up, spec.height_mm, [400., 2400.], 1.),
+                ];
+                for id in [light.id.clone(), format!("{}.flashing", light.id)] {
+                    result.push(record(
+                        &id,
+                        "rooflight",
+                        building,
+                        (Some(light.fill.level), Status::Existing),
+                        Source::Rooflight(bi, ri),
+                        properties.clone(),
+                        handles.clone(),
+                    ));
+                }
+            }
+
             {
                 for (di, d) in roof.dormers.iter().enumerate() {
                     let Some(spec) = building.roof.dormers().get(di) else { continue };
@@ -660,6 +694,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
             gutters,
             drainage,
             dormers,
+            rooflights,
         } => {
             properties.extend([
                 number("pitch_deg", "Roof pitch", *pitch_deg, "deg", 5.0, 75.0),
@@ -672,6 +707,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("gables", "Gable facade IDs", json!(gables), true),
                 field("drainage", "Optional drainage detail / explicit downpipes", json!(drainage), true),
                 field("dormers", "Parametric roof dormers", json!(dormers), true),
+                field("rooflights", "Parametric inclined roof windows", json!(rooflights), true),
             ]);
         }
         trigon_model::Roof::Mansard { parameters: p } => {
@@ -686,6 +722,7 @@ fn roof_record(building: &Building, bi: usize, id: &str, level: Option<usize>) -
                 field("gutters", "Half-round gutters", p.gutters, true),
                 field("gables", "Gable facade IDs", json!(p.gables), true),
                 field("dormers", "Parametric roof dormers", json!(p.dormers), true),
+                field("rooflights", "Parametric inclined roof windows", json!(p.rooflights), true),
                 field("covering", "Lower/upper roof covering", json!(p.covering), true),
             ]);
         }
@@ -1130,6 +1167,26 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             b.ground_floor = checked("ground floor elevation", b.storeys.get(b.ground_level).map_or(b.ground_floor, |s| s.elevation), 0.0, 300000.0)?;
             Ok(selected_id.to_string())
         }
+        Source::Rooflight(bi, ri) => {
+            let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing rooflight building"))?;
+            let d = b.roof.rooflights_mut().and_then(|v| v.get_mut(ri)).ok_or_else(|| invalid("missing rooflight source"))?;
+            for (key, value) in properties {
+                match key.as_str() {
+                    "facade" => d.facade = text(key, value)?,
+                    "window_type" => d.window_type = text(key, value)?,
+                    "u_mm" => d.u_mm = numeric(key, value)?,
+                    "run_mm" => d.run_mm = numeric(key, value)?,
+                    "yaw_deg" => d.yaw_deg = numeric(key, value)?,
+                    "width_mm" => d.width_mm = numeric(key, value)?,
+                    "height_mm" => d.height_mm = numeric(key, value)?,
+                    "stand_off_mm" => d.stand_off_mm = numeric(key, value)?,
+                    "flashing_mm" => d.flashing_mm = numeric(key, value)?,
+                    _ => return Err(invalid("unknown rooflight property")),
+                }
+            }
+            d.validate()?;
+            Ok(selected_id.to_string())
+        }
         Source::Dormer(bi, di) => {
             let b = doc.buildings.get_mut(bi).ok_or_else(|| invalid("missing dormer building"))?;
             let dormers = b.roof.dormers_mut().ok_or_else(|| invalid("dormers require a pitched or mansard roof"))?;
@@ -1171,6 +1228,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                             gutters: false,
                             drainage: None,
                             dormers: Vec::new(),
+                            rooflights: Vec::new(),
                         }
                     }
                     Some("pitched") => {}
@@ -1204,6 +1262,7 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         gutters,
                         drainage,
                         dormers,
+                        rooflights,
                     } => match key.as_str() {
                         "pitch_deg" => *pitch_deg = numeric(key, value)?,
                         "gables" => {
@@ -1225,9 +1284,11 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "gutters" => *gutters = boolean(key, value)?,
                         "drainage" => *drainage = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("drainage: {e}")))?,
                         "dormers" => *dormers = serde_json::from_value(value.clone()).map_err(|_| invalid("dormers require typed roof instances"))?,
+                        "rooflights" => *rooflights = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("rooflights: {e}")))?,
                         _ => return Err(invalid("unknown roof property")),
                     },
                     trigon_model::Roof::Mansard { parameters: p } => match key.as_str() {
+                        "rooflights" => p.rooflights = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("rooflights: {e}")))?,
                         "eave_facades" => {
                             return Err(invalid("eave_facades is supported only on pitched roofs; mansard selection is not implemented"));
                         }

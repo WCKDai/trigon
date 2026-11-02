@@ -124,6 +124,11 @@ pub fn opening_schedule_from_built(doc: &Document, buildings: &[Built]) -> Resul
                 schedule.rows.push(row(doc, building, &wall.id, true, &opening.fill)?);
             }
         }
+        if let Some(roof) = &building.roof {
+            for light in &roof.rooflights {
+                schedule.rows.push(row(doc, building, &roof.id, true, &light.fill)?);
+            }
+        }
         for wall in &building.interior {
             for opening in &wall.doors {
                 schedule.rows.push(row(doc, building, &wall.id, false, &opening.fill)?);

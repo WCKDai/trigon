@@ -390,6 +390,25 @@ fn multi_plane_dormer_front_exports_its_real_underside_and_net_volume() {
     let built = trigon_model::build(&doc).unwrap();
     let text = export(&doc, &built);
     let records = entities(&text);
+    let roof = built[0].roof.as_ref().unwrap();
+    let source_volume = crate::ifc::part21::volume(&roof.cover);
+    let exported_volume: f64 = crate::ifc::model_shapes(&doc, &built)
+        .iter()
+        .filter(|(key, _)| key == &roof.id || key.starts_with(&format!("{}.face", roof.id)))
+        .map(|(_, m)| crate::ifc::part21::volume(m))
+        .sum();
+    assert!(
+        (exported_volume - source_volume).abs() < source_volume * 0.001,
+        "multi-plane host shell volume changed: {source_volume} -> {exported_volume} mm³"
+    );
+    for read in [trigon_ifcread::read_ifc_lite, trigon_ifcread::read_bimifc] {
+        let result = read(&text).unwrap();
+        let gid = crate::ifc::guid(&format!("trigon:{}", roof.id));
+        let e = result.elements.iter().find(|e| e.global_id == gid).unwrap();
+        let mesh = trigon_model::Mesh { positions: e.mesh.positions.clone(), triangles: e.mesh.triangles.clone() };
+        let volume = crate::ifc::part21::volume(&mesh);
+        assert!((volume - source_volume).abs() < source_volume * 1e-4, "reader host shell volume changed: {source_volume} -> {volume} mm³");
+    }
     let front = &built[0].roof.as_ref().unwrap().dormers[0].front;
     let seg = &front.segments[0];
     let (&id, wall) = records.iter().find(|(_, e)| e.kind == "IFCWALL" && e.attributes[0] == gid(&seg.id)).unwrap();
@@ -404,4 +423,123 @@ fn multi_plane_dormer_front_exports_its_real_underside_and_net_volume() {
         .unwrap();
     let quantity = references(qset.attributes[5]).into_iter().map(|k| &records[&k]).find(|e| e.attributes[0] == "'NetVolume'").unwrap();
     assert!((quantity.attributes[3].parse::<f64>().unwrap() - crate::ifc::part21::volume(&seg.mesh) / 1e9).abs() < 1e-8);
+}
+
+#[test]
+fn rooflights_export_window_opening_host_identities_and_inclined_quantities() {
+    let mut doc = Document::default();
+    let mut b = trigon_model::Building::new("b", "Inclined windows", &[[0., 0.], [24000., 0.], [24000., 12000.], [0., 12000.]], 3, 3400.).unwrap();
+    b.roof=serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220,
+        "rooflights":[{"id":"light","facade":"b.f1","u_mm":10000,"run_mm":500,"window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100}]})).unwrap();
+    let existing_type_keys = ["rooflight:window.casement.2", "rooflight:17:window.casement.2"];
+    b.facades[0].bays = vec![5000., 7000.];
+    for (bay, id) in existing_type_keys.into_iter().enumerate() {
+        doc.types.push(ComponentType {
+            id: id.into(),
+            name: "Existing facade door namespace fixture".into(),
+            width: 900.,
+            height: 2100.,
+            sill: 0.,
+            kind: ComponentKind::PanelDoor { leaves: 1, panel_columns: 1, panel_rows: 2, glazed_rows: 0 },
+        });
+        b.facades[0].placements.push(serde_json::from_value(serde_json::json!({"level":0,"bay":bay,"type":id})).unwrap());
+    }
+    doc.buildings.push(b);
+    let built = trigon_model::build(&doc).unwrap();
+    let text = export(&doc, &built);
+    let records = entities(&text);
+    let light = &built[0].roof.as_ref().unwrap().rooflights[0];
+    let (&window_id, window) = records.iter().find(|(_, e)| e.kind == "IFCWINDOW" && e.attributes[0] == gid(&light.id)).unwrap();
+    assert_eq!(window.attributes[10], ".SKYLIGHT.");
+    assert_eq!(window.attributes[8].parse::<f64>().unwrap(), 1000.);
+    assert_eq!(window.attributes[9].parse::<f64>().unwrap(), 800.);
+    let (&opening_id, _) = records.iter().find(|(_, e)| e.kind == "IFCOPENINGELEMENT" && e.attributes[0] == gid(&light.opening_id)).unwrap();
+    let (&roof_id, _) = records.iter().find(|(_, e)| e.kind == "IFCROOF" && e.attributes[0] == gid("b.roof")).unwrap();
+    assert!(
+        records.values().any(|e| e.kind == "IFCRELVOIDSELEMENT" && reference(e.attributes[4]) == roof_id && reference(e.attributes[5]) == opening_id)
+    );
+    assert!(
+        records
+            .values()
+            .any(|e| e.kind == "IFCRELFILLSELEMENT" && reference(e.attributes[4]) == opening_id && reference(e.attributes[5]) == window_id)
+    );
+    assert!(records.values().any(|e| e.kind == "IFCWINDOWTYPE" && e.attributes[9] == ".SKYLIGHT."));
+    let qset = records
+        .values()
+        .filter(|e| e.kind == "IFCRELDEFINESBYPROPERTIES" && references(e.attributes[4]).contains(&window_id))
+        .map(|e| &records[&reference(e.attributes[5])])
+        .find(|e| e.kind == "IFCELEMENTQUANTITY")
+        .unwrap();
+    let area = references(qset.attributes[5]).into_iter().map(|k| &records[&k]).find(|e| e.attributes[0] == "'Area'").unwrap();
+    assert_eq!(area.attributes[3].parse::<f64>().unwrap(), 0.8);
+    let bytes = crate::glb::write(&built, &[]);
+    let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let glb: serde_json::Value = serde_json::from_slice(&bytes[20..20 + length]).unwrap();
+    let nodes = glb["nodes"].as_array().unwrap();
+    let window = nodes.iter().find(|n| n["name"] == light.id).unwrap();
+    assert_eq!(window["extras"]["ifc_class"], "IfcWindow");
+    assert_eq!(window["extras"]["host_roof"], "b.roof");
+    assert_eq!(window["extras"]["quantities"]["opening_area_m2"], 0.8);
+    let opening = nodes.iter().find(|n| n["name"] == light.opening_id).unwrap();
+    assert_eq!(opening["extras"]["fill"], light.id);
+    for read in [trigon_ifcread::read_ifc_lite, trigon_ifcread::read_bimifc] {
+        let result = read(&text).unwrap();
+        for key in [&light.id, &format!("{}.flashing", light.id)] {
+            let guid = crate::ifc::guid(&format!("trigon:{key}"));
+            let element = result.elements.iter().find(|e| e.global_id == guid).unwrap();
+            assert!(!element.mesh.triangles.is_empty(), "reader must build the actual positive product mesh");
+        }
+        let roof_guids: BTreeSet<_> = crate::ifc::model_shapes(&doc, &built)
+            .iter()
+            .filter(|(key, _)| key == "b.roof" || key.starts_with("b.roof."))
+            .map(|(key, _)| crate::ifc::guid(&format!("trigon:{key}")))
+            .collect();
+        let roofs: Vec<_> = result.elements.iter().filter(|e| roof_guids.contains(&e.global_id)).collect();
+        assert!(!roofs.is_empty());
+        let hits = |q: [f64; 2]| {
+            roofs
+                .iter()
+                .map(|e| {
+                    e.mesh
+                        .triangles
+                        .iter()
+                        .filter(|t| {
+                            let p = t.map(|i| light.frame.local(e.mesh.positions[i as usize]));
+                            let det = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+                            if det.abs() < 1e-8 {
+                                return false;
+                            }
+                            let s = ((q[0] - p[0][0]) * (p[2][1] - p[0][1]) - (q[1] - p[0][1]) * (p[2][0] - p[0][0])) / det;
+                            let t = ((p[1][0] - p[0][0]) * (q[1] - p[0][1]) - (p[1][1] - p[0][1]) * (q[0] - p[0][0])) / det;
+                            s >= 0. && t >= 0. && s + t <= 1.
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        for q in [[400., 2.], [400., 500.], [400., 998.]] {
+            assert_eq!(hits(q), 0, "the exported roof must retain its true normal reveal at {q:?}");
+        }
+        assert!(hits([-2., 500.]) > 0, "roof next to the cut must remain present");
+        let q = [-2., 500.];
+        let mut depths = Vec::new();
+        for roof in &roofs {
+            for t in &roof.mesh.triangles {
+                let p = t.map(|i| light.frame.local(roof.mesh.positions[i as usize]));
+                let det = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+                if det.abs() < 1e-8 {
+                    continue;
+                }
+                let s = ((q[0] - p[0][0]) * (p[2][1] - p[0][1]) - (q[1] - p[0][1]) * (p[2][0] - p[0][0])) / det;
+                let t = ((p[1][0] - p[0][0]) * (q[1] - p[0][1]) - (p[1][1] - p[0][1]) * (q[0] - p[0][0])) / det;
+                if s >= 0. && t >= 0. && s + t <= 1. {
+                    depths.push(p[0][2] + s * (p[1][2] - p[0][2]) + t * (p[2][2] - p[0][2]));
+                }
+            }
+        }
+        depths.sort_by(f64::total_cmp);
+        depths.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert_eq!(depths.len(), 2, "exactly two roof skins at the adjacent normal probe: {depths:?}");
+        assert!((depths[0] + 220.).abs() < 0.01 && depths[1].abs() < 0.01, "normal roof build-up must remain 220 mm, got {depths:?}");
+    }
 }

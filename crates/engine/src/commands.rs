@@ -587,6 +587,22 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "rooflight.add",
+        summary: "Add an explicit parametric inclined roof window with a normal through-roof void, reusable rectangular window family, fitted curb and flashing. Source dimensions are planning inputs. Validated, atomic, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::rooflights::Add>,
+        run: |s, v| crate::rooflights::add(s, parse("rooflight.add", v)?),
+    },
+    CommandSpec {
+        id: "rooflight.remove",
+        summary: "Remove a rooflight by its stable local source id and restore its host roof. Atomic, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::rooflights::Remove>,
+        run: |s, v| crate::rooflights::remove(s, parse("rooflight.remove", v)?),
+    },
+    CommandSpec {
         id: "building.set_roof",
         summary: "Set the roof: flat, or pitched from the eaves (the top of the walls) at `pitch_deg`, or at the pitch that puts \
                   the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
@@ -2190,6 +2206,8 @@ struct SetRoof {
     break_run_mm: Option<f64>,
     /// Shed dormers with coordinated roof voids, on one straight pitched or mansard face each.
     dormers: Option<Vec<trigon_model::roof::Dormer>>,
+    /// Optional explicit inclined window sources; empty/omitted keeps legacy roof bytes.
+    rooflights: Option<Vec<trigon_model::roof::Rooflight>>,
     /// Optional lower/upper slate or tagpap construction, with typed family dimensions.
     covering: Option<trigon_model::roof::Covering>,
     /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
@@ -2581,8 +2599,8 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
     if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.covering.is_some()) {
         return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg, break_run_mm and covering require kind mansard".into()).into());
     }
-    if p.kind == "flat" && p.dormers.is_some() {
-        return Err(ModelError::Invalid("dormers require a pitched or mansard roof".into()).into());
+    if p.kind == "flat" && (p.dormers.is_some() || p.rooflights.is_some()) {
+        return Err(ModelError::Invalid("dormers and rooflights require a pitched or mansard roof".into()).into());
     }
     let b = s.doc.building_mut(p.building.as_deref())?;
     let roof = match p.kind.as_str() {
@@ -2617,6 +2635,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                 gutters: p.gutters.unwrap_or(false),
                 drainage: p.drainage,
                 dormers: p.dormers.unwrap_or_default(),
+                rooflights: p.rooflights.unwrap_or_default(),
             }
         }
         "mansard" => {
@@ -2640,6 +2659,7 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     thickness_mm: p.thickness_mm.unwrap_or(0.0),
                     gutters: p.gutters.unwrap_or(false),
                     dormers: p.dormers.unwrap_or_default(),
+                    rooflights: p.rooflights.unwrap_or_default(),
                     covering: p.covering,
                 },
             }

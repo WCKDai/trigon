@@ -226,6 +226,11 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
                 add(&mut w, &format!("{}.roof", d.id), &[(Material::Steel, &d.roof)]);
                 add(&mut w, &format!("{}.cheeks", d.id), &[(Material::Steel, &d.cheeks)]);
             }
+            for light in &r.rooflights {
+                let parts: Vec<_> = light.fill.parts.iter().map(|(m, mesh)| (*m, mesh)).collect();
+                add(&mut w, &light.id, &parts);
+                add(&mut w, &format!("{}.flashing", light.id), &[(Material::Steel, &light.flashing)]);
+            }
         }
         for iw in &b.interior {
             add(&mut w, &iw.id, &[(Material::Plaster, &iw.mesh)]);
@@ -251,6 +256,23 @@ pub fn write_with_site(built: &[Built], site: &[trigon_model::site::BuiltSiteObj
             node["extras"]["trigon_source"] = json!(o.source);
             node["extras"]["phase_status"] = json!(o.status.name());
             node["extras"]["exchange_classification"] = json!(format!("Trigon {} (presentation geometry)", o.class.name()));
+        }
+    }
+    for b in built {
+        if let Some(r) = &b.roof {
+            for light in &r.rooflights {
+                if let Some(node) = nodes.iter_mut().find(|n| n["name"] == light.id) {
+                    node["extras"]["ifc_class"] = json!("IfcWindow");
+                    node["extras"]["ifc_global_id"] = json!(crate::ifc::guid(&format!("trigon:{}", light.id)));
+                    node["extras"]["predefined_type"] = json!("SKYLIGHT");
+                    node["extras"]["host_roof"] = json!(r.id);
+                    node["extras"]["opening_id"] = json!(light.opening_id);
+                    node["extras"]["window_type"] = json!(light.fill.type_id);
+                    node["extras"]["quantities"] =
+                        json!({"width_mm":light.fill.width,"height_mm":light.fill.height,"opening_area_m2":light.fill.width*light.fill.height/1e6});
+                }
+                nodes.push(json!({"name":light.opening_id,"extras":{"trigon_id":light.opening_id,"ifc_class":"IfcOpeningElement","host_roof":r.id,"fill":light.id,"geometry_role":"through-roof void (negative volume)"}}));
+            }
         }
     }
     // Keep all legacy indices stable and include every appended material actually referenced.

@@ -4,6 +4,8 @@
 //! intersection of the adjoining roof planes, preserving their pitch on oblique gables too.
 
 pub mod drainage;
+pub mod opening;
+pub use opening::Rooflight;
 
 use geo_straight_skeleton::Skeleton;
 use serde::{Deserialize, Serialize};
@@ -124,9 +126,12 @@ pub enum Roof {
         /// Optional detailed channels and explicit downpipes. Missing keeps legacy geometry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         drainage: Option<drainage::Drainage>,
-        /// Shed dormers with real voids in one continuous thick roof face.
+        /// Shed dormers; explicit multi_plane intent can follow adjoining pitched hip planes.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         dormers: Vec<Dormer>,
+        /// Optional inclined roof windows; omission/empty preserves legacy source and geometry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rooflights: Vec<Rooflight>,
     },
     /// Two continuous roof pitches with a shared hip/ridge skeleton and a real slope break.
     Mansard {
@@ -136,6 +141,20 @@ pub enum Roof {
 }
 
 impl Roof {
+    pub fn rooflights(&self) -> &[Rooflight] {
+        match self {
+            Self::Flat => &[],
+            Self::Pitched { rooflights, .. } => rooflights,
+            Self::Mansard { parameters } => &parameters.rooflights,
+        }
+    }
+    pub fn rooflights_mut(&mut self) -> Option<&mut Vec<Rooflight>> {
+        match self {
+            Self::Flat => None,
+            Self::Pitched { rooflights, .. } => Some(rooflights),
+            Self::Mansard { parameters } => Some(&mut parameters.rooflights),
+        }
+    }
     pub fn dormers(&self) -> &[Dormer] {
         match self {
             Self::Flat => &[],

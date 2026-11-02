@@ -21,6 +21,10 @@ pub(crate) enum Action {
     DefineAnnotation(trigon_model::annotation::Annotation),
     #[serde(rename = "building.add")]
     AddBuilding(crate::local_building::Add),
+    #[serde(rename = "rooflight.add")]
+    AddRooflight(crate::rooflights::Add),
+    #[serde(rename = "rooflight.remove")]
+    RemoveRooflight(crate::rooflights::Remove),
     #[serde(rename = "edit.move")]
     Move(edit::Move),
     #[serde(rename = "edit.align")]
@@ -67,6 +71,8 @@ fn run(s: &mut Session, action: Action) -> Result<Value> {
         Action::ConfigureView(p) => crate::view_config::configure(s, p),
         Action::DefineAnnotation(p) => crate::views::define_annotation(s, p),
         Action::AddBuilding(p) => crate::local_building::add(s, p),
+        Action::AddRooflight(p) => crate::rooflights::add(s, p),
+        Action::RemoveRooflight(p) => crate::rooflights::remove(s, p),
         Action::Move(p) => edit::move_elements(s, p),
         Action::Align(p) => edit::align(s, p),
         Action::AlignWalls(p) => edit::align_walls(s, p),

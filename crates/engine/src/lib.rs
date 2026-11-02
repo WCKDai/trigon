@@ -32,6 +32,7 @@ mod plan_output;
 mod plan_range;
 mod precision;
 mod precision_audit;
+mod rooflights;
 mod rooms;
 mod schedule_export;
 mod schedules;

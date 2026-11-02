@@ -165,6 +165,7 @@ impl Ifc<'_> {
         let Some(r) = &b.roof else { return };
         let top = b.storeys.len().saturating_sub(1);
         let pieces = split::roof(r, &b.walls);
+        let exact_openings = split::opening_shell(self.doc, b);
         let thickness = pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness());
         let up = catalog::pitched_roof((thickness * 10.0).round() / 10.0);
         let placed = self.w.place(Some(fl.at(top)), fl.at(top).frame);
@@ -177,7 +178,7 @@ impl Ifc<'_> {
         };
         // Mitred slope breaks have different top/soffit boundaries. Export the real shell,
         // rather than reconstructing it as unrelated plane extrusions with overlaps or gaps.
-        let shape = if r.compound {
+        let shape = if r.compound || exact_openings {
             self.w
                 .faceset(&r.cover, &placed.frame)
                 .and_then(|item| {
@@ -195,13 +196,25 @@ impl Ifc<'_> {
             placed.id,
             string(&r.id)
         ));
-        let reference = if r.compound { "Original mansard shell - illustrative build-up; covering is separate" } else { &up.name };
+        let reference = if r.compound {
+            "Original mansard shell - illustrative build-up; covering is separate"
+        } else if exact_openings {
+            "Original pitched shell with exact parametric roof openings - illustrative build-up"
+        } else {
+            &up.name
+        };
         self.common("Pset_RoofCommon", roof, reference, None, vec![("IsExternal", Val::Bool(true))]);
         fl.contain(top, roof);
+        self.rooflights(r, roof, fl);
         let mut planes = Vec::new();
         for piece in &pieces {
             match &piece.gable {
                 None => {
+                    // Inclined apertures offset top and underside boundaries in plan. The
+                    // legacy centroid pairing / fallback extrusion cannot reproduce that shell.
+                    if exact_openings {
+                        continue;
+                    }
                     if let Some(id) = self.roof_plane(piece, &up, placed, r.pitch_deg) {
                         planes.push(id);
                     }

@@ -20,6 +20,7 @@ mod balconies;
 mod catalog;
 mod fills;
 mod part21;
+mod rooflights;
 pub mod sample;
 mod site;
 mod slabs;

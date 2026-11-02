@@ -112,6 +112,12 @@ impl Ifc<'_> {
 
     /// A window or door in `frame`, placed relative to its opening.
     pub(super) fn fill(&mut self, e: &BuiltElement, opening: Placed, frame: Frame, external: bool, fl: &mut Floors) -> usize {
+        self.fill_as(e, opening, frame, external, fl, false)
+    }
+    pub(super) fn skylight(&mut self, e: &BuiltElement, opening: Placed, frame: Frame, fl: &mut Floors) -> usize {
+        self.fill_as(e, opening, frame, true, fl, true)
+    }
+    fn fill_as(&mut self, e: &BuiltElement, opening: Placed, frame: Frame, external: bool, fl: &mut Floors, skylight: bool) -> usize {
         let placed = self.w.place(Some(opening), frame);
         let material_items = self.tessellated_parts(&e.parts, &frame);
         let items: Vec<_> = material_items.iter().map(|(_, item)| *item).collect();
@@ -123,27 +129,42 @@ impl Ifc<'_> {
         let kind = ty.map(|t| &t.kind);
         let (g, name, tag) = (gid(&e.id), string(&e.name), string(&e.id));
         let (h, wd) = (real(e.height), real(e.width));
+        let predefined = if skylight { ".SKYLIGHT." } else { ".WINDOW." };
         let id = if door {
             let op = kind.map_or(".SINGLE_SWING_LEFT.", door_operation);
             self.w.add(format!("IFCDOOR({g},$,{name},$,$,#{},{shape},{tag},{h},{wd},.DOOR.,{op},$)", placed.id))
         } else {
             let part = kind.map_or(".NOTDEFINED.", window_partitioning);
-            self.w.add(format!("IFCWINDOW({g},$,{name},$,$,#{},{shape},{tag},{h},{wd},.WINDOW.,{part},$)", placed.id))
+            self.w.add(format!("IFCWINDOW({g},$,{name},$,$,#{},{shape},{tag},{h},{wd},{predefined},{part},$)", placed.id))
         };
         if let Some(definition) = definition {
             self.opening_materials(id, definition, &material_items);
         }
         // The type: the component type, or for doors Trigon makes itself (interior doors) one by name.
         let reference = ty.map_or(e.name.as_str(), |t| t.name.as_str());
-        let tg = gid(&format!("type:{}", e.type_id));
-        let (tn, tt) = (string(reference), string(&e.type_id));
+        let type_key = if skylight {
+            // Encode the source-key boundary and avoid every real facade-family key.
+            // Repeated namespace prefixes cannot equal another encoded rooflight key.
+            let mut key = format!("rooflight:{}:{}", e.type_id.len(), e.type_id);
+            for _ in 0..=self.doc.types.len() {
+                if !self.doc.types.iter().any(|t| t.id == key) {
+                    break;
+                }
+                key = format!("rooflight:{key}");
+            }
+            key
+        } else {
+            e.type_id.clone()
+        };
+        let tg = gid(&format!("type:{type_key}"));
+        let (tn, tt) = (string(reference), string(&type_key));
         let operation = kind.map_or(".SINGLE_SWING_LEFT.", door_operation);
         let partitioning = kind.map_or(".NOTDEFINED.", window_partitioning);
-        self.cat.typed(&mut self.w, &e.type_id, id, |w| {
+        self.cat.typed(&mut self.w, &type_key, id, |w| {
             if door {
                 w.add(format!("IFCDOORTYPE({tg},$,{tn},$,$,$,$,{tt},$,.DOOR.,{operation},.F.,$)"))
             } else {
-                w.add(format!("IFCWINDOWTYPE({tg},$,{tn},$,$,$,$,{tt},$,.WINDOW.,{partitioning},.F.,$)"))
+                w.add(format!("IFCWINDOWTYPE({tg},$,{tn},$,$,$,$,{tt},$,{predefined},{partitioning},.F.,$)"))
             }
         });
         let pset = if door { "Pset_DoorCommon" } else { "Pset_WindowCommon" };

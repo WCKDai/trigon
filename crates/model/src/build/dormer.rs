@@ -224,6 +224,19 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         ty.width = spec.width_mm;
         ty.height = spec.height_mm;
         ty.validate()?;
+        if spec.multi_plane
+            && !matches!(
+                &ty.kind,
+                ComponentKind::Window { .. }
+                    | ComponentKind::FixedWindow
+                    | ComponentKind::HistoricWindow { shape: crate::component::WindowShape::Rectangular, .. }
+            )
+        {
+            return Err(ModelError::Invalid(format!(
+                "multi_plane dormer {} requires a rectangular window family; curved front profiles are unsupported",
+                spec.id
+            )));
+        }
         let (left, right) = (spec.u_mm - ty.width / 2.0, spec.u_mm + ty.width / 2.0);
         let front = spec.setback_mm;
         let sample = |u, w, up| {
@@ -488,10 +501,42 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn roof_opening_multi_plane_refuses_non_rectangular_fronts() {
+        let mut doc = Document::default();
+        doc.types.push(crate::ComponentType {
+            id: "round".into(),
+            name: "Round fixture".into(),
+            width: 1100.,
+            height: 1100.,
+            sill: 0.,
+            kind: ComponentKind::HistoricWindow {
+                shape: crate::component::WindowShape::Round,
+                lights: 1,
+                top_light: 0.,
+                panes_across: 1,
+                panes_down: 1,
+                muntins: crate::component::Muntins::TrueDivided,
+                muntin_width_mm: 18.,
+                operable: false,
+            },
+        });
+        let mut b = Building::new("b", "Shape guard", &[[0., 0.], [24000., 0.], [24000., 12000.], [0., 12000.]], 3, 3400.).unwrap();
+        b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220,
+            "dormers":[{"id":"round","facade":"b.f1","u_mm":12000,"window_type":"round","width_mm":1100,"height_mm":1100,"multi_plane":true}]}))
+        .unwrap();
+        doc.buildings.push(b);
+        let before = doc.clone();
+        let error = crate::build(&doc).unwrap_err().to_string();
+        assert!(error.contains("rectangular"), "{error}");
+        assert_eq!(before, doc);
+        doc.buildings[0].roof.dormers_mut().unwrap()[0].multi_plane = false;
+        assert!(crate::build(&doc).is_ok(), "the legacy curved-window path must remain supported");
+    }
     #[test]
     fn chamfer_multi_plane_has_closed_coordinated_solids_and_a_real_void() {
         for rotation in [0.0_f64, 37.25, -118.] {
@@ -1016,7 +1061,7 @@ mod tests {
         closed(&built[0].roof.as_ref().unwrap().dormers[0].cheeks);
     }
 
-    fn closed(mesh: &Mesh) {
+    pub(crate) fn closed(mesh: &Mesh) {
         let mut edges = BTreeMap::<_, (u32, i32)>::new();
         let mut volume = 0.0;
         let key = |p: [f64; 3]| p.map(|v| (v * 1e5).round() as i64);
@@ -1026,7 +1071,7 @@ mod tests {
             let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
             let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
             let n = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]];
-            assert!(n.iter().map(|v| v * v).sum::<f64>() > 1e-10);
+            assert!(n.iter().map(|v| v * v).sum::<f64>() > 1e-10, "degenerate face {a:?} {b:?} {c:?}, normal {n:?}");
             volume += a.iter().zip(n).map(|(a, n)| a * n).sum::<f64>() / 6.0;
             for (a, b) in [(key(a), key(b)), (key(b), key(c)), (key(c), key(a))] {
                 let (edge, sign) = if a < b { ((a, b), 1) } else { ((b, a), -1) };

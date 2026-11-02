@@ -15,6 +15,8 @@ mod balcony;
 mod dormer;
 mod opening;
 mod roof_opening;
+mod rooflight;
+pub use rooflight::{BuiltRooflight, RooflightFrame};
 
 /// Window and door frames sit this far behind the outer wall face, mm.
 pub const REVEAL: f64 = 120.0;
@@ -280,6 +282,7 @@ pub struct BuiltRoof {
     /// Multiple slopes/mitres require their actual shell in exchange, not one-plane extrusion.
     pub compound: bool,
     pub dormers: Vec<BuiltDormer>,
+    pub rooflights: Vec<BuiltRooflight>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1002,6 +1005,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 }
             }
             let dormers = dormer::build(doc, b, &mut r.cover, b.roof.dormers())?;
+            let rooflights = rooflight::build(doc, b, &mut r.cover, &dormers)?;
             let mut gable_parts = std::collections::BTreeMap::<Material, Mesh>::new();
             if compound || walls.iter().any(|w| gables.contains(&w.id) && w.finish != Material::Wall) {
                 for tri in &r.gables.triangles {
@@ -1044,6 +1048,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 pitch_deg,
                 compound,
                 dormers,
+                rooflights,
             })
         }
     };

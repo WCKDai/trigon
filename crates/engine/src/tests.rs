@@ -2646,3 +2646,93 @@ fn plan_headers_preserve_the_sole_building_present_at_a_floor_index() {
     s.execute("view.define", json!({"id":"roof","name":"Roof","kind":{"view":"plan","level":1}})).unwrap();
     assert_eq!(crate::views::sheet(&s.doc, "roof", trigon_model::build::View::latest(&s.doc)).unwrap().project, "West fixture");
 }
+
+mod rooflight_consumers_tests {
+    use super::*;
+
+    fn fixture() -> Session {
+        let mut s = Session::new(Box::new(Canned));
+        s.execute("building.add", json!({"id":"b","name":"Public rooflight consumers","footprint":[[0,0],[24000,0],[24000,12000],[0,12000]],"storeys":1,"storey_height_mm":3000})).unwrap();
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220})).unwrap();
+        s.execute(
+            "rooflight.add",
+            json!({"rooflight":{"id":"light","facade":"b.f1","u_mm":10000,"run_mm":500,
+            "window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100}}),
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn rooflight_schedule_uses_actual_slope_plane_dimensions_and_roof_host() {
+        let s = fixture();
+        let before = s.doc.clone();
+        let schedule = crate::opening_schedule(&s.doc, trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert_eq!(schedule.rows.len(), 1, "one actual roof window, no flashing/void counted as fills");
+        let row = &schedule.rows[0];
+        assert_eq!(row.id, "b.rooflight.light");
+        assert_eq!(row.host_id, "b.roof");
+        assert_eq!((row.width_mm, row.height_mm, row.area_m2), (800., 1000., Some(0.8)));
+        assert_eq!(row.kind, crate::ScheduleOpeningKind::Window);
+        assert_eq!(row.quantity_basis, crate::OpeningQuantityBasis::OuterLining);
+        assert!(row.external);
+        assert_eq!((schedule.totals.instances, schedule.totals.windows, schedule.totals.area_excluded), (1, 1, 0));
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn rooflight_drawing_strokes_pick_the_same_editable_source_as_3d() {
+        let mut s = fixture();
+        s.execute("view.define", json!({"id":"front","name":"Rooflight facade","kind":{"view":"facade","facade":"b.f1"}})).unwrap();
+        let before = s.doc.clone();
+        let preview = crate::drawing_view(&s.doc, "front", trigon_model::build::View::latest(&s.doc)).unwrap();
+        let segment = preview
+            .element_segments
+            .iter()
+            .find(|s| s.id == "b.rooflight.light" && s.kind == crate::DrawingElementKind::Opening)
+            .expect("visible roof window owns drawing strokes");
+        let [a, b] = segment.segment;
+        let hit = preview.pick_element([(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.], 0.01).unwrap();
+        assert_eq!(hit.id, "b.rooflight.light");
+        assert!(preview.element_segments.iter().any(|s| s.id == "b.rooflight.light.flashing"));
+        s.execute("element.get", json!({"id":hit.id})).unwrap();
+        s.execute("element.get", json!({"id":"b.rooflight.light.flashing"})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn rooflight_preflights_apply_once_replay_and_keep_redo_after_failed_preview() {
+        let mut s = fixture();
+        let before = s.doc.clone();
+        let spec = json!({"id":"other","facade":"b.f1","u_mm":14000,"run_mm":500,
+            "window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100});
+        let action = json!({"command":"rooflight.add","params":{"rooflight":spec}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        let accepted = s.doc.clone();
+        assert_eq!(accepted.journal.len(), before.journal.len() + 1);
+        assert_eq!(accepted.journal.last().unwrap().command, "rooflight.add");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        let mut invalid = action.clone();
+        invalid["params"]["rooflight"]["run_mm"] = json!(-1);
+        assert!(s.execute("precision.preview", json!({"action":invalid})).is_err());
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        assert!(s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).is_err());
+        let remove = s.execute("precision.preview", json!({"action":{"command":"rooflight.remove","params":{"id":"other"}}})).unwrap();
+        assert_eq!(s.doc, accepted);
+        s.execute("precision.apply", json!({"action":remove["action"],"preview_token":remove["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.last().unwrap().command, "rooflight.remove");
+        let final_doc = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        let mut replay = Session::new(Box::new(Canned));
+        for entry in &final_doc.journal {
+            replay.execute(&entry.command, entry.params.clone()).unwrap();
+        }
+        assert_eq!(replay.doc, final_doc);
+    }
+}

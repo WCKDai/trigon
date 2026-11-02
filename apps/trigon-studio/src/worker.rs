@@ -228,6 +228,37 @@ mod tests {
     }
 
     #[test]
+    fn rooflight_scene_picking_and_properties_use_the_same_source() {
+        use serde_json::json;
+        let mut s = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Rooflight worker","footprint":[[0,0],[24000,0],[24000,12000],[0,12000]],"storeys":3,"storey_height_mm":3400}),
+        )
+        .unwrap();
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220})).unwrap();
+        s.execute("rooflight.add",json!({"rooflight":{"id":"light","facade":"b.f1","u_mm":10000,"run_mm":500,"window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100}})).unwrap();
+        let before = s.doc.clone();
+        let prepared = run(&job(s.doc.clone(), None)).scene.unwrap().unwrap();
+        for id in ["b.rooflight.light", "b.rooflight.light.flashing"] {
+            assert!(prepared.scene.elements.iter().any(|e| e.id == id));
+            assert!(prepared.properties.iter().any(|p| p["id"] == id && p["editable"] == true));
+        }
+        let built = trigon_model::build(&s.doc).unwrap();
+        let light = &built[0].roof.as_ref().unwrap().rooflights[0];
+        let point = light.frame.point([400., 500., 1000.]);
+        let origin = std::array::from_fn(|k| ((point[k] - prepared.scene.origin[k]) / 1000.) as f32);
+        let direction = light.frame.normal.map(|v| -v as f32);
+        let pick = prepared.scene.pick(origin, direction, None).unwrap();
+        assert_eq!(prepared.scene.elements[pick].id, light.id);
+        s.execute("element.set", json!({"id":"b.rooflight.light","properties":{"height_mm":1100}})).unwrap();
+        assert_ne!(prepared.scene.vertices, run(&job(s.doc.clone(), None)).scene.unwrap().unwrap().scene.vertices);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(before, s.doc);
+        assert_eq!(prepared.scene.vertices, run(&job(s.doc, None)).scene.unwrap().unwrap().scene.vertices);
+    }
+
+    #[test]
     fn roof_dormer_scene_schedule_and_editable_properties_share_source_identity() {
         use serde_json::json;
         let mut s = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));

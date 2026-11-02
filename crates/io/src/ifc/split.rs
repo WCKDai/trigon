@@ -337,6 +337,13 @@ pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
     out
 }
 
+/// Explicit new openings require the actual closed shell, rather than legacy
+/// face-pair reconstruction. Default/empty legacy sources keep their original bytes.
+pub(super) fn opening_shell(doc: &Document, b: &Built) -> bool {
+    b.roof.as_ref().is_some_and(|r| !r.rooflights.is_empty())
+        || doc.buildings.iter().find(|source| source.id == b.building_id).is_some_and(|source| source.roof.dormers().iter().any(|d| d.multi_plane))
+}
+
 /// A roof plane's frame: z up its normal, x level along the plane.
 pub fn plane_frame(polygon: &[[f64; 3]]) -> Option<Frame> {
     let mut n = unit(normal(polygon))?;
@@ -545,10 +552,14 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
             out.push((s.id.clone(), s.mesh.clone()));
         }
         if let Some(r) = &b.roof {
-            if r.compound {
+            let exact_openings = opening_shell(doc, b);
+            if r.compound || exact_openings {
                 out.push((r.id.clone(), r.cover.clone()));
             }
             for p in roof(r, &b.walls) {
+                if exact_openings && p.gable.is_none() {
+                    continue;
+                }
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
             out.extend(gutters(r));
@@ -559,6 +570,10 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
             for d in &r.dormers {
                 out.push((format!("{}.roof", d.id), d.roof.clone()));
                 out.push((format!("{}.cheeks", d.id), d.cheeks.clone()));
+            }
+            for light in &r.rooflights {
+                out.push((light.id.clone(), merged(&light.fill.parts)));
+                out.push((format!("{}.flashing", light.id), light.flashing.clone()));
             }
         }
         for iw in &b.interior {

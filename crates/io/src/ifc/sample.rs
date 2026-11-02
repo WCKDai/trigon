@@ -97,6 +97,7 @@ pub fn document() -> Result<Document> {
         gutters: true,
         drainage: None,
         dormers: Vec::new(),
+        rooflights: Vec::new(),
     };
     b.plinth = Some(Plinth { height: 500.0, projection: 30.0 });
     // A rendered courtyard side, and rendered bands at the floors of the street front.

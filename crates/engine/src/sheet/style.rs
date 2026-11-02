@@ -84,6 +84,20 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
             }
         }
         if let Some(r) = &b.roof {
+            for light in &r.rooflights {
+                let element = Some(Element::new(&light.id, DrawingElementKind::Opening));
+                for (material, mesh) in &light.fill.parts {
+                    out.push(part(mesh, class_of(light.fill.class, *material), next(), *material, Role::Both, element.clone()));
+                }
+                out.push(part(
+                    &light.flashing,
+                    Class::Roof,
+                    next(),
+                    Material::Steel,
+                    Role::Both,
+                    Some(Element::new(&format!("{}.flashing", light.id), DrawingElementKind::Roof)),
+                ));
+            }
             let element = Some(Element::new(&r.id, DrawingElementKind::Roof));
             out.push(part(&r.cover, Class::Roof, next(), Material::Roof, Role::Both, element.clone()));
             if r.gable_parts.is_empty() {

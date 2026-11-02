@@ -530,6 +530,26 @@ impl Scene {
                     true,
                     &parts,
                 );
+                for light in &r.rooflights {
+                    let parts: Vec<_> =
+                        light.fill.parts.iter().map(|(material, mesh)| Part { mesh, rgba: material.rgba(), material: *material }).collect();
+                    b.add(
+                        &light.id,
+                        "rooflight",
+                        Some(light.fill.level),
+                        vec![("width", mm(light.fill.width)), ("slope-plane height", mm(light.fill.height))],
+                        true,
+                        &parts,
+                    );
+                    b.add(
+                        &format!("{}.flashing", light.id),
+                        "rooflight flashing",
+                        Some(light.fill.level),
+                        Vec::new(),
+                        true,
+                        &[Part { mesh: &light.flashing, rgba: Material::Steel.rgba(), material: Material::Steel }],
+                    );
+                }
                 for d in &r.dormers {
                     for (suffix, kind, mesh) in [("roof", "dormer roof", &d.roof), ("cheeks", "dormer cheeks", &d.cheeks)] {
                         b.add(

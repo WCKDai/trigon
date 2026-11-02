@@ -122,6 +122,7 @@ fn conform(mesh: &Mesh, fr: &FacadeFrame, lines: &[([f64; 2], [f64; 2])]) -> Mes
         for k in 0..3 {
             let (a, b) = (p[k], p[(k + 1) % 3]);
             let (aa, bb) = (local(fr, a), local(fr, b));
+            let length = a.iter().zip(b).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
             let mut steps = vec![0.];
             for (l, r, ss) in &lines {
                 if let (Some(sa), Some(sb)) = (station([aa[0], aa[1]], *l, *r), station([bb[0], bb[1]], *l, *r)) {
@@ -130,14 +131,14 @@ fn conform(mesh: &Mesh, fr: &FacadeFrame, lines: &[([f64; 2], [f64; 2])]) -> Mes
                     }
                     for s in ss {
                         let t = (s - sa) / (sb - sa);
-                        if t > EPS && t < 1. - EPS {
+                        if t > 0. && t < 1. && t * length > EPS && (1. - t) * length > EPS {
                             steps.push(t);
                         }
                     }
                 }
             }
             steps.sort_by(f64::total_cmp);
-            steps.dedup_by(|a, b| (*a - *b).abs() < EPS);
+            steps.dedup_by(|a, b| (*a - *b).abs() * length < EPS);
             boundary.extend(steps.into_iter().map(|t| std::array::from_fn(|i| a[i] + t * (b[i] - a[i]))));
         }
         if boundary.len() == 3 {
@@ -151,8 +152,98 @@ fn conform(mesh: &Mesh, fr: &FacadeFrame, lines: &[([f64; 2], [f64; 2])]) -> Mes
     }
     out
 }
+/// Reconcile only unmatched collinear edge subdivisions. This inserts existing
+/// boundary vertices into incident triangles; it cannot fill a hole or reverse a face.
+/// Clipping an already clipped shell can split a shared source edge outside the
+/// current aperture, so checking just the new aperture's lines is insufficient.
+fn conform_shared_edges(mesh: &Mesh) -> Mesh {
+    use std::collections::BTreeMap;
+    let key = |p: [f64; 3]| p.map(|v| (v * 1e6).round() as i64);
+    let edge = |a: [i64; 3], b: [i64; 3]| if a < b { ((a, b), 1_i64) } else { ((b, a), -1_i64) };
+    let mut counts = BTreeMap::<_, (usize, i64)>::new();
+    let mut points = BTreeMap::new();
+    for t in &mesh.triangles {
+        let p = t.map(|i| mesh.positions.get(i as usize).copied().unwrap_or_default());
+        for k in 0..3 {
+            let a = key(p[k]);
+            let b = key(p[(k + 1) % 3]);
+            points.insert(a, p[k]);
+            let (e, sign) = edge(a, b);
+            let c = counts.entry(e).or_default();
+            c.0 += 1;
+            c.1 += sign;
+        }
+    }
+    let bad: std::collections::BTreeSet<_> = counts.into_iter().filter(|(_, c)| *c != (2, 0)).map(|(e, _)| e).collect();
+    if bad.is_empty() {
+        return mesh.clone();
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let candidates: Vec<_> = bad.iter().flat_map(|(a, b)| [a, b]).filter(|k| seen.insert(**k)).filter_map(|k| points.get(k).copied()).collect();
+    let mut out = Mesh::default();
+    for t in &mesh.triangles {
+        let p = t.map(|i| mesh.positions.get(i as usize).copied().unwrap_or_default());
+        let mut boundary = Vec::new();
+        for k in 0..3 {
+            let (a, b) = (p[k], p[(k + 1) % 3]);
+            let mut stations = vec![(0., a)];
+            if bad.contains(&edge(key(a), key(b)).0) {
+                let d = std::array::from_fn::<_, 3, _>(|k| b[k] - a[k]);
+                let length2 = d.iter().map(|v| v * v).sum::<f64>();
+                let length = length2.sqrt();
+                if length > EPS {
+                    for &q in &candidates {
+                        let step = q.iter().zip(a).zip(d).map(|((q, a), d)| (q - a) * d).sum::<f64>() / length2;
+                        if step <= 0. || step >= 1. || step * length <= EPS || (1. - step) * length <= EPS {
+                            continue;
+                        }
+                        let residual = q.iter().zip(a).zip(d).map(|((q, a), d)| (q - a - step * d).powi(2)).sum::<f64>();
+                        if residual <= EPS * EPS {
+                            stations.push((step, q));
+                        }
+                    }
+                }
+            }
+            let length = a.iter().zip(b).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
+            stations.sort_by(|a, b| a.0.total_cmp(&b.0));
+            stations.dedup_by(|a, b| (a.0 - b.0).abs() * length < EPS);
+            boundary.extend(stations.into_iter().map(|(_, p)| p));
+        }
+        if boundary.len() == 3 {
+            polygon(&mut out, &boundary);
+        } else {
+            let c = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.);
+            for k in 0..boundary.len() {
+                polygon(&mut out, &[c, boundary[k], boundary[(k + 1) % boundary.len()]]);
+            }
+        }
+    }
+    out
+}
 fn edges(outline: &[[f64; 2]]) -> Vec<([f64; 2], [f64; 2])> {
     outline.iter().copied().zip(outline.iter().copied().cycle().skip(1)).take(outline.len()).collect()
+}
+// A separating axis proves these projected convex polygons are disjoint. Avoid
+// splitting remote triangles along the aperture's infinite supporting lines:
+// repeated openings would otherwise multiply irrelevant fragments and slivers.
+fn disjoint(a: &[[f64; 3]], b: &[[f64; 2]]) -> bool {
+    let aa: Vec<_> = a.iter().map(|p| [p[0], p[1]]).collect();
+    for ring in [&aa[..], b] {
+        for (&p, &q) in ring.iter().zip(ring.iter().cycle().skip(1)).take(ring.len()) {
+            let d = sub(q, p);
+            if d == [0., 0.] {
+                continue;
+            }
+            let range = |ring: &[[f64; 2]]| {
+                ring.iter().map(|&q| cross(d, sub(q, p))).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)))
+            };
+            let (x, y) = (range(&aa), range(b));
+            if x.1 <= y.0 || y.1 <= x.0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 fn carve(mesh: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]]) -> Result<Mesh> {
     let mut current = mesh.clone();
@@ -160,6 +251,10 @@ fn carve(mesh: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]]) -> Result<Mesh> {
         let mut out = Mesh::default();
         for t in &current.triangles {
             let mut p = t.iter().map(|&i| local(fr, current.positions.get(i as usize).copied().unwrap_or_default())).collect::<Vec<_>>();
+            if disjoint(&p, &cut) {
+                polygon(&mut out, &t.map(|i| current.positions.get(i as usize).copied().unwrap_or_default()));
+                continue;
+            }
             for k in 0..3 {
                 if p.is_empty() {
                     break;
@@ -209,7 +304,7 @@ pub(super) fn cut(mesh: &Mesh, host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2
     for t in triangles(outline)? {
         lines.extend(edges(&t));
     }
-    Ok(conform(&out, fr, &lines))
+    Ok(conform_shared_edges(&conform(&out, fr, &lines)))
 }
 pub(super) fn volume(host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]], high: Plane) -> Result<Mesh> {
     let polys = patches(host, fr, outline, false)?;
@@ -241,9 +336,34 @@ pub(super) fn volume(host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]], high: 
     for t in triangles(outline)? {
         lines.extend(edges(&t));
     }
-    Ok(conform(&out, fr, &lines))
+    Ok(conform_shared_edges(&conform(&out, fr, &lines)))
 }
 pub(super) fn prism(fr: &FacadeFrame, outline: &[[f64; 2]], low: Plane, high: Plane) -> Result<Mesh> {
+    // Intersections on one rear plane can differ from a straight line by floating
+    // round-off. Remove only intermediate stations within the existing 1e-6 mm
+    // geometry resolution, before triangulating either skin or making the sides.
+    let mut ring = outline.to_vec();
+    while ring.len() > 3 {
+        let n = ring.len();
+        let redundant = (0..n).find(|&k| {
+            let (a, p, b) = (ring[(k + n - 1) % n], ring[k], ring[(k + 1) % n]);
+            let d = sub(b, a);
+            let span = d[0].hypot(d[1]);
+            if span <= EPS {
+                return false;
+            }
+            let q = sub(p, a);
+            let along = (q[0] * d[0] + q[1] * d[1]) / span;
+            along >= 0. && along <= span && cross(d, q).abs() / span <= EPS
+        });
+        match redundant {
+            Some(k) => {
+                ring.remove(k);
+            }
+            None => break,
+        }
+    }
+    let outline = ring.as_slice();
     let mut mesh = Mesh::default();
     if !mesh.polygon(outline, &[], |p| fr.point(p[0], p[1], high.z(p[0], p[1]))) {
         return Err(ModelError::Invalid("empty roof opening prism".into()));
@@ -377,11 +497,36 @@ pub(super) fn front_window(mesh: &Mesh, fr: &FacadeFrame, opening: Rect, front: 
     for t in triangles(&outline)? {
         lines.extend(edges(&t));
     }
-    let out = conform(&out, &identity, &lines);
+    let out = conform_shared_edges(&conform(&out, &identity, &lines));
     Ok(Mesh { positions: out.positions.iter().map(|p| fr.point(p[0], -p[2], p[1])).collect(), triangles: out.triangles })
 }
 pub(super) fn limits(host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]], top: bool) -> Result<(f64, f64)> {
     let p = patches(host, fr, outline, top)?;
     let values = p.iter().flatten().map(|p| p[2]);
     Ok((values.clone().fold(f64::INFINITY, f64::min), values.fold(f64::NEG_INFINITY, f64::max)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rear_crease_stations_keep_both_prism_skins_conforming() {
+        let fr = FacadeFrame::new([150000., -270000.], [150999., -269963.]).unwrap();
+        let outline = [
+            [0., 0.],
+            [1700., 0.],
+            [1700., 2200.],
+            [1500., 2100.],
+            [1300., 2000. + 1e-8],
+            [1100., 1900.],
+            [900., 1800.],
+            [800., 1800.],
+            [600., 1900. - 1e-8],
+            [400., 2000.],
+            [200., 2100.],
+            [0., 2200.],
+        ];
+        let mesh = prism(&fr, &outline, Plane([0., 0.1, 12000.]), Plane([0., 0.1, 12065.])).unwrap();
+        crate::build::dormer::tests::closed(&mesh);
+    }
 }
