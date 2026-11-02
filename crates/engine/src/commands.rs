@@ -1427,7 +1427,7 @@ static COMMANDS: &[CommandSpec] = &[
             for &l in &levels {
                 let ink = if use_scan { crate::drawings::ink_for(s, l, contrast)? } else { None };
                 let b = s.doc.building(p.building.as_deref())?;
-                found.extend(crate::rooms::rooms_for(b, l, min, ink.as_ref().map(|f| f as &dyn Fn([f64; 2]) -> bool)));
+                found.extend(crate::rooms::rooms_for(b, l, min, ink.as_ref().map(|f| f as &dyn Fn([f64; 2]) -> bool))?);
             }
             let b = s.doc.building_mut(p.building.as_deref())?;
             b.rooms.retain_mut(|r| {

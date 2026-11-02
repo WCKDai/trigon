@@ -1014,6 +1014,18 @@ impl Building {
         crate::build::inner_ring_by(&ring, |i| kept.get(i).map_or(self.wall_thickness, |&e| self.edge_thickness(e, level)))
     }
 
+    /// A simple material-bounded usable outline on one storey, before stair openings.
+    /// Unlike `storey_inner`, it is not indexed by source facade corner. Derivation is
+    /// shared with floor slabs; no source coordinates or wall identities are changed.
+    pub fn storey_usable_outline(&self, level: usize) -> Result<Vec<[f64; 2]>> {
+        if self.storeys.get(level).is_none() {
+            return Err(ModelError::Invalid("usable outline needs an existing storey".into()));
+        }
+        let (outer, _) = self.storey_ring(level);
+        let inner = self.storey_inner(level);
+        crate::build::floor_outline(&outer, &inner).map_err(|e| ModelError::Invalid(format!("storey {level}: {e}")))
+    }
+
     /// Whether footprint edge `edge` has its own wall on a storey (not where a straight basement
     /// wall cuts a step off).
     pub fn edge_on_storey(&self, edge: usize, level: usize) -> bool {

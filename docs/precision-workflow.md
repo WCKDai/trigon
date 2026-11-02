@@ -253,3 +253,17 @@ from extending through the same branch and duplicating material. Thickness, comb
 length and source order resolve priority; the saved axes, source IDs and lifetimes remain
 unchanged. Intentional gaps and noncoincident source ends are not snapped by this correction.
 Mixed-thickness transitions and other audit candidates still need source and joint review.
+
+## Material-bounded floors and rooms
+
+Floor profiles reconcile consumed corners against the filled facade material instead
+of trusting a potentially folded indexed inner line. Zero-area consumed bands own no
+material. The resulting usable profile must remain simple, strictly inside the exterior
+and connected; disconnected pieces are explicitly refused. Stair void sides follow
+their ring winding, with outward closed solids and consistent volume.
+
+`Building::storey_usable_outline` exposes that same boundary before stair openings.
+It does not replace the facade-indexed `storey_inner` contract. Room detection uses the
+canonical boundary and clips its raster-derived candidates to it, preventing exterior
+phantom rooms. Existing room definitions change only through an explicit command.
+This checks geometric consistency; the evidence still determines the correct walls.

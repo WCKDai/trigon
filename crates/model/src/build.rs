@@ -914,31 +914,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
     let mut slabs = Vec::with_capacity(levels + 1);
     let openings =
         |level: usize| -> Result<Vec<Vec<[f64; 2]>>> { b.stairs.iter().filter(|st| st.levels.contains(&level)).map(crate::stair::opening).collect() };
-    for (i, s) in b.storeys.iter().enumerate() {
-        let inner = storey_inners.get(i).cloned().unwrap_or_default();
-        let thickness = b.floor_thickness(i);
-        let z0 = s.elevation - thickness;
-        if above(z0) {
-            continue;
-        }
-        let holes = match i.checked_sub(1) {
-            Some(l) => openings(l)?,
-            None => Vec::new(),
-        };
-        let (inner, holes) = slab_shape(&inner, holes)?;
-        slabs.push(BuiltSlab {
-            id: if s.roof_level { format!("{}.attic", b.id) } else { format!("{}.slab.L{i}", b.id) },
-            kind: SlabKind::Floor,
-            level: i,
-            mesh: prism_with_holes(&inner, &holes, z0, thickness),
-            polygon: inner,
-            z_bottom: z0,
-            thickness,
-            holes,
-        });
-    }
     let top_level = levels.saturating_sub(1);
-    let top_inner = inners.get(top_level).cloned().unwrap_or_default();
     let roof = match b.roof.base() {
         _ if above(h - b.ceiling_thickness(top_level)) => None,
         crate::roof::Roof::Flat => {
@@ -960,20 +936,6 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         | crate::roof::Roof::Mansard {
             parameters: crate::roof::Mansard { gables, straighten_mm, overhang_mm, verge_mm, thickness_mm, gutters, .. },
         } => {
-            if b.attic_level().is_none() {
-                let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
-                // The attic floor closes the top storey; the roof rises from the eaves above it.
-                slabs.push(BuiltSlab {
-                    id: format!("{}.attic", b.id),
-                    kind: SlabKind::Floor,
-                    level: top_level,
-                    mesh: prism_with_holes(&top_inner, &holes, h - b.attic_thickness(), b.attic_thickness()),
-                    polygon: top_inner,
-                    z_bottom: h - b.attic_thickness(),
-                    thickness: b.attic_thickness(),
-                    holes,
-                });
-            }
             let selected = match b.roof.base() {
                 crate::Roof::Pitched { eave_facades, .. } | crate::Roof::HalfHipped { eave_facades, .. } => eave_facades.as_deref(),
                 _ => None,
@@ -1101,6 +1063,52 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         }
         crate::Roof::TwoCutPlumb(_) => return Err(ModelError::Invalid("nested roof cuts are unsupported".into())),
     };
+    // Keep established roof-host diagnostics ahead of the new derived-profile checks.
+    // Floor buffers retain their original order before the optional flat roof slab.
+    let mut floor_slabs = Vec::with_capacity(levels + 1);
+    for (i, s) in b.storeys.iter().enumerate() {
+        let thickness = b.floor_thickness(i);
+        let z0 = s.elevation - thickness;
+        if above(z0) {
+            continue;
+        }
+        let (exterior, _) = rings.get(i).ok_or_else(|| ModelError::Invalid(format!("floor interior: storey {i} has no exterior ring")))?;
+        let reference = storey_inners.get(i).ok_or_else(|| ModelError::Invalid(format!("floor interior: storey {i} has no facade reference")))?;
+        let inner = floor_outline(exterior, reference).map_err(|e| ModelError::Invalid(format!("storey {i}: {e}")))?;
+        let holes = match i.checked_sub(1) {
+            Some(l) => openings(l)?,
+            None => Vec::new(),
+        };
+        let (inner, holes) = slab_shape(&inner, holes)?;
+        floor_slabs.push(BuiltSlab {
+            id: if s.roof_level { format!("{}.attic", b.id) } else { format!("{}.slab.L{i}", b.id) },
+            kind: SlabKind::Floor,
+            level: i,
+            mesh: prism_with_holes(&inner, &holes, z0, thickness),
+            polygon: inner,
+            z_bottom: z0,
+            thickness,
+            holes,
+        });
+    }
+    if roof.is_some() && b.attic_level().is_none() {
+        let top_inner = inners.get(top_level).cloned().unwrap_or_default();
+        let top_inner = floor_outline(&b.footprint, &top_inner).map_err(|e| ModelError::Invalid(format!("attic floor: {e}")))?;
+        let (top_inner, holes) = slab_shape(&top_inner, openings(top_level)?)?;
+        // The attic floor closes the top storey; the roof rises from the eaves above it.
+        floor_slabs.push(BuiltSlab {
+            id: format!("{}.attic", b.id),
+            kind: SlabKind::Floor,
+            level: top_level,
+            mesh: prism_with_holes(&top_inner, &holes, h - b.attic_thickness(), b.attic_thickness()),
+            polygon: top_inner,
+            z_bottom: h - b.attic_thickness(),
+            thickness: b.attic_thickness(),
+            holes,
+        });
+    }
+    floor_slabs.append(&mut slabs);
+    let slabs = floor_slabs;
     // Interior walls, storey by storey, joined to each other and to that storey's facade face.
     let mut interior = Vec::new();
     for (level, s) in b.storeys.iter().enumerate() {
@@ -1383,6 +1391,147 @@ fn check_inner_ring(outer: &[[f64; 2]], inner: &[[f64; 2]]) -> Result<()> {
     Ok(())
 }
 
+// Derived floor profiles need geometric boundaries, unlike the indexed wall
+// references which intentionally retain one point per source facade corner.
+const FLOOR_PLAN_EPS: f64 = 1e-6;
+
+fn floor_segments_meet(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    if (0..2).any(|i| a[i].max(b[i]) + FLOOR_PLAN_EPS < c[i].min(d[i]) || c[i].max(d[i]) + FLOOR_PLAN_EPS < a[i].min(b[i])) {
+        return false;
+    }
+    let side = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| {
+        let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if length <= FLOOR_PLAN_EPS { 0.0 } else { ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / length }
+    };
+    let opposite = |x: f64, y: f64| (x <= FLOOR_PLAN_EPS && y >= -FLOOR_PLAN_EPS) || (y <= FLOOR_PLAN_EPS && x >= -FLOOR_PLAN_EPS);
+    opposite(side(a, b, c), side(a, b, d)) && opposite(side(c, d, a), side(c, d, b))
+}
+
+fn floor_ring_simple(ring: &[[f64; 2]]) -> bool {
+    let n = ring.len();
+    if n < 3 || crate::footprint::signed_area2(ring).abs() <= FLOOR_PLAN_EPS * FLOOR_PLAN_EPS {
+        return false;
+    }
+    for i in 0..n {
+        let (a, b, c) = (ring[i], ring[(i + 1) % n], ring[(i + 2) % n]);
+        let (ab, bc) = ([b[0] - a[0], b[1] - a[1]], [c[0] - b[0], c[1] - b[1]]);
+        let length = ab[0].hypot(ab[1]);
+        if length <= FLOOR_PLAN_EPS || ((ab[0] * bc[1] - ab[1] * bc[0]).abs() <= FLOOR_PLAN_EPS * length && ab[0] * bc[0] + ab[1] * bc[1] < 0.0) {
+            return false;
+        }
+        for j in i + 1..n {
+            if j == i + 1 || (i == 0 && j == n - 1) {
+                continue;
+            }
+            if floor_segments_meet(a, b, ring[j], ring[(j + 1) % n]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn floor_ring_inside(outer: &[[f64; 2]], inner: &[[f64; 2]]) -> bool {
+    let point_inside = |p: [f64; 2]| {
+        let mut inside = false;
+        for i in 0..outer.len() {
+            let (a, b) = (outer[i], outer[(i + 1) % outer.len()]);
+            if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+                inside = !inside;
+            }
+        }
+        inside
+    };
+    inner.iter().all(|&p| point_inside(p))
+        && (0..inner.len())
+            .all(|i| (0..outer.len()).all(|j| !floor_segments_meet(inner[i], inner[(i + 1) % inner.len()], outer[j], outer[(j + 1) % outer.len()])))
+}
+
+/// A simple usable floor bounded by the storey's actual facade material. This
+/// does not alter the indexed reference line, source corners or wall identities.
+pub(crate) fn floor_outline(outer: &[[f64; 2]], inner: &[[f64; 2]]) -> Result<Vec<[f64; 2]>> {
+    let invalid = |message: &str| ModelError::Invalid(format!("floor interior: {message}"));
+    if outer.len() != inner.len() || outer.len() > 2000 || outer.iter().chain(inner).flatten().any(|v| !v.is_finite() || v.abs() > 1e9) {
+        return Err(invalid("facade reference coordinates are invalid"));
+    }
+    if !floor_ring_simple(outer) || crate::footprint::signed_area2(outer) <= 0.0 {
+        return Err(invalid("the exterior outline must be simple and counter-clockwise"));
+    }
+    use i_overlay::core::{fill_rule::FillRule, overlay_rule::OverlayRule};
+    use i_overlay::float::overlay::FloatOverlay;
+    let n = outer.len();
+    let mut material = Vec::with_capacity(n);
+    let mut simple_material = true;
+    for i in 0..n {
+        let mut band = Vec::with_capacity(4);
+        for point in [outer[i], outer[(i + 1) % n], inner[(i + 1) % n], inner[i]] {
+            if band.last().is_none_or(|q: &[f64; 2]| (q[0] - point[0]).hypot(q[1] - point[1]) > FLOOR_PLAN_EPS) {
+                band.push(point);
+            }
+        }
+        if band.first().zip(band.last()).is_some_and(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]) <= FLOOR_PLAN_EPS) {
+            band.pop();
+        }
+        if floor_ring_simple(&band) {
+            if crate::footprint::signed_area2(&band) < 0.0 {
+                band.reverse();
+            }
+            material.push(vec![band]);
+        } else {
+            // Collapsed mitres can put a short end of a material band outside
+            // its source edge. Reconcile each band's nonzero filled region
+            // separately, so an exterior negative lobe cannot cancel an
+            // overlapping neighbouring wall. The final floor still must be
+            // one simple region strictly inside the exterior.
+            simple_material = false;
+            let mut pieces = FloatOverlay::with_subj(&vec![band]).overlay(OverlayRule::Subject, FillRule::NonZero);
+            // A completely consumed, collinear source band owns no area.
+            // Neighbouring bands still have to enclose the final floor.
+            for shape in &mut pieces {
+                for (index, ring) in shape.iter_mut().enumerate() {
+                    if (crate::footprint::signed_area2(ring) > 0.0) != (index == 0) {
+                        ring.reverse();
+                    }
+                }
+            }
+            material.extend(pieces);
+        }
+    }
+    let ribs_clear = || {
+        (0..n).all(|i| (0..n).filter(|&j| j != i && (j + 1) % n != i).all(|j| !floor_segments_meet(outer[i], inner[i], inner[j], inner[(j + 1) % n])))
+    };
+    if simple_material && floor_ring_simple(inner) && crate::footprint::signed_area2(inner) > 0.0 && floor_ring_inside(outer, inner) && ribs_clear() {
+        // Preserve exact old coordinates and triangulation when the original
+        // references already describe a valid material-bounded interior.
+        return Ok(inner.to_vec());
+    }
+    let mut shapes = FloatOverlay::with_subj_and_clip(&vec![outer.to_vec()], &material).overlay(OverlayRule::Difference, FillRule::NonZero);
+    if shapes.is_empty() {
+        return Err(invalid("facade material consumes the entire floor"));
+    }
+    if shapes.len() != 1 {
+        return Err(ModelError::Invalid(format!(
+            "floor interior: facade material splits the floor into {} disconnected regions; explicit floor components are required",
+            shapes.len()
+        )));
+    }
+    let mut shape = shapes.pop().ok_or_else(|| invalid("no floor contour remains"))?;
+    if shape.len() != 1 {
+        return Err(ModelError::Invalid(format!(
+            "floor interior: facade material creates {} contours including masonry islands; explicit floor void ownership is required",
+            shape.len()
+        )));
+    }
+    let mut outline = shape.pop().ok_or_else(|| invalid("no floor boundary remains"))?;
+    if crate::footprint::signed_area2(&outline) < 0.0 {
+        outline.reverse();
+    }
+    if !floor_ring_simple(&outline) || !floor_ring_inside(outer, &outline) {
+        return Err(invalid("the repaired floor does not form a simple boundary strictly inside its facades"));
+    }
+    Ok(outline)
+}
+
 /// A slab's outline and holes with its stair openings cut out. Openings may not overlap each
 /// other. An opening that runs into the walls (a stairwell against the facade) is clipped to the
 /// slab, so the slab's outline takes a notch there instead of a hole.
@@ -1424,16 +1573,15 @@ fn slab_shape(outer: &[[f64; 2]], holes: Vec<Vec<[f64; 2]>>) -> Result<(Vec<[f64
     use i_overlay::float::overlay::FloatOverlay;
     let subj = vec![outer.to_vec()];
     let shapes = FloatOverlay::with_subj_and_clip(&subj, &holes).overlay(OverlayRule::Difference, FillRule::NonZero);
-    let area = |shape: &Vec<Vec<[f64; 2]>>| shape.first().map_or(0.0, |o| crate::footprint::signed_area2(o).abs() / 2.0);
-    if shapes.iter().filter(|sh| area(sh) > 1.0e6).count() > 1 {
+    if shapes.len() > 1 {
         return Err(ModelError::Invalid("stair openings cut the floor slab in two".into()));
     }
-    let mut biggest = shapes.into_iter().max_by(|a, b| area(a).total_cmp(&area(b))).unwrap_or_default();
-    if biggest.is_empty() {
+    let mut single = shapes.into_iter().next().unwrap_or_default();
+    if single.is_empty() {
         return Err(ModelError::Invalid("stair openings leave nothing of the floor slab".into()));
     }
-    let outline = biggest.remove(0);
-    Ok((outline, biggest))
+    let outline = single.remove(0);
+    Ok((outline, single))
 }
 
 /// A vertical prism on a counter-clockwise polygon.
@@ -1442,6 +1590,18 @@ pub fn prism(poly: &[[f64; 2]], z0: f64, height: f64) -> Mesh {
 }
 
 fn prism_with_holes(poly: &[[f64; 2]], holes: &[Vec<[f64; 2]>], z0: f64, height: f64) -> Mesh {
+    // Earcut accepts either ring orientation, but the side quads below use a
+    // CCW outer and CCW void references (the void sides are reversed). Retain
+    // the exact established buffers for already-correct references.
+    let oriented_outer = (crate::footprint::signed_area2(poly) < 0.0).then(|| poly.iter().rev().copied().collect::<Vec<_>>());
+    let poly = oriented_outer.as_deref().unwrap_or(poly);
+    let oriented_holes = holes.iter().any(|ring| crate::footprint::signed_area2(ring) < 0.0).then(|| {
+        holes
+            .iter()
+            .map(|ring| if crate::footprint::signed_area2(ring) < 0.0 { ring.iter().rev().copied().collect() } else { ring.clone() })
+            .collect::<Vec<_>>()
+    });
+    let holes = oriented_holes.as_deref().unwrap_or(holes);
     let mut m = Mesh::default();
     let z1 = z0 + height;
     m.polygon(poly, holes, |p| [p[0], p[1], z1]);
@@ -2029,6 +2189,48 @@ mod tests {
         assert!(lo[1] >= -1e-6 && hi[1] <= 400.0 + 1e-6, "{lo:?} {hi:?}");
     }
 
+    fn prism_test_volume(mesh: &Mesh) -> f64 {
+        let origin = mesh.positions[0];
+        mesh.triangles
+            .iter()
+            .map(|tri| {
+                let [a, b, c] = tri.map(|i| std::array::from_fn::<_, 3, _>(|k| mesh.positions[i as usize][k] - origin[k]));
+                (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn prism_voids_are_closed_outward_and_volume_exact_for_either_ring_winding() {
+        for (angle, offset, z0) in [(0_f64, [0.0, 0.0], 0.0), (37.0, [12345.0, -54321.0], 5000.0)] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |[x, y]: [f64; 2]| [offset[0] + x * cos - y * sin, offset[1] + x * sin + y * cos];
+            let outer: Vec<_> = [[0., 0.], [10000., 0.], [10000., 8000.], [0., 8000.]].map(at).to_vec();
+            let hole: Vec<_> = [[1000., 1000.], [3000., 1000.], [3000., 3000.], [1000., 3000.]].map(at).to_vec();
+            let baseline = prism_with_holes(&outer, std::slice::from_ref(&hole), z0, 200.0);
+            let expected = (10000.0 * 8000.0 - 2000.0 * 2000.0) * 200.0;
+            for reverse_outer in [false, true] {
+                for reverse_hole in [false, true] {
+                    let mut outer = outer.clone();
+                    let mut hole = hole.clone();
+                    if reverse_outer {
+                        outer.reverse();
+                    }
+                    if reverse_hole {
+                        hole.reverse();
+                    }
+                    let mesh = prism_with_holes(&outer, &[hole], z0, 200.0);
+                    roof_shell_is_closed_and_outward(&mesh);
+                    assert!((prism_test_volume(&mesh) - expected).abs() < 1.0);
+                    // Reversing a reference twice returns its original start/order.
+                    // Correct established inputs therefore keep identical buffers.
+                    assert_eq!(mesh.positions, baseline.positions);
+                    assert_eq!(mesh.triangles, baseline.triangles);
+                }
+            }
+        }
+    }
+
     #[test]
     fn stairs_open_the_arrival_slab_but_leave_the_lowest_floor_solid() {
         let mut doc = doc_with_block();
@@ -2607,6 +2809,163 @@ mod tests {
         let mut doc = doc_with_block();
         doc.buildings[0].facades[0].kind = FacadeKind::Party;
         assert!(build(&doc).is_err());
+    }
+
+    fn repaired_floor_test_volume(mesh: &Mesh) -> f64 {
+        let origin = mesh.positions[0];
+        mesh.triangles
+            .iter()
+            .map(|tri| {
+                let [a, b, c] = tri.map(|i| std::array::from_fn::<_, 3, _>(|k| mesh.positions[i as usize][k] - origin[k]));
+                (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0
+            })
+            .sum()
+    }
+
+    fn repaired_floor_test_simple(ring: &[[f64; 2]]) {
+        let n = ring.len();
+        assert!(n >= 3);
+        let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        for i in 0..n {
+            let (a, b) = (ring[i], ring[(i + 1) % n]);
+            assert!((b[0] - a[0]).hypot(b[1] - a[1]) > 1e-6, "no collapsed floor edges");
+            for j in i + 1..n {
+                if j == i + 1 || (i == 0 && j == n - 1) {
+                    continue;
+                }
+                let (c, d) = (ring[j], ring[(j + 1) % n]);
+                assert!(!(cross(a, b, c) * cross(a, b, d) < 0.0 && cross(c, d, a) * cross(c, d, b) < 0.0), "self-crossing floor edges {i}/{j}");
+            }
+        }
+    }
+
+    #[test]
+    fn consumed_shallow_returns_make_a_simple_bounded_floor_against_actual_wall_material() {
+        for (angle, offset) in [(0_f64, [0.0, 0.0]), (37.0, [12345.0, -54321.0])] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |[x, y]: [f64; 2]| [offset[0] + x * cos - y * sin, offset[1] + x * sin + y * cos];
+            let local = |p: [f64; 2]| {
+                let (x, y) = (p[0] - offset[0], p[1] - offset[1]);
+                [x * cos + y * sin, -x * sin + y * cos]
+            };
+            let fp = [[0., 0.], [10000., 0.], [10000., 12000.], [11000., 12000.], [11000., 12300.], [0., 12300.]].map(at);
+            let mut doc = Document::default();
+            let mut b = Building::new("b", "Synthetic shallow return", &fp, 2, 3000.0).unwrap();
+            assert_eq!(b.footprint.len(), 6);
+            b.set_wall_schedule(&[480.0, 480.0]).unwrap();
+            let top = b.facades.iter().find(|f| f.edge == 4).unwrap().id.clone();
+            b.set_facade_schedule(&[top], &[360.0, 360.0]).unwrap();
+            doc.buildings.push(b);
+            let built = build(&doc).unwrap();
+            let floors: Vec<_> = built[0].slabs.iter().filter(|s| s.kind == SlabKind::Floor).collect();
+            assert_eq!(floors.len(), 2, "do not discard a floor while repairing its boundary");
+            // Exact intersection of x=9520 with the actual adjoining inner face
+            // [480,11940]→[10520,12210], independent of the inset/Boolean code.
+            let top_right = 11940.0 + 270.0 * 9040.0 / 10040.0;
+            let expected_area = 9040.0 * ((11940.0 - 480.0) + (top_right - 480.0)) / 2.0;
+            for slab in floors {
+                let polygon: Vec<_> = slab.polygon.iter().copied().map(local).collect();
+                for p in &polygon {
+                    assert!(p[0] >= 480.0 - 0.001 && p[0] <= 9520.0 + 0.001, "floor side escapes its material boundary: {p:?}");
+                    assert!(p[1] >= 480.0 - 0.001 && p[1] <= 12300.0 + 0.001, "floor escapes the exterior: {p:?}");
+                    let inner_top = 11940.0 + 270.0 * (p[0] - 480.0) / 10040.0;
+                    assert!(p[1] <= inner_top + 0.001, "floor overlaps the nonincident top-wall material: {p:?}");
+                }
+                repaired_floor_test_simple(&polygon);
+                assert!((crate::doc::polygon_area(&polygon) - expected_area).abs() < 5.0, "do not hide excursions by arbitrary shrinkage");
+                roof_shell_is_closed_and_outward(&slab.mesh);
+                assert!((repaired_floor_test_volume(&slab.mesh) - expected_area * slab.thickness).abs() < 1000.0);
+            }
+        }
+    }
+
+    #[test]
+    fn facade_material_that_disconnects_a_floor_requires_explicit_components() {
+        let fp = [
+            [0., 0.],
+            [4000., 0.],
+            [4000., 1700.],
+            [6000., 1700.],
+            [6000., 0.],
+            [10000., 0.],
+            [10000., 4000.],
+            [6000., 4000.],
+            [6000., 2300.],
+            [4000., 2300.],
+            [4000., 4000.],
+            [0., 4000.],
+        ];
+        let mut doc = Document::default();
+        let mut b = Building::new("b", "Synthetic narrow neck", &fp, 1, 3000.0).unwrap();
+        b.set_wall_schedule(&[400.0]).unwrap();
+        doc.buildings.push(b);
+        let error = build(&doc).unwrap_err().to_string();
+        assert!(error.contains("floor interior") && error.contains("disconnected"), "{error}");
+    }
+
+    #[test]
+    fn a_consumed_zero_area_facade_band_keeps_the_complete_bounded_floor() {
+        let mut doc = Document::default();
+        let footprint = [[0., 0.], [10000., 0.], [10000., 11580.], [10700., 12000.], [0., 12000.]];
+        let mut building = Building::new("b", "Synthetic consumed facade", &footprint, 1, 3000.).unwrap();
+        assert_eq!(building.footprint.len(), 5);
+        building.wall_thickness = 480.;
+        building.facades[1].wall_schedule = vec![100.];
+        doc.buildings.push(building);
+        let before = doc.clone();
+        let built = build(&doc).unwrap();
+        let slab = &built[0].slabs[0];
+        let expected_area = (9900. - 480.) * (11520. - 480.);
+        repaired_floor_test_simple(&slab.polygon);
+        assert!((crate::doc::polygon_area(&slab.polygon) - expected_area).abs() < 1.);
+        assert!(slab.polygon.iter().all(|p| p[0] >= 480. - 0.001 && p[0] <= 9900. + 0.001 && p[1] >= 480. - 0.001 && p[1] <= 11520. + 0.001));
+        roof_shell_is_closed_and_outward(&slab.mesh);
+        assert!((repaired_floor_test_volume(&slab.mesh) - expected_area * slab.thickness).abs() < 1000.);
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn a_folded_consumed_band_preserves_the_exact_material_bounded_trapezoid() {
+        let outer = [[0., 0.], [10000., 0.], [10000., 11820.], [10180., 11820.], [10180., 12000.], [0., 12000.]];
+        let thickness = [600., 700., 100., 360., 240., 1500.];
+        let inner = inner_ring_by(&outer, |i| thickness[i]);
+        let band = [outer[2], outer[3], inner[3], inner[2]];
+        assert!(!floor_ring_simple(&band), "the fixture must exercise the folded-band branch");
+        let floor = floor_outline(&outer, &inner).unwrap();
+        repaired_floor_test_simple(&floor);
+        let expected_area = 7800. * ((11760. - 600.) + (11835. - 600.)) / 2.;
+        assert!((crate::doc::polygon_area(&floor) - expected_area).abs() < 1.);
+        for p in &floor {
+            assert!(p[0] >= 1500. - 0.001 && p[0] <= 9300. + 0.001 && p[1] >= 600. - 0.001);
+            assert!(p[1] <= 11760. + 80. * (p[0] - 1500.) / 8320. + 0.001);
+        }
+        let mesh = prism(&floor, 2800., 200.);
+        roof_shell_is_closed_and_outward(&mesh);
+        assert!((repaired_floor_test_volume(&mesh) - expected_area * 200.).abs() < 1000.);
+    }
+
+    #[test]
+    fn a_small_disconnected_slab_piece_is_refused_instead_of_silently_discarded() {
+        let outer = [[0., 0.], [10000., 0.], [10000., 8000.], [0., 8000.]];
+        // A 1m-wide opening crosses the floor, leaving a0.8m² right-hand island.
+        let opening = vec![[8900., -500.], [9900., -500.], [9900., 8500.], [8900., 8500.]];
+        let error = slab_shape(&outer, vec![opening]).unwrap_err().to_string();
+        assert!(error.contains("stair openings cut the floor slab in two"), "{error}");
+    }
+
+    #[test]
+    fn valid_floor_references_keep_their_exact_profile_and_mesh_buffers() {
+        let mut doc = Document::default();
+        doc.buildings.push(Building::new("b", "Synthetic valid floor", &[[0., 0.], [11000., 0.], [11000., 9000.], [0., 9000.]], 2, 3000.0).unwrap());
+        let built = build(&doc).unwrap();
+        for slab in built[0].slabs.iter().filter(|s| s.kind == SlabKind::Floor) {
+            let expected = doc.buildings[0].storey_inner(slab.level);
+            assert_eq!(slab.polygon, expected);
+            assert!(slab.holes.is_empty());
+            let mesh = prism(&expected, slab.z_bottom, slab.thickness);
+            assert_eq!(slab.mesh.positions, mesh.positions);
+            assert_eq!(slab.mesh.triangles, mesh.triangles);
+        }
     }
 
     #[test]
