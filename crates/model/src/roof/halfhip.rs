@@ -206,7 +206,31 @@ pub(super) fn lower(under: &Mesh, plane: CapPlane) -> Result<Mesh> {
 
 /// Clip vertical source gable faces; never project their upper vertices into the wall.
 pub(super) fn clip_gables(gables: &Mesh, plane: CapPlane) -> Result<Mesh> {
-    transform(gables, plane, false)
+    let clipped = transform(gables, plane, false)?;
+    // Consumers identify each source gable by connected vertex indices. A fan can
+    // otherwise turn one clipped face into several IFC walls. Reuse only exact
+    // coordinates, including across successive caps; never round or move a vertex.
+    let mut mesh = Mesh::default();
+    let mut indices = std::collections::BTreeMap::new();
+    for triangle in &clipped.triangles {
+        let mut shared = [0u32; 3];
+        for (to, from) in shared.iter_mut().zip(triangle) {
+            let point = *clipped.positions.get(*from as usize).ok_or_else(|| ModelError::Invalid("clipped gable index is absent".into()))?;
+            let key = point.map(|v| if v == 0. { 0 } else { v.to_bits() });
+            *to = match indices.get(&key) {
+                Some(i) => *i,
+                None => {
+                    let index =
+                        u32::try_from(mesh.positions.len()).map_err(|_| ModelError::Invalid("clipped gable exceeds index capacity".into()))?;
+                    mesh.positions.push(point);
+                    indices.insert(key, index);
+                    index
+                }
+            };
+        }
+        mesh.triangles.push(shared);
+    }
+    Ok(mesh)
 }
 
 fn transform(source: &Mesh, plane: CapPlane, lower_above: bool) -> Result<Mesh> {

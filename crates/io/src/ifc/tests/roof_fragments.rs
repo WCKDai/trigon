@@ -6,6 +6,45 @@ use super::*;
 use crate::ifc::{guid, part21, write};
 
 #[test]
+fn clipped_gables_keep_one_complete_product_per_source_facade() {
+    for rotation in [0.0_f64, 31.] {
+        for caps in [
+            serde_json::json!([{"facade":"b.f4","drop_mm":1200}]),
+            serde_json::json!([{"facade":"b.f2","drop_mm":900},{"facade":"b.f4","drop_mm":1200}]),
+        ] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let outline =
+                [[0., 0.], [30000., 0.], [30000., 12000.], [0., 12000.]].map(|[x, y]| [142000. + x * cos - y * sin, -270000. + x * sin + y * cos]);
+            let mut doc = Document::default();
+            let mut b = trigon_model::Building::new("b", "Public connected gable", &outline, 3, 3000.).unwrap();
+            b.roof=serde_json::from_value(serde_json::json!({"kind":"half_hipped","pitch_deg":45,"gables":["b.f2","b.f4"],"half_hips":caps,"thickness_mm":200,"overhang_mm":180,"verge_mm":135})).unwrap();
+            doc.buildings.push(b);
+            let built = trigon_model::build(&doc).unwrap();
+            let roof = built[0].roof.as_ref().unwrap();
+            let pieces: Vec<_> = split::roof(roof, &built[0].walls).into_iter().filter(|p| p.gable.is_some()).collect();
+            assert_eq!(pieces.len(), 2, "each source gable must remain one physical wall: {:?}", pieces.iter().map(|p| &p.key).collect::<Vec<_>>());
+            for id in ["b.f2.gable", "b.f4.gable"] {
+                assert_eq!(pieces.iter().filter(|p| p.key == id).count(), 1);
+            }
+            let clipped = pieces.iter().find(|p| p.key == "b.f4.gable").unwrap();
+            let frame = split::gable_frame(&clipped.polygon, &built[0].walls[3]).unwrap();
+            let ring: Vec<_> = clipped
+                .polygon
+                .iter()
+                .map(|p| {
+                    let q = frame.local(*p);
+                    [q[0], q[2]]
+                })
+                .collect();
+            assert!((part21::area(&ring).abs() / 1e6 - 34.56).abs() < 1e-8, "clipped gable area must be complete");
+            let text = write(&doc, &built, "halfhip.ifc", "2026-01-01T00:00:00");
+            assert_eq!(text.lines().filter(|l| l.contains("=IFCWALL(") && l.contains("Gavltrekant")).count(), 2);
+            assert!(!text.lines().any(|l| l.contains("=IFCWALL(") && l.contains("'b.roof.gable")));
+        }
+    }
+}
+
+#[test]
 fn unopened_half_hip_exports_the_actual_shell_type_and_clipped_gable() {
     let mut doc = Document::default();
     let mut b =
