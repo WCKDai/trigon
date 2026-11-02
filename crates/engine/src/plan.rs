@@ -855,7 +855,8 @@ pub(crate) fn entrance_label(
         }
     }
     let (left, right) = if front { ("TV", "TH") } else { ("TH", "TV") };
-    let mut text = if entrance.number.is_empty() { "Opgang (nummer ukendt)".into() } else { entrance.number.clone() };
+    let number = if entrance.number.is_empty() { "(nummer ukendt)" } else { entrance.number.as_str() };
+    let mut text = if entrance.number.is_empty() { format!("Opgang {number}") } else { number.to_owned() };
     if known.iter().any(|door| door == left) {
         text = format!("{left}{separator}{text}");
     }
@@ -879,7 +880,7 @@ pub(crate) fn entrance_label(
         deg: 0.0,
         outward: [0.0, 0.0],
         text,
-        legend: format!("Opgang {} — {}", entrance.number, details.join(" / ")),
+        legend: format!("Opgang {number} — {}", details.join(" / ")),
         unit_records: units.len(),
         unknown_door_units: unknown,
         placement_note: None,
@@ -2431,6 +2432,28 @@ mod tests {
                 .any(|text| text.text.contains("Opgang 1A") && text.text.contains("TV") && text.text.contains("TH"))
         );
         assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn entrance_register_legend_keeps_an_explicit_unknown_number() {
+        for number in ["", "1A"] {
+            let mut s = entrance_tag_fixture();
+            s.doc.buildings[0].entrances.truncate(1);
+            let entrance = &mut s.doc.buildings[0].entrances[0];
+            entrance.number = number.into();
+            entrance.stair = None;
+            let before = s.doc.clone();
+            let sheet = drawing_sheet(&s.doc, 0, View::latest(&s.doc)).unwrap();
+            let record = &sheet.metrics["entrance_labels"]["records"][0];
+            let expected = format!("Opgang {} — TV / TH", if number.is_empty() { "(nummer ukendt)" } else { number });
+            assert_eq!(record["state"], "legend");
+            assert_eq!(record["legend_text"], expected);
+            assert!(
+                entrance_tag_texts(&sheet.scene).iter().any(|text| text.text == expected),
+                "the printed fallback must retain the unknown-number notice"
+            );
+            assert_eq!(s.doc, before);
+        }
     }
 
     #[test]
