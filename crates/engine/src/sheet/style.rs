@@ -60,6 +60,7 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
     };
     for b in built {
         let walls = next();
+        let mut band_groups = HashMap::new();
         for w in b.exterior_walls() {
             let element = Element::new(&w.id, DrawingElementKind::FacadeWall);
             let gable = b.roof.iter().any(|r| r.gable_walls.iter().any(|g| g.front.id == w.id));
@@ -67,7 +68,16 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
             for seg in &w.segments {
                 out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut, Some(element.clone())));
             }
-            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both, Some(element)));
+            out.push(part(&w.plinth, Class::Plinth, next(), Material::Plinth, Role::Both, Some(element.clone())));
+            // These are the actual closed band solids, not facade-only decoration.
+            // Share a material group across walls to suppress seams on aligned runs;
+            // do not duplicate the aggregate when explicit material parts exist.
+            let bands: Vec<_> =
+                if w.trim_parts.is_empty() { vec![(Material::Render, &w.trim)] } else { w.trim_parts.iter().map(|(m, mesh)| (*m, mesh)).collect() };
+            for (material, mesh) in bands.into_iter().filter(|(_, mesh)| !mesh.is_empty()) {
+                let group = *band_groups.entry(material).or_insert_with(&mut next);
+                out.push(part(mesh, Class::Wall, group, material, Role::Both, Some(element.clone())));
+            }
             for e in w.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&w.attachments) {
                 if e.status == Status::Demolished {
                     continue;

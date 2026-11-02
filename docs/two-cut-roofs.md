@@ -75,6 +75,10 @@ the horizontal return and are omitted for this mode. GLB, sections, picking and
 roof openings consume the same built geometry. Reader/schema verification does
 not establish editable Revit family behavior or actual Revit import acceptance.
 
+Sections, ranged plans and elevations include the actual closed facade-band
+solids, with explicit material parts exported once. Their drawing ownership leads
+back to the editable host facade; brick cornices use masonry section hatching.
+
 The terminology follows the [Autodesk rafter-cut documentation](https://help.autodesk.com/cloudhelp/2023/ENU/Revit-ArchDesign/files/GUID-AAEDDF4E-C84B-4DEF-90CF-B38480AFEA31.htm).
 This is an original parametric implementation; no external application code is used.
 

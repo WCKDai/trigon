@@ -20,6 +20,47 @@ use crate::sheet::cut::{self, Shape};
 use crate::sheet::project::{Class, Look, Near, project};
 use crate::sheet::{Anchor, Fill, Layer, Rgb, Scene, Stroke, Text, Viewport, level_text, scale_text, style};
 
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn roof_bearing_cornice_is_cut_and_projected_from_the_same_built_band() {
+        let mut doc = Document::default();
+        let mut b =
+            trigon_model::Building::new("b", "Public coordinated eave", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.).unwrap();
+        b.roof=serde_json::from_value(json!({"kind":"two_cut_plumb","fascia_depth_mm":20.,"roof":{"kind":"pitched","pitch_deg":46.,"gables":["b.f2","b.f4"],"overhang_mm":400.,"verge_mm":135.,"thickness_mm":200.}})).unwrap();
+        b.facades[0].bands =
+            serde_json::from_value(json!([{"levels":[0],"bottom":2820.,"top":3000.,"projection":135.,"finish":"yellow_brick"}])).unwrap();
+        doc.buildings.push(b);
+        for (id, kind) in [
+            ("cut", json!({"view":"section","from":[6000,-1000],"to":[6000,2000],"depth_mm":100})),
+            ("front", json!({"view":"facade","facade":"b.f1"})),
+        ] {
+            doc.views.push(serde_json::from_value(json!({"id":id,"name":id,"kind":kind})).unwrap());
+        }
+        let before = doc.clone();
+        let built = build_view(&doc, View::latest(&doc)).unwrap();
+        assert!(!built[0].walls[0].trim.is_empty());
+        let cut = crate::views::drawing_view(&doc, "cut", View::latest(&doc)).unwrap();
+        assert!(
+            cut.element_regions.iter().filter(|r| r.id == "b.f1").any(|r| r
+                .rings
+                .iter()
+                .filter(|ring| crate::drawings::inside(ring, [900., 2860.]))
+                .count()
+                % 2
+                == 1),
+            "the physical135mm cornice must occupy its actual section, outside the structural wall"
+        );
+        let facade = crate::views::drawing_view(&doc, "front", View::latest(&doc)).unwrap();
+        let hit = facade.pick_element([6000., 2820.], 0.01).expect("projected band bottom must be visible and pickable");
+        assert_eq!(hit.id, "b.f1");
+        assert_eq!(doc, before);
+    }
+}
+
 /// Drawing area on the 1600 × 900 sheet, px: room at the sides for the level marks.
 const AREA: [f64; 4] = [230.0, 150.0, 1140.0, 640.0];
 
@@ -45,7 +86,7 @@ impl Poche {
             Material::Frame | Material::Door | Material::Sill => Poche::Frame,
             Material::Roof => Poche::Roof,
             Material::Wall | Material::Plaster if class == Class::Partition => Poche::Partition,
-            Material::Wall | Material::Plaster => Poche::Masonry,
+            Material::Wall | Material::Plaster | Material::BrickRed | Material::BrickYellow => Poche::Masonry,
             _ => Poche::Concrete,
         }
     }
