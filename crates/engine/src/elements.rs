@@ -856,7 +856,7 @@ fn point(key: &str, value: &Value) -> Result<[f64; 2]> {
     }
     Ok(p)
 }
-fn polygon(key: &str, value: &Value, exact: Option<usize>) -> Result<Vec<[f64; 2]>> {
+pub(crate) fn polygon(key: &str, value: &Value, exact: Option<usize>) -> Result<Vec<[f64; 2]>> {
     let values = value.as_array().ok_or_else(|| invalid(format!("{key}: expected a point array")))?;
     if !(3..=2000).contains(&values.len()) || exact.is_some_and(|n| values.len() != n) {
         return Err(invalid(format!("{key}: invalid point count")));

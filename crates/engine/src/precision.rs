@@ -292,6 +292,59 @@ mod drawing_preview_tests {
     }
 
     #[test]
+    fn room_authoring_rejects_invalid_polygons_atomically_without_losing_redo() {
+        let mut s = session();
+        let polygon = json!([[1000.0, 1000.0], [5000.0, 1000.0], [5000.0, 2500.0], [3000.0, 2500.0], [3000.0, 4000.0], [1000.0, 4000.0]]);
+        let room = json!({"id":"room","name":"","levels":[0],"polygon":polygon});
+        s.execute("interior.add_rooms", json!({"building":"b","rooms":[room]})).unwrap();
+        assert_eq!(json!(s.doc.buildings[0].rooms[0].polygon), polygon, "concave input coordinates stay exact");
+        let accepted = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        let before = s.doc.clone();
+        let before_glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        for bad in [
+            json!({"levels":[0],"polygon":[[0,0],[0,0],[0,0]]}),
+            json!({"levels":[0],"polygon":[[0,0],[1000,0],[2000,0]]}),
+            json!({"levels":[0],"polygon":[[0,0],[2000,2000],[0,2000],[2000,0]]}),
+            json!({"levels":[0],"polygon":[[0,0],[2000,0],[2000,2000],[1000,0],[0,2000]]}),
+            json!({"levels":[0],"polygon":[[0,0],[1,0],[0,1]]}),
+            json!({"levels":[0],"polygon":[[0,0],[1e20,0],[0,1000]]}),
+            json!({"levels":[],"polygon":polygon}),
+        ] {
+            let mut invalid = bad;
+            invalid["name"] = json!("");
+            invalid["id"] = json!("invalid");
+            let params = json!({"building":"b","rooms":[room,invalid]});
+            for (command, request) in
+                [("interior.add_rooms", params.clone()), ("precision.preview", json!({"action":{"command":"interior.add_rooms","params":params}}))]
+            {
+                assert!(s.execute(command, request.clone()).is_err(), "{command} accepted {request}");
+                assert_eq!(s.doc, before, "a valid first room must not survive a refused batch");
+                assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+                assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), before_glb);
+            }
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        s.execute("edit.undo", json!({})).unwrap();
+        let mut clockwise = polygon.as_array().unwrap().clone();
+        clockwise.reverse();
+        let action = json!({"command":"interior.add_rooms","params":{"building":"b","rooms":[
+            {"id":"clockwise","name":"","levels":[0],"polygon":clockwise}
+        ]}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(json!(s.doc.buildings[0].rooms[0].polygon), json!(clockwise), "clockwise winding is preserved");
+        let accepted = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+    }
+
+    #[test]
     fn interior_previews_report_candidate_sanity_and_apply_one_replayable_edit() {
         let mut s = session();
         s.execute("interior.add_walls",json!({"building":"b","walls":[{"id":"host","levels":[0],"a":[1000,4000],"b":[11000,4000],"thickness":240,"doors":[{"at":5000,"width":900,"height":2100}]}]})).unwrap();

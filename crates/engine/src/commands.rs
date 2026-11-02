@@ -69,9 +69,10 @@ pub(crate) fn add_interior_rooms(s: &mut Session, p: AddRooms) -> Result<Value> 
     }
     let start = b.rooms.len();
     for (k, mut r) in p.rooms.into_iter().enumerate() {
-        if r.polygon.len() < 3 || r.polygon.len() > 256 || r.polygon.iter().flatten().any(|v| !v.is_finite()) || r.levels.iter().any(|l| *l >= n) {
-            return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
+        if r.polygon.len() < 3 || r.polygon.len() > 256 || r.levels.is_empty() || r.levels.iter().any(|l| *l >= n) {
+            return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and at least one storey below {n}")).into());
         }
+        r.polygon = crate::elements::polygon(&format!("room {k} polygon"), &json!(r.polygon), None)?;
         if r.id.is_empty() {
             r.id = format!("{}.room{}", b.id, start + k);
         }
@@ -1390,7 +1391,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "interior.add_rooms",
-        summary: "Add rooms: a name and a polygon (site mm) on the listed storeys; plans label them with name and area.",
+        summary: "Add rooms: a name and a simple polygon (site mm) on at least one listed full storey. Uses the same bounded coordinates, minimum edges and area as room edits; plans label name and area.",
         mutates: true,
         journaled: true,
         schema: schema::<AddRooms>,

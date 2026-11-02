@@ -147,6 +147,14 @@ edit. Applying the returned action creates one underlying `interior.add_walls` o
 registered scans is not a preflight action: these previews do not read files, infer new room
 names, split existing room polygons or repair door conflicts automatically.
 
+New room authoring uses the same polygon validation as room boundary edits: simple,
+nonintersecting boundaries, coordinates within ±100,000,000 mm, edges of at least 1 mm
+and area of at least 0.01 m². `interior.add_rooms` retains its 3–256 corner limit and
+requires at least one full storey. It preserves valid coordinates and winding exactly.
+A refused direct command or precision preview preserves the whole document and Redo,
+including when an earlier room in the batch was valid. Reading existing native files
+and the defensive rendering of malformed legacy room records are unchanged.
+
 `view.audit` shapes lettering with the bundled SVG fonts at the final physical scale. It returns
 rotated ink/halo corners, visible polygons, clipping, actual displayed text and unrounded
 measurement values. Saved annotations and generated room/balcony labels retain their exact
