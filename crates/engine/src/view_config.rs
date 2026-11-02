@@ -574,6 +574,7 @@ mod room_label_tests {
             winders: None,
             turn_depths: None,
             turn_chamfer: None,
+            boundary: None,
         });
         configure(&mut s, "area", 100., None);
         let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();

@@ -624,6 +624,11 @@ pub struct Stair {
     /// in mm. Only for non-rounded U-turn stairs; absent preserves rectangular turns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_chamfer: Option<[f64; 2]>,
+    /// Optional fitted outer boundary of flights and turn, site-local mm, closing implicitly.
+    /// May follow a concave window recess. Overrides the rounded shape and requires no turn_chamfer,
+    /// keeping the flight frame, well and tread/riser parameters. Floor landings stay outside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<Vec<[f64; 2]>>,
 }
 
 fn yes() -> bool {

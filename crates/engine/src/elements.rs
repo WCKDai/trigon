@@ -483,8 +483,9 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                 number("tread_mm", "Tread parameter (null = automatic)", json!(source.tread), "mm", 150.0, 400.0),
                 number("landing_mm", "Landing parameter (null = automatic)", json!(source.landing), "mm", 300.0, frame.width * 2.0),
                 number("well_mm", "Well parameter (null = automatic)", json!(source.well), "mm", 0.0, frame.width / 3.0),
-                field("rounded", "Rounded turn", source.rounded, true),
-                field("turn_chamfer_mm", "Turn corner cuts: run/across (null = rectangular)", json!(source.turn_chamfer), true),
+                field("boundary", "Fitted stair boundary", json!(source.boundary), true),
+                field("rounded", "Rounded turn", source.rounded, source.boundary.is_none()),
+                field("turn_chamfer_mm", "Turn corner cuts: run/across (null = rectangular)", json!(source.turn_chamfer), source.boundary.is_none()),
                 choice(
                     "stair_kind",
                     "Stair kind",
@@ -1086,15 +1087,17 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
             }
             crate::edit::update_parameters(doc, &format!("{root}.L{level}"), |item| {
                 let crate::edit::Item::Stair(stair) = item else { return Err(invalid("wrong stair source")) };
+                let previous = stair.clone();
                 let frame = trigon_model::stair::frame(stair)?;
                 let width = properties.get("width_mm").map(|v| numeric("width_mm", v)).transpose()?.unwrap_or(frame.width);
                 let length = properties.get("length_mm").map(|v| numeric("length_mm", v)).transpose()?.unwrap_or(frame.length);
-                if properties.contains_key("width_mm") || properties.contains_key("length_mm") {
+                if width != frame.width || length != frame.length {
                     stair.outline = vec![frame.at(0.0, 0.0), frame.at(length, 0.0), frame.at(length, width), frame.at(0.0, width)];
                 }
                 for (key, value) in properties {
                     match key.as_str() {
                         "outline" => stair.outline = polygon(key, value, Some(4))?,
+                        "boundary" => stair.boundary = if value.is_null() { None } else { Some(polygon(key, value, None)?) },
                         "width_mm" | "length_mm" => {}
                         "tread_mm" => stair.tread = if value.is_null() { None } else { Some(numeric(key, value)?) },
                         "landing_mm" => stair.landing = if value.is_null() { None } else { Some(numeric(key, value)?) },
@@ -1110,6 +1113,37 @@ fn apply(doc: &mut Document, source: &Source, properties: &BTreeMap<String, Valu
                         "stair_kind" => stair.kind = serde_json::from_value(value.clone()).map_err(|_| invalid("unknown stair kind"))?,
                         _ => return Err(invalid("unknown stair property")),
                     }
+                }
+                if !properties.contains_key("boundary")
+                    && (stair.outline != previous.outline || stair.landing != previous.landing)
+                    && let Some(boundary) = previous.boundary
+                {
+                    let mut unfitted = stair.clone();
+                    unfitted.boundary = None;
+                    let next = trigon_model::stair::frame(&unfitted)?;
+                    let depths = |st: &trigon_model::Stair, width: f64| match st.kind {
+                        trigon_model::StairKind::Straight => [0., 0.],
+                        trigon_model::StairKind::UTurn => [0., st.landing.unwrap_or(width / 2.)],
+                        trigon_model::StairKind::DoubleQuarterTurn => st.turn_depths.unwrap_or([width; 2]),
+                    };
+                    let old_depths = depths(&trigon_model::Stair { boundary: None, ..previous }, frame.width);
+                    let new_depths = depths(stair, next.width);
+                    stair.boundary = Some(
+                        boundary
+                            .into_iter()
+                            .map(|p| {
+                                let [s, t] = frame.local(p);
+                                let s = if s < 0. {
+                                    s * new_depths[0] / old_depths[0].max(1.)
+                                } else if s <= frame.length {
+                                    s * next.length / frame.length
+                                } else {
+                                    next.length + (s - frame.length) * new_depths[1] / old_depths[1].max(1.)
+                                };
+                                next.at(s, t * next.width / frame.width)
+                            })
+                            .collect(),
+                    );
                 }
                 trigon_model::stair::frame(stair)?;
                 Ok(())
@@ -1789,6 +1823,59 @@ mod tests {
     }
 
     #[test]
+    fn fitted_stair_boundary_moves_and_resizes_with_its_model_and_restores_exactly() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let boundary =
+            json!([[2000., 8000.], [6300., 8000.], [6300., 8500.], [6500., 8500.], [6500., 9500.], [6300., 9500.], [6300., 10000.], [2000., 10000.]]);
+        let id = update(&mut s, "stairs.L1", json!({"boundary":boundary}));
+        assert_eq!(property(&descriptor(&mut s, &id), "boundary"), boundary);
+        assert_eq!(property(&descriptor(&mut s, "stairs.L0"), "boundary"), Value::Null);
+        let fitted = s.doc.clone();
+        let copied = s.execute("edit.copy", json!({"targets":[id],"delta":[5000,0,0]})).unwrap();
+        let copy_id = copied["targets"][0].as_str().unwrap();
+        let copy_boundary: Vec<[f64; 2]> = serde_json::from_value(property(&descriptor(&mut s, copy_id), "boundary")).unwrap();
+        assert_eq!(copy_boundary[0], [7000., 8000.]);
+        assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+        assert_eq!(s.doc, fitted);
+        s.execute("edit.align", json!({"targets":[id],"axis":"x","anchor":"end","coordinate":7000})).unwrap();
+        let aligned: Vec<[f64; 2]> = serde_json::from_value(property(&descriptor(&mut s, &id), "boundary")).unwrap();
+        assert_eq!(aligned.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max), 7000.);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, fitted);
+        let moved = s.execute("edit.move", json!({"targets":[id],"delta":[123,-456,0]})).unwrap();
+        let next = moved["targets"][0].as_str().unwrap();
+        let actual: Vec<[f64; 2]> = serde_json::from_value(property(&descriptor(&mut s, next), "boundary")).unwrap();
+        let original: Vec<[f64; 2]> = serde_json::from_value(boundary).unwrap();
+        for (a, b) in actual.iter().zip(&original) {
+            assert!((a[0] - b[0] - 123.).abs() < 1e-6 && (a[1] - b[1] + 456.).abs() < 1e-6);
+        }
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, fitted);
+        let redo = s.redo.clone();
+        for invalid in [
+            json!([]),
+            json!([[2000, 8000], [6500, 10000], [6500, 8000], [2000, 10000]]),
+            json!([[2000, 8000], [100000, 8000], [100000, 10000], [2000, 10000]]),
+        ] {
+            assert!(s.execute("element.set", json!({"id":id,"properties":{"boundary":invalid}})).is_err());
+            assert_eq!(s.doc, fitted);
+            assert_eq!(s.redo, redo);
+        }
+        assert!(s.execute("element.set", json!({"id":id,"properties":{"rounded":true}})).is_err());
+        assert_eq!(s.doc, fitted);
+        assert_eq!(s.redo, redo);
+        update(&mut s, &id, json!({"width_mm":2200,"length_mm":3850,"landing_mm":1100}));
+        let actual: Vec<[f64; 2]> = serde_json::from_value(property(&descriptor(&mut s, &id), "boundary")).unwrap();
+        for (a, b) in actual.iter().zip(&original) {
+            assert!((a[0] - 2000. - (b[0] - 2000.) * 1.1).abs() < 1e-6 && (a[1] - 8000. - (b[1] - 8000.) * 1.1).abs() < 1e-6);
+        }
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
     fn stair_chamfer_property_is_storey_scoped_atomic_and_exactly_undoable() {
         let mut s = session();
         let before = s.doc.clone();
@@ -1813,6 +1900,24 @@ mod tests {
         assert_eq!(trigon_model::build(&s.doc).unwrap(), after_mesh);
         update(&mut s, &id, json!({"turn_chamfer_mm":null}));
         assert_eq!(property(&descriptor(&mut s, &id), "turn_chamfer_mm"), Value::Null);
+    }
+
+    #[test]
+    fn fitted_stair_replaces_the_old_turn_definition_atomically_and_resizes_without_a_stale_chamfer() {
+        let mut s = session();
+        let id = update(&mut s, "stairs.L1", json!({"turn_chamfer_mm":[250.,350.]}));
+        let original = s.doc.clone();
+        let boundary = json!([[2000., 8000.], [6500., 8000.], [6500., 10000.], [2000., 10000.]]);
+        let error = s.execute("element.set", json!({"id":id,"properties":{"boundary":boundary}})).unwrap_err().to_string();
+        assert!(error.contains("mutually exclusive"), "{error}");
+        assert_eq!(s.doc, original);
+        update(&mut s, &id, json!({"boundary":boundary,"turn_chamfer_mm":null}));
+        assert_eq!(property(&descriptor(&mut s, &id), "turn_chamfer_mm"), Value::Null);
+        update(&mut s, &id, json!({"width_mm":600.}));
+        assert_eq!(property(&descriptor(&mut s, &id), "width_mm"), 600.);
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, original);
     }
 
     #[test]
