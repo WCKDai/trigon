@@ -483,7 +483,7 @@ mod tests {
         let view = trigon_model::build::View::latest(&s.doc);
         let plan = crate::plan_sheet_svg(&s.doc, 3, view).unwrap();
         assert!(plan.contains("3. sal / tagkvist"));
-        let section = crate::section::scene(&s.doc, [[10000., -1000.], [10000., 13000.]], false, 10000., view, "Section", "").unwrap();
+        let section = crate::section::scene(&s.doc, [[10000., -1000.], [10000., 13000.]], false, 10000., view, "Section", "", None).unwrap();
         assert!(section.svg().contains("tagkvist"));
     }
     #[test]
@@ -569,6 +569,7 @@ mod tests {
             trigon_model::build::View::latest(&s.doc),
             "Rear section",
             "",
+            None,
         )
         .unwrap();
         let svg = section.svg();

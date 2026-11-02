@@ -1100,9 +1100,17 @@ fn section_level_names_from_multiple_wings_stay_inside_the_sheet() {
         s.execute("building.set_roof", json!({"building":id,"kind":"pitched","pitch_deg":35})).unwrap();
         s.execute("building.set_attic", json!({"building":id,"floor":9450})).unwrap();
     }
-    let section =
-        crate::section::scene(&s.doc, [[6000., -1000.], [6000., 33000.]], false, 1000., trigon_model::build::View::latest(&s.doc), "Both wings", "")
-            .unwrap();
+    let section = crate::section::scene(
+        &s.doc,
+        [[6000., -1000.], [6000., 33000.]],
+        false,
+        1000.,
+        trigon_model::build::View::latest(&s.doc),
+        "Both wings",
+        "",
+        None,
+    )
+    .unwrap();
     let texts: Vec<_> = section.scene.items.iter().filter_map(|i| if let crate::sheet::Item::Text(t) = i { Some(t.clone()) } else { None }).collect();
     let ink = crate::plan_output::text_ink_bounds(&texts).unwrap();
     assert!(texts.iter().any(|t| t.text.contains("North wing") && t.text.contains("South wing")));
@@ -1112,6 +1120,46 @@ fn section_level_names_from_multiple_wings_stay_inside_the_sheet() {
         let lo = section.vp.px([text.at[0] + bounds[0] * section.scene.scale, text.at[1] + bounds[1] * section.scene.scale]);
         let hi = section.vp.px([text.at[0] + bounds[2] * section.scene.scale, text.at[1] + bounds[3] * section.scene.scale]);
         assert!(lo[0] >= 16. && hi[0] <= 1584. && hi[1] >= 120. && lo[1] <= 820., "{} at {lo:?}..{hi:?}", text.text);
+    }
+}
+
+#[test]
+fn configured_sections_separate_nearby_level_labels_at_actual_paper_scale() {
+    let mut s = Session::new(Box::new(Canned));
+    for (id, name, x0, x1, floor) in [("main", "Main wing", 0., 30000., 8250.), ("rear", "Rear wing", -16000., 0., 8130.)] {
+        s.execute("building.add", json!({"id":id,"name":name,"footprint":[[x0,0],[x1,0],[x1,12000],[x0,12000]],"storeys":3,"storey_height_mm":3000}))
+            .unwrap();
+        s.execute("building.set_roof", json!({"building":id,"kind":"pitched","pitch_deg":35})).unwrap();
+        s.execute("building.set_attic", json!({"building":id,"floor":floor,"name":format!("Roof {id}")})).unwrap();
+    }
+    s.execute(
+        "view.define",
+        json!({"id":"levels","name":"Nearby roof floors","kind":{"view":"section","from":[-17000,6000],"to":[31000,6000],"depth_mm":500}}),
+    )
+    .unwrap();
+    let glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+    for denominator in [250., 300.] {
+        s.execute("view.configure",json!({"id":"levels","template":{"name":"Public physical scale","sizing":{"mode":"fixed","denominator":denominator,"centre":[20000,6000]}}})).unwrap();
+        let before = s.doc.clone();
+        let audit = s.execute("view.audit", json!({"id":"levels"})).unwrap();
+        assert_eq!(audit["total_findings"], 0, "{denominator}: {}", audit["findings"]);
+        let labels = audit["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|t| t["text"].as_str().unwrap().contains("Roof main")));
+        assert!(labels.iter().any(|t| t["text"].as_str().unwrap().contains("Roof rear")));
+        assert!(labels.iter().all(|t| t["size_mm_paper"] == 2.6), "physical lettering must not shrink to conceal overlap");
+        let sheet = crate::views::sheet_unclipped(&s.doc, "levels", trigon_model::build::View::latest(&s.doc)).unwrap();
+        for z in [0., 3000., 6000., 8130., 8250., 9000.] {
+            assert!(
+                sheet.scene.items.iter().any(|item| match item {
+                    crate::sheet::Item::Path(p) if p.layer == crate::sheet::Layer::Level && p.stroke.as_ref().is_some_and(|s| s.dashed) =>
+                        p.rings.iter().any(|r| r.len() == 2 && r.iter().all(|q| (q[1] - z).abs() < 1e-6)),
+                    _ => false,
+                }),
+                "datum witness {z} must stay at its true elevation"
+            );
+        }
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
     }
 }
 

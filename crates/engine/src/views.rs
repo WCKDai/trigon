@@ -128,7 +128,13 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
             "",
             view.template.as_ref().is_some_and(|template| template.hide_balcony_dimensions),
         )?,
-        DrawingViewKind::Section { from, to, flip, depth_mm } => crate::section::scene(doc, [*from, *to], *flip, *depth_mm, phase, &view.name, "")?,
+        DrawingViewKind::Section { from, to, flip, depth_mm } => {
+            let scale = view.template.as_ref().and_then(|t| match t.sizing {
+                trigon_model::annotation::ViewSizing::Fixed { denominator, .. } => Some(denominator),
+                _ => None,
+            });
+            crate::section::scene(doc, [*from, *to], *flip, *depth_mm, phase, &view.name, "", scale)?
+        }
     };
     sheet.title = view.name.clone();
     if let Some(template) = &view.template {

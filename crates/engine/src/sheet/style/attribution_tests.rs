@@ -199,7 +199,7 @@ fn full_sheet(doc: &trigon_model::Document, name: &str, baseline: bool) -> (Shee
         crate::elevation::scene(doc, crate::elevation::Side::Facade("public.f1"), phase, (None, None), "Public facade", "", true)
     } else {
         let width = doc.buildings[0].footprint[1][0];
-        crate::section::scene(doc, [[width + 1000.0, 4000.0], [-1000.0, 4000.0]], false, 20_000.0, phase, "Public section", "")
+        crate::section::scene(doc, [[width + 1000.0, 4000.0], [-1000.0, 4000.0]], false, 20_000.0, phase, "Public section", "", None)
     };
     let elapsed = start.elapsed().as_nanos();
     USE_FULL_SCAN.with(|flag| flag.set(previous));

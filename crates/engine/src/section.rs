@@ -129,10 +129,20 @@ pub(crate) fn sheet(
     if !matches!(ext, "png" | "svg" | "pdf" | "dxf") {
         return Err(ModelError::Invalid("use .pdf, .png, .svg or .dxf for a section".into()).into());
     }
-    scene(doc, line, flip, depth, view, title, caption)?.write(path)
+    scene(doc, line, flip, depth, view, title, caption, None)?.write(path)
 }
 
-pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64, view: View, title: &str, caption: &str) -> Result<Sheet> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scene(
+    doc: &Document,
+    line: [[f64; 2]; 2],
+    flip: bool,
+    depth: f64,
+    view: View,
+    title: &str,
+    caption: &str,
+    final_scale: Option<f64>,
+) -> Result<Sheet> {
     if title.len() > 200 || caption.len() > 500 {
         return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
     }
@@ -308,7 +318,7 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
             })
             .collect();
         let ink = crate::plan_output::text_ink_bounds(&labels)?;
-        let left = ink.into_iter().flatten().map(|b| 16.0 + (5.0 - b[0]) / crate::sheet::MM_PER_PX).fold(AREA[0], f64::max);
+        let left = ink.iter().flatten().map(|b| 16.0 + (5.0 - b[0]) / crate::sheet::MM_PER_PX).fold(AREA[0], f64::max);
         if vp.px([0.0, 0.0])[0] < left {
             let width = AREA[0] + AREA[2] - left;
             if width < 100.0 {
@@ -318,18 +328,61 @@ pub(crate) fn scene(doc: &Document, line: [[f64; 2]; 2], flip: bool, depth: f64,
             scale = vp.scale();
             scene.scale = scale;
         }
-        let s = scale;
+        // A fixed saved-view template is applied after this scene is generated.
+        // Use its real paper scale for datum spacing, not the temporary fit scale.
+        // Keep every witness at its exact Z and jog the annotation heads if needed.
+        let s = final_scale.unwrap_or(scale);
+        let baselines = if final_scale.is_some() {
+            trigon_model::checked("section lettering scale", s, 1.0, 1e7)?;
+            let values: Vec<_> = levels
+                .iter()
+                .map(|(z, _)| {
+                    let mut value = Text::new(Layer::Level, [0., 0.], level_text(z - zero), 2.6);
+                    value.anchor = Anchor::Start;
+                    value.middle = false;
+                    value
+                })
+                .collect();
+            let value_ink = crate::plan_output::text_ink_bounds(&values)?;
+            let mut ys: Vec<f64> = Vec::new();
+            let mut previous_top = f64::NEG_INFINITY;
+            for (k, (z, _)) in levels.iter().enumerate() {
+                let bounds = [ink[k], value_ink[k]].into_iter().flatten();
+                let (low, high) = bounds.fold((0.0_f64, 0.0_f64), |(lo, hi), b| (lo.min(b[1]), hi.max(b[3])));
+                let mut y = z + 0.8 * s;
+                y = y.max(previous_top + 0.75 * s - low * s);
+                if let Some(prev) = ys.last() {
+                    y = y.max(prev + 3.0 * s);
+                }
+                previous_top = y + high * s;
+                ys.push(y);
+            }
+            Some(ys)
+        } else {
+            None
+        };
         for (k, (z, name)) in levels.iter().enumerate() {
             let (x0, x1) = (-3.0 * s, length + 3.0 * s);
             let dashed = Stroke { dashed: true, ..Stroke::new(0.18) };
             scene.line(Layer::Level, [x0, *z], [x1, *z], dashed);
             // Mark and lettering above the line, or below it when the next level up is too close.
             let crowded = levels.get(k + 1).is_some_and(|(next, _)| next - z < 4.0 * s);
-            let (up, y) = if crowded { (-1.0, z - 3.2 * s) } else { (1.0, z + 0.8 * s) };
+            let (up, y) = if let Some(ys) = &baselines {
+                (1.0, ys[k])
+            } else if crowded {
+                (-1.0, z - 3.2 * s)
+            } else {
+                (1.0, z + 0.8 * s)
+            };
+            let head_z = if baselines.is_some() { y - 0.8 * s } else { *z };
             let m = length + 7.0 * s;
+            if (head_z - z).abs() > 1e-6 {
+                scene.polyline(Layer::Level, vec![[x1, *z], [length + 5.0 * s, *z], [m, head_z]], Stroke::new(0.18));
+                scene.polyline(Layer::Level, vec![[x0, *z], [-4.0 * s, head_z], [-4.5 * s, head_z]], Stroke::new(0.18));
+            }
             scene.polygon(
                 Layer::Level,
-                vec![vec![[m, *z], [m + 1.3 * s, *z + 2.2 * s * up], [m - 1.3 * s, *z + 2.2 * s * up]]],
+                vec![vec![[m, head_z], [m + 1.3 * s, head_z + 2.2 * s * up], [m - 1.3 * s, head_z + 2.2 * s * up]]],
                 Some(Fill::Solid([0x1a, 0x1a, 0x1a])),
                 None,
             );

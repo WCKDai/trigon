@@ -205,6 +205,12 @@ fitted scale. `{"mode":"fixed","denominator":100,"centre":[6000,4000]}` means ph
 on the existing 338.6667 × 190.5 mm sheet: 10,000 model mm prints as 100 paper mm at 100% print size.
 It crops instead of silently shrinking. SVG uses 96 CSS px/inch; PDF embeds the physical page size.
 PNG is 1600 × 900 at that same intended paper size; image viewers/printers can override print size.
+Fixed-scale sections space generated level names and values using actual glyph ink at that
+paper scale, with 0.75 mm between text rows. Close levels use jogged leaders; their witness
+lines remain at the exact source elevation. Lettering stays 2.6 mm rather than shrinking.
+The chosen centre and crop still need enough room for long names and the highest level:
+`view.audit` reports insufficient framing, and precision preview returns those findings.
+Unconfigured section exports retain their existing layout and geometry fingerprints.
 DXF remains model-space 1:1 with paper weights and linetype scale. An optional drawing-mm `crop`
 rectangle clips geometry before fitting or fixed paper placement. Viewport clipping is applied to
 exported DXF and picking too; text outside a crop is removed by insertion point (glyph outlines at
