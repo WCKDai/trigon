@@ -29,6 +29,9 @@ schedules include the inclined aperture dimensions, area and roof host. Drawing 
 ownership uses the same editable instance ID as 3D selection. IFC exports a window, its
 opening and host relationship; GLB preserves the source product identities.
 
+The `.opening` ID returned by `rooflight.add` is also an authoring alias. Editing it changes
+the coordinated rooflight source, so the void, frame and flashing regenerate together.
+
 ## Compatibility and verification limits
 
 The native `rooflights` lists are optional on pitched and mansard roofs. Empty lists are

@@ -567,7 +567,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                     handle("width_mm", "Roof-plane width", light.frame.origin, light.frame.x, spec.width_mm, [300., 3000.], 1.),
                     handle("height_mm", "Height along roof slope", light.frame.origin, light.frame.up, spec.height_mm, [400., 2400.], 1.),
                 ];
-                for id in [light.id.clone(), format!("{}.flashing", light.id)] {
+                for id in [light.id.clone(), light.opening_id.clone(), format!("{}.flashing", light.id)] {
                     result.push(record(
                         &id,
                         "rooflight",

@@ -51,6 +51,37 @@ mod tests {
     fn spec() -> Value {
         json!({"id":"light","facade":"b.f1","u_mm":10000,"run_mm":500,"window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100})
     }
+
+    #[test]
+    fn returned_rooflight_opening_id_resolves_to_its_editable_source() {
+        let mut s = session();
+        let added = s.execute("rooflight.add", json!({"rooflight":spec()})).unwrap();
+        let id = added["opening_id"].as_str().unwrap();
+        assert_eq!(id, "b.rooflight.light.opening");
+        let source = s.doc.clone();
+        let properties = s.execute("element.get", json!({"id":id})).unwrap();
+        assert_eq!(s.doc, source, "opening inspection is read-only");
+        assert_eq!(properties["kind"], "rooflight");
+        let glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let action = json!({"command":"element.set","params":{"id":id,"properties":{"width_mm":900}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, source);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(s.doc.buildings[0].roof.rooflights()[0].width_mm, 900.);
+        let updated = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, source);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        assert!(s.execute("element.set", json!({"id":id,"properties":{"width_mm":0}})).is_err());
+        assert_eq!(s.doc, source);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, updated);
+        s.execute("rooflight.remove", json!({"id":"light"})).unwrap();
+        assert!(s.execute("element.get", json!({"id":id})).is_err());
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, updated);
+        assert_eq!(s.execute("element.get", json!({"id":id})).unwrap()["kind"], "rooflight");
+    }
     #[test]
     fn roof_opening_ids_cannot_alias_generated_opening_or_flashing_ids() {
         let mut s = session();
