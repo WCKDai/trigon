@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use trigon_model::build::{FacadeFrame, PhaseFilter, View, even_bays, resolve_facade};
 use trigon_model::{Building, ComponentType, Document, FacadeKind, ModelError, Placement, Site};
@@ -40,6 +40,44 @@ fn parse<T: DeserializeOwned>(id: &str, v: &Value) -> Result<T> {
 
 pub fn commands() -> &'static [CommandSpec] {
     COMMANDS
+}
+
+pub(crate) fn add_interior_walls(s: &mut Session, p: AddWalls) -> Result<Value> {
+    let b = s.doc.building_mut(p.building.as_deref())?;
+    let n = b.storeys.len();
+    if p.walls.len() > 5000 {
+        return Err(ModelError::Invalid("at most 5000 walls at a time".into()).into());
+    }
+    for w in &p.walls {
+        w.validate(n)?;
+    }
+    let start = b.interior_walls.len();
+    for (k, mut w) in p.walls.into_iter().enumerate() {
+        if w.id.is_empty() {
+            w.id = format!("{}.iw{}", b.id, start + k);
+        }
+        b.interior_walls.push(w);
+    }
+    Ok(json!({"added": b.interior_walls.len() - start, "interior_walls": b.interior_walls.len()}))
+}
+
+pub(crate) fn add_interior_rooms(s: &mut Session, p: AddRooms) -> Result<Value> {
+    let b = s.doc.building_mut(p.building.as_deref())?;
+    let n = b.storeys.len();
+    if p.rooms.iter().any(|r| r.levels.iter().any(|l| b.attic_level() == Some(*l))) {
+        return Err(ModelError::Invalid("roof-level rooms and habitable quantities require unsupported roof clipping".into()).into());
+    }
+    let start = b.rooms.len();
+    for (k, mut r) in p.rooms.into_iter().enumerate() {
+        if r.polygon.len() < 3 || r.polygon.len() > 256 || r.polygon.iter().flatten().any(|v| !v.is_finite()) || r.levels.iter().any(|l| *l >= n) {
+            return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
+        }
+        if r.id.is_empty() {
+            r.id = format!("{}.room{}", b.id, start + k);
+        }
+        b.rooms.push(r);
+    }
+    Ok(json!({"rooms": b.rooms.len()}))
 }
 
 static COMMANDS: &[CommandSpec] = &[
@@ -120,7 +158,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "precision.preview",
-        summary: "Preview a typed local model or drawing action on a separate document. Returns exact source changes, validation and an opaque same-build token bound to the complete document and action. Drawing changes include bounded glyph, crop and overlap feedback for affected views; unavailable checks are explicit. Read-only: no journal, files, credentials or network.",
+        summary: "Preview a typed local model or drawing action, including interior.add_walls and interior.add_rooms, on a separate document. Returns exact source changes, validation and a same-build conflict token. Optional sanity scopes precision.audit to the candidate. Drawing changes include bounded glyph, crop and overlap feedback; unavailable checks are explicit. Read-only: no journal, files, credentials or network.",
         mutates: false,
         journaled: false,
         schema: schema::<crate::precision::Preview>,
@@ -1233,25 +1271,7 @@ static COMMANDS: &[CommandSpec] = &[
         mutates: true,
         journaled: true,
         schema: schema::<AddWalls>,
-        run: |s, v| {
-            let p: AddWalls = parse("interior.add_walls", v)?;
-            let b = s.doc.building_mut(p.building.as_deref())?;
-            let n = b.storeys.len();
-            if p.walls.len() > 5000 {
-                return Err(ModelError::Invalid("at most 5000 walls at a time".into()).into());
-            }
-            for w in &p.walls {
-                w.validate(n)?;
-            }
-            let start = b.interior_walls.len();
-            for (k, mut w) in p.walls.into_iter().enumerate() {
-                if w.id.is_empty() {
-                    w.id = format!("{}.iw{}", b.id, start + k);
-                }
-                b.interior_walls.push(w);
-            }
-            Ok(json!({"added": b.interior_walls.len() - start, "interior_walls": b.interior_walls.len()}))
-        },
+        run: |s, v| add_interior_walls(s, parse("interior.add_walls", v)?),
     },
     CommandSpec {
         id: "interior.doors_from_gaps",
@@ -1372,29 +1392,7 @@ static COMMANDS: &[CommandSpec] = &[
         mutates: true,
         journaled: true,
         schema: schema::<AddRooms>,
-        run: |s, v| {
-            let p: AddRooms = parse("interior.add_rooms", v)?;
-            let b = s.doc.building_mut(p.building.as_deref())?;
-            let n = b.storeys.len();
-            if p.rooms.iter().any(|r| r.levels.iter().any(|l| b.attic_level() == Some(*l))) {
-                return Err(ModelError::Invalid("roof-level rooms and habitable quantities require unsupported roof clipping".into()).into());
-            }
-            let start = b.rooms.len();
-            for (k, mut r) in p.rooms.into_iter().enumerate() {
-                if r.polygon.len() < 3
-                    || r.polygon.len() > 256
-                    || r.polygon.iter().flatten().any(|v| !v.is_finite())
-                    || r.levels.iter().any(|l| *l >= n)
-                {
-                    return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
-                }
-                if r.id.is_empty() {
-                    r.id = format!("{}.room{}", b.id, start + k);
-                }
-                b.rooms.push(r);
-            }
-            Ok(json!({"rooms": b.rooms.len()}))
-        },
+        run: |s, v| add_interior_rooms(s, parse("interior.add_rooms", v)?),
     },
     CommandSpec {
         id: "interior.detect_rooms",
@@ -1954,9 +1952,9 @@ struct TraceWalls {
     stairs: Option<bool>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AddWalls {
+pub(crate) struct AddWalls {
     building: Option<String>,
     walls: Vec<trigon_model::InteriorWall>,
 }
@@ -1982,9 +1980,9 @@ struct AddStairs {
     clear_walls_inside: Option<bool>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AddRooms {
+pub(crate) struct AddRooms {
     building: Option<String>,
     rooms: Vec<trigon_model::Room>,
 }

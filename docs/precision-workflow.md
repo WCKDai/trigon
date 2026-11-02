@@ -131,6 +131,22 @@ jamb is excluded. Buildable geometry can still contain this source conflict; the
 requires review of the drawing and door placement before any repair. The audit does not
 close an opening, move a wall or certify a structural connection.
 
+Interior wall and room additions use the same preflight as movement and alignment. For
+example, `precision.preview` accepts an `action` with `command: "interior.add_walls"` and
+the ordinary command's `params`. Add an optional `sanity` object with the same building,
+storeys and tolerances as `precision.audit` to inspect the candidate before changing the
+project. The returned `sanity_feedback` retains complete counts and explicit truncation;
+`validation.sanity` is `no_findings_in_scope`, `needs_review` or `unverified`. A model-build
+pass does not imply that its connections make architectural sense. An unavailable audit
+includes its error and never counts as passed.
+
+Omitting `sanity` preserves the existing response and avoids the additional audit. The
+inspection scope is independent of the token, which binds the source document and exact
+edit. Applying the returned action creates one underlying `interior.add_walls` or
+`interior.add_rooms` journal entry, without nesting command execution. Room detection from
+registered scans is not a preflight action: these previews do not read files, infer new room
+names, split existing room polygons or repair door conflicts automatically.
+
 `view.audit` shapes lettering with the bundled SVG fonts at the final physical scale. It returns
 rotated ink/halo corners, visible polygons, clipping, actual displayed text and unrounded
 measurement values. Saved annotations and generated room/balcony labels retain their exact

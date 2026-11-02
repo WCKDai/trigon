@@ -25,6 +25,10 @@ pub(crate) enum Action {
     AddRooflight(crate::rooflights::Add),
     #[serde(rename = "rooflight.remove")]
     RemoveRooflight(crate::rooflights::Remove),
+    #[serde(rename = "interior.add_walls")]
+    AddWalls(crate::commands::AddWalls),
+    #[serde(rename = "interior.add_rooms")]
+    AddRooms(crate::commands::AddRooms),
     #[serde(rename = "edit.move")]
     Move(edit::Move),
     #[serde(rename = "edit.align")]
@@ -45,6 +49,9 @@ pub(crate) enum Action {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Preview {
     pub action: Action,
+    /// Optional bounded geometric audit of the candidate, before applying. Findings need
+    /// source review; unavailable checks are explicitly unverified. No files are read.
+    pub sanity: Option<crate::precision_audit::Audit>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -73,6 +80,8 @@ fn run(s: &mut Session, action: Action) -> Result<Value> {
         Action::AddBuilding(p) => crate::local_building::add(s, p),
         Action::AddRooflight(p) => crate::rooflights::add(s, p),
         Action::RemoveRooflight(p) => crate::rooflights::remove(s, p),
+        Action::AddWalls(p) => crate::commands::add_interior_walls(s, p),
+        Action::AddRooms(p) => crate::commands::add_interior_rooms(s, p),
         Action::Move(p) => edit::move_elements(s, p),
         Action::Align(p) => edit::align(s, p),
         Action::AlignWalls(p) => edit::align_walls(s, p),
@@ -150,6 +159,14 @@ pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
     }
     let mut response = json!({"preview_token":preview_token,"action":action,"changes":diff,"result":result,
         "validation":{"model_build":"passed","annotations":"passed"},"applied":false});
+    if let Some(scope) = p.sanity {
+        let feedback = match crate::precision_audit::audit(&candidate, scope) {
+            Ok(audit) => audit,
+            Err(error) => json!({"status":"unverified","error":error.to_string()}),
+        };
+        response["validation"]["sanity"] = feedback["status"].clone();
+        response["sanity_feedback"] = feedback;
+    }
     if !drawings.is_empty() {
         let mut rendered = true;
         let feedback: Vec<_> = drawings
@@ -266,6 +283,67 @@ mod drawing_preview_tests {
         )
         .unwrap();
         s
+    }
+
+    #[test]
+    fn interior_previews_report_candidate_sanity_and_apply_one_replayable_edit() {
+        let mut s = session();
+        s.execute("interior.add_walls",json!({"building":"b","walls":[{"id":"host","levels":[0],"a":[1000,4000],"b":[11000,4000],"thickness":240,"doors":[{"at":5000,"width":900,"height":2100}]}]})).unwrap();
+        let actions = [
+            json!({"command":"interior.add_walls","params":{"building":"b","walls":[{"id":"branch","levels":[0],"a":[6000,4000],"b":[6000,6500],"thickness":100}]}}),
+            json!({"command":"interior.add_rooms","params":{"building":"b","rooms":[{"id":"room","name":"Measured room","levels":[0],"polygon":[[1000,1000],[4000,1000],[4000,3000],[1000,3000]]}]}}),
+        ];
+        for action in actions {
+            let before = s.doc.clone();
+            let history = (s.undo.len(), s.redo.len(), s.dirty);
+            let before_glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+            let plain = s.execute("precision.preview", json!({"action":action})).unwrap();
+            assert!(plain.get("sanity_feedback").is_none());
+            let preview = s.execute("precision.preview", json!({"action":action,"sanity":{"building":"b","levels":[0]}})).unwrap();
+            assert_eq!(s.doc, before);
+            assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+            assert_eq!(plain["preview_token"], preview["preview_token"], "read-only audit options do not change an edit");
+            assert_eq!(preview["validation"]["sanity"], "needs_review");
+            assert_eq!(preview["sanity_feedback"]["finding_counts"]["wall_end_in_door_opening"], 1);
+            assert_eq!(preview["sanity_feedback"]["truncated"], false);
+            s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+            assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+            assert_eq!(s.doc.journal.last().unwrap().command, action["command"].as_str().unwrap());
+            assert_eq!(preview["sanity_feedback"], s.execute("precision.audit", json!({"building":"b","levels":[0]})).unwrap());
+            let accepted = s.doc.clone();
+            assert!(s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).is_err());
+            assert_eq!(s.doc, accepted);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.doc, before);
+            assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), before_glb);
+            for bad in [
+                json!({"command":"interior.add_walls","params":{"walls":[{"a":[1,1],"b":[1,1],"levels":[0],"thickness":100}]}}),
+                json!({"command":"interior.add_rooms","params":{"rooms":[{"name":"bad","levels":[999],"polygon":[[0,0],[1000,0],[1000,1000]]}]}}),
+            ] {
+                assert!(s.execute("precision.preview", json!({"action":bad})).is_err());
+                assert_eq!(s.doc, before);
+            }
+            s.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(s.doc, accepted);
+        }
+        let mut replay = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        for entry in &s.doc.journal {
+            replay.execute(&entry.command, entry.params.clone()).unwrap();
+        }
+        assert_eq!(s.doc, replay.doc);
+    }
+
+    #[test]
+    fn unavailable_candidate_sanity_is_explicit_and_read_only() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let action = json!({"command":"view.define","params":{"id":"p","name":"Plan","kind":{"view":"plan","level":0}}});
+        let preview = s.execute("precision.preview", json!({"action":action,"sanity":{"building":"absent"}})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(preview["validation"]["model_build"], "passed");
+        assert_eq!(preview["validation"]["sanity"], "unverified");
+        assert_eq!(preview["sanity_feedback"]["status"], "unverified");
+        assert!(preview["sanity_feedback"]["error"].as_str().unwrap().contains("absent"));
     }
 
     fn plan(s: &mut Session) {
