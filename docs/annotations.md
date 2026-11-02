@@ -30,6 +30,16 @@ additional clearance for the printed stroke. For example, 25 mm in the model all
 margin must increase at smaller drawing scales. The audit measures model footprints against
 the 1000 mm wall cut, not printed ink or full-height accessibility clearance.
 
+`view.audit {"id":"plan","check_wall_overlap":true}` also compares each visible glyph halo
+box with the saved plan's actual wall-material regions. `text_over_wall` findings include the
+label's provenance, wall ID, overlap area in drawing mm² and read-only inspection commands.
+Door/shaft voids are preserved; the selected storey's wall geometry is used. Rotated text is
+measured at the final printed scale. These are conservative box intersections requiring review,
+not pixel-level glyph tests. Wall strokes and other model lines are excluded. This optional
+check is plan-only; omitting it retains the existing direct audit behavior. Drawing actions in
+`precision.preview` enable it for plans, so a misplaced label gets feedback before applying it.
+Neither command moves, clips or suppresses the label in response to a finding.
+
 Saved plan templates can enable live room tags with `room_labels: "area"` or `"name_and_area"`
 through `view.configure` (also in Studio's view-template panel). Tags use the selected storey's
 room definitions, so a name or polygon edit updates the name and calculated square metres.

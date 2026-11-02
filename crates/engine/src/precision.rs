@@ -180,7 +180,16 @@ pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
             .map(|id| {
                 match crate::lettering_audit::audit(
                     &candidate,
-                    crate::lettering_audit::Audit { id: id.clone(), clearance_mm_paper: 0.5, max_results: 1000 },
+                    crate::lettering_audit::Audit {
+                        id: id.clone(),
+                        clearance_mm_paper: 0.5,
+                        max_results: 1000,
+                        check_wall_overlap: candidate
+                            .doc
+                            .views
+                            .iter()
+                            .any(|v| v.id == id && matches!(v.kind, trigon_model::annotation::DrawingViewKind::Plan { .. })),
+                    },
                 ) {
                     Ok(audit) => audit,
                     Err(error) => {
@@ -443,7 +452,8 @@ mod drawing_preview_tests {
             s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
             assert_eq!(s.doc.buildings, before.buildings, "drawing changes cannot alter geometry sources");
             assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
-            assert_eq!(preview["drawing_feedback"][0], s.execute("view.audit", json!({"id":"p"})).unwrap());
+            assert_eq!(preview["drawing_feedback"][0]["wall_overlap_check"]["status"], "checked");
+            assert_eq!(preview["drawing_feedback"][0], s.execute("view.audit", json!({"id":"p","check_wall_overlap":true})).unwrap());
             let applied = s.doc.clone();
             s.execute("edit.undo", json!({})).unwrap();
             assert_eq!(s.doc, before);

@@ -143,7 +143,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "view.audit",
-        summary: "Read-only lettering validation at final physical view scale. Measures bundled SVG glyph ink/halos, rotated corners, crop clipping and potential text overlaps; returns exact annotation/element provenance and unrounded dimension values. No automatic movement or suppression.",
+        summary: "Read-only lettering validation at final physical view scale. Measures bundled SVG glyph ink/halos, rotated corners, crop clipping and potential text overlaps; returns exact annotation/element provenance and unrounded dimension values. Plans can opt into check_wall_overlap for actual wall-material collisions and exact wall IDs. No automatic movement or suppression.",
         mutates: false,
         journaled: false,
         schema: schema::<crate::lettering_audit::Audit>,
