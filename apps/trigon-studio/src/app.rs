@@ -732,7 +732,14 @@ impl StudioApp {
         ui.horizontal(|ui| {
             theme::wordmark(ui);
             ui.separator();
-            let project = self.session.doc.buildings.first().map(|b| b.name.clone()).unwrap_or_else(|| "Untitled project".into());
+            let project = self
+                .session
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .or_else(|| self.session.doc.buildings.first().map(|building| building.name.clone()))
+                .unwrap_or_else(|| "Untitled project".into());
             let short = if project.chars().count() > 24 { format!("{}…", project.chars().take(24).collect::<String>()) } else { project.clone() };
             ui.menu_button(short, |ui| {
                 ui.strong(&project);
