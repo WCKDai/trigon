@@ -811,9 +811,22 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 if !(z1 - z0 >= 10.0) || above(z0) {
                     continue;
                 }
+                // Implicit straightening predates source-bearing caps. A legacy band on
+                // an absorbed facade retains its original flat cap; explicit source eaves
+                // and Two Cut–Plumb still require the support checks in seat_cornice.
                 let bearing_cap = (z1 - h).abs() < 1e-6
                     && matches!(b.roof.base(), crate::Roof::Pitched { drainage, gables, .. } | crate::Roof::HalfHipped { drainage, gables, .. }
-                        if (drainage.is_some() || b.roof.fascia_depth().is_some()) && !gables.contains(&f.id));
+                        if (drainage.is_some() || b.roof.fascia_depth().is_some()) && !gables.contains(&f.id))
+                    && match b.roof.base() {
+                        crate::Roof::Pitched { eave_facades: None, straighten_mm, .. }
+                        | crate::Roof::HalfHipped { eave_facades: None, straighten_mm, .. }
+                            if b.roof.fascia_depth().is_none() =>
+                        {
+                            let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
+                            kept.iter().enumerate().any(|(k, &i)| i == f.edge && kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len())
+                        }
+                        _ => true,
+                    };
                 let mut piece = facing_piece(
                     &fr,
                     f,
@@ -2188,6 +2201,51 @@ mod tests {
             let reopened: Document = serde_json::from_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
             assert_eq!(built, build(&reopened).unwrap());
         }
+    }
+
+    #[test]
+    fn legacy_straightened_roof_keeps_unseated_facade_band_caps() {
+        let ring = [[0., 0.], [4000., 0.], [4000., 800.], [10000., 800.], [10000., 0.], [24000., 0.], [24000., 10000.], [0., 10000.]];
+        let mut b = Building::new("b", "Synthetic legacy stepped bands", &ring, 1, 3000.).unwrap();
+        assert_eq!(b.footprint.len(), 8);
+        b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":40,"straighten_mm":1200,
+            "overhang_mm":300,"thickness_mm":250,"gutters":true,"drainage":{}}))
+        .unwrap();
+        b.facades[2].bands.push(crate::doc::Band { levels: vec![0], bottom: 2550., top: 3000., projection: 40., finish: None });
+        let mut doc = Document::default();
+        doc.buildings.push(b);
+        let source = serde_json::to_vec(&doc).unwrap();
+        let built = build(&doc).expect("a legacy band on an implicitly straightened facade must remain buildable");
+        let mut legacy = doc.clone();
+        if let crate::Roof::Pitched { drainage, .. } = &mut legacy.buildings[0].roof {
+            *drainage = None;
+        }
+        assert_eq!(built[0].walls, build(&legacy).unwrap()[0].walls, "absorbed legacy facades retain their pre-seating band geometry");
+        assert!(built[0].walls[2].trim.positions.iter().filter(|p| (p[2] - 3000.).abs() < 1e-6).count() > 2);
+        roof_shell_is_closed_and_outward(&built[0].walls[2].trim);
+        assert_eq!(
+            build_cut(&doc, View::latest(&doc), Some(2800.)).unwrap()[0].walls,
+            build_cut(&legacy, View::latest(&legacy), Some(2800.)).unwrap()[0].walls,
+            "legacy cut views retain their existing clipping path"
+        );
+        let reopened: Document = serde_json::from_slice(&source).unwrap();
+        assert_eq!(built, build(&reopened).unwrap());
+        assert_eq!(source, serde_json::to_vec(&doc).unwrap());
+
+        let mut selected = doc.clone();
+        let mut roof = serde_json::to_value(&selected.buildings[0].roof).unwrap();
+        roof["eave_facades"] = serde_json::json!(["b.f1", "b.f6", "b.f7", "b.f8"]);
+        selected.buildings[0].roof = serde_json::from_value(roof).unwrap();
+        let error = build(&selected).unwrap_err().to_string();
+        assert!(error.contains("b.f3") && error.contains("eave_facades"), "explicit bearing selections remain strict: {error}");
+
+        let mut two_cut = doc.clone();
+        if let crate::Roof::Pitched { overhang_mm, .. } = &mut two_cut.buildings[0].roof {
+            *overhang_mm = 500.;
+        }
+        two_cut.buildings[0].roof = two_cut.buildings[0].roof.clone().with_two_cut_plumb(Some(20.)).unwrap();
+        let error = build(&two_cut).unwrap_err().to_string();
+        assert!(error.contains("retained by roof straightening"), "explicit two-cut support must remain strict: {error}");
     }
 
     #[test]

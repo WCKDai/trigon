@@ -259,6 +259,28 @@ fn first_facade_facing(s: &mut Session, faces: &str) -> String {
 }
 
 #[test]
+fn native_legacy_straightened_roof_band_document_reopens_unchanged() {
+    let ring = [[0., 0.], [4000., 0.], [4000., 800.], [10000., 800.], [10000., 0.], [24000., 0.], [24000., 10000.], [0., 10000.]];
+    let mut b = trigon_model::Building::new("b", "Synthetic native legacy bands", &ring, 1, 3000.).unwrap();
+    b.roof = serde_json::from_value(json!({"kind":"pitched","pitch_deg":40,"straighten_mm":1200,
+        "overhang_mm":300,"thickness_mm":250,"gutters":true,"drainage":{}}))
+    .unwrap();
+    b.facades[2].bands.push(trigon_model::doc::Band { levels: vec![0], bottom: 2550., top: 3000., projection: 40., finish: None });
+    let mut doc = trigon_model::Document::default();
+    doc.buildings.push(b);
+    let source = serde_json::to_vec(&doc).unwrap();
+    let path = std::env::temp_dir().join(format!("trigon-legacy-roof-band-{}.trigon", std::process::id()));
+    std::fs::write(&path, &source).unwrap();
+    let mut s = Session::new(Box::new(Canned));
+    let result = s.execute("document.open", json!({"path":path}));
+    let after = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    result.expect("existing native files with implicit straightening and detailed drainage must open");
+    assert_eq!(s.doc, doc);
+    assert_eq!(after, source, "opening must not migrate or rewrite the native source");
+}
+
+#[test]
 fn address_to_facade_to_exports() {
     let mut s = session();
     let info = s.execute("document.info", Value::Null).unwrap();
