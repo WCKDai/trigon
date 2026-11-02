@@ -216,7 +216,7 @@ pub(crate) fn scene(
         }
         scene.text(t);
     }
-    let floor = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
+    let floor = doc.buildings.iter().find(|source| source.id == b.building_id).map(|source| source.name.as_str()).unwrap_or_default();
     let metrics = json!({"triangles": projection.triangles, "lines": projection.edges.len(), "mm_per_px": mm, "scale": scale_text(scene.scale), "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
     Ok(Sheet {
         scene,
@@ -228,4 +228,31 @@ pub(crate) fn scene(
         note: None,
         metrics,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Session;
+
+    #[test]
+    fn facade_header_uses_its_own_building_without_changing_along_selection() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        for (id, name, x) in [("west", "West wing", 0), ("east", "East wing", 20000)] {
+            s.execute(
+                "building.add",
+                json!({"id":id,"name":name,"footprint":[[x,0],[x+12000,0],[x+12000,8000],[x,8000]],"storeys":2,"storey_height_mm":3000}),
+            )
+            .unwrap();
+        }
+        let before = s.doc.clone();
+        let view = View::latest(&s.doc);
+        for (facade, name) in [("west.f1", "West wing"), ("east.f1", "East wing")] {
+            let sheet = scene(&s.doc, Side::Facade(facade), view, (None, None), "Facade", "", false).unwrap();
+            assert_eq!(sheet.project, name, "facade {facade} must identify its own source building");
+        }
+        let sheet = scene(&s.doc, Side::Along([[0., 0.], [12000., 0.]]), view, (None, None), "Along", "", false).unwrap();
+        assert_eq!(sheet.project, "West wing", "an unscoped along view retains its first visible building");
+        assert_eq!(s.doc, before, "drawing captions never rewrite source names or geometry");
+    }
 }
