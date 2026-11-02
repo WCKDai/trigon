@@ -93,8 +93,7 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
         });
         let Some(&[(i, e), (j, _)]) = pairs.first() else { continue };
         let Some(main) = direction(i, e) else { continue };
-        let mut branches: Vec<_> =
-            incident.iter().copied().filter(|&(k, g)| direction(k, g).is_some_and(|d| cross(main, d).abs() >= MIN_SIN)).collect();
+        let branches: Vec<_> = incident.iter().copied().filter(|&(k, g)| direction(k, g).is_some_and(|d| cross(main, d).abs() >= MIN_SIN)).collect();
         if branches.is_empty() {
             continue;
         }
@@ -102,12 +101,14 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
         // opposite collinear endpoints through every leg, including equal-width seams.
         let mut run = BTreeSet::from([i, j]);
         let mut pending = vec![i, j];
+        let mut run_stations = BTreeMap::new();
         while let Some(k) = pending.pop() {
             for (end, point) in [walls[k].a, walls[k].b].into_iter().enumerate() {
                 let Some(inward) = direction(k, end) else { continue };
                 for &(other, other_end) in stations.get(&endpoint_key(point)).into_iter().flatten() {
                     let Some(d) = direction(other, other_end) else { continue };
                     if cross(main, d).abs() <= 1e-9 && dot(inward, d) < 0.0 {
+                        run_stations.insert(endpoint_key(point), point);
                         // Internal seams belong to the continuous band, even if the legacy
                         // near-face solver mistook a nearby wide branch for an end target.
                         reset[k][end] = true;
@@ -121,19 +122,44 @@ pub(crate) fn join(walls: &[Axis], facade: &[[f64; 2]], band: f64) -> Vec<Profil
                 }
             }
         }
-        branches.sort_by(|&(a, _), &(b, _)| walls[b].thickness.total_cmp(&walls[a].thickness).then_with(|| axis_order(&walls[a], &walls[b])));
-        for (k, &(b, g)) in branches.iter().enumerate() {
-            reset[b][g] = true;
-            clips[b].extend(run.iter().copied());
-            contacts[b][g] = Some(run.clone());
-            locals[b] = Some(Local { origin: if e == 0 { walls[i].a } else { walls[i].b }, t: main, n: [-main[1], main[0]] });
-            // Transverse branches on the same side can share material outside the run too.
-            // Assign that intersection once, without admitting near-parallel joins.
-            for &(a, h) in &branches[..k] {
-                if let (Some(x), Some(y)) = (direction(a, h), direction(b, g))
-                    && cross(x, y).abs() >= MIN_SIN
-                {
-                    clips[b].insert(a);
+        let origin = if e == 0 { walls[i].a } else { walls[i].b };
+        let mut branch_stations = vec![(origin, branches)];
+        for (key, point) in run_stations {
+            if key == endpoint_key(origin) {
+                continue;
+            }
+            let Some(incident) = stations.get(&key) else { continue };
+            // Other stepped stations keep the owner chosen by the outer loop. Equal-width
+            // seams have no such pass: resetting their run caps must also recompute their
+            // branches, rather than leave a legacy trim against the nearby wider shoulder.
+            let stepped = incident.iter().enumerate().any(|(k, &(a, h))| {
+                incident[..k].iter().any(|&(b, g)| {
+                    let (Some(x), Some(y)) = (direction(a, h), direction(b, g)) else { return false };
+                    (walls[a].thickness - walls[b].thickness).abs() > 1e-6 && cross(x, y).abs() <= 1e-9 && dot(x, y) < 0.0
+                })
+            });
+            if !stepped {
+                branch_stations.push((
+                    point,
+                    incident.iter().copied().filter(|&(b, g)| direction(b, g).is_some_and(|d| cross(main, d).abs() >= MIN_SIN)).collect(),
+                ));
+            }
+        }
+        for (origin, mut branches) in branch_stations {
+            branches.sort_by(|&(a, _), &(b, _)| walls[b].thickness.total_cmp(&walls[a].thickness).then_with(|| axis_order(&walls[a], &walls[b])));
+            for (k, &(b, g)) in branches.iter().enumerate() {
+                reset[b][g] = true;
+                clips[b].extend(run.iter().copied());
+                contacts[b][g] = Some(run.clone());
+                locals[b] = Some(Local { origin, t: main, n: [-main[1], main[0]] });
+                // Transverse branches on the same side can share material outside the run too.
+                // Assign that intersection once, without admitting near-parallel joins.
+                for &(a, h) in &branches[..k] {
+                    if let (Some(x), Some(y)) = (direction(a, h), direction(b, g))
+                        && cross(x, y).abs() >= MIN_SIN
+                    {
+                        clips[b].insert(a);
+                    }
                 }
             }
         }

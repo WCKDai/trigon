@@ -460,6 +460,48 @@ mod tests {
     }
 
     #[test]
+    fn stepped_run_recomputes_branches_at_equal_width_seams() {
+        let sources = [
+            Axis { a: [1000., 5000.], b: [3000., 5000.], thickness: 240. },
+            Axis { a: [3000., 5000.], b: [3120., 5000.], thickness: 120. },
+            Axis { a: [3120., 5000.], b: [9000., 5000.], thickness: 120. },
+            Axis { a: [3000., 2000.], b: [3000., 5000.], thickness: 120. },
+            Axis { a: [3120., 8000.], b: [3120., 5000.], thickness: 180. },
+        ];
+        for (angle, offset) in [(0_f64, [0.0, 0.0]), (37.0, [150000.0, -270000.0]), (-118.0, [-30000.0, 41000.0])] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |p: [f64; 2]| [offset[0] + p[0] * cos - p[1] * sin, offset[1] + p[0] * sin + p[1] * cos];
+            for seam in [3120.0, 3360.0] {
+                let mut sources = sources;
+                sources[1].b[0] = seam;
+                sources[2].a[0] = seam;
+                sources[4].a[0] = seam;
+                sources[4].b[0] = seam;
+                let sources = sources.map(|w| Axis { a: at(w.a), b: at(w.b), ..w });
+                for order in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [2, 4, 1, 3, 0]] {
+                    for reversals in 0..32 {
+                        let raw: Vec<_> = order
+                            .iter()
+                            .map(|&i| if reversals & (1 << i) == 0 { sources[i] } else { Axis { a: sources[i].b, b: sources[i].a, ..sources[i] } })
+                            .collect();
+                        let walls = built_sources(&raw);
+                        assert_complete_partition(&raw, &walls);
+                        for wall in &walls {
+                            let area: f64 = wall.cut.iter().map(|r| crate::footprint::signed_area2(r) / 2.0).sum();
+                            assert!((closed_outward_volume(&wall.mesh) - area * wall.height).abs() < 1.0);
+                            for end in wall.ends.iter().flatten() {
+                                if let Target::Wall(target) = end.target {
+                                    assert!(shared_boundary(&wall.cut, &walls[target].cut) > 1e-3, "join metadata must name a contacted wall");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stepped_run_follows_equal_width_seams_and_ignores_remote_material() {
         let sources = [
             Axis { a: [1000., 5000.], b: [3000., 5000.], thickness: 240. },
