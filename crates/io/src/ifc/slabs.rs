@@ -1,7 +1,8 @@
 //! Floors and roofs. A floor is an `IfcSlab` extruded from its outline with the stair openings
 //! as voids in the profile, so the hole is part of the slab's shape everywhere it is read (also
 //! where the slab's outline takes a notch at the wall) and needs no boolean at import. A roof is
-//! an `IfcRoof`: a flat roof of one slab, a pitched roof of one slab per plane; gables are walls.
+//! an `IfcRoof`: a flat roof of one slab; unopened pitched roofs use plane slabs, while opened
+//! roofs retain their original cover with explicit solid-quantity status. Gables are walls.
 
 use trigon_model::build::BuiltSlab;
 use trigon_model::{Built, Mesh, SlabKind};
@@ -79,6 +80,87 @@ fn roof_fragment_solid(piece: &split::RoofPiece, frame: &Frame) -> Option<Mesh> 
         return None;
     }
     Some(mesh)
+}
+
+/// A closed shell's volume and complete boundary area at the writer's coordinate precision.
+/// This is not an outer-roof-skin area: soffits, fascia and reveals are included in the area.
+/// Check every edge-connected component, so an outward shell cannot hide an inverted one.
+fn roof_shell_quantities(mesh: &Mesh, frame: &Frame) -> Option<(f64, f64)> {
+    if mesh.is_empty() {
+        return None;
+    }
+    let local: Vec<_> = mesh.positions.iter().map(|&p| frame.local(p)).collect();
+    if local.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e9) {
+        return None;
+    }
+    let keys: Vec<_> = local.iter().map(|p| p.map(|v| (v * 1e6).round() as i64)).collect();
+    let written: Vec<_> = keys.iter().map(|p| p.map(|v| v as f64 / 1e6)).collect();
+    let mut edges = std::collections::BTreeMap::<_, (usize, i32, usize)>::new();
+    let mut neighbours = vec![Vec::new(); mesh.triangles.len()];
+    let (mut source_area, mut written_area) = (0., 0.);
+    for (index, t) in mesh.triangles.iter().enumerate() {
+        let [a, b, c] = [*local.get(t[0] as usize)?, *local.get(t[1] as usize)?, *local.get(t[2] as usize)?];
+        let [wa, wb, wc] = [*written.get(t[0] as usize)?, *written.get(t[1] as usize)?, *written.get(t[2] as usize)?];
+        let (n, wn) = (cross(sub(b, a), sub(c, a)), cross(sub(wb, wa), sub(wc, wa)));
+        if !dot(n, wn).is_finite() || dot(n, wn) <= 0. {
+            return None;
+        }
+        source_area += dot(n, n).sqrt() / 2.;
+        written_area += dot(wn, wn).sqrt() / 2.;
+        for k in 0..3 {
+            let (a, b) = (*keys.get(t[k] as usize)?, *keys.get(t[(k + 1) % 3] as usize)?);
+            let entry = edges.entry((a.min(b), a.max(b))).or_insert((0, 0, index));
+            if entry.0 > 0 {
+                neighbours[index].push(entry.2);
+                neighbours[entry.2].push(index);
+            }
+            entry.0 += 1;
+            entry.1 += if a < b { 1 } else { -1 };
+        }
+    }
+    if edges.is_empty()
+        || edges.values().any(|e| e.0 != 2 || e.1 != 0)
+        || !source_area.is_finite()
+        || !written_area.is_finite()
+        || source_area <= 0.
+        || (written_area - source_area).abs() > source_area * 0.001
+    {
+        return None;
+    }
+    let mut seen = vec![false; mesh.triangles.len()];
+    let mut volume = 0.;
+    for first in 0..mesh.triangles.len() {
+        if seen[first] {
+            continue;
+        }
+        let vertex = mesh.triangles[first][0] as usize;
+        let (origin, written_origin) = (*local.get(vertex)?, *written.get(vertex)?);
+        let (mut source_volume, mut written_volume) = (0., 0.);
+        let mut pending = vec![first];
+        while let Some(index) = pending.pop() {
+            if seen[index] {
+                continue;
+            }
+            seen[index] = true;
+            let t = mesh.triangles[index];
+            let [a, b, c] = t.map(|i| sub(local[i as usize], origin));
+            let [wa, wb, wc] = t.map(|i| sub(written[i as usize], written_origin));
+            source_volume += dot(a, cross(b, c)) / 6.;
+            written_volume += dot(wa, cross(wb, wc)) / 6.;
+            pending.extend(neighbours[index].iter().copied().filter(|&next| !seen[next]));
+        }
+        // Never use abs(): an inverted component is not a verified outward solid.
+        if !source_volume.is_finite()
+            || !written_volume.is_finite()
+            || source_volume < 0.5
+            || written_volume <= 0.
+            || (written_volume - source_volume).abs() > source_volume * 0.001
+        {
+            return None;
+        }
+        volume += source_volume;
+    }
+    volume.is_finite().then_some((volume, source_area))
 }
 
 impl Ifc<'_> {
@@ -159,15 +241,79 @@ impl Ifc<'_> {
         }
     }
 
-    /// A pitched roof: an IfcRoof of one slab per roof plane, its gables as walls and its
-    /// gutters as gutter segments.
+    /// A multi-plane shell has no single layer-usage axis. Preserve the illustrative
+    /// construction on a proper roof type and layer set without inventing that orientation.
+    fn roof_shell_metadata(&mut self, b: &Built, roof: usize, frame: &Frame, kind: &str, up: &catalog::BuildUp, represented: bool) {
+        let Some(r) = &b.roof else { return };
+        let mut props = vec![
+            ("QuantityBasis", Val::Text("Original parametric cover only; boundary area includes soffits, fascia and reveals; separate coverings and dormer assemblies excluded".into())),
+            ("OuterSkinAreas", Val::Text("Unavailable: no certified gross/net outer-skin partition is retained; no Qto_RoofBaseQuantities area is inferred from volume or upward reveals".into())),
+            ("Representation", Val::Text(if represented { "Original parametric cover" } else { "Unavailable: empty or unrepresentable source coordinates/indices; no substitute geometry emitted" }.into())),
+        ];
+        if let Some(thickness) = split::source_roof_thickness(self.doc, b) {
+            let key = format!("roof:{}:{kind}", up.name);
+            let created = !self.cat.types.contains_key(&key);
+            let ty = self.cat.typed(&mut self.w, &key, roof, |w| {
+                w.add(format!("IFCROOFTYPE({},$,{},$,$,$,$,$,$,{kind})", gid(&format!("rooftype:{}:{kind}", up.name)), string(&up.name)))
+            });
+            let layers = self.cat.layer_set(&mut self.w, up);
+            if created {
+                self.cat.associate(&format!("roofset:{}", up.name), layers, ty);
+            }
+            self.cat.associate(&format!("roofset:{}", up.name), layers, roof);
+            props.push(("SourceNormalThickness", Val::Length(thickness)));
+            props.push(("ConstructionBasis", Val::Text("Illustrative family build-up at declared normal source thickness; layer positions within this multi-plane shell are not resolved".into())));
+        } else {
+            props.push((
+                "ConstructionBasis",
+                Val::Text("Unverified: no positive declared source build-up representable at written precision; no normal thickness or material-layer construction is inferred".into()),
+            ));
+        }
+        if let Some((volume, boundary)) = roof_shell_quantities(&r.cover, frame) {
+            props.push((
+                "SolidCoverage",
+                Val::Text(
+                    "Verified closed, consistently oriented positive components at written precision; self-intersection is not certified".into(),
+                ),
+            ));
+            self.cat.quantities(
+                &mut self.w,
+                &format!("{}.geometry", r.id),
+                "Trigon_RoofQuantities",
+                &[Qty::Volume("SolidVolume", volume / 1e9), Qty::Area("TotalBoundaryArea", boundary / 1e6)],
+                roof,
+            );
+        } else {
+            // Preserve the actual cover; never replace an unsupported source shell with
+            // fictitious prisms or publish a successful solid-quantity certificate.
+            props.push(("SolidCoverage", Val::Text("Unverified: source cover or written shell fails finite, closure, orientation, positive-volume or rounding checks; solid quantities omitted".into())));
+        }
+        self.cat.pset(&mut self.w, "Trigon_RoofGeometry", &props, roof);
+    }
+
+    /// A pitched roof: an IfcRoof with an exact opened cover or unopened plane slabs,
+    /// its gables as walls and its gutters as gutter segments.
     pub(super) fn roof(&mut self, b: &Built, fl: &mut Floors) {
         let Some(r) = &b.roof else { return };
         let top = b.storeys.len().saturating_sub(1);
         let pieces = split::roof(r, &b.walls);
         let exact_openings = split::opening_shell(self.doc, b);
-        let thickness = pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness());
-        let up = catalog::pitched_roof((thickness * 10.0).round() / 10.0);
+        let thickness = if r.compound || exact_openings {
+            split::source_roof_thickness(self.doc, b)
+                .unwrap_or_else(|| pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness()))
+        } else {
+            pieces.iter().find(|p| p.gable.is_none()).map_or(ROOF_PLANE, |p| p.thickness())
+        };
+        let up = if (r.compound || exact_openings) && split::source_roof_thickness(self.doc, b).is_some() {
+            let mut up = catalog::pitched_roof(thickness);
+            // Catalog layer sets are cached by name. Distinct fractional source thicknesses
+            // must not collapse into the legacy display name rounded to whole millimetres.
+            let dimension = super::part21::real(thickness);
+            up.name = format!("Tag, tegl på spær {} mm (illustrative shell)", dimension.trim_end_matches('.'));
+            up
+        } else {
+            catalog::pitched_roof((thickness * 10.0).round() / 10.0)
+        };
         let placed = self.w.place(Some(fl.at(top)), fl.at(top).frame);
         let kind = if r.compound {
             ".MANSARD_ROOF."
@@ -179,12 +325,18 @@ impl Ifc<'_> {
         // Mitred slope breaks have different top/soffit boundaries. Export the real shell,
         // rather than reconstructing it as unrelated plane extrusions with overlaps or gaps.
         let shape = if r.compound || exact_openings {
-            self.w
-                .faceset(&r.cover, &placed.frame)
-                .and_then(|item| {
-                    self.cat.paint(&mut self.w, item, catalog::TILES);
-                    self.shape("Tessellation", &[item], None, catalog::L_ROOF)
+            // The generic number writer replaces nonfinite numbers with zero. An exact
+            // roof must not claim that fabricated shape, or emit out-of-range face indices.
+            let representable = r.cover.positions.iter().all(|&p| placed.frame.local(p).iter().all(|v| v.is_finite() && v.abs() <= 1e9))
+                && r.cover.triangles.iter().flatten().all(|&i| i < u32::MAX && (i as usize) < r.cover.positions.len());
+            representable
+                .then(|| {
+                    self.w.faceset(&r.cover, &placed.frame).and_then(|item| {
+                        self.cat.paint(&mut self.w, item, catalog::TILES);
+                        self.shape("Tessellation", &[item], None, catalog::L_ROOF)
+                    })
                 })
+                .flatten()
                 .map_or_else(|| "$".into(), |id| format!("#{id}"))
         } else {
             "$".into()
@@ -204,13 +356,16 @@ impl Ifc<'_> {
             &up.name
         };
         self.common("Pset_RoofCommon", roof, reference, None, vec![("IsExternal", Val::Bool(true))]);
+        if r.compound || exact_openings {
+            self.roof_shell_metadata(b, roof, &placed.frame, kind, &up, shape != "$");
+        }
         fl.contain(top, roof);
         self.rooflights(r, roof, fl);
         let mut planes = Vec::new();
         for piece in &pieces {
             match &piece.gable {
                 None => {
-                    // Inclined apertures offset top and underside boundaries in plan. The
+                    // Openings split top and underside tessellations differently. The
                     // legacy centroid pairing / fallback extrusion cannot reproduce that shell.
                     if exact_openings {
                         continue;

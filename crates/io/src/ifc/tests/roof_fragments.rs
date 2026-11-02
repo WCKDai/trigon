@@ -331,3 +331,6 @@ fn shallow_positive_roof_fragments_use_solids_instead_of_short_extrusions() {
     assert!(writer.w.lines.iter().any(|l| l.starts_with("IFCTRIANGULATEDFACESET(")));
     assert!(!writer.w.lines.iter().any(|l| l.starts_with("IFCEXTRUDEDAREASOLID(")));
 }
+
+#[path = "roof_shells.rs"]
+mod roof_shells;

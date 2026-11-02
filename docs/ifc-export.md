@@ -44,7 +44,7 @@ with gutters, and rooms. Regenerate it with
 | Opening | `IfcOpeningElement` .OPENING. + `IfcRelVoidsElement` | One per wall piece the opening cuts (a stairwell window across a floor cuts two pieces), placed in the piece at the opening's outer bottom-left corner seen from outside; a box as wide and high as the opening within that piece, through the piece's thickness | |
 | Window, door | `IfcWindow`, `IfcDoor` + `IfcRelFillsElement` | Placed relative to its opening (`PlacementRelTo` = the opening's placement), origin at the opening's outer bottom-left corner, x along the facade, z up, +y into the building. `OverallWidth`, `OverallHeight`. `Body` `Tessellation`: frame and sashes, leaves, glass and sill as separately coloured face sets | `IfcWindowType` (partitioning SINGLE/DOUBLE/TRIPLE_PANEL_VERTICAL) or `IfcDoorType` (operation) per Trigon type. `Pset_WindowCommon`/`Pset_DoorCommon` (Reference = type name, IsExternal, Status) |
 | Floor (`<building>.slab.L<n>`, attic floor) | `IfcSlab` .FLOOR. (.BASESLAB. on the ground) | Extruded from the floor's outline; stair openings are inner loops of the profile (`IfcArbitraryProfileDefWithVoids`) | "Etagedæk, træbjælkelag 200 mm" (ceiling plaster 20, joists with pugging, floorboards 22) or "Terrændæk, beton 200 mm"; usage AXIS3, POSITIVE (from the underside up). `Pset_SlabCommon`, `Qto_SlabBaseQuantities` |
-| Pitched roof | `IfcRoof` (GABLE_ROOF or HIP_ROOF) aggregating `IfcSlab` .ROOF. per roof plane | Each plane placed in its own plane (z up its normal, x level along it). With a build-up (`thickness_mm`, overhang, verge) the plane is the solid between its soffit and its top face, which lies straight above it (the fascia and verge boards are vertical): a closed triangulated solid, because an extrusion that isn't square to its profile is misread by some readers (bimifc 0.1.0 put it metres off; ifc-lite and IfcOpenShell read it right). A bare roof surface gets a 250 mm slab hanging square below it, as an extrusion. A plane next to a gable, warped where the ridge was slid onto the gable, is always a triangulated solid that follows Trigon's surface | "Tag, tegl på spær 250 mm" (rafters 200, tiles on battens 50) at the roof's thickness; usage AXIS3, POSITIVE (from the soffit up). `Pset_SlabCommon.PitchAngle` |
+| Unopened pitched roof | `IfcRoof` (GABLE_ROOF or HIP_ROOF) aggregating `IfcSlab` .ROOF. per roof plane | Each plane placed in its own plane (z up its normal, x level along it). With a build-up (`thickness_mm`, overhang, verge) the plane is the solid between its soffit and its top face, which lies straight above it (the fascia and verge boards are vertical): a closed triangulated solid, because an extrusion that isn't square to its profile is misread by some readers (bimifc 0.1.0 put it metres off; ifc-lite and IfcOpenShell read it right). A bare roof surface gets a 250 mm slab hanging square below it, as an extrusion. A plane next to a gable, warped where the ridge was slid onto the gable, is always a triangulated solid that follows Trigon's surface | "Tag, tegl på spær 250 mm" (rafters 200, tiles on battens 50) at the roof's thickness; usage AXIS3, POSITIVE (from the soffit up). `Pset_SlabCommon.PitchAngle` |
 | Gutters | `IfcPipeSegment` .GUTTER. 'Tagrende' per eave | Triangulated, in the top storey | Zinc |
 | Gable | `IfcWall` .SOLIDWALL. | The triangle above the eaves in the facade's plane, extruded into the building by the top storey's wall thickness | The facade's wall type |
 | Flat roof | `IfcRoof` .FLAT_ROOF. aggregating one `IfcSlab` .ROOF. | Extruded outline | "Tagdæk, fladt 300 mm" |
@@ -267,3 +267,42 @@ to native Vectorworks objects where possible.
 
 Report anything that comes in as a generic object instead of the element above, with the element's
 GlobalId.
+
+### Exact opened roofs and retained BIM construction
+
+Positive-thickness pitched roofs with built dormers, and roofs with explicit inclined/multi-plane
+openings, use their actual cover on the existing parent `IfcRoof`. This intentionally retires
+the reconstructed `.faceN` roof slabs for those hosts. Different top/soffit triangulations can
+otherwise defeat centroid pairing, substitute a 250 mm illustrative slab for an explicitly
+200 mm host, and introduce overlap or gaps. The parent roof GlobalId, source document, openings,
+other building products and GLB are unchanged. Ordinary unopened roofs and surface-only legacy
+roof planes retain their existing path, including the documented 250 mm illustrative bare-plane
+convention and bounded positive-fragment fallback.
+
+An exact roof with positive declared build-up has an `IfcRoofType`, the source normal thickness,
+and an illustrative material layer set on its type and occurrence. It has no fictitious single
+`IfcMaterialLayerSetUsage` axis across multiple slopes. These construction layers describe the
+family assumption; their spatial arrangement within the whole shell is not resolved. This follows
+the [buildingSMART material-layer-set definition](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcmaterialresource/lexical/ifcmateriallayerset.htm).
+
+`Trigon_RoofQuantities` supplies only provable `SolidVolume` (m³) and `TotalBoundaryArea` (m²)
+of that actual cover. Boundary area includes both skins, fascia and aperture reveals; separate
+coverings and dormer assemblies are excluded. It is **not** a roof outer-skin net area.
+`Qto_RoofBaseQuantities.GrossArea`, `NetArea` and `ProjectedArea` are deliberately omitted for
+these exact shells until a reliable gross/outer-skin partition is retained. Upward reveal faces
+must not be counted as roof skin, and volume divided by nominal thickness is not generally a
+valid area for warped gable or compound geometry. The
+[buildingSMART roof quantity definition](https://standards.buildingsmart.org/IFC/RELEASE/IFC4/FINAL/HTML/schema/ifcsharedbldgelements/qset/qto_roofbasequantities.htm)
+does not define roof-base volume quantities.
+
+The custom `Trigon_RoofGeometry` properties state this basis and the verification status. A
+quantity certificate requires finite, nondegenerate, closed, consistently oriented edges at the
+writer's 0.000001 mm coordinate precision, a positive signed volume for **every** edge-connected
+component, and no inversion/collapse or greater than 0.1% volume/area change from rounding.
+Finite unsupported source geometry is preserved with an explicit `Unverified` status and without
+solid quantities. Nonfinite/out-of-range coordinates or invalid face indices are explicitly
+reported as unrepresentable, with the roof body omitted rather than zero-coerced substitute
+coordinates. A declared thickness below written precision receives no positive-length or material
+construction claim. No case is repaired by guessed replacement slabs. This check does not certify absence
+of self-intersections or actual receiving-application behaviour. A successful parse or matched
+bounds alone remains insufficient to establish solid coverage.

@@ -337,10 +337,23 @@ pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
     out
 }
 
-/// Explicit new openings require the actual closed shell, rather than legacy
-/// face-pair reconstruction. Default/empty legacy sources keep their original bytes.
+/// Declared normal thickness, not a guessed face-pair extrusion thickness.
+pub(super) fn source_roof_thickness(doc: &Document, b: &Built) -> Option<f64> {
+    let source = doc.buildings.iter().find(|source| source.id == b.building_id)?;
+    let thickness = match &source.roof {
+        trigon_model::Roof::Pitched { thickness_mm, .. } => *thickness_mm,
+        trigon_model::Roof::Mansard { parameters } => parameters.thickness_mm,
+        trigon_model::Roof::Flat => return None,
+    };
+    (thickness.is_finite() && thickness <= 1000. && (thickness * 1e6).round() > 0.).then_some(thickness)
+}
+
+/// Openings require the actual cover rather than heuristic face-pair reconstruction.
+/// Ordinary dormer-free and bare surface legacy sources retain their existing path.
+/// Solid certification is separate: the writer reports an unsupported actual shell as
+/// unverified and omits its quantities, rather than manufacturing replacement material.
 pub(super) fn opening_shell(doc: &Document, b: &Built) -> bool {
-    b.roof.as_ref().is_some_and(|r| !r.rooflights.is_empty())
+    b.roof.as_ref().is_some_and(|r| !r.rooflights.is_empty() || (!r.dormers.is_empty() && source_roof_thickness(doc, b).is_some()))
         || doc.buildings.iter().find(|source| source.id == b.building_id).is_some_and(|source| source.roof.dormers().iter().any(|d| d.multi_plane))
 }
 
