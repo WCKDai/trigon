@@ -2,32 +2,30 @@
 
 use eframe::egui;
 
-pub const INK: egui::Color32 = egui::Color32::from_rgb(237, 239, 233);
-pub const MUTED: egui::Color32 = egui::Color32::from_rgb(156, 166, 167);
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(220, 112, 63);
-pub const PANEL: egui::Color32 = egui::Color32::from_rgb(27, 31, 32);
-pub const CHROME: egui::Color32 = egui::Color32::from_rgb(20, 24, 25);
-pub const LINE: egui::Color32 = egui::Color32::from_rgb(58, 64, 65);
-pub const PAPER: egui::Color32 = egui::Color32::from_rgb(245, 241, 231);
+pub const INK: egui::Color32 = egui::Color32::from_rgb(236, 238, 240);
+pub const MUTED: egui::Color32 = egui::Color32::from_rgb(169, 176, 183);
+pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 112, 53);
+pub const PANEL: egui::Color32 = egui::Color32::from_rgb(41, 44, 47);
+pub const CHROME: egui::Color32 = egui::Color32::from_rgb(32, 34, 37);
+pub const LINE: egui::Color32 = egui::Color32::from_rgb(66, 71, 77);
+pub const PAPER: egui::Color32 = egui::Color32::from_rgb(245, 245, 242);
 pub const DRAWING_INK: egui::Color32 = egui::Color32::from_rgb(37, 43, 43);
 
-/// Reuse the portable Liberation family already distributed under SIL OFL 1.1 in engine/assets.
+/// Portable UI typography distributed under SIL OFL 1.1 in Studio assets.
 pub fn apply(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, data, family) in [
-        (
-            "Liberation Sans",
-            include_bytes!("../../../crates/engine/assets/liberation-sans/LiberationSans-Regular.ttf").as_slice(),
-            egui::FontFamily::Proportional,
-        ),
-        (
-            "Liberation Mono",
-            include_bytes!("../../../crates/engine/assets/liberation/LiberationMono-Regular.ttf").as_slice(),
-            egui::FontFamily::Monospace,
-        ),
+        ("Inter", include_bytes!("../assets/fonts/inter/Inter-400.ttf").as_slice(), egui::FontFamily::Proportional),
+        ("IBM Plex Mono", include_bytes!("../assets/fonts/plex-mono/IBM-Plex-Mono-400.ttf").as_slice(), egui::FontFamily::Monospace),
+        ("Inter Medium", include_bytes!("../assets/fonts/inter/Inter-500.ttf").as_slice(), egui::FontFamily::Name("Inter Medium".into())),
+        ("Inter Semibold", include_bytes!("../assets/fonts/inter/Inter-600.ttf").as_slice(), egui::FontFamily::Name("Inter Semibold".into())),
     ] {
         fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(data)));
         fonts.families.entry(family).or_default().insert(0, name.into());
+    }
+    let fallback = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    for name in ["Inter Medium", "Inter Semibold"] {
+        fonts.families.entry(egui::FontFamily::Name(name.into())).or_default().extend(fallback.clone());
     }
     ctx.set_fonts(fonts);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
@@ -35,21 +33,21 @@ pub fn apply(ctx: &egui::Context) {
     style.visuals.panel_fill = PANEL;
     style.visuals.window_fill = PANEL;
     style.visuals.extreme_bg_color = CHROME;
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(33, 38, 39);
+    style.visuals.faint_bg_color = egui::Color32::from_rgb(52, 56, 61);
     style.visuals.override_text_color = Some(INK);
     style.visuals.hyperlink_color = ACCENT;
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(72, 43, 31);
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(73, 51, 41);
     style.visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
     style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, LINE);
     style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, MUTED);
-    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(32, 37, 38);
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(48, 54, 55);
+    style.visuals.widgets.inactive.weak_bg_fill = CHROME;
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(52, 56, 61);
     style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, LINE);
     style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, INK);
-    style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(50, 57, 58);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(59, 65, 66);
+    style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(52, 56, 61);
+    style.visuals.widgets.hovered.bg_fill = LINE;
     style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(72, 43, 31);
+    style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(73, 51, 41);
     style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
     style.visuals.window_corner_radius = egui::CornerRadius::same(5);
     style.visuals.menu_corner_radius = egui::CornerRadius::same(4);
@@ -65,9 +63,9 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.interact_size.y = 28.0;
     style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::new(13.0, egui::FontFamily::Name("Inter Medium".into())));
     style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
-    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::new(18.0, egui::FontFamily::Name("Inter Semibold".into())));
     ctx.set_style_of(egui::Theme::Dark, style);
     ctx.set_theme(egui::ThemePreference::Dark);
 }
@@ -100,10 +98,10 @@ pub fn mark(ui: &mut egui::Ui, width: f32) {
     }
 }
 
-/// Original vector mark paired with a spaced text wordmark; no reference brand assets.
+/// Compact wordmark in the Studio UI's semibold family.
 pub fn wordmark(ui: &mut egui::Ui) {
-    mark(ui, 28.0);
-    ui.label(egui::RichText::new("T R I G O N").size(18.0).strong().color(INK));
+    mark(ui, 24.0);
+    ui.label(egui::RichText::new("TRIGON").font(egui::FontId::new(18.0, egui::FontFamily::Name("Inter Semibold".into()))).color(INK));
 }
 
 pub fn workspace_tab(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
