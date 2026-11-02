@@ -570,17 +570,27 @@ impl Authoring {
     }
 
     pub fn ribbon(&mut self, ui: &mut egui::Ui) {
-        for (tool, icon, label) in [
-            (Tool::Move, Icon::Move, "Move"),
-            (Tool::Copy, Icon::Copy, "Copy"),
-            (Tool::Align, Icon::Align, "Align"),
-            (Tool::Levels, Icon::Levels, "To levels"),
-        ] {
-            if icons::ribbon_button(ui, icon, label, self.tool == tool).clicked() {
-                self.tool = tool;
+        egui::Grid::new("modify-ribbon").num_columns(3).spacing(egui::vec2(4.0, 2.0)).show(ui, |ui| {
+            for (i, (tool, icon, label)) in [
+                (Tool::Move, Icon::Move, "Move"),
+                (Tool::Copy, Icon::Copy, "Copy"),
+                (Tool::Align, Icon::Align, "Align"),
+                (Tool::Levels, Icon::Levels, "To levels"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if icons::ribbon_button(ui, icon, label, self.tool == tool).clicked() {
+                    self.tool = tool;
+                }
+                if i == 2 {
+                    ui.end_row();
+                }
             }
-        }
-        ui.selectable_value(&mut self.tool, Tool::Delete, "Delete");
+            if ui.add(egui::Button::new("Delete").frame(false).selected(self.tool == Tool::Delete).min_size(egui::vec2(100.0, 28.0))).clicked() {
+                self.tool = Tool::Delete;
+            }
+        });
     }
 
     pub(crate) fn command_controls_first(&self) -> bool {

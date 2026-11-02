@@ -1,6 +1,7 @@
 //! Trigon Studio: the desktop app where the owner and an AI agent build a model together. The
 //! agent drives the same session over the control channel (`trigon mcp` bridges to it), and the
 //! owner watches every command land: in the activity feed, and highlighted in the model.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod activity;

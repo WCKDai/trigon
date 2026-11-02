@@ -171,7 +171,7 @@ impl Properties {
                 ui.add_enabled_ui(editable, |ui| {
                     if let Some(choices) = property["choices"].as_array() {
                         let mut text = value.as_str().unwrap_or_default().to_string();
-                        egui::ComboBox::from_id_salt("value").selected_text(&text).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt("value").width(ui.available_width()).truncate().selected_text(&text).show_ui(ui, |ui| {
                             for choice in choices.iter().filter_map(Value::as_str) {
                                 ui.selectable_value(&mut text, choice.to_string(), choice);
                             }

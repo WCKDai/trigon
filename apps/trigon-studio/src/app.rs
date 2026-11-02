@@ -841,9 +841,11 @@ impl StudioApp {
     }
 
     fn ribbon(&mut self, ui: &mut egui::Ui) {
+        let compact = ui.available_width() < 1200.0;
         egui::ScrollArea::horizontal().id_salt("ribbon-scroll").show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 3.0);
             ui.horizontal(|ui| {
-                ui.set_min_height(78.0);
+                ui.set_min_height(80.0);
                 if self.view_ribbon {
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
@@ -858,6 +860,7 @@ impl StudioApp {
                             }
                             if icons::button(ui, Icon::Bookmark, "Saved views", false).clicked() {
                                 self.authoring.tab = Tab::Drawings;
+                                self.view_ribbon = false;
                             }
                         });
                         theme::eyebrow(ui, "OPEN VIEWS");
@@ -876,115 +879,70 @@ impl StudioApp {
                     match self.authoring.tab {
                         Tab::Project => {
                             ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| self.authoring.ribbon(ui));
-                                });
-                                theme::eyebrow(ui, "MODIFY SELECTION");
+                                ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| self.authoring.ribbon(ui));
+                                theme::eyebrow(ui, "MODIFY");
                             });
                             ui.separator();
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    let level = self.reference_level();
-                                    if ui
-                                        .add_enabled_ui(level.is_some(), |ui| icons::ribbon_button(ui, Icon::Guide, "Guide", false))
-                                        .inner
-                                        .on_hover_text("Create a red dotted plan reference with exact endpoints")
-                                        .clicked()
-                                        && let Some(level) = level
-                                    {
-                                        self.begin_reference_guide(level, None);
-                                    }
-                                    if icons::ribbon_button(ui, Icon::Outline, "Outline", self.inspector == Inspector::Outline)
-                                        .on_hover_text("Inspect exact source edges and use them as alignment guides")
-                                        .clicked()
-                                    {
-                                        self.inspect_project(Inspector::Outline);
-                                    }
-                                    if icons::ribbon_button(ui, Icon::Align, "Wall face", false)
-                                        .on_hover_text("Align selected walls to a guide or actual wall face, with a movement bound")
-                                        .clicked()
-                                    {
-                                        self.inspect_elements();
-                                        self.authoring.choose_wall_alignment();
-                                    }
-                                    if icons::ribbon_button(ui, Icon::Levels, "Copy levels", false)
-                                        .on_hover_text("Preview an exact transfer to named destination storeys")
-                                        .clicked()
-                                    {
-                                        self.inspect_elements();
-                                        self.authoring.choose_copy_to_levels();
-                                    }
-                                });
-                                theme::eyebrow(ui, "SET OUT / COORDINATION");
-                            });
-                            ui.separator();
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    for (icon, label, query) in [
-                                        (Icon::Window, "Windows", "window"),
-                                        (Icon::Door, "Doors", "door"),
-                                        (Icon::Railing, "Balconies", "balcony"),
-                                        (Icon::Component, "All types", ""),
-                                    ] {
-                                        if icons::ribbon_button(ui, icon, label, false)
-                                            .on_hover_text("Open shared project types and placement controls")
-                                            .clicked()
-                                        {
-                                            self.authoring.tab = Tab::Families;
-                                            self.authoring.search = query.into();
+                            if compact {
+                                ui.vertical(|ui| {
+                                    ui.menu_button("Set out", |ui| {
+                                        if self.coordination_ribbon(ui) {
+                                            ui.close();
                                         }
-                                    }
+                                    });
+                                    theme::eyebrow(ui, "COORDINATION");
                                 });
-                                theme::eyebrow(ui, "COMPONENT LIBRARY");
-                            });
-                            ui.separator();
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    for (icon, label, query) in [
-                                        (Icon::Wall, "Walls", "interior"),
-                                        (Icon::Stair, "Stairs", "stair"),
-                                        (Icon::Roof, "Roof", "roof"),
-                                        (Icon::Slab, "Slabs", "slab"),
-                                    ] {
-                                        if icons::ribbon_button(ui, icon, label, false)
-                                            .on_hover_text("Find the typed modelling commands and their parameters")
-                                            .clicked()
-                                        {
-                                            self.palette.show_query(query);
+                                ui.vertical(|ui| {
+                                    ui.menu_button("Components", |ui| {
+                                        if self.components_ribbon(ui) {
+                                            ui.close();
                                         }
-                                    }
+                                    });
+                                    theme::eyebrow(ui, "LIBRARY");
                                 });
-                                theme::eyebrow(ui, "BUILD / COMMANDS");
-                            });
-                            ui.separator();
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    if icons::ribbon_button(ui, Icon::Entrance, "Entrances", self.inspector == Inspector::Entrance).clicked() {
-                                        let id = self
-                                            .session
-                                            .doc
-                                            .buildings
-                                            .iter()
-                                            .find(|b| !b.entrances.is_empty())
-                                            .map(|b| format!("{}.entrance0", b.id));
-                                        if let Some(id) = id {
-                                            self.select_entrance(id);
-                                        } else {
-                                            self.status = Some(("This project has no stored entrance records.".into(), true));
+                                ui.vertical(|ui| {
+                                    ui.menu_button("Build", |ui| {
+                                        if self.build_ribbon(ui) {
+                                            ui.close();
                                         }
-                                    }
-                                    if icons::ribbon_button(ui, Icon::Terrain, "Terrain", self.inspector == Inspector::Terrain).clicked() {
-                                        self.inspect_project(Inspector::Terrain);
-                                    }
+                                    });
+                                    theme::eyebrow(ui, "MODEL");
                                 });
-                                theme::eyebrow(ui, "SITE / PROJECT DATA");
-                            });
+                                ui.vertical(|ui| {
+                                    ui.menu_button("Site", |ui| {
+                                        if self.site_ribbon(ui) {
+                                            ui.close();
+                                        }
+                                    });
+                                    theme::eyebrow(ui, "PROJECT");
+                                });
+                            } else {
+                                ui.vertical(|ui| {
+                                    self.coordination_ribbon(ui);
+                                    theme::eyebrow(ui, "SET OUT");
+                                });
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    self.components_ribbon(ui);
+                                    theme::eyebrow(ui, "COMPONENTS");
+                                });
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    self.build_ribbon(ui);
+                                    theme::eyebrow(ui, "BUILD");
+                                });
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    self.site_ribbon(ui);
+                                    theme::eyebrow(ui, "SITE");
+                                });
+                            }
                         }
                         Tab::Families => {
                             ui.vertical(|ui| {
                                 icons::show(ui, Icon::Component, 24.0);
                                 ui.label("Shared types · variants · placement · portable libraries");
-                                theme::eyebrow(ui, "EDIT EVERY REFERENCING INSTANCE THROUGH TYPE PROPERTIES");
+                                theme::eyebrow(ui, "COMPONENT LIBRARY");
                             });
                         }
                         Tab::Drawings => {
@@ -1008,6 +966,111 @@ impl StudioApp {
                 }
             });
         });
+    }
+
+    fn coordination_ribbon(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut chosen = false;
+        egui::Grid::new("coordination-ribbon").num_columns(2).spacing(egui::vec2(4.0, 2.0)).show(ui, |ui| {
+            let level = self.reference_level();
+            if ui
+                .add_enabled_ui(level.is_some(), |ui| icons::ribbon_button(ui, Icon::Guide, "Guide", false))
+                .inner
+                .on_hover_text("Create a red dotted plan reference with exact endpoints")
+                .clicked()
+                && let Some(level) = level
+            {
+                self.begin_reference_guide(level, None);
+                chosen = true;
+            }
+            if icons::ribbon_button(ui, Icon::Outline, "Outline", self.inspector == Inspector::Outline)
+                .on_hover_text("Inspect source edges and use them as alignment guides")
+                .clicked()
+            {
+                self.inspect_project(Inspector::Outline);
+                chosen = true;
+            }
+            ui.end_row();
+            if icons::ribbon_button(ui, Icon::Align, "Wall face", false)
+                .on_hover_text("Align selected walls to a guide or wall face, with a movement bound")
+                .clicked()
+            {
+                self.inspect_elements();
+                self.authoring.choose_wall_alignment();
+                chosen = true;
+            }
+            if icons::ribbon_button(ui, Icon::Levels, "Copy levels", false).on_hover_text("Preview a transfer to named destination storeys").clicked()
+            {
+                self.inspect_elements();
+                self.authoring.choose_copy_to_levels();
+                chosen = true;
+            }
+        });
+        chosen
+    }
+
+    fn components_ribbon(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut chosen = false;
+        egui::Grid::new("components-ribbon").num_columns(2).spacing(egui::vec2(4.0, 2.0)).show(ui, |ui| {
+            for (i, (icon, label, query)) in [
+                (Icon::Window, "Windows", "window"),
+                (Icon::Door, "Doors", "door"),
+                (Icon::Railing, "Balconies", "balcony"),
+                (Icon::Component, "All types", ""),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if icons::ribbon_button(ui, icon, label, false).on_hover_text("Open shared project types and placement controls").clicked() {
+                    self.authoring.tab = Tab::Families;
+                    self.authoring.search = query.into();
+                    chosen = true;
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        chosen
+    }
+
+    fn build_ribbon(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut chosen = false;
+        egui::Grid::new("build-ribbon").num_columns(2).spacing(egui::vec2(4.0, 2.0)).show(ui, |ui| {
+            for (i, (icon, label, query)) in
+                [(Icon::Wall, "Walls", "interior"), (Icon::Stair, "Stairs", "stair"), (Icon::Roof, "Roof", "roof"), (Icon::Slab, "Slabs", "slab")]
+                    .into_iter()
+                    .enumerate()
+            {
+                if icons::ribbon_button(ui, icon, label, false).on_hover_text("Find modelling commands and their parameters").clicked() {
+                    self.palette.show_query(query);
+                    chosen = true;
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+        chosen
+    }
+
+    fn site_ribbon(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut chosen = false;
+        ui.vertical(|ui| {
+            if icons::ribbon_button(ui, Icon::Entrance, "Entrances", self.inspector == Inspector::Entrance).clicked() {
+                let id = self.session.doc.buildings.iter().find(|b| !b.entrances.is_empty()).map(|b| format!("{}.entrance0", b.id));
+                if let Some(id) = id {
+                    self.select_entrance(id);
+                } else {
+                    self.status = Some(("This project has no stored entrance records.".into(), true));
+                }
+                chosen = true;
+            }
+            if icons::ribbon_button(ui, Icon::Terrain, "Terrain", self.inspector == Inspector::Terrain).clicked() {
+                self.inspect_project(Inspector::Terrain);
+                chosen = true;
+            }
+        });
+        chosen
     }
 
     fn command_strip(&mut self, ui: &mut egui::Ui) {
@@ -1154,7 +1217,7 @@ impl StudioApp {
             match self.mode {
                 Mode::ThreeD => {
                     let label = self.level.and_then(|l| levels.get(l)).map_or("All levels".to_string(), |n| format!("Up to {n}"));
-                    egui::ComboBox::from_id_salt("level").selected_text(label).show_ui(ui, |ui| {
+                    view_combo(ui, "level", &label, 160.0, |ui| {
                         ui.selectable_value(&mut self.level, None, "All levels");
                         for (i, n) in levels.iter().enumerate() {
                             ui.selectable_value(&mut self.level, Some(i), format!("Up to {n}"));
@@ -1163,7 +1226,7 @@ impl StudioApp {
                 }
                 Mode::Drawing => {
                     let label = self.session.doc.views.iter().find(|v| v.id == self.drawing).map_or("Choose drawing", |v| v.name.as_str());
-                    egui::ComboBox::from_id_salt("saved-drawing").selected_text(label).show_ui(ui, |ui| {
+                    view_combo(ui, "saved-drawing", label, 190.0, |ui| {
                         for v in &self.session.doc.views {
                             ui.selectable_value(&mut self.drawing, v.id.clone(), &v.name);
                         }
@@ -1171,7 +1234,7 @@ impl StudioApp {
                 }
                 Mode::Plan => {
                     let label = levels.get(self.plan_level).cloned().unwrap_or_else(|| "Level".into());
-                    egui::ComboBox::from_id_salt("plan-level").selected_text(label).show_ui(ui, |ui| {
+                    view_combo(ui, "plan-level", &label, 160.0, |ui| {
                         for (i, n) in levels.iter().enumerate() {
                             ui.selectable_value(&mut self.plan_level, i, n);
                         }
@@ -1181,26 +1244,23 @@ impl StudioApp {
             let phases: Vec<(String, String)> = self.session.doc.phases.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
             if phases.len() > 1 {
                 let label = phases.get(self.phase).map_or("Phase".to_string(), |p| p.1.clone());
-                egui::ComboBox::from_id_salt("phase").selected_text(label).show_ui(ui, |ui| {
+                view_combo(ui, "phase", &label, 190.0, |ui| {
                     for (i, (_, name)) in phases.iter().enumerate() {
                         ui.selectable_value(&mut self.phase, i, name);
                     }
                 });
-                egui::ComboBox::from_id_salt("filter").selected_text(filter_name(self.filter)).show_ui(ui, |ui| {
+                view_combo(ui, "filter", filter_name(self.filter), 110.0, |ui| {
                     for f in [PhaseFilter::Complete, PhaseFilter::Demolition, PhaseFilter::New, PhaseFilter::All] {
                         ui.selectable_value(&mut self.filter, f, filter_name(f));
                     }
                 });
             }
             if self.mode == Mode::ThreeD {
-                egui::ComboBox::from_id_salt("appearance")
-                    .selected_text(if self.phase_colors { "Phase colors" } else { "Materials" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.phase_colors, false, "Materials");
-                        ui.selectable_value(&mut self.phase_colors, true, "Phase colors");
-                    })
-                    .response
-                    .on_hover_text("Materials show actual finishes. Phase colors highlight new work. Phase visibility and status are independent.");
+                view_combo(ui, "appearance", if self.phase_colors { "Phase colors" } else { "Materials" }, 120.0, |ui| {
+                    ui.selectable_value(&mut self.phase_colors, false, "Materials");
+                    ui.selectable_value(&mut self.phase_colors, true, "Phase colors");
+                })
+                .on_hover_text("Materials show actual finishes. Phase colors highlight new work. Phase visibility and status are independent.");
             }
             if ui.button("Fit").on_hover_text("Frame the whole model (F)").clicked() {
                 self.fit();
@@ -1428,7 +1488,7 @@ impl StudioApp {
             }
             return;
         }
-        ui.heading(if self.authoring.tab == Tab::Families { "Type properties" } else { "Properties" });
+        ui.label(egui::RichText::new(if self.authoring.tab == Tab::Families { "Type properties" } else { "Properties" }).strong().size(14.0));
         let selected = self.selection.and_then(|i| self.scene.elements.get(i)).cloned();
         if let Some(reason) = blocked {
             ui.label(egui::RichText::new(reason).color(theme::ACCENT));
@@ -1441,7 +1501,7 @@ impl StudioApp {
         if self.authoring.tab != Tab::Families
             && let Some(element) = &selected
         {
-            ui.monospace(&element.id);
+            ui.add(egui::Label::new(egui::RichText::new(&element.id).monospace()).wrap());
             let edit = self.properties.ui(ui, &element.id, blocked);
             if let Some(edit) = edit {
                 self.apply_property_edit(edit);
@@ -1472,9 +1532,9 @@ impl StudioApp {
             return;
         };
         theme::eyebrow(ui, "PICKED ELEMENT");
-        egui::Grid::new("selection").num_columns(2).striped(true).show(ui, |ui| {
+        egui::Grid::new("selection").num_columns(2).max_col_width(ui.available_width() * 0.55).striped(true).show(ui, |ui| {
             ui.weak("id");
-            ui.monospace(&e.id);
+            ui.add(egui::Label::new(egui::RichText::new(&e.id).monospace()).wrap());
             ui.end_row();
             ui.weak("category");
             ui.label(e.kind);
@@ -1596,14 +1656,15 @@ impl StudioApp {
     }
 
     fn project_browser(&mut self, ui: &mut egui::Ui) {
-        theme::eyebrow(
-            ui,
-            match self.authoring.tab {
-                Tab::Project => "PROJECT",
+        ui.label(
+            egui::RichText::new(match self.authoring.tab {
+                Tab::Project => "Project Browser",
                 Tab::Families => "FAMILIES / COMPONENTS",
                 Tab::Drawings => "VIEWS / DRAWINGS",
                 Tab::Schedules => "SCHEDULES",
-            },
+            })
+            .strong()
+            .size(13.0),
         );
         ui.separator();
         if self.authoring.tab == Tab::Schedules {
@@ -1628,7 +1689,7 @@ impl StudioApp {
         ui.add(egui::TextEdit::singleline(&mut self.browser_query).char_limit(256).hint_text("Search project…").desired_width(f32::INFINITY));
         let query = self.browser_query.trim().to_lowercase();
         let project = self.session.doc.buildings.first().map_or("Untitled project", |b| b.name.as_str());
-        ui.heading(project);
+        ui.add(egui::Label::new(egui::RichText::new(project).color(theme::MUTED)).wrap());
         let before = (self.mode, self.level, self.plan_level);
         ui.add_space(8.0);
         if ui.selectable_label(self.mode == Mode::ThreeD && self.level.is_none(), "3D model").clicked() {
@@ -2272,21 +2333,29 @@ impl StudioApp {
             .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(12, 3)))
             .show(ui, |ui| self.command_strip(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        let window_width = ctx.content_rect().width();
+        let activity_floating = self.show_activity && window_width < 1200.0;
+        let dock_max_width = (window_width * 0.30).clamp(250.0, 380.0);
         egui::Panel::left("project-dock")
             .resizable(true)
             .default_size(300.0)
-            .size_range(250.0..=520.0)
+            .size_range(250.0..=dock_max_width)
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(12))
             .show(ui, |ui| {
-                let properties_max = (ui.available_height() - 150.0).max(80.0);
-                egui::Panel::top("properties-pane").resizable(true).default_size(322.0).size_range(80.0..=properties_max).show(ui, |ui| {
-                    egui::ScrollArea::vertical().id_salt("properties-scroll").show(ui, |ui| self.selection_panel(ui));
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.spacing_mut().text_edit_width = ui.available_width();
+                let properties_min = (ui.available_height() * 0.44).clamp(112.0, 260.0);
+                let properties_max = (ui.available_height() - 130.0).max(properties_min);
+                egui::Panel::top("properties-pane").resizable(true).default_size(322.0).size_range(properties_min..=properties_max).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("properties-scroll").auto_shrink([false, false]).show(ui, |ui| self.selection_panel(ui));
                 });
-                let browser = egui::ScrollArea::vertical().id_salt("project-scroll").show(ui, |ui| self.project_browser(ui));
+                ui.add_space(8.0);
+                let browser =
+                    egui::ScrollArea::vertical().id_salt("project-scroll").auto_shrink([false, false]).show(ui, |ui| self.project_browser(ui));
                 self.browser_rect = Some(browser.inner_rect);
             });
-        if self.show_activity {
-            egui::Panel::right("activity").resizable(true).default_size(280.0).min_size(220.0).show(ui, |ui| {
+        if self.show_activity && !activity_floating {
+            egui::Panel::right("activity").resizable(true).default_size(280.0).size_range(220.0..=(window_width * 0.22).min(320.0)).show(ui, |ui| {
                 if let Some(action) = self.feed.ui(ui, true, true) {
                     self.undo_redo(action);
                 }
@@ -2313,6 +2382,20 @@ impl StudioApp {
                 Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
             }
         });
+        if activity_floating {
+            let mut open = self.show_activity;
+            let mut action = None;
+            egui::Window::new("Activity")
+                .open(&mut open)
+                .default_width(300.0)
+                .default_height(300.0)
+                .max_height((ctx.content_rect().height() - 100.0).max(160.0))
+                .show(&ctx, |ui| action = self.feed.ui(ui, true, true));
+            self.show_activity = open;
+            if let Some(action) = action {
+                self.undo_redo(action);
+            }
+        }
         if let Some(run) = self.palette.ui(&ctx) {
             let r = self.run(Who::Owner, run.command, run.params);
             self.palette.set_outcome(r.map(|v| crate::activity::pretty(&v)));
@@ -2345,6 +2428,15 @@ impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.workspace_ui(ui);
     }
+}
+
+/// ComboBox::width is a minimum; constrain its child UI as well so long saved names
+/// cannot expand the canvas. Allocating the whole control lets the parent wrap it.
+fn view_combo(ui: &mut egui::Ui, id: &str, label: &str, width: f32, choices: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    ui.allocate_ui_with_layout(egui::vec2(width, ui.spacing().interact_size.y), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        egui::ComboBox::from_id_salt(id).width(width).truncate().selected_text(label).show_ui(ui, choices).response.on_hover_text(label)
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -2658,6 +2750,197 @@ mod tests {
         app.run(Who::Owner, "document.new", json!({})).unwrap();
         assert!(app.open_views.is_empty());
         assert!(app.active_view.is_none(), "views and their navigation cannot leak into another project");
+    }
+
+    #[test]
+    fn properties_recover_from_a_collapsed_split_and_window_resize() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let document = app.session.doc.clone();
+        let ctx = egui::Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        theme::apply(&ctx);
+        ctx.data_mut(|data| {
+            data.insert_persisted(
+                egui::Id::new("properties-pane"),
+                egui::containers::panel::PanelState { outer_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 80.0)) },
+            );
+        });
+        let mut failures = Vec::new();
+        for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1440.0, 900.0)] {
+            for selected in [None, Some(window(&app)), None] {
+                app.selection = selected;
+                for _ in 0..3 {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() },
+                        |ui| app.workspace_ui(ui),
+                    );
+                    output.textures_delta.clear();
+                }
+                let properties = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("properties-pane")).unwrap().outer_rect;
+                let minimum = if size.y >= 800.0 { 240.0 } else { 100.0 };
+                if properties.height() < minimum {
+                    failures.push(format!("Properties collapsed at {size:?}: {properties:?}"));
+                }
+                let browser = app.browser_rect.unwrap();
+                if browser.height() < 100.0 || properties.bottom() > browser.top() {
+                    failures.push(format!("dock regions overlap or collapse: {properties:?}, {browser:?}"));
+                }
+            }
+        }
+        ctx.data_mut(|data| data.clear());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(app.session.doc, document, "resizing/selection cannot edit the building");
+    }
+
+    #[test]
+    fn architecture_actions_are_visible_inside_the_ribbon() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))), ..Default::default() },
+            |ui| {
+                egui::Panel::top("ribbon-test").show(ui, |ui| app.ribbon(ui));
+            },
+        );
+        let mut failures = Vec::new();
+        for label in [
+            "Move",
+            "Copy",
+            "Align",
+            "To levels",
+            "Guide",
+            "Outline",
+            "Wall face",
+            "Copy levels",
+            "Windows",
+            "Doors",
+            "Balconies",
+            "All types",
+            "Walls",
+            "Stairs",
+            "Roof",
+            "Slabs",
+            "Entrances",
+            "Terrain",
+        ] {
+            let matches = output
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some((shape.clip_rect, egui::Rect::from_min_size(text.pos, text.galley.size())))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if matches.is_empty() || !matches.iter().all(|(clip, rect)| clip.contains_rect(*rect)) {
+                failures.push(format!("missing or clipped ribbon action {label}: {matches:?}"));
+            }
+        }
+        output.textures_delta.clear();
+        ctx.data_mut(|data| data.clear());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn long_project_labels_and_activity_leave_room_for_the_canvas() {
+        let mut app = app(true);
+        app.authoring.tab = Tab::Project;
+        app.session.doc.phases[app.phase].name = "Existing building and proposed works ".repeat(7);
+        app.session.doc.buildings[0].storeys[0].name = "Ground floor reference level ".repeat(7);
+        app.level = Some(0);
+        let index = window(&app);
+        Arc::make_mut(&mut app.scene).elements[index].id = "selected-opening-with-a-long-source-identity-".repeat(5);
+        app.selection = Some(index);
+        app.show_activity = true;
+        let document = app.session.doc.clone();
+        let ctx = egui::Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        theme::apply(&ctx);
+        ctx.data_mut(|data| {
+            for id in ["project-dock", "activity"] {
+                data.insert_persisted(
+                    egui::Id::new(id),
+                    egui::containers::panel::PanelState { outer_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 500.0)) },
+                );
+            }
+        });
+        let mut failures = Vec::new();
+        for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1440.0, 900.0)] {
+            for _ in 0..3 {
+                let mut output = ctx
+                    .run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
+                        app.workspace_ui(ui)
+                    });
+                output.textures_delta.clear();
+            }
+            let canvas = app.viewport_rect.unwrap();
+            if canvas.width() < 450.0 || canvas.height() < 100.0 || canvas.right() > size.x + 1.0 || canvas.bottom() > size.y + 1.0 {
+                failures.push(format!("crowded or overflowing canvas at {size:?}: {canvas:?}"));
+            }
+        }
+        ctx.data_mut(|data| data.clear());
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(app.session.doc, document);
+    }
+
+    #[test]
+    fn compact_ribbon_menus_open_the_same_editors_without_editing_the_model() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let document = app.session.doc.clone();
+        let ctx = egui::Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        theme::apply(&ctx);
+        let draw = |app: &mut StudioApp, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(820.0, 520.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let click = |app: &mut StudioApp, label: &str| -> bool {
+            let shapes = draw(app, Vec::new());
+            // Prefer the ribbon/menu action over a workspace tab with the same label.
+            let point = shapes.iter().rev().find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == label
+                {
+                    let point = text.pos + text.galley.size() * 0.5;
+                    shape.clip_rect.contains(point).then_some(point)
+                } else {
+                    None
+                }
+            });
+            let Some(point) = point else { return false };
+            for event in [
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(app, vec![event]);
+            }
+            true
+        };
+        let terrain = click(&mut app, "Site") && click(&mut app, "Terrain") && app.inspector == Inspector::Terrain;
+        let components =
+            click(&mut app, "Components") && click(&mut app, "Windows") && app.authoring.tab == Tab::Families && app.authoring.search == "window";
+        app.authoring.tab = Tab::Project;
+        let outline = click(&mut app, "Set out") && click(&mut app, "Outline") && app.inspector == Inspector::Outline;
+        ctx.data_mut(|data| data.clear());
+        assert!(terrain && components && outline, "compact menu routes: terrain={terrain}, components={components}, outline={outline}");
+        assert_eq!(app.session.doc, document);
     }
 
     #[test]
