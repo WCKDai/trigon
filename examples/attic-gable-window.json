@@ -1,0 +1,7 @@
+[
+  {"command":"building.add","params":{"id":"b","name":"Synthetic attic gable","footprint":[[0,0],[30000,0],[30000,12000],[0,12000]],"storeys":3,"storey_height_mm":3000}},
+  {"command":"building.set_roof","params":{"kind":"half_hipped","pitch_deg":45,"gables":["b.f2","b.f4"],"half_hips":[{"facade":"b.f4","drop_mm":1200}],"thickness_mm":200,"overhang_mm":180,"verge_mm":135}},
+  {"command":"building.set_attic","params":{"floor":8250,"name":"Roof"}},
+  {"command":"facade.set_bays","params":{"facade":"b.f4","centres":[4000,8000]}},
+  {"command":"facade.place","params":{"facade":"b.f4","type":"window.casement.2","levels":[3],"bays":[0],"u":6000,"width":1200,"height":1000,"sill":2700}}
+]

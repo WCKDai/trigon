@@ -29,10 +29,32 @@ pub enum Material {
     Render,
     /// Red brick, where a facade isn't the building's usual brick.
     BrickRed,
+    /// Yellow facing brick, explicitly assigned rather than changing a building's default brick.
+    BrickYellow,
+    /// Appended site presentation materials; existing indices stay stable.
+    Paving,
+    Gravel,
+    Grass,
+    Bark,
+    Foliage,
+    Soil,
+    Planter,
+    /// Painted white metal, distinct from white timber window/door frames.
+    SteelWhite,
+    /// Dark elastomer glazing seals, distinct from painted steel railings.
+    Gasket,
+    /// Neutral outdoor ground; actual paving/soil composition is project information.
+    Ground,
+    /// Original slate/shingle roof presentation material.
+    Slate,
+    /// Bituminous roofing felt (tagpap).
+    Felt,
+    /// Warm painted render; appended to retain every existing material index.
+    RenderTerracotta,
 }
 
 impl Material {
-    pub const ALL: [Material; 16] = [
+    pub const ALL: [Material; 30] = [
         Material::Wall,
         Material::Slab,
         Material::Roof,
@@ -49,6 +71,20 @@ impl Material {
         Material::Plaster,
         Material::Render,
         Material::BrickRed,
+        Material::BrickYellow,
+        Material::Paving,
+        Material::Gravel,
+        Material::Grass,
+        Material::Bark,
+        Material::Foliage,
+        Material::Soil,
+        Material::Planter,
+        Material::SteelWhite,
+        Material::Gasket,
+        Material::Ground,
+        Material::Slate,
+        Material::Felt,
+        Material::RenderTerracotta,
     ];
 
     pub fn name(self) -> &'static str {
@@ -69,6 +105,20 @@ impl Material {
             Material::Plaster => "plaster",
             Material::Render => "render",
             Material::BrickRed => "brick_red",
+            Material::BrickYellow => "brick_yellow",
+            Material::Paving => "paving",
+            Material::Gravel => "gravel",
+            Material::Grass => "grass",
+            Material::Bark => "bark",
+            Material::Foliage => "foliage",
+            Material::Soil => "soil",
+            Material::Planter => "planter",
+            Material::SteelWhite => "steel_white",
+            Material::Gasket => "gasket",
+            Material::Ground => "ground",
+            Material::Slate => "slate",
+            Material::Felt => "felt",
+            Material::RenderTerracotta => "render_terracotta",
         }
     }
 
@@ -91,7 +141,44 @@ impl Material {
             Material::Plaster => [0.93, 0.92, 0.89, 1.0],
             Material::Render => [0.90, 0.90, 0.88, 1.0],
             Material::BrickRed => [0.55, 0.22, 0.14, 1.0],
+            Material::BrickYellow => [0.57, 0.43, 0.22, 1.0],
+            Material::Paving => [0.52, 0.51, 0.47, 1.0],
+            Material::Gravel => [0.62, 0.58, 0.48, 1.0],
+            Material::Grass => [0.22, 0.31, 0.12, 1.0],
+            Material::Bark => [0.25, 0.16, 0.09, 1.0],
+            Material::Foliage => [0.19, 0.32, 0.10, 1.0],
+            Material::Soil => [0.20, 0.14, 0.08, 1.0],
+            Material::Planter => [0.30, 0.31, 0.28, 1.0],
+            Material::SteelWhite => Material::Frame.rgba(),
+            Material::Gasket => Material::Railing.rgba(),
+            Material::Ground => [0.38, 0.40, 0.35, 1.0],
+            Material::Slate => [0.12, 0.14, 0.16, 1.0],
+            Material::Felt => [0.065, 0.07, 0.075, 1.0],
+            Material::RenderTerracotta => [0.60, 0.21, 0.15, 1.0],
         }
+    }
+
+    pub fn masonry(self) -> bool {
+        matches!(self, Self::Wall | Self::BrickRed | Self::BrickYellow)
+    }
+
+    /// Original running-bond material coordinates, anchored to site-local millimetres.
+    /// One repeat is 480 × 132 mm: two 240 × 66 modules with 228 × 54 brick faces and
+    /// 12 mm joints. This is a presentation template, not a measurement of an existing bond.
+    /// `normal` is the triangle cross product in original coordinates; it need not be unit.
+    pub fn masonry_uv(self, point: [f64; 3], normal: [f64; 3]) -> Option<[f32; 2]> {
+        if !self.masonry() || point.iter().any(|v| !v.is_finite() || v.abs() > 1e9) || normal.iter().any(|v| !v.is_finite() || v.abs() > 1e30) {
+            return None;
+        }
+        let horizontal = normal[0].hypot(normal[1]);
+        if normal[2].abs() > horizontal {
+            return Some([(point[0] / 480.0) as f32, (-point[1] / 132.0) as f32]);
+        }
+        if horizontal <= 1e-12 {
+            return None;
+        }
+        let along = point[0] * (normal[1] / horizontal) - point[1] * (normal[0] / horizontal);
+        Some([(along / 480.0) as f32, (-point[2] / 132.0) as f32])
     }
 }
 
@@ -206,7 +293,65 @@ impl Mesh {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn appended_terrain_and_roof_materials_preserve_the_published_material_prefix() {
+        // Published pre-integration inventory from immutable revision 5ff5d3a.
+        let legacy = [
+            "wall",
+            "slab",
+            "roof",
+            "frame",
+            "glass",
+            "door",
+            "sill",
+            "railing",
+            "reference",
+            "steel",
+            "deck",
+            "demolished",
+            "plinth",
+            "plaster",
+            "render",
+            "brick_red",
+            "brick_yellow",
+            "paving",
+            "gravel",
+            "grass",
+            "bark",
+            "foliage",
+            "soil",
+            "planter",
+            "steel_white",
+            "gasket",
+        ];
+        assert_eq!(super::Material::ALL[..26].iter().map(|m| m.name()).collect::<Vec<_>>(), legacy);
+        for (index, material) in super::Material::ALL.iter().enumerate() {
+            assert_eq!(*material as usize, index, "GPU/export material indices must agree with the shared table");
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn masonry_coordinates_preserve_physical_scale_and_ignore_normal_magnitude() {
+        for material in [Material::Wall, Material::BrickRed, Material::BrickYellow] {
+            assert_eq!(material.masonry_uv([480.0, 0.0, -132.0], [0.0, 1.0, 0.0]), Some([1.0, 1.0]));
+            assert_eq!(material.masonry_uv([480.0, 0.0, -132.0], [0.0, 9000.0, 0.0]), Some([1.0, 1.0]));
+            assert_eq!(material.masonry_uv([0.0, 480.0, 132.0], [1.0, 0.0, 0.0]), Some([-1.0, -1.0]));
+            assert_eq!(material.masonry_uv([480.0, 132.0, 0.0], [0.0, 0.0, 1.0]), Some([1.0, -1.0]));
+            assert!(material.masonry_uv([f64::NAN, 0.0, 0.0], [0.0, 1.0, 0.0]).is_none());
+            assert!(material.masonry_uv([0.0; 3], [f64::INFINITY, 0.0, 0.0]).is_none());
+            assert!(material.masonry_uv([f64::MAX, 0.0, 0.0], [0.0, 1.0, 0.0]).is_none());
+            assert!(material.masonry_uv([0.0; 3], [0.0; 3]).is_none());
+        }
+        for material in Material::ALL.into_iter().filter(|m| !m.masonry()) {
+            assert!(material.masonry_uv([0.0; 3], [0.0, 1.0, 0.0]).is_none());
+        }
+        assert_ne!(Material::BrickYellow.rgba(), Material::Wall.rgba());
+        assert_eq!(serde_json::from_str::<Material>("\"wall\"").unwrap(), Material::Wall);
+        assert_eq!(serde_json::from_str::<Material>("\"brick_red\"").unwrap(), Material::BrickRed);
+        assert_eq!(serde_json::from_str::<Material>("\"brick_yellow\"").unwrap(), Material::BrickYellow);
+    }
 
     #[test]
     fn polygon_with_hole_triangulates() {

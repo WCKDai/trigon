@@ -199,6 +199,94 @@ pub(crate) fn skin(fr: &FacadeFrame, spans: &[Span], holes: &[Rect]) -> Option<M
     ok.then_some(m)
 }
 
+/// Convex curved openings use their actual outline on both wall faces and every reveal.
+/// Kept separate from the established rectangular path to retain old drawing bytes.
+pub(crate) fn skin_profiles(fr: &FacadeFrame, spans: &[Span], holes: &[Vec<[f64; 2]>]) -> Option<Mesh> {
+    let (first, last) = (spans.first()?, spans.last()?);
+    let mut m = Mesh::default();
+    let mut ok = fill(&mut m, &cut(&rect(0.0, fr.length, first.z0, last.z1), holes), |p| fr.point(p[0], 0.0, p[1]), [fr.n[0], fr.n[1], 0.0]);
+    for s in spans {
+        ok &= profile_inner(&mut m, fr, s, holes);
+        ends(&mut m, fr, s);
+    }
+    ok &= profile_cap(&mut m, fr, last, last.z1, true, holes);
+    ok &= profile_cap(&mut m, fr, first, first.z0, false, holes);
+    for pair in spans.windows(2) {
+        let (lo, hi) = (&pair[0], &pair[1]);
+        if (lo.thickness - hi.thickness).abs() < EPS && (lo.in0 - hi.in0).abs() < EPS && (lo.in1 - hi.in1).abs() < EPS {
+            continue;
+        }
+        let (wide, narrow, up) = if lo.thickness >= hi.thickness { (lo, hi, true) } else { (hi, lo, false) };
+        let mut cuts = profile_crossing(holes, lo.z1, wide.thickness);
+        cuts.push(band(fr, narrow));
+        ok &= fill(&mut m, &cut(&band(fr, wide), &cuts), |p| fr.point(p[0], p[1], lo.z1), [0.0, 0.0, if up { 1.0 } else { -1.0 }]);
+    }
+    ok.then_some(m)
+}
+
+fn profile_crossing(holes: &[Vec<[f64; 2]>], z: f64, depth: f64) -> Vec<Vec<[f64; 2]>> {
+    holes.iter().filter_map(|p| crate::profile::width_at(p, z)).filter(|(a, b)| b - a > 1e-6).map(|(a, b)| rect(a, b, -1.0, depth + 1.0)).collect()
+}
+
+fn profile_cap(m: &mut Mesh, fr: &FacadeFrame, s: &Span, z: f64, up: bool, holes: &[Vec<[f64; 2]>]) -> bool {
+    // Approach from inside the span so an opening at the floor also cuts its bottom cap.
+    let inside_z = z + if up { -1e-7 } else { 1e-7 };
+    fill(m, &cut(&band(fr, s), &profile_crossing(holes, inside_z, s.thickness)), |p| fr.point(p[0], p[1], z), [0.0, 0.0, if up { 1.0 } else { -1.0 }])
+}
+
+fn profile_inner(m: &mut Mesh, fr: &FacadeFrame, s: &Span, holes: &[Vec<[f64; 2]>]) -> bool {
+    let d = s.thickness;
+    let ok = fill(m, &cut(&rect(s.in0, s.in1, s.z0, s.z1), holes), |p| fr.point(p[0], d, p[1]), [-fr.n[0], -fr.n[1], 0.0]);
+    for poly in holes {
+        for i in 0..poly.len() {
+            let (mut a, mut b) = (poly[i], poly[(i + 1) % poly.len()]);
+            if a[1].max(b[1]) < s.z0 || a[1].min(b[1]) > s.z1 {
+                continue;
+            }
+            let (original_a, original_b) = (a, b);
+            if (a[1] - b[1]).abs() < 1e-9 {
+                if a[1] <= s.z0 + 1e-8 || a[1] >= s.z1 - 1e-8 {
+                    continue;
+                }
+            } else {
+                let clip = |p: [f64; 2]| {
+                    let z = p[1].clamp(s.z0, s.z1);
+                    [original_a[0] + (original_b[0] - original_a[0]) * (z - original_a[1]) / (original_b[1] - original_a[1]), z]
+                };
+                a = clip(a);
+                b = clip(b);
+            }
+            if (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-8 {
+                continue;
+            }
+            let normal = [-(b[1] - a[1]) * fr.t[0], -(b[1] - a[1]) * fr.t[1], b[0] - a[0]];
+            quad(m, [fr.point(a[0], 0.0, a[1]), fr.point(b[0], 0.0, b[1]), fr.point(b[0], d, b[1]), fr.point(a[0], d, a[1])], normal);
+        }
+    }
+    ok
+}
+
+pub(crate) fn segment_profiles(fr: &FacadeFrame, id: &str, s: &Span, holes: &[Vec<[f64; 2]>]) -> Option<WallSegment> {
+    let mut m = Mesh::default();
+    let mut ok = fill(&mut m, &cut(&rect(0.0, fr.length, s.z0, s.z1), holes), |p| fr.point(p[0], 0.0, p[1]), [fr.n[0], fr.n[1], 0.0]);
+    ok &= profile_inner(&mut m, fr, s, holes);
+    ok &= profile_cap(&mut m, fr, s, s.z0, false, holes);
+    ok &= profile_cap(&mut m, fr, s, s.z1, true, holes);
+    ends(&mut m, fr, s);
+    let openings = holes.iter().enumerate().filter(|(_, p)| p.iter().any(|p| p[1] > s.z0) && p.iter().any(|p| p[1] < s.z1)).map(|(i, _)| i).collect();
+    let (a, b) = (fr.point(0.0, 0.0, 0.0), fr.point(fr.length, 0.0, 0.0));
+    ok.then(|| WallSegment {
+        id: id.into(),
+        level: s.level,
+        thickness: s.thickness,
+        z0: s.z0,
+        z1: s.z1,
+        plan: [[a[0], a[1]], [b[0], b[1]], s.qe, s.qs],
+        mesh: m,
+        openings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

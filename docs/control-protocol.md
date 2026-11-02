@@ -70,7 +70,10 @@ The channel is untrusted input; nothing a client sends can crash Studio.
 - A request line may be at most **16 MiB**; a longer one is answered `request too large` and the
   connection is closed.
 - A connection that sends **8** lines that are not JSON is closed.
-- At most **16** connections are served at once; further ones get `too many connections`.
+- At most **16** connections are served at once. Up to **4** independent refusal workers send
+  `too many connections`, then drain at most 64 KiB for at most 500 ms. The accept thread keeps
+  accepting while those drains wait. With all refusal workers occupied, excess sockets close
+  immediately; worker creation remains bounded. No refused request reaches the app.
 - At most **64** requests wait for the window at once (more are answered `busy`), and the window
   takes at most 64 per frame, so a flood can't starve drawing.
 - A request the window hasn't answered within **60 s** is answered
@@ -89,12 +92,22 @@ The channel is untrusted input; nothing a client sends can crash Studio.
 | `command.run` | `command`: a command id (`facade.place`), `params`: its parameters | the command's result. Runs exactly as the owner's commands do: journaled, undoable, refused changes leave the model as it was. Listed in the feed under the client's name, and the rebuild after a change highlights what it changed |
 | `commands.list` | `schemas?`: bool | every command: `id`, `summary`, `changes_model`, and with `schemas` its `params_schema` |
 | `document.summary` | — | `document.info`, plus `path` and `unsaved` |
-| `ui.view` | `mode?`: `3d` or `plan`; `level?`: a level index (the plan's level; in 3D, show up to that level, cut 1.2 m above its floor), or `null` for the whole model in 3D; `phase?`: a phase id; `filter?`: `complete`, `demolition`, `new` or `all`; `fit?`: bool; `focus?`: an element id (a facade's wall such as `b1.f3`, a placement such as `b1.f3.L2.B0`), framed and seen from outside its facade | the view: `mode`, `level`, `plan_level`, `levels`, `phase`, `phases`, `filter`, `selection`, `camera`, `model_box_m`, `window_hidden`. The parameters are checked whole before anything changes |
+| `ui.view` | `mode?`: `3d`, `plan` or `drawing`; `drawing?`: saved drawing view id (implies drawing mode); `level?`: a level index (the plan's level; in 3D, show up to that level, cut 1.2 m above its floor), or `null` for the whole model in 3D; `phase?`: a phase id; `filter?`: `complete`, `demolition`, `new` or `all`; `appearance?`: `materials` (default actual finishes) or `phases` (3D phase colors); `fit?`: bool; `focus?`: an element id (a facade's wall such as `b1.f3`, a placement such as `b1.f3.L2.B0`), framed and seen from outside its facade | the view: `mode`, `drawing`, `drawings`, `drawing_mapping`, `level`, `plan_level`, `levels`, `phase`, `phases`, `filter`, `appearance`, `selection`, `camera`, `model_box_m`, `window_hidden`. The parameters are checked whole before anything changes |
 | `ui.click` | `x`, `y`: window points from the top left; `button?`: `left` (default), `right`, `middle`; `double?`; `shift?`, `command?`, `alt?`, `ctrl?` | `{queued, window_hidden}`. Real pointer input: the events a click makes (move, press, release) are fed to the window one per frame, so they act exactly as the owner's click (picking an element, pressing a button). Nothing arrives while the window is hidden |
 | `ui.key` | `key`: an egui key name (`K`, `Escape`, `Enter`, `Z`…); `command?`, `shift?`, `alt?`, `ctrl?` | `{queued, window_hidden}`. A real key press and release (`{"key": "K", "command": true}` opens the command palette) |
+| `ui.drag` | `from`, `to`: `[x,y]` in window points; `steps?`: integer 1–60 (default 8); the same optional modifiers as `ui.click` | `{queued, window_hidden}`. Primary-button press, bounded intermediate moves, and release, delivered one event per frame. The entire request is checked before input is queued. |
 | `ui.screenshot` | `target?`: `viewport` (default) or `window`; `path?`: a `.png` file to write; `raise?`: bool | `{width, height, target}` plus `path`, or `png_base64` when no path is given. Answered once the view shows the latest change (a rebuild in progress is waited for). `viewport` is drawn offscreen at the viewport's size (the 3D view on the GPU, the plan with resvg) and works with the window covered. `window` captures the whole window with the activity feed; a minimised or covered window draws nothing, so the request fails at once unless `raise: true` brings the window to the front first (it takes focus from the owner: only when they asked for it). Window captures wider than 2400 pixels are halved |
 
 Any other method is answered `unknown method`, with the list.
+
+`ui.view` also returns `viewport_window_points: [x,y,width,height]` and `handles`, the currently
+available dimensional handles for the selected element. Each handle gives its `key`, `label`,
+`point: [x,y]` in window points, and `value_mm`. These are the same projected markers drawn by the
+window; stale, historical, ambiguous or noneditable selections expose no handles. Use `ui.drag`
+to operate one through the same input path as a pointer, then read the refreshed source properties.
+`window_focused` reports the native focus flag (or null if the platform has not supplied it).
+Handle drags cancel on lost focus; an explicitly requested window screenshot with `raise: true`
+requests focus even if the window reports that it is already unoccluded.
 
 ## Example
 
@@ -123,3 +136,17 @@ again, since it may have run; the next call reconnects, also to a restarted Stud
   through commands (`document.save`, exports). Polykrom's `allow_paths` folder limits are not
   implemented yet.
 - Credentials never pass through the channel: data providers read them from Studio's environment.
+
+
+Saved drawing workspaces use the same annotation commands as headless sessions; see
+[annotations](annotations.md). In drawing mode, `ui.view` returns `drawing_mapping` once ready:
+`origin` is drawing [0,0] in window points, `points_per_mm` is the positive scale and `viewport`
+is [left, top, width, height]. Map drawing [x,y] to [origin.x + x*scale, origin.y - y*scale].
+Pan/zoom changes this mapping, so read it again before synthetic point picking. A failed or
+pending drawing does not expose an old transform.
+
+The 3D appearance choice is ephemeral UI state: it does not alter the model, its journal, phase visibility, schedules or phase status. Materials preserve the existing demolition cue. Phase colors explicitly highlight new work.
+
+For native drawing performance investigation, `ui.view` includes `drawing_raster` upload/discard
+counters and last CPU allocation/render/conversion/texture-enqueue times. GPU upload and frame
+pacing require native profiling; the response sets `gpu_upload_measured: false`.

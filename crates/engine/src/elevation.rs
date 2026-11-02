@@ -13,9 +13,9 @@ use trigon_model::build::{FacadeFrame, Status, View, build_view, resolve_facade}
 use trigon_model::{ComponentKind, Document, ModelError};
 
 use crate::Result;
-use crate::plan::{Label, write_output};
+use crate::plan::Label;
 use crate::sheet::project::{Look, Near, project};
-use crate::sheet::{Halo, Layer, MM_PER_PX, PAGE_MM, Scene, Stroke, Text, Viewport, dxf, scale_text, sheet_scale, style, svg};
+use crate::sheet::{Halo, Layer, MM_PER_PX, Scene, Sheet, Stroke, Text, Viewport, scale_text, sheet_scale, style};
 
 /// Drawing area on the 1600 × 900 sheet, px.
 const LEFT: f64 = 80.0;
@@ -47,12 +47,24 @@ pub(crate) fn sheet(
     caption: &str,
     path: PathBuf,
 ) -> Result<Value> {
-    if title.len() > 200 || caption.len() > 500 {
-        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
-    }
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or_default();
     if !matches!(ext, "png" | "svg" | "pdf" | "dxf") {
         return Err(ModelError::Invalid("use .pdf, .png, .svg or .dxf for an elevation".into()).into());
+    }
+    scene(doc, side, view, range, title, caption, false)?.write(path)
+}
+
+pub(crate) fn scene(
+    doc: &Document,
+    side: Side<'_>,
+    view: View,
+    range: (Option<f64>, Option<f64>),
+    title: &str,
+    caption: &str,
+    hide_balcony_dimensions: bool,
+) -> Result<Sheet> {
+    if title.len() > 200 || caption.len() > 500 {
+        return Err(ModelError::Invalid("the title is limited to 200 bytes and the caption to 500".into()).into());
     }
     let built = build_view(doc, view)?;
     let (b, fr) = match side {
@@ -112,8 +124,14 @@ pub(crate) fn sheet(
         .map(|w| (w.id.as_str(), w.frame))
         .collect();
     for (mb, (id, wf)) in doc.buildings.iter().filter(|x| x.id == b.building_id).flat_map(|mb| facing.iter().map(move |f| (mb, f))) {
+        if hide_balcony_dimensions {
+            continue;
+        }
         let Ok(f) = mb.facade(id) else { continue };
         for r in resolve_facade(doc, mb, f)? {
+            if matches!(r.ty.kind, ComponentKind::GuardRail { .. }) {
+                continue;
+            }
             let Some(depth) = r.ty.kind.depth() else { continue };
             if !matches!(view.status(r.lifetime), Some(Status::Existing | Status::New)) {
                 continue;
@@ -136,6 +154,8 @@ pub(crate) fn sheet(
                 fs,
                 text: format!("Ca. {depth:.0} × {width:.0}"),
                 balcony: true,
+                source: None,
+                clearance: None,
             });
             ticks.push((px(c - width / 2.0, r.rect.v0 - 330.0), px(c + width / 2.0, r.rect.v0 - 330.0)));
         }
@@ -143,7 +163,15 @@ pub(crate) fn sheet(
     // Entrances above the roof, named as seen from this side: "TV 7 TH" from the street the stair
     // is entered from, "TH 7 TV" from behind.
     for e in &doc.buildings.iter().find(|x| x.id == b.building_id).map(|x| x.entrances.clone()).unwrap_or_default() {
-        let Some(st) = e.stair.as_ref().and_then(|id| doc.buildings.iter().flat_map(|x| &x.stairs).find(|s| &s.id == id)) else { continue };
+        let Some(source) = doc.buildings.iter().find(|x| x.id == b.building_id) else { continue };
+        let Some(st) = e
+            .stair_at(source.ground_level)
+            .and_then(|id| source.stairs.iter().find(|s| s.id == id))
+            .or_else(|| e.stair.as_ref().and_then(|id| source.stairs.iter().find(|s| &s.id == id)))
+            .or_else(|| e.stair_by_level.iter().find_map(|(level, id)| source.stairs.iter().find(|s| &s.id == id && s.levels.contains(level))))
+        else {
+            continue;
+        };
         let Ok(sf) = trigon_model::stair::frame(st) else { continue };
         let core = sf.at(sf.length / 2.0, sf.width / 2.0);
         let u = (core[0] - fr.origin[0]) * fr.t[0] + (core[1] - fr.origin[1]) * fr.t[1];
@@ -163,14 +191,14 @@ pub(crate) fn sheet(
             (ahead, _) => ahead.is_some(),
         };
         let text = if front { format!("TV {} TH", e.number) } else { format!("TH {} TV", e.number) };
-        labels.push(Label { at: px(u, top + 900.0), alt: None, deg: 0.0, fs: 18.0, text, balcony: false });
+        labels.push(Label { at: px(u, top + 900.0), alt: None, deg: 0.0, fs: 18.0, text, balcony: false, source: None, clearance: None });
     }
     let mut placed: Vec<Label> = Vec::new();
     for l in labels {
         let fits = |l: &Label| !placed.iter().any(|q| q.overlaps(l));
         if fits(&l) {
             placed.push(l);
-        } else if let Some(at) = l.alt.filter(|at| fits(&Label { at: *at, alt: None, text: l.text.clone(), ..l })) {
+        } else if let Some(at) = l.alt.filter(|at| fits(&Label { at: *at, alt: None, text: l.text.clone(), ..l.clone() })) {
             placed.push(Label { at, alt: None, ..l });
         }
     }
@@ -189,26 +217,15 @@ pub(crate) fn sheet(
         scene.text(t);
     }
     let floor = doc.buildings.first().map(|b| b.name.as_str()).unwrap_or_default();
-    let mut result = json!({"written": path, "triangles": projection.triangles, "lines": projection.edges.len(), "mm_per_px": mm, "scale": scale_text(scene.scale), "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
-    let bytes = match ext {
-        "dxf" => {
-            let text = dxf::write(&scene, &dxf::TitleBlock { title, project: floor, caption, note: None });
-            result["dxf"] = dxf::summary(&text);
-            dxf::bytes(&text)
-        }
-        _ => {
-            let page =
-                svg::sheet(&svg::Frame { title, project: floor, caption, footer: title, note: None }, &scene, &vp, [0.0, 120.0, 1600.0, 700.0]);
-            match ext {
-                "pdf" => crate::plan_output::pdf(std::slice::from_ref(&page), PAGE_MM)?,
-                "png" => crate::plan_output::png(&page)?,
-                _ => page.into_bytes(),
-            }
-        }
-    };
-    write_output(&path, &bytes)?;
-    if ext == "png" {
-        result["image_path"] = json!(path);
-    }
-    Ok(result)
+    let metrics = json!({"triangles": projection.triangles, "lines": projection.edges.len(), "mm_per_px": mm, "scale": scale_text(scene.scale), "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
+    Ok(Sheet {
+        scene,
+        vp,
+        clip: [0.0, 120.0, 1600.0, 700.0],
+        title: title.into(),
+        project: floor.into(),
+        caption: caption.into(),
+        note: None,
+        metrics,
+    })
 }

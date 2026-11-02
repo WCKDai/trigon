@@ -24,7 +24,11 @@ site_load_address (outline, storeys and heights from public data) → facade_lis
 facade_set_bays → facade_place with component types from types_list (windows, doors, French and \
 cantilever balconies) → export_ifc / export_gltf → document_save. Lengths are millimetres. \
 Every change is checked; a refused change leaves the model as it was and the error says why. \
-edit_undo reverts the last change.";
+edit_undo reverts the last change. For precise reconstruction, prioritise registered drawings and \
+measured controls: drawing_to_site with exact:true or drawing_measure_stair → element_get / \
+view_snap → precision_audit and view_audit → precision_preview → precision_apply with the returned \
+preview_token and unchanged action → audit/export → edit_undo if needed. Preview never changes \
+the project. Millimetre calculations do not establish the accuracy of incomplete source evidence.";
 
 const STUDIO_INSTRUCTIONS: &str = " You are connected to Trigon Studio: the owner watches every \
 command land in the model and in the activity feed. studio_view shows them a level, a phase or the \
@@ -130,15 +134,17 @@ fn studio_tools() -> Value {
     json!([
         {
             "name": "studio_view",
-            "description": "Change what the owner sees in Trigon Studio and return the view: mode (3d or plan), level (the plan's \
+            "description": "Change what the owner sees in Trigon Studio and return the view: mode (3d, plan or drawing), drawing (a saved drawing view id), level (the plan's \
                             level; in 3D the top level shown, cut 1.2 m above its floor; null shows everything), phase (a phase id), \
-                            filter (complete, demolition, new, all), fit (true frames the whole model), focus (an element id such as a \
+                            filter (complete, demolition, new, all), appearance (materials or phases, 3D only), fit (true frames the whole model), focus (an element id such as a \
                             facade's wall \"b1.f3\" or a placement: frames it, seen from outside its facade).",
             "inputSchema": {"type": "object", "properties": {
-                "mode": {"type": "string", "enum": ["3d", "plan"]},
+                "mode": {"type": "string", "enum": ["3d", "plan", "drawing"]},
+                "drawing": {"type":"string", "maxLength":80},
                 "level": {"type": ["integer", "null"], "minimum": 0},
                 "phase": {"type": "string"},
                 "filter": {"type": "string", "enum": ["complete", "demolition", "new", "all"]},
+                "appearance": {"type":"string", "enum":["materials","phases"]},
                 "fit": {"type": "boolean"},
                 "focus": {"type": "string"}
             }, "additionalProperties": false}

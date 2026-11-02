@@ -4,6 +4,8 @@ use super::*;
 use trigon_model::build::{PhaseFilter, View, build_view};
 use trigon_model::{Room, Stair};
 
+mod quantities;
+
 fn sample() -> (Document, Vec<Built>, String) {
     let doc = sample::document().unwrap();
     let built = trigon_model::build(&doc).unwrap();
@@ -13,6 +15,141 @@ fn sample() -> (Document, Vec<Built>, String) {
 
 fn count(text: &str, entity: &str) -> usize {
     text.matches(&format!("={entity}(")).count()
+}
+
+#[test]
+fn material_separated_facade_bands_keep_covering_ids_and_declared_colours() {
+    let mut doc = sample::document().unwrap();
+    let id = doc.buildings[0].facades[0].id.clone();
+    doc.buildings[0].facades[0].bands = serde_json::from_value(serde_json::json!([
+        {"levels":[0],"bottom":0.0,"top":2400.0,"projection":20.0,"finish":"render_terracotta"},
+        {"levels":[1],"bottom":2700.0,"top":2800.0,"projection":50.0,"finish":"yellow_brick"}
+    ]))
+    .unwrap();
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "bands.ifc", "2026-01-01T00:00:00");
+    for material in [trigon_model::Material::RenderTerracotta, trigon_model::Material::BrickYellow] {
+        let key = format!("{id}.trim.{}", material.name());
+        assert!(text.lines().any(|line| line.contains("=IFCCOVERING(") && line.contains(&string(&key))));
+        let mat = catalog::of(material);
+        assert!(text.contains(&format!("IFCMATERIAL({},$,{})", string(mat.name), string(mat.category))));
+        assert!(split::model_shapes(&doc, &built).iter().any(|(name, mesh)| name == &key && !mesh.is_empty()));
+    }
+    assert!(!text.lines().any(|line| line.contains("=IFCCOVERING(") && line.contains(&string(&format!("{id}.trim")))));
+}
+
+#[test]
+fn custom_balcony_plan_json_uses_unbounded_ifc_text_without_losing_parameters() {
+    let points = trigon_model::balcony::Plan::Bowed { return_fraction: 0.35 }
+        .outline(3000.0, 1500.0)
+        .unwrap()
+        .into_iter()
+        .map(|p| [p[0] / 3000.0, p[1] / 1500.0])
+        .collect();
+    let plan = trigon_model::balcony::Plan::Polygon { points };
+    plan.outline(3000.0, 1500.0).unwrap();
+    let encoded = serde_json::to_string(&plan).unwrap();
+    assert!(encoded.chars().count() > 255, "valid custom plans can exceed IfcLabel's bound");
+    let mut doc = Document::default();
+    let mut building =
+        trigon_model::Building::new("b", "Custom balcony fixture", &[[0., 0.], [9000., 0.], [9000., 6000.], [0., 6000.]], 1, 3000.).unwrap();
+    building.facades[0].bays = vec![4500.0];
+    building.facades[0].placements = serde_json::from_value(serde_json::json!([{"level":0,"bay":0,"type":"custom"}])).unwrap();
+    doc.buildings.push(building);
+    doc.types.push(trigon_model::ComponentType {
+        id: "custom".into(),
+        name: "Custom convex balcony".into(),
+        width: 3000.0,
+        height: 1100.0,
+        sill: 0.0,
+        kind: trigon_model::ComponentKind::ShapedBalcony { depth: 1500.0, thickness: 180.0, plan: plan.clone() },
+    });
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "custom.ifc", "2026-01-01T00:00:00");
+    let property = text.lines().find(|line| line.contains("IFCPROPERTYSINGLEVALUE('ParametricPlan'")).unwrap();
+    let expected = format!("IFCTEXT({})", string(&encoded));
+    assert!(property.contains(&expected), "full parametric JSON must use IfcText: {property}");
+    let restored: trigon_model::balcony::Plan = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(restored, plan);
+}
+
+#[test]
+fn painted_balcony_metal_is_classified_as_steel_instead_of_timber() {
+    let mut doc = sample::document().unwrap();
+    for ty in &mut doc.types {
+        if let trigon_model::ComponentKind::SteelBalcony { finish, .. } = &mut ty.kind {
+            *finish = trigon_model::component::Finish::White;
+        }
+    }
+    let built = trigon_model::build(&doc).unwrap();
+    let white_metals: Vec<_> = built
+        .iter()
+        .flat_map(|b| &b.walls)
+        .flat_map(|w| &w.attachments)
+        .filter(|e| matches!(doc.component(&e.type_id).unwrap().kind, trigon_model::ComponentKind::SteelBalcony { .. }))
+        .flat_map(|e| &e.parts)
+        .filter(|(m, _)| m.rgba() == trigon_model::Material::Frame.rgba())
+        .collect();
+    assert!(!white_metals.is_empty());
+    assert!(white_metals.iter().all(|(m, _)| catalog::of(*m).category == "steel"));
+}
+
+#[test]
+fn detailed_glazing_seals_have_rubber_material_semantics() {
+    let doc = sample::document().unwrap();
+    let built = trigon_model::build(&doc).unwrap();
+    let seals: Vec<_> = built
+        .iter()
+        .flat_map(|b| &b.walls)
+        .flat_map(|w| &w.openings)
+        .flat_map(|o| &o.fill.parts)
+        .filter(|(m, _)| m.rgba() == trigon_model::Material::Railing.rgba())
+        .collect();
+    assert!(!seals.is_empty());
+    assert!(seals.iter().all(|(m, _)| catalog::of(*m).category == "rubber"));
+}
+
+#[test]
+fn opening_material_constituents_are_exported_and_linked_to_named_shape_aspects() {
+    let (_, _, text) = sample();
+    assert!(text.contains(&format!("IFCMATERIAL({},$,'rubber')", string(catalog::GASKET.name))));
+    assert!(count(&text, "IFCMATERIALCONSTITUENTSET") > 0);
+    assert!(text.contains("IFCMATERIALCONSTITUENT('Gasket',$,"));
+    assert!(text.lines().any(|line| line.contains("IFCSHAPEASPECT(") && line.contains(",'Gasket',$,.T.,")));
+}
+
+#[test]
+fn independent_guard_exports_as_one_ifc_railing_without_an_assembly_deck_or_opening() {
+    let mut doc = Document::default();
+    let mut building =
+        trigon_model::Building::new("guard-b", "Guard fixture", &[[0., 0.], [9000., 0.], [9000., 6000.], [0., 6000.]], 1, 3000.).unwrap();
+    building.facades[0].bays = vec![4500.];
+    building.facades[0].placements = serde_json::from_value(serde_json::json!([{"level":0,"bay":0,"type":"guard"}])).unwrap();
+    doc.buildings.push(building);
+    doc.types.push(
+        serde_json::from_value(serde_json::json!({
+            "id":"guard","name":"Independent guard","width":1500,"height":1100,"sill":200,
+            "kind":{"family":"guard_rail","projection":150,"railing":"norrebro","finish":"white","handrail":true}
+        }))
+        .unwrap(),
+    );
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "guard.ifc", "2026-01-01T00:00:00");
+    assert_eq!(count(&text, "IFCRAILING"), 1);
+    for entity in ["IFCELEMENTASSEMBLY", "IFCOPENINGELEMENT", "IFCWINDOW", "IFCDOOR", "IFCBEAM"] {
+        assert_eq!(count(&text, entity), 0, "{entity}");
+    }
+    assert_eq!(count(&text, "IFCSLAB"), built[0].slabs.len());
+    let guard = &built[0].walls[0].attachments[0];
+    let mut mesh = trigon_model::Mesh::default();
+    for (_, part) in &guard.parts {
+        mesh.append(part);
+    }
+    let expected = mesh.bounds().unwrap();
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        let actual = read.elements.iter().find(|e| e.global_id == guid(&format!("trigon:{}", guard.id))).unwrap();
+        assert!(trigon_ifcread::bounds_deviation(expected, actual.mesh.bounds().unwrap()) < 0.01, "{}", read.reader.name());
+    }
 }
 
 #[test]
@@ -148,4 +285,40 @@ fn a_built_up_roof_is_one_slab_per_plane_as_thick_as_its_build_up() {
     let planes: Vec<_> = split::roof(r, &bare[0].walls).into_iter().filter(|p| p.gable.is_none()).collect();
     assert_eq!(planes.len(), 4);
     assert!(planes.iter().all(|p| (p.thickness() - split::ROOF_PLANE).abs() < 1e-6));
+}
+
+#[test]
+fn explicit_drainage_reads_back_with_stable_ids_and_correct_pipe_classes() {
+    use trigon_model::roof::drainage::{Downpipe, Drainage};
+    let mut doc = sample::document().unwrap();
+    let facade = doc.buildings[0].facades[0].id.clone();
+    if let trigon_model::Roof::Pitched { drainage, gutters, .. } = &mut doc.buildings[0].roof {
+        *gutters = true;
+        *drainage = Some(Drainage {
+            downpipes: vec![Downpipe {
+                id: "rain-a".into(),
+                facade,
+                along_mm: 3000.0,
+                diameter_mm: 80.0,
+                wall_offset_mm: 100.0,
+                bottom_mm: 150.0,
+                shoe_mm: 200.0,
+            }],
+            ..Default::default()
+        });
+    }
+    let built = trigon_model::build(&doc).unwrap();
+    let text = write(&doc, &built, "drainage.ifc", "2026-01-01T00:00:00");
+    assert!(text.contains(".RIGIDSEGMENT.)"));
+    assert!(text.contains(".GUTTER.)"));
+    let shapes = model_shapes(&doc, &built);
+    for read in [trigon_ifcread::read_ifc_lite(&text).unwrap(), trigon_ifcread::read_bimifc(&text).unwrap()] {
+        assert!(read.failures.is_empty(), "{:?}", read.failures);
+        for (id, mesh) in shapes.iter().filter(|(id, _)| id.contains(".gutter") || id.contains(".downpipe.")) {
+            let guid = guid(&format!("trigon:{id}"));
+            let e = read.elements.iter().find(|e| e.global_id == guid).unwrap();
+            assert!(e.class.eq_ignore_ascii_case("IfcPipeSegment"));
+            assert!(trigon_ifcread::bounds_deviation(mesh.bounds().unwrap(), e.mesh.bounds().unwrap()) < 0.01);
+        }
+    }
 }

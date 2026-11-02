@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use trigon_model::build::{FacadeFrame, PhaseFilter, View, even_bays, resolve_facade};
 use trigon_model::{Building, ComponentType, Document, FacadeKind, ModelError, Placement, Site};
@@ -42,7 +42,293 @@ pub fn commands() -> &'static [CommandSpec] {
     COMMANDS
 }
 
+pub(crate) fn add_interior_walls(s: &mut Session, p: AddWalls) -> Result<Value> {
+    let b = s.doc.building_mut(p.building.as_deref())?;
+    let n = b.storeys.len();
+    if p.walls.len() > 5000 {
+        return Err(ModelError::Invalid("at most 5000 walls at a time".into()).into());
+    }
+    for w in &p.walls {
+        w.validate(n)?;
+    }
+    let start = b.interior_walls.len();
+    for (k, mut w) in p.walls.into_iter().enumerate() {
+        if w.id.is_empty() {
+            w.id = format!("{}.iw{}", b.id, start + k);
+        }
+        b.interior_walls.push(w);
+    }
+    Ok(json!({"added": b.interior_walls.len() - start, "interior_walls": b.interior_walls.len()}))
+}
+
+pub(crate) fn add_interior_rooms(s: &mut Session, p: AddRooms) -> Result<Value> {
+    let b = s.doc.building_mut(p.building.as_deref())?;
+    let n = b.storeys.len();
+    if p.rooms.iter().any(|r| r.levels.iter().any(|l| b.attic_level() == Some(*l))) {
+        return Err(ModelError::Invalid("roof-level rooms and habitable quantities require unsupported roof clipping".into()).into());
+    }
+    let start = b.rooms.len();
+    for (k, mut r) in p.rooms.into_iter().enumerate() {
+        if r.polygon.len() < 3 || r.polygon.len() > 256 || r.polygon.iter().flatten().any(|v| !v.is_finite()) || r.levels.iter().any(|l| *l >= n) {
+            return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
+        }
+        if r.id.is_empty() {
+            r.id = format!("{}.room{}", b.id, start + k);
+        }
+        b.rooms.push(r);
+    }
+    Ok(json!({"rooms": b.rooms.len()}))
+}
+
 static COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        id: "site.add",
+        summary: "Add a typed ground area, tree, bench or planter in site-local mm. Explicit design intent; validated, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Add>,
+        run: |s, v| crate::site::add(s, parse("site.add", v)?),
+    },
+    CommandSpec {
+        id: "site.set",
+        summary: "Replace one site's typed source while preserving its ID. Validated, atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Set>,
+        run: |s, v| crate::site::set(s, parse("site.set", v)?),
+    },
+    CommandSpec {
+        id: "site.delete",
+        summary: "Delete a site source, in every phase. Undo restores its exact parameters and lifetime.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::site::Id>,
+        run: |s, v| crate::site::delete(s, parse("site.delete", v)?),
+    },
+    CommandSpec {
+        id: "site.list",
+        summary: "List exact site sources and design intent; these are not building opening or room quantities.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("site.list", v)?;
+            Ok(json!({"objects":s.doc.site_objects}))
+        },
+    },
+    CommandSpec {
+        id: "export.fbx",
+        summary: "Export binary FBX through an optional locally installed Blender, for Lumion and rendering tools. Pure Rust model geometry passes through GLB; an isolated public-API converter embeds textures and verifies source IDs, triangle counts, UVs and vertices within 0.1 mm on re-import before atomic file replacement. No account or GUI required. TRIGON_BLENDER selects an operator-configured executable.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::fbx::Export>,
+        run: |s, v| crate::fbx::export(s, parse("export.fbx", v)?),
+    },
+    CommandSpec {
+        id: "site.set_terrain",
+        summary: "Set/remove a parametric ground height grid in site-local mm. Buildings trim the surface, keeping ground out of floors. Bounded, validated, atomic and undoable; unmeasured flat ground is a presentation assumption.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::terrain::Set>,
+        run: |s, v| crate::terrain::set(s, parse("site.set_terrain", v)?),
+    },
+    CommandSpec {
+        id: "site.sample_terrain",
+        summary: "Sample a bounded ground grid from Danmarks Højdemodel DTM using configured Dataforsyningen access. Converts DVR90 metres to site-local mm, records source attribution, rejects missing data. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::terrain::Sample>,
+        run: |s, v| crate::terrain::sample(s, parse("site.sample_terrain", v)?),
+    },
+    CommandSpec {
+        id: "view.audit",
+        summary: "Read-only lettering validation at final physical view scale. Measures bundled SVG glyph ink/halos, rotated corners, crop clipping and potential text overlaps; returns exact annotation/element provenance and unrounded dimension values. No automatic movement or suppression.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::lettering_audit::Audit>,
+        run: |s, v| crate::lettering_audit::audit(s, parse("view.audit", v)?),
+    },
+    CommandSpec {
+        id: "precision.audit",
+        summary: "Read-only bounded sanity audit: wall gaps, near-parallel material overlaps, end-to-end axis/face misalignment, small abrupt angle changes, and overlapping visible/departing stairs. Wall solids use a 1000 mm floor cut. Exact IDs, storeys, distances, closest points and deltas; build errors and ambiguous IDs are explicit. Findings require review and never trigger repairs.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::precision_audit::Audit>,
+        run: |s, v| crate::precision_audit::audit(s, parse("precision.audit", v)?),
+    },
+    CommandSpec {
+        id: "precision.preview",
+        summary: "Preview a typed local model or drawing action, including interior.add_walls and interior.add_rooms, on a separate document. Returns exact source changes, validation and a same-build conflict token. Optional sanity scopes precision.audit to the candidate. Drawing changes include bounded glyph, crop and overlap feedback; unavailable checks are explicit. Read-only: no journal, files, credentials or network.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::precision::Preview>,
+        run: |s, v| crate::precision::preview(s, parse("precision.preview", v)?),
+    },
+    CommandSpec {
+        id: "precision.apply",
+        summary: "Apply precisely the previewed action if the complete document and action still match its token. Rejects stale previews; validates model and annotations, one atomic journal entry and exact Undo. Tokens are conflict checks, not authorization.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::precision::Apply>,
+        run: |s, v| crate::precision::apply(s, parse("precision.apply", v)?),
+    },
+    CommandSpec {
+        id: "edit.connect_walls",
+        summary: "Connect 2 to 16 explicitly selected interior-wall endpoints to an exact centre-line junction, within a caller-specified 0.001..300 mm displacement limit. Keeps other storeys and hosted door world positions; rejects ambiguous/mixed scopes. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::ConnectWalls>,
+        run: |s, v| crate::edit::connect_walls(s, parse("edit.connect_walls", v)?),
+    },
+    CommandSpec {
+        id: "annotation.move_label",
+        summary: "Move a saved text/leader label by exact drawing-plane mm, preserving style/content and leader witnesses. Dimensions move only perpendicular to their measurement; level marks horizontally. Generated labels are excluded. Validated, atomic, undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::precision::MoveLabel>,
+        run: |s, v| crate::precision::move_label(s, parse("annotation.move_label", v)?),
+    },
+    CommandSpec {
+        id: "element.get",
+        summary: "Inspect a semantic model element and its editable source properties and dimensional handles in the requested phase view. Read-only; exact built IDs.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::elements::Get>,
+        run: |s, v| crate::elements::get(s, parse("element.get", v)?),
+    },
+    CommandSpec {
+        id: "element.set",
+        summary: "Update the selected element's advertised source properties. Shared parametric model for plans and 3D; validated, atomic and undoable. Ambiguous and historical edits are refused.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::elements::Set>,
+        run: |s, v| crate::elements::set(s, parse("element.set", v)?),
+    },
+    CommandSpec {
+        id: "schedule.export",
+        summary: "Write an opening schedule to .csv or .json with the same building/storey/phase filters as schedule.openings. CSV uses UTF-8, model millimetres, m2 areas and an apostrophe prefix for formula-like text. Atomic file output; document and history are unchanged.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::schedule_export::Export>,
+        run: |s, v| crate::schedule_export::export(s, parse("schedule.export", v)?),
+    },
+    CommandSpec {
+        id: "schedule.openings",
+        summary: "List actual built windows and doors with semantic IDs, building/host/storey/type, phase status and dimensions. Areas are outer-lining profile m2 (width × height for rectangular families); loggia facade-hole areas are excluded. Optional building, levels and phase/filter. Read-only and deterministic; does not change history.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::schedules::OpeningScheduleRequest>,
+        run: |s, v| crate::schedules::openings(s, parse("schedule.openings", v)?),
+    },
+    CommandSpec {
+        id: "view.define",
+        summary: "Create or replace a named plan, facade or section drawing view. Coordinates are drawing-plane mm. A view with annotations may be renamed, but its coordinate frame cannot change. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<trigon_model::annotation::DrawingView>,
+        run: |s, v| crate::views::define_view(s, parse("view.define", v)?),
+    },
+    CommandSpec {
+        id: "view.configure",
+        summary: "Set or clear a saved view's persistent template: line weights, physical scale or fit/crop, and optional plan-only floor-relative cut/top/bottom/depth. Null template restores legacy drawing defaults. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::view_config::Configure>,
+        run: |s, v| crate::view_config::configure(s, parse("view.configure", v)?),
+    },
+    CommandSpec {
+        id: "view.apply_template",
+        summary: "Copy a configured saved view's template to 1 to 256 distinct target views, preserving their coordinate frames and annotations. All targets validate before any change; atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::view_config::Apply>,
+        run: |s, v| crate::view_config::apply(s, parse("view.apply_template", v)?),
+    },
+    CommandSpec {
+        id: "view.list",
+        summary: "List saved drawing views with validity and annotation counts. Stale model references remain repairable.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<NoParams>,
+        run: |s, v| parse::<NoParams>("view.list", v).map(|_| crate::views::list_views(s)),
+    },
+    CommandSpec {
+        id: "view.remove",
+        summary: "Remove an empty saved drawing view. Remove its annotations first. Undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::views::Id>,
+        run: |s, v| {
+            let p: crate::views::Id = parse("view.remove", v)?;
+            crate::views::remove_view(s, &p.id)
+        },
+    },
+    CommandSpec {
+        id: "view.snap",
+        summary: "Find the closest endpoint, midpoint, intersection or grid point within a tolerance in drawing mm in a saved view. Read-only; returns the original point when no candidate is near.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::SnapRequest>,
+        run: |s, v| {
+            let p: crate::views::SnapRequest = parse("view.snap", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::snap(&s.doc, p, view)
+        },
+    },
+    CommandSpec {
+        id: "view.pick",
+        summary: "Find the nearest visible model-element line within tolerance_mm in a saved drawing view. Drawing-plane mm; returns hit with the existing semantic id, kind, nearest point and distance_mm, or null. Exact ties prefer openings, interior walls, facade walls, then lexical id. Read-only.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::PickRequest>,
+        run: |s, v| {
+            let p: crate::views::PickRequest = parse("view.pick", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::pick(&s.doc, p, view)
+        },
+    },
+    CommandSpec {
+        id: "view.export",
+        summary: "Export one saved drawing view and its annotations to SVG, PNG, vector PDF or DXF at 1:1 in drawing-plane mm. Phase/filter defaults match other sheet exports.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::Export>,
+        run: |s, v| {
+            let p: crate::views::Export = parse("view.export", v)?;
+            let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
+            crate::views::sheet(&s.doc, &p.id, view)?.write(PathBuf::from(p.path))
+        },
+    },
+    CommandSpec {
+        id: "annotation.define",
+        summary: "Create or replace text, an aligned measured dimension, a leader/tag, a vertical level mark, a manual drafting line or a filled region in a saved view. Positions/offsets are drawing mm; size_mm and line widths are paper mm. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<trigon_model::annotation::Annotation>,
+        run: |s, v| crate::views::define_annotation(s, parse("annotation.define", v)?),
+    },
+    CommandSpec {
+        id: "annotation.list",
+        summary: "List drafting annotations, optionally filtered to one saved drawing view.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::views::ListAnnotations>,
+        run: |s, v| {
+            let p: crate::views::ListAnnotations = parse("annotation.list", v)?;
+            crate::views::list_annotations(s, p.view.as_deref())
+        },
+    },
+    CommandSpec {
+        id: "annotation.remove",
+        summary: "Remove one drafting annotation. Undoable; model geometry is unchanged.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::views::Id>,
+        run: |s, v| {
+            let p: crate::views::Id = parse("annotation.remove", v)?;
+            crate::views::remove_annotation(s, &p.id)
+        },
+    },
     CommandSpec {
         id: "group.define",
         summary: "Save a named group of up to 256 editable source definitions/instances. Groups may be targets of edit commands (group:<id>); references to existing groups are flattened. Atomic and undoable.",
@@ -129,6 +415,14 @@ static COMMANDS: &[CommandSpec] = &[
         journaled: true,
         schema: schema::<crate::edit::Align>,
         run: |s, v| crate::edit::align(s, parse("edit.align", v)?),
+    },
+    CommandSpec {
+        id: "edit.align_walls",
+        summary: "Make nearly parallel interior walls exactly collinear, or align their left/right faces to a picked reference wall. Preserves length, door distances and unselected storeys. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::edit::AlignWalls>,
+        run: |s, v| crate::edit::align_walls(s, parse("edit.align_walls", v)?),
     },
     CommandSpec {
         id: "edit.delete",
@@ -229,9 +523,25 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| load_address(s, parse("site.load_address", v)?),
     },
     CommandSpec {
+        id: "building.add",
+        summary: "Create a local parametric building from an explicit measured footprint, storey count/height and optional evidence. Preserves vertices by default; optional context simplification is explicit. Multiple buildings share one local frame. No data service, credentials or file generation; validated, atomic, undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::local_building::Add>,
+        run: |s, v| crate::local_building::add(s, parse("building.add", v)?),
+    },
+    CommandSpec {
+        id: "building.set_attic",
+        summary: "Create/edit an explicit last roof floor below fixed eaves on a pitched or mansard host; floor is site-local mm. Reuses the attic slab, preserves existing levels/openings and rehosts facade bands in world height. A 100..2000 mm knee wall is not room height. No automatic stair copies; roof-clipped rooms/interiors/quantities are unsupported. remove:true explicitly restores the legacy eaves slab. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::attic::SetAttic>,
+        run: |s, v| crate::attic::set(s, parse("building.set_attic", v)?),
+    },
+    CommandSpec {
         id: "building.set_storeys",
         summary: "Set the number of storeys, the floor-to-floor height and the ground floor's level above the terrain (mm). \
-                  Placements above the new top storey are removed.",
+                  Placements and facade-band occurrences above the new top storey are removed.",
         mutates: true,
         journaled: true,
         schema: schema::<SetStoreys>,
@@ -249,7 +559,7 @@ static COMMANDS: &[CommandSpec] = &[
         id: "building.set_levels",
         summary: "Set the storeys from explicit floor levels (mm above the site's terrain, rising) and the top of the last storey \
                   (eaves or attic floor), for storeys of different heights read from a section drawing. `source` records where \
-                  the levels came from as evidence. Placements above the new top storey are removed.",
+                  the levels came from as evidence. Placements and facade-band occurrences above the new top storey are removed.",
         mutates: true,
         journaled: true,
         schema: schema::<SetLevels>,
@@ -267,25 +577,68 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "building.add_basement",
         summary: "Add a basement storey below the lowest storey, its floor `floor` mm relative to the terrain (negative, e.g. \
-                  read from a section). Every storey reference (placements, interior, registered plans) moves up by one; \
-                  the outer walls then reach down to the basement floor. `source` is recorded as evidence.",
+                  read from a section). Building occurrences and their group references move up by one. Saved/registered \
+                  plan indices move automatically in a single-building project. With multiple buildings and plan references, \
+                  choose remap_global_plan_levels=true to advance all global plan indices or false to retain them. \
+                  The outer walls reach down to the basement floor. `source` is recorded as evidence.",
         mutates: true,
         journaled: true,
         schema: schema::<AddBasement>,
         run: |s, v| {
             let p: AddBasement = parse("building.add_basement", v)?;
+            let id = s.doc.building(p.building.as_deref())?.id.clone();
+            let building = s.doc.buildings.iter().position(|b| b.id == id).ok_or_else(|| ModelError::NotFound(format!("building {id}")))?;
+            let global_plans = s.doc.views.iter().any(|view| matches!(view.kind, trigon_model::annotation::DrawingViewKind::Plan { .. }))
+                || s.doc.drawings.iter().any(|drawing| drawing.plans.iter().any(|plan| !plan.levels.is_empty()));
+            let remap = p.remap_global_plan_levels.or_else(|| (s.doc.buildings.len() == 1 || !global_plans).then_some(true)).ok_or_else(|| {
+                ModelError::Invalid(
+                    "multiple buildings share global plan indices; set remap_global_plan_levels to true to advance all saved/registered plans, or false to retain their indices".into(),
+                )
+            })?;
+            let groups = crate::edit::basement_group_targets(&s.doc, building)?;
             let b = s.doc.building_mut(p.building.as_deref())?;
             b.add_basement(p.floor, p.name.as_deref().unwrap_or("Kælder"))?;
             if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
                 b.evidence.push(trigon_model::Evidence { source: src, supplies: "levels".into(), attribution: p.attribution.unwrap_or_default() });
             }
-            for d in &mut s.doc.drawings {
-                for r in &mut d.plans {
-                    r.levels.iter_mut().for_each(|l| *l += 1);
+            if remap {
+                for view in &mut s.doc.views {
+                    if let trigon_model::annotation::DrawingViewKind::Plan { level } = &mut view.kind {
+                        *level = level.checked_add(1).ok_or_else(|| ModelError::Invalid("saved plan storey overflows".into()))?;
+                    }
+                }
+                for drawing in &mut s.doc.drawings {
+                    for plan in &mut drawing.plans {
+                        for level in &mut plan.levels {
+                            *level = level.checked_add(1).ok_or_else(|| ModelError::Invalid("registered plan storey overflows".into()))?;
+                        }
+                    }
                 }
             }
+            for (group, targets) in s.doc.groups.iter_mut().zip(groups) {
+                group.targets = targets;
+            }
+            // Stale plans may be loaded for repair, but rebasing must not produce a
+            // structurally invalid native file. The outer command rolls back on refusal.
+            trigon_model::annotation::validate_document(&s.doc)?;
             Ok(info(&s.doc))
         },
+    },
+    CommandSpec {
+        id: "rooflight.add",
+        summary: "Add an explicit parametric inclined roof window with a normal through-roof void, reusable rectangular window family, fitted curb and flashing. Source dimensions are planning inputs. Validated, atomic, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::rooflights::Add>,
+        run: |s, v| crate::rooflights::add(s, parse("rooflight.add", v)?),
+    },
+    CommandSpec {
+        id: "rooflight.remove",
+        summary: "Remove a rooflight by its stable local source id and restore its host roof. Atomic, journaled and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::rooflights::Remove>,
+        run: |s, v| crate::rooflights::remove(s, parse("rooflight.remove", v)?),
     },
     CommandSpec {
         id: "building.set_roof",
@@ -293,7 +646,8 @@ static COMMANDS: &[CommandSpec] = &[
                   the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
                   gable (wing ends, walls against neighbours). A pitched roof can carry on past the walls (`overhang_mm` at the \
                   eaves, `verge_mm` at the gables), have a build-up (`thickness_mm`, with fascia, soffit and verge boards) and \
-                  `gutters`. `source` records where the values came from.",
+                  `gutters`. Kind half_hipped adds explicit half_hips source-gable caps on a convex four-edge wing. \
+                  `source` records where the values came from.",
         mutates: true,
         journaled: true,
         schema: schema::<SetRoof>,
@@ -430,7 +784,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "facade.set_finish",
-        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick or render (white). Without \
+        summary: "Set the outer finish of facades: brick (the building's facing brick), red_brick, yellow_brick, render (white) or render_terracotta. Without \
                   `facades` it sets the building's default; `clear: true` makes the listed facades follow the building again.",
         mutates: true,
         journaled: true,
@@ -474,12 +828,7 @@ static COMMANDS: &[CommandSpec] = &[
             let b = s.doc.building_mut(p.building.as_deref())?;
             let storeys = b.storeys.len();
             for band in &p.bands {
-                trigon_model::checked("band bottom", band.bottom, -10_000.0, 10_000.0)?;
-                trigon_model::checked("band top", band.top, band.bottom + 10.0, 10_000.0)?;
-                trigon_model::checked("band projection", band.projection, 1.0, 500.0)?;
-                if band.levels.is_empty() || band.levels.iter().any(|l| *l >= storeys) {
-                    return Err(ModelError::Invalid(format!("band levels must be storey indices below {storeys}")).into());
-                }
+                band.validate(storeys)?;
             }
             for id in &p.facades {
                 b.facade_mut(id)?.bands = p.bands.clone();
@@ -526,7 +875,8 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "facade.place",
         summary: "Place a component type in facade slots. `levels` and `bays` are lists of indices (omit for all). Replaces what was \
-                  in those slots. Optional width, height and sill (mm) override the type for these slots.",
+                  in those slots. Optional width, height and sill (mm) override the type. Optional facade-local u (mm) \
+                  requires exactly one explicitly selected level and bay; it preserves all other bay centres and placements.",
         mutates: true,
         journaled: true,
         schema: schema::<Place>,
@@ -619,8 +969,35 @@ static COMMANDS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        id: "types.install_copenhagen",
+        summary: "Install original parametric Danish Dannebrog, crosspost, segmental/round, true/applied muntin and panel-door families. Explicit style defaults, not surveyed or certified products. Existing definitions are never overwritten. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<NoParams>,
+        run: |s, v| {
+            parse::<NoParams>("types.install_copenhagen", v)?;
+            let mut installed = Vec::new();
+            for ty in trigon_model::component::copenhagen_types() {
+                ty.validate()?;
+                if let Some(existing) = s.doc.types.iter().find(|t| t.id == ty.id) {
+                    if existing != &ty {
+                        return Err(ModelError::Invalid(format!(
+                            "type {} already has different parameters; rename it or install in a new document",
+                            ty.id
+                        ))
+                        .into());
+                    }
+                } else {
+                    installed.push(ty.id.clone());
+                    s.doc.types.push(ty);
+                }
+            }
+            Ok(json!({"installed":installed,"family_defaults":true}))
+        },
+    },
+    CommandSpec {
         id: "types.define",
-        summary: "Add a component type or replace one with the same id. Every facade using it is re-checked.",
+        summary: "Add a component type or replace one with the same id. Facade uses are re-checked and all hosted geometry, including dormer windows, is built before committing.",
         mutates: true,
         journaled: true,
         schema: schema::<ComponentType>,
@@ -634,8 +1011,25 @@ static COMMANDS: &[CommandSpec] = &[
             for b in s.doc.buildings.clone() {
                 check_building(&s.doc, Some(&b.id))?;
             }
+            trigon_model::build(&s.doc)?;
             Ok(json!({"defined": t.id}))
         },
+    },
+    CommandSpec {
+        id: "types.export",
+        summary: "Export selected component types (or all) to a portable, parametric .trigonlib library.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::libraries::Export>,
+        run: |s, v| crate::libraries::export(s, parse("types.export", v)?),
+    },
+    CommandSpec {
+        id: "types.import",
+        summary: "Import a parametric .trigonlib library; replace explicitly updates all linked instances as one undoable change.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::libraries::Import>,
+        run: |s, v| crate::libraries::import(s, parse("types.import", v)?),
     },
     CommandSpec {
         id: "evidence.photos",
@@ -786,8 +1180,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "drawing.to_site",
-        summary: "Convert drawing pixels on a registered plan to site mm (x east, y north), to place walls, stairs and rooms read \
-                  off the drawing.",
+        summary: "Convert registered plan pixels to site mm. exact:true preserves unrounded f64 coordinates; default whole-mm output is unchanged. Coordinates inherit the source registration's accuracy.",
         mutates: false,
         journaled: false,
         schema: schema::<ToSite>,
@@ -802,16 +1195,27 @@ static COMMANDS: &[CommandSpec] = &[
             if p.points.len() > 10_000 || p.points.iter().flatten().any(|v| !v.is_finite()) {
                 return Err(ModelError::Invalid("give up to 10000 finite points".into()).into());
             }
+            if p.exact && p.points.iter().flat_map(|q| reg.to_site(*q)).any(|v| !v.is_finite() || v.abs() > 1e8) {
+                return Err(ModelError::Invalid("exact converted points must be finite site-local coordinates within 100 km".into()).into());
+            }
             Ok(json!(
                 p.points
                     .iter()
                     .map(|q| {
                         let r = reg.to_site(*q);
-                        [r[0].round(), r[1].round()]
+                        if p.exact { r } else { [r[0].round(), r[1].round()] }
                     })
                     .collect::<Vec<_>>()
             ))
         },
+    },
+    CommandSpec {
+        id: "drawing.measure_stair",
+        summary: "Measure a stair candidate on a registered scan without changing the document/history. Returns full-precision source parameters, fit measurements and mm/pixel resolution. Does not claim survey accuracy or add/replace stairs; preview an explicit element.set action to apply it.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::precision::MeasureStair>,
+        run: |s, v| crate::precision::measure_stair(s, parse("drawing.measure_stair", v)?),
     },
     CommandSpec {
         id: "drawing.fit_stair",
@@ -869,25 +1273,7 @@ static COMMANDS: &[CommandSpec] = &[
         mutates: true,
         journaled: true,
         schema: schema::<AddWalls>,
-        run: |s, v| {
-            let p: AddWalls = parse("interior.add_walls", v)?;
-            let b = s.doc.building_mut(p.building.as_deref())?;
-            let n = b.storeys.len();
-            if p.walls.len() > 5000 {
-                return Err(ModelError::Invalid("at most 5000 walls at a time".into()).into());
-            }
-            for w in &p.walls {
-                w.validate(n)?;
-            }
-            let start = b.interior_walls.len();
-            for (k, mut w) in p.walls.into_iter().enumerate() {
-                if w.id.is_empty() {
-                    w.id = format!("{}.iw{}", b.id, start + k);
-                }
-                b.interior_walls.push(w);
-            }
-            Ok(json!({"added": b.interior_walls.len() - start, "interior_walls": b.interior_walls.len()}))
-        },
+        run: |s, v| add_interior_walls(s, parse("interior.add_walls", v)?),
     },
     CommandSpec {
         id: "interior.doors_from_gaps",
@@ -1008,41 +1394,28 @@ static COMMANDS: &[CommandSpec] = &[
         mutates: true,
         journaled: true,
         schema: schema::<AddRooms>,
-        run: |s, v| {
-            let p: AddRooms = parse("interior.add_rooms", v)?;
-            let b = s.doc.building_mut(p.building.as_deref())?;
-            let n = b.storeys.len();
-            let start = b.rooms.len();
-            for (k, mut r) in p.rooms.into_iter().enumerate() {
-                if r.polygon.len() < 3
-                    || r.polygon.len() > 256
-                    || r.polygon.iter().flatten().any(|v| !v.is_finite())
-                    || r.levels.iter().any(|l| *l >= n)
-                {
-                    return Err(ModelError::Invalid(format!("room {k}: give 3 to 256 finite corners and storeys below {n}")).into());
-                }
-                if r.id.is_empty() {
-                    r.id = format!("{}.room{}", b.id, start + k);
-                }
-                b.rooms.push(r);
-            }
-            Ok(json!({"rooms": b.rooms.len()}))
-        },
+        run: |s, v| add_interior_rooms(s, parse("interior.add_rooms", v)?),
     },
     CommandSpec {
         id: "interior.detect_rooms",
         summary: "Find the rooms on the given storeys: the spaces enclosed by the modelled walls and, where a plan is \
                   registered, the drawn lines (partitions, door leaves); door gaps up to 1.1 m are closed. Stores them, replacing earlier detected rooms on those storeys. Rooms smaller than min_area_m2 \
-                  (default 1.0) are ignored. Plans label each room with its area.",
+                  (default 1.0) are ignored. Omitted levels select all full storeys, including basements, but exclude an explicit roof level. Plans label each room with its area.",
         mutates: true,
         journaled: true,
         schema: schema::<DetectRooms>,
         run: |s, v| {
             let p: DetectRooms = parse("interior.detect_rooms", v)?;
             let b = s.doc.building(p.building.as_deref())?;
-            let levels = p.levels.clone().unwrap_or_else(|| (0..b.storeys.len()).collect());
+            let levels = p.levels.clone().unwrap_or_else(|| (0..b.storeys.len()).filter(|l| b.attic_level() != Some(*l)).collect());
             if levels.iter().any(|l| *l >= b.storeys.len()) {
                 return Err(ModelError::Invalid("levels must be existing storeys".into()).into());
+            }
+            if levels.iter().any(|l| b.attic_level() == Some(*l)) {
+                return Err(ModelError::Invalid(
+                    "roof-level room detection and habitable areas require unsupported roof clipping; select full storeys explicitly".into(),
+                )
+                .into());
             }
             let min = trigon_model::checked("min_area_m2", p.min_area_m2.unwrap_or(1.0), 0.2, 100.0)?;
             let contrast = trigon_model::checked("contrast", p.contrast.unwrap_or(40.0), 5.0, 250.0)?;
@@ -1090,6 +1463,10 @@ static COMMANDS: &[CommandSpec] = &[
             }
             if matches!(what, "all" | "stairs") {
                 b.stairs.clear();
+                for entrance in &mut b.entrances {
+                    entrance.stair = None;
+                    entrance.stair_by_level.clear();
+                }
             }
             if matches!(what, "all" | "rooms") {
                 b.rooms.clear();
@@ -1148,6 +1525,7 @@ static COMMANDS: &[CommandSpec] = &[
                     number: e.number,
                     point: [(e.point_utm[0] - origin[0]) * 1000.0, (e.point_utm[1] - origin[1]) * 1000.0],
                     stair: None,
+                    stair_by_level: Default::default(),
                     units: e
                         .units
                         .into_iter()
@@ -1347,7 +1725,11 @@ static COMMANDS: &[CommandSpec] = &[
                 None if p.cut_mm.is_some() => return Err(ModelError::Invalid("cut_mm needs cut_level".into()).into()),
                 None => None,
             };
-            let bytes = trigon_io::glb::write(&trigon_model::build::build_cut(&s.doc, view, cut)?, &refs);
+            let bytes = trigon_io::glb::write_with_site(
+                &trigon_model::build::build_cut(&s.doc, view, cut)?,
+                &trigon_model::site::build(&s.doc, view, cut)?,
+                &refs,
+            );
             write_file(&path, &bytes)?;
             Ok(json!({"written": path, "bytes": bytes.len()}))
         },
@@ -1367,7 +1749,13 @@ static COMMANDS: &[CommandSpec] = &[
             let path = checked_path(&p.path, "ifc")?;
             let view = view_of(&s.doc, p.phase.as_deref(), p.filter.as_deref())?;
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("model.ifc").to_string();
-            let text = trigon_io::ifc::write(&s.doc, &trigon_model::build::build_view(&s.doc, view)?, &name, &time::now_utc());
+            let text = trigon_io::ifc::write_with_site(
+                &s.doc,
+                &trigon_model::build::build_view(&s.doc, view)?,
+                &trigon_model::site::build(&s.doc, view, None)?,
+                &name,
+                &time::now_utc(),
+            );
             write_file(&path, text.as_bytes())?;
             Ok(json!({"written": path, "bytes": text.len()}))
         },
@@ -1526,6 +1914,9 @@ struct DrawingRegister {
 #[serde(deny_unknown_fields)]
 struct ToSite {
     name: String,
+    /// Return unrounded coordinates. False preserves the legacy whole-mm output.
+    #[serde(default)]
+    exact: bool,
     /// A storey the plan is registered for.
     level: usize,
     /// Drawing pixels [x, y].
@@ -1563,9 +1954,9 @@ struct TraceWalls {
     stairs: Option<bool>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AddWalls {
+pub(crate) struct AddWalls {
     building: Option<String>,
     walls: Vec<trigon_model::InteriorWall>,
 }
@@ -1591,9 +1982,9 @@ struct AddStairs {
     clear_walls_inside: Option<bool>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct AddRooms {
+pub(crate) struct AddRooms {
     building: Option<String>,
     rooms: Vec<trigon_model::Room>,
 }
@@ -1792,18 +2183,35 @@ struct AddBasement {
     /// Basement floor, mm relative to the terrain (negative).
     floor: f64,
     name: Option<String>,
+    /// Global saved/registered plans share one level index across buildings. Required when
+    /// inserting into a multi-building project that already has plan references.
+    remap_global_plan_levels: Option<bool>,
     source: Option<String>,
     attribution: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SetRoof {
+pub(crate) struct SetRoof {
     building: Option<String>,
-    /// flat or pitched.
+    /// flat, pitched, half_hipped or mansard.
     kind: String,
+    /// Explicit clipped gable ends; requires kind half_hipped and one or two existing gables.
+    half_hips: Option<Vec<trigon_model::roof::HalfHip>>,
     /// Roof pitch in degrees.
     pitch_deg: Option<f64>,
+    /// Mansard lower slope (default 68°).
+    lower_pitch_deg: Option<f64>,
+    /// Mansard upper slope (default 25°).
+    upper_pitch_deg: Option<f64>,
+    /// Mansard underside break, horizontal inward run from the exterior wall (default 1300 mm).
+    break_run_mm: Option<f64>,
+    /// Shed dormers with coordinated roof voids, on one straight pitched or mansard face each.
+    dormers: Option<Vec<trigon_model::roof::Dormer>>,
+    /// Optional explicit inclined window sources; empty/omitted keeps legacy roof bytes.
+    rooflights: Option<Vec<trigon_model::roof::Rooflight>>,
+    /// Optional lower/upper slate or tagpap construction, with typed family dimensions.
+    covering: Option<trigon_model::roof::Covering>,
     /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
     ridge: Option<f64>,
     /// Facades that end in a gable.
@@ -1819,6 +2227,8 @@ struct SetRoof {
     thickness_mm: Option<f64>,
     /// Gutters along the eaves (default false).
     gutters: Option<bool>,
+    /// Opt-in channel detail and explicit pipe positions; requires gutters.
+    drainage: Option<trigon_model::roof::drainage::Drainage>,
     source: Option<String>,
     attribution: Option<String>,
 }
@@ -1937,9 +2347,9 @@ struct SetBays {
     margin: Option<f64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Place {
+pub(crate) struct Place {
     facade: String,
     /// Component type id, see types.list.
     #[serde(rename = "type")]
@@ -1948,6 +2358,8 @@ struct Place {
     levels: Option<Vec<usize>>,
     /// Bay indices; omit for all.
     bays: Option<Vec<usize>>,
+    /// Exact facade-local centre (mm); one explicitly selected level and bay only.
+    u: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
     /// mm above the storey's floor; may be negative down to the terrain.
@@ -1972,7 +2384,7 @@ fn selected(list: &Option<Vec<usize>>, i: usize) -> bool {
 }
 
 /// Paths must carry the expected extension, so a command can't overwrite an unrelated file.
-fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
+pub(crate) fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
     let path = PathBuf::from(p);
     if path.extension().and_then(|e| e.to_str()) != Some(ext) {
         return Err(EngineError::Io(format!("{p}: the file name must end in .{ext}")));
@@ -1980,7 +2392,7 @@ fn checked_path(p: &str, ext: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| EngineError::Io(format!("{}: {e}", dir.display())))?;
     }
@@ -1995,6 +2407,7 @@ pub fn read_document(path: &Path) -> Result<Document> {
     }
     // A document that doesn't build is reported now, not at export.
     trigon_model::build(&doc)?;
+    trigon_model::annotation::validate_document(&doc)?;
     Ok(doc)
 }
 
@@ -2002,6 +2415,15 @@ fn check_building(doc: &Document, id: Option<&str>) -> Result<()> {
     let b = doc.building(id)?;
     for f in &b.facades {
         resolve_facade(doc, b, f)?;
+    }
+    // Above-eaves gable apertures depend on the actual roof underside, which cannot
+    // be certified by rectangular facade resolution. Cover every direct caller
+    // (placement, bay/level/thickness edits and phase changes), before history commits.
+    // Layouts without half-hipped roof-level placements keep their existing path.
+    if matches!(b.roof, trigon_model::Roof::HalfHipped { .. })
+        && b.attic_level().is_some_and(|level| b.facades.iter().any(|f| f.placements.iter().any(|p| p.level == level)))
+    {
+        trigon_model::build(doc)?;
     }
     Ok(())
 }
@@ -2041,12 +2463,12 @@ fn info(doc: &Document) -> Value {
             "terrain_m_dvr90": s.elevation,
             "evidence": s.evidence,
         })),
-        "buildings": doc.buildings.iter().map(|b| json!({
+        "buildings": doc.buildings.iter().map(|b| { let mut result = json!({
             "id": b.id,
             "name": b.name,
             "storeys": b.storeys.len(),
             "storey_height_mm": b.storeys.first().map(|s| s.height),
-            "levels_mm": b.storeys.iter().map(|s| json!({"name": s.name, "floor": s.elevation, "height": s.height})).collect::<Vec<_>>(),
+            "levels_mm": b.storeys.iter().map(|s| if s.roof_level { json!({"name": s.name, "floor": s.elevation, "knee_wall_mm": s.height, "roof_level": true}) } else { json!({"name": s.name, "floor": s.elevation, "height": s.height}) }).collect::<Vec<_>>(),
             "ground_floor_mm": b.ground_floor,
             "ground_level": b.ground_level,
             "height_mm": b.height(),
@@ -2055,7 +2477,12 @@ fn info(doc: &Document) -> Value {
             "attributes": b.attributes,
             "facades": facades(doc, b),
             "evidence": b.evidence,
-        })).collect::<Vec<_>>(),
+        });
+        if b.attic_level().is_some() {
+            result["roof_level"] = crate::attic::description(b);
+            result["full_storeys_above_ground"] = json!(b.storeys.iter().skip(b.ground_level).filter(|s| !s.roof_level).count());
+        }
+        result }).collect::<Vec<_>>(),
         "types": doc.types.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
         "phases": doc.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
         "active_phase": doc.phases.get(doc.active_index()).map(|p| p.id.as_str()),
@@ -2181,11 +2608,23 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
 }
 
 /// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
-fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+pub(crate) fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
+    if p.half_hips.is_some() && p.kind != "half_hipped" {
+        return Err(ModelError::Invalid("half_hips requires kind half_hipped".into()).into());
+    }
+    if p.kind == "half_hipped" && p.half_hips.as_ref().is_none_or(Vec::is_empty) {
+        return Err(ModelError::Invalid("half_hipped requires explicit half_hips source gables and drops".into()).into());
+    }
+    if p.kind != "mansard" && (p.lower_pitch_deg.is_some() || p.upper_pitch_deg.is_some() || p.break_run_mm.is_some() || p.covering.is_some()) {
+        return Err(ModelError::Invalid("lower_pitch_deg, upper_pitch_deg, break_run_mm and covering require kind mansard".into()).into());
+    }
+    if p.kind == "flat" && (p.dormers.is_some() || p.rooflights.is_some()) {
+        return Err(ModelError::Invalid("dormers and rooflights require a pitched or mansard roof".into()).into());
+    }
     let b = s.doc.building_mut(p.building.as_deref())?;
     let roof = match p.kind.as_str() {
         "flat" => trigon_model::Roof::Flat,
-        "pitched" => {
+        "pitched" | "half_hipped" => {
             let gables = p.gables.unwrap_or_default();
             for g in &gables {
                 b.facade(g)?;
@@ -2204,17 +2643,48 @@ fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
                     return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
                 }
             };
-            trigon_model::Roof::Pitched {
+            let roof = trigon_model::Roof::Pitched {
                 pitch_deg: pitch,
                 gables,
                 straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                eave_facades: None,
                 overhang_mm: trigon_model::checked("overhang_mm", p.overhang_mm.unwrap_or(0.0), 0.0, 2000.0)?,
                 verge_mm: trigon_model::checked("verge_mm", p.verge_mm.unwrap_or(0.0), 0.0, 1500.0)?,
                 thickness_mm: trigon_model::checked("thickness_mm", p.thickness_mm.unwrap_or(0.0), 0.0, 1000.0)?,
                 gutters: p.gutters.unwrap_or(false),
+                drainage: p.drainage,
+                dormers: p.dormers.unwrap_or_default(),
+                rooflights: p.rooflights.unwrap_or_default(),
+            };
+            if p.kind == "half_hipped" { roof.with_half_hips(p.half_hips.unwrap_or_default())? } else { roof }
+        }
+        "mansard" => {
+            if p.drainage.is_some() {
+                return Err(
+                    ModelError::Invalid("detailed drainage is supported only on pitched roofs; mansard drainage is not implemented".into()).into()
+                );
+            }
+            if p.pitch_deg.is_some() || p.ridge.is_some() {
+                return Err(ModelError::Invalid("mansard roofs use lower_pitch_deg, upper_pitch_deg and break_run_mm".into()).into());
+            }
+            trigon_model::Roof::Mansard {
+                parameters: trigon_model::roof::Mansard {
+                    lower_pitch_deg: p.lower_pitch_deg.unwrap_or(68.0),
+                    upper_pitch_deg: p.upper_pitch_deg.unwrap_or(25.0),
+                    break_run_mm: p.break_run_mm.unwrap_or(1300.0),
+                    gables: p.gables.unwrap_or_default(),
+                    straighten_mm: p.straighten_mm.unwrap_or(1200.0),
+                    overhang_mm: p.overhang_mm.unwrap_or(0.0),
+                    verge_mm: p.verge_mm.unwrap_or(0.0),
+                    thickness_mm: p.thickness_mm.unwrap_or(0.0),
+                    gutters: p.gutters.unwrap_or(false),
+                    dormers: p.dormers.unwrap_or_default(),
+                    rooflights: p.rooflights.unwrap_or_default(),
+                    covering: p.covering,
+                },
             }
         }
-        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat or pitched")).into()),
+        other => return Err(ModelError::Invalid(format!("roof kind {other}: use flat, pitched, half_hipped or mansard")).into()),
     };
     b.roof = roof;
     if let Some(src) = p.source.filter(|x| !x.trim().is_empty()) {
@@ -2346,7 +2816,7 @@ fn end_in(doc_phases: &[trigon_model::Phase], pl: &mut Placement, k: usize) -> O
     }
 }
 
-fn place(s: &mut Session, p: Place) -> Result<Value> {
+pub(crate) fn place(s: &mut Session, p: Place) -> Result<Value> {
     let new_is_opening = s.doc.component(&p.type_id)?.kind.is_opening();
     let k = match p.phase.as_deref() {
         Some(id) => s.doc.phase_index(id)?,
@@ -2378,6 +2848,12 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
             return Err(ModelError::Invalid(format!("bay {bay} doesn't exist (facade {} has {} bays)", p.facade, f.bays.len())).into());
         }
     }
+    if let Some(u) = p.u {
+        trigon_model::checked("placement u", u, -1e8, 1e8)?;
+        if p.levels.is_none() || p.bays.is_none() || level_list.len() != 1 || bay_list.len() != 1 {
+            return Err(ModelError::Invalid("an explicit u requires one explicitly selected level and bay".into()).into());
+        }
+    }
     let (mut count, mut demolished) = (0, 0);
     for &level in &level_list {
         for &bay in &bay_list {
@@ -2395,7 +2871,7 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
             }
             f.placements = keep;
             f.placements.push(Placement {
-                u: None,
+                u: p.u,
                 level,
                 bay,
                 type_id: p.type_id.clone(),
@@ -2519,8 +2995,16 @@ fn comparison(c: &trigon_ifcread::Comparison) -> Value {
 /// Bounding boxes of this document's elements, keyed by the GlobalId the IFC export gives them.
 fn model_bounds(doc: &Document) -> Result<std::collections::BTreeMap<String, ([f64; 3], [f64; 3])>> {
     let built = trigon_model::build(doc)?;
+    let site = trigon_model::site::build(doc, trigon_model::build::View::latest(doc), None)?;
     Ok(trigon_io::ifc::model_shapes(doc, &built)
         .into_iter()
+        .chain(site.into_iter().map(|o| {
+            let mut m = trigon_model::Mesh::default();
+            for (_, part) in o.parts {
+                m.append(&part);
+            }
+            (o.id, m)
+        }))
         .filter_map(|(id, mesh)| Some((trigon_io::ifc::guid(&format!("trigon:{id}")), mesh.bounds()?)))
         .collect())
 }
@@ -2625,4 +3109,51 @@ fn reference_meshes(doc: &Document) -> Result<Vec<(String, trigon_model::Mesh)>>
         out.extend(by_class.into_iter().map(|(class, m)| (format!("{}/{class}", rf.name), m)));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod roof_opening_tests {
+    use super::*;
+    fn chamfer() -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Public synthetic chamfer",
+            "footprint":[[0,0],[12000,0],[12000,8000],[10000,10000],[0,10000]],"storeys":3,"storey_height_mm":3400}),
+        )
+        .unwrap();
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":200,"overhang_mm":180,"straighten_mm":0})).unwrap();
+        s
+    }
+    #[test]
+    fn public_multi_plane_command_is_atomic_and_replays_exactly() {
+        let mut s = chamfer();
+        let before = s.doc.clone();
+        let legacy = json!({"id":"corner","facade":"b.f3","u_mm":1414.213562373095,
+            "window_type":"window.casement.2","width_mm":1400,"height_mm":1000,"setback_mm":350,
+            "cheek_mm":100,"head_mm":130,"sill_clearance_mm":80,"roof_pitch_deg":6,"roof_thickness_mm":65});
+        let error = s.execute("element.set", json!({"id":"b.roof","properties":{"dormers":[legacy.clone()]}})).unwrap_err().to_string();
+        assert!(error.contains("0.010000 mm"));
+        assert_eq!(s.doc, before);
+        let mut intent = legacy.clone();
+        intent["multi_plane"] = json!(true);
+        s.execute("element.set", json!({"id":"b.roof","properties":{"dormers":[intent.clone()]}})).unwrap();
+        let accepted = s.doc.clone();
+        let built = trigon_model::build(&accepted).unwrap();
+        let glb = trigon_io::glb::write(&built, &[]);
+        let ifc = trigon_io::ifc::write(&accepted, &built, "fixture.ifc", "fixed");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        let failure = s.doc.clone();
+        intent["u_mm"] = json!(1e300);
+        assert!(s.execute("element.set", json!({"id":"b.roof","properties":{"dormers":[intent]}})).is_err());
+        assert_eq!(s.doc, failure);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        assert_eq!(trigon_io::ifc::write(&s.doc, &trigon_model::build(&s.doc).unwrap(), "fixture.ifc", "fixed"), ifc);
+        let reopened: Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(s.doc, reopened);
+        assert_eq!(built, trigon_model::build(&reopened).unwrap());
+    }
 }

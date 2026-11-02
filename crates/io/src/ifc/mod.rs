@@ -20,7 +20,9 @@ mod balconies;
 mod catalog;
 mod fills;
 mod part21;
+mod rooflights;
 pub mod sample;
+mod site;
 mod slabs;
 mod spaces;
 mod split;
@@ -40,9 +42,18 @@ pub use split::model_shapes;
 
 /// Writes the document's buildings as IFC4. `timestamp` is ISO 8601 (for FILE_NAME).
 pub fn write(doc: &Document, built: &[Built], file_name: &str, timestamp: &str) -> String {
+    write_with_site(doc, built, &[], file_name, timestamp)
+}
+
+/// Writes building geometry and separately built site sources in the caller's exact phase view.
+pub fn write_with_site(doc: &Document, built: &[Built], objects: &[trigon_model::site::BuiltSiteObject], file_name: &str, timestamp: &str) -> String {
     let mut x = Ifc::new(doc);
     let project = x.project();
     let site = x.site(project);
+    x.site_objects(objects, site);
+    for terrain in built.iter().filter_map(|b| b.terrain.as_ref()) {
+        x.terrain(terrain, site);
+    }
     let mut buildings = Vec::new();
     for b in built {
         buildings.push(x.building(b, site));
@@ -105,6 +116,21 @@ impl Floors {
 }
 
 impl<'a> Ifc<'a> {
+    fn terrain(&mut self, mesh: &Mesh, site: (usize, Placed)) {
+        let placed = self.w.place(Some(site.1), Frame::at([0.; 3]));
+        let Some(item) = self.w.faceset(mesh, &placed.frame) else { return };
+        self.cat.paint(&mut self.w, item, catalog::GROUND);
+        let Some(shape) = self.shape("Tessellation", &[item], None, "L-Terrain") else { return };
+        let id = self.w.add(format!(
+            "IFCGEOGRAPHICELEMENT({},$,'Terrain surface',$,$,#{},#{shape},'site.terrain',.TERRAIN.)",
+            gid("site.terrain"),
+            placed.id
+        ));
+        self.w.add(format!("IFCRELCONTAINEDINSPATIALSTRUCTURE({},$,$,$,(#{id}),#{})", gid("site.terrain.contains"), site.0));
+        self.common("Pset_GeographicElementCommon", id, "Terrain surface", None, vec![("IsExternal", catalog::Val::Bool(true))]);
+        self.made_of(id, catalog::GROUND);
+    }
+
     fn new(doc: &'a Document) -> Self {
         let mut w = W::default();
         let wcs = w.axis2([0.0; 3], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]);
@@ -169,9 +195,10 @@ impl<'a> Ifc<'a> {
             let p = self.w.place(Some(placed), Frame::at([0.0, 0.0, s.elevation]));
             fl.placed.push(p);
             storeys.push(self.w.add(format!(
-                "IFCBUILDINGSTOREY({},$,{},$,$,#{},$,$,.ELEMENT.,{})",
+                "IFCBUILDINGSTOREY({},$,{},{},$,#{},$,$,.ELEMENT.,{})",
                 gid(&format!("{}.storey.{i}", b.building_id)),
                 string(&s.name),
+                if s.roof_level { string("Roof level; knee wall is not room height; roof-clipped interiors unavailable") } else { "$".into() },
                 p.id,
                 real(s.elevation)
             )));
@@ -180,7 +207,7 @@ impl<'a> Ifc<'a> {
         let bd = doc.buildings.iter().find(|x| x.id == b.building_id);
 
         let pieces = self.walls(b, bd, &mut fl);
-        for wall in &b.walls {
+        for wall in b.exterior_walls() {
             let mine: Vec<&walls::Piece> = pieces.iter().filter(|p| p.wall == wall.id).collect();
             self.openings(wall, &mine, &mut fl);
             self.wall_balconies(wall, &mut fl);
@@ -225,11 +252,16 @@ impl<'a> Ifc<'a> {
 
     /// Tessellated parts in `frame`'s coordinates, each in its material's colour.
     fn tessellated(&mut self, parts: &[(Material, Mesh)], frame: &Frame) -> Vec<usize> {
+        self.tessellated_parts(parts, frame).into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// Retain the material of each emitted item, including when empty meshes are omitted.
+    fn tessellated_parts(&mut self, parts: &[(Material, Mesh)], frame: &Frame) -> Vec<(Material, usize)> {
         let mut items = Vec::with_capacity(parts.len());
         for (m, mesh) in parts {
             if let Some(item) = self.w.faceset(mesh, frame) {
                 self.cat.paint(&mut self.w, item, catalog::of(*m));
-                items.push(item);
+                items.push((*m, item));
             }
         }
         items

@@ -1,0 +1,65 @@
+{
+  "format": "trigon/library/1",
+  "types": [
+    {
+      "id": "library.balcony.steel.round",
+      "name": "Steel balcony / round bars",
+      "width": 2700.0,
+      "height": 1100.0,
+      "sill": 0.0,
+      "kind": {
+        "family": "steel_balcony",
+        "depth": 1500.0,
+        "railing": "frederiksberg",
+        "finish": "galvanised",
+        "deck": "cumaru",
+        "handrail": true,
+        "screens": "none",
+        "tie_rods": false
+      }
+    },
+    {
+      "id": "library.balcony.steel.flat",
+      "name": "Steel balcony / flat bars",
+      "width": 2700.0,
+      "height": 1100.0,
+      "sill": 0.0,
+      "kind": {
+        "family": "steel_balcony",
+        "depth": 1500.0,
+        "railing": "vesterbro",
+        "finish": "anthracite",
+        "deck": "fibre_concrete",
+        "handrail": false,
+        "screens": "none",
+        "tie_rods": false
+      }
+    },
+    {
+      "id": "library.balcony.french",
+      "name": "French balcony / two leaves",
+      "width": 1200.0,
+      "height": 2250.0,
+      "sill": 0.0,
+      "kind": {
+        "family": "french_balcony",
+        "leaves": 2,
+        "rail_height": 1000.0
+      }
+    },
+    {
+      "id": "library.railing.flat",
+      "name": "Independent guard / flat bars",
+      "width": 1500.0,
+      "height": 1100.0,
+      "sill": 0.0,
+      "kind": {
+        "family": "guard_rail",
+        "projection": 150.0,
+        "railing": "norrebro",
+        "finish": "galvanised",
+        "handrail": false
+      }
+    }
+  ]
+}

@@ -35,6 +35,12 @@ impl Provider for Canned {
     fn heights(&self, _: &[[f64; 2]]) -> trigon_data::Result<Heights> {
         Ok(Heights { terrain: 12.0, median: 15.2, top: 17.9, eaves: 15.0, samples: 1800, evidence: ev("dhm:test") })
     }
+    fn terrain(&self, origin: [f64; 2], spacing: [f64; 2], columns: u32, rows: u32) -> trigon_data::Result<Vec<Vec<f64>>> {
+        assert!((origin[0] - (721989.65 - 20.0)).abs() < 1e-6);
+        assert!((origin[1] - (6178579.47 - 10.0)).abs() < 1e-6);
+        assert_eq!(spacing, [20.0, 10.0]);
+        Ok((0..rows).map(|row| (0..columns).map(|col| 12.0 + f64::from(col) * 0.1 + f64::from(row) * 0.2).collect()).collect())
+    }
     fn photos(&self, _: [f64; 2]) -> trigon_data::Result<Vec<Photo>> {
         Ok(vec![Photo {
             id: "p-north".into(),
@@ -90,6 +96,53 @@ fn session() -> Session {
     let mut s = Session::new(Box::new(Canned));
     s.execute("site.load_address", json!({"address": "Frederikssundsvej 28, 2400 København"})).unwrap();
     s
+}
+
+#[test]
+fn explicit_roof_floor_keeps_eaves_and_reuses_the_attic_slab() {
+    let mut s = session();
+    s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":35})).unwrap();
+    let eaves = s.doc.buildings[0].height();
+    let floors = s.doc.buildings[0].storeys.clone();
+    s.execute("building.set_attic", json!({"floor":eaves - 750.0,"name":"Tagkvist"})).unwrap();
+    let b = &s.doc.buildings[0];
+    assert_eq!(b.height(), eaves);
+    assert_eq!(b.storeys.len(), floors.len() + 1);
+    let built = trigon_model::build(&s.doc).unwrap();
+    let slab = built[0].slabs.iter().find(|slab| slab.id == format!("{}.attic", b.id)).unwrap();
+    assert_eq!(slab.z_bottom + slab.thickness, eaves - 750.0);
+    assert_eq!(slab.level, floors.len());
+    assert_eq!(built[0].slabs.len(), floors.len() + 1, "no duplicate eaves slab");
+}
+
+#[test]
+fn reducing_storeys_prunes_facade_band_levels_and_undo_restores_them() {
+    for (command, params) in
+        [("building.set_storeys", json!({"count":2,"height":3000})), ("building.set_levels", json!({"floors":[0,3000],"top":6000}))]
+    {
+        let mut s = session();
+        let facade = s.doc.buildings[0].facades[0].id.clone();
+        s.execute(
+            "element.set",
+            json!({"id":facade,"properties":{"bands":[
+                {"levels":[0,1,4],"bottom":2000,"top":2200,"projection":30,"finish":"yellow_brick"},
+                {"levels":[4],"bottom":2500,"top":2700,"projection":40}
+            ]}}),
+        )
+        .unwrap();
+        let before = serde_json::to_vec(&s.doc).unwrap();
+        s.execute(command, params).unwrap();
+        let bands = &s.doc.buildings[0].facades[0].bands;
+        assert_eq!(bands.len(), 1, "bands with no remaining occurrences must be removed");
+        assert_eq!(bands[0].levels, vec![0, 1]);
+        assert_eq!(bands[0].finish, Some(trigon_model::doc::WallFinish::YellowBrick));
+        trigon_model::build(&s.doc).unwrap();
+        let after = serde_json::to_vec(&s.doc).unwrap();
+        assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), before);
+        assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
+        assert_eq!(serde_json::to_vec(&s.doc).unwrap(), after);
+    }
 }
 
 #[test]
@@ -360,6 +413,144 @@ fn editing_one_storey_preserves_the_other_instances_and_undo() {
     assert_eq!(s.doc, before);
     s.execute("edit.redo", json!({})).unwrap();
     assert_eq!(s.doc.buildings[0].interior_walls.len(), 2);
+}
+
+#[test]
+fn wall_alignment_makes_axes_collinear_preserving_length_doors_other_storeys_and_exact_undo() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"reference","levels":[0,1],"a":[-4000,1000],"b":[-2000,1000],"thickness":200},
+            {"id":"target","levels":[0,1],"a":[-4000,50],"b":[-2000,75],"thickness":120,"doors":[{"at":650,"width":700}]}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let target = before.buildings[0].interior_walls.iter().find(|w| w.id == "target").unwrap();
+    let length = (target.b[0] - target.a[0]).hypot(target.b[1] - target.a[1]);
+    let out = s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":"reference.L1"})).unwrap();
+    assert_eq!(out["targets"].as_array().unwrap().len(), 1);
+    let walls = &s.doc.buildings[0].interior_walls;
+    assert_eq!(walls.iter().find(|w| w.id == "reference"), before.buildings[0].interior_walls.iter().find(|w| w.id == "reference"));
+    let ground = walls.iter().find(|w| w.id == "target").unwrap();
+    assert_eq!(ground.levels, [0]);
+    assert_eq!((ground.a, ground.b), (target.a, target.b));
+    let aligned = walls.iter().find(|w| w.id != "reference" && w.levels == [1]).unwrap();
+    assert_eq!((aligned.a[1], aligned.b[1]), (1000.0, 1000.0));
+    assert!(((aligned.b[0] - aligned.a[0]).hypot(aligned.b[1] - aligned.a[1]) - length).abs() < 1e-9);
+    assert_eq!(aligned.doors, target.doors);
+    assert_eq!(aligned.thickness, target.thickness);
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    trigon_model::build(&s.doc).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn wall_alignment_matches_diagonal_faces_including_reversed_source_directions() {
+    for theta in [0.0_f64, 0.61, 1.27] {
+        for reversed in [false, true] {
+            let mut s = session();
+            let t = [theta.cos(), theta.sin()];
+            let n = [-t[1], t[0]];
+            let origin = [-3000., 0.];
+            let at = |along: f64, across: f64| [origin[0] + t[0] * along + n[0] * across, origin[1] + t[1] * along + n[1] * across];
+            let (mut a, mut b) = (at(100., 40.), at(1800., 70.));
+            if reversed {
+                std::mem::swap(&mut a, &mut b);
+            }
+            s.execute(
+                "interior.add_walls",
+                json!({"walls":[
+                    {"id":"reference","levels":[0],"a":origin,"b":at(2000.,0.),"thickness":200},
+                    {"id":"target","levels":[0],"a":a,"b":b,"thickness":100}
+                ]}),
+            )
+            .unwrap();
+            let before = s.doc.clone();
+            s.execute("edit.align_walls", json!({"targets":["target.L0"],"reference":"reference.L0","reference_face":"left","target_face":"right"}))
+                .unwrap();
+            let w = s.doc.buildings[0].interior_walls.iter().find(|w| w.id == "target").unwrap();
+            let direction = if reversed { -1.0 } else { 1.0 };
+            for p in [w.a, w.b] {
+                let face = [p[0] - direction * n[0] * 50., p[1] - direction * n[1] * 50.];
+                let offset = (face[0] - origin[0]) * n[0] + (face[1] - origin[1]) * n[1];
+                assert!((offset - 100.).abs() < 1e-8, "diagonal/reversed faces must be on the same exact line");
+            }
+            let original_length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            assert!(((w.b[0] - w.a[0]).hypot(w.b[1] - w.a[1]) - original_length).abs() < 1e-8);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.doc, before);
+        }
+    }
+}
+
+#[test]
+fn wall_alignment_rejects_mixed_targets_self_reference_and_nonparallel_walls_atomically() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"reference","levels":[0,1],"a":[-4000,1000],"b":[-2000,1000],"thickness":200},
+            {"id":"target","levels":[0,1],"a":[-4000,50],"b":[-2000,75],"thickness":120},
+            {"id":"perpendicular","levels":[0],"a":[-3000,0],"b":[-3000,2000],"thickness":120}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let facade = before.buildings[0].facades[0].id.clone();
+    s.execute("facade.set_bays", json!({"facade":facade,"count":2})).unwrap();
+    s.execute("facade.place", json!({"facade":facade,"type":"window.casement.2","levels":[0],"bays":[0]})).unwrap();
+    let before = s.doc.clone();
+    let history = s.undo.len();
+    for params in [
+        json!({"targets":["target.L0","perpendicular.L0"],"reference":"reference.L0"}),
+        json!({"targets":["target.L0",format!("{facade}.L0.B0")],"reference":"reference.L0"}),
+        json!({"targets":["reference.L1"],"reference":"wall:reference"}),
+        json!({"targets":["wall:target"],"reference":"reference.L1","target_face":"invalid"}),
+        json!({"targets":["wall:target"],"reference":format!("{facade}.L0.B0")}),
+        json!({"targets":[],"reference":"reference.L0"}),
+        json!({"targets":["target.L0"],"reference":"reference.L0","angle":f64::MAX}),
+    ] {
+        assert!(s.execute("edit.align_walls", params).is_err());
+        assert_eq!(s.doc, before);
+        assert_eq!(s.undo.len(), history);
+    }
+}
+
+#[test]
+fn wall_cleanup_preserves_hosted_door_centres_and_definitions_with_atomic_exact_undo() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"door-a","levels":[0],"a":[-4000,0],"b":[-2000,0],"thickness":100,"doors":[{"at":800,"width":700}]},
+            {"id":"door-b","levels":[0],"a":[-1950,0],"b":[0,0],"thickness":100,"doors":[{"at":800,"width":700}]},
+            {"id":"cross","levels":[0],"a":[-4080,-1000],"b":[-4080,1000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    let after = s.doc.clone();
+    assert_eq!(after.buildings[0].interior_walls.iter().map(|w| w.doors.len()).sum::<usize>(), 2);
+    for old in before.buildings[0].interior_walls.iter().filter(|w| !w.doors.is_empty()) {
+        let new = after.buildings[0].interior_walls.iter().find(|w| w.id == old.id).unwrap();
+        assert_eq!(old.doors.len(), new.doors.len());
+        for (a, b) in old.doors.iter().zip(&new.doors) {
+            assert!((old.a[0] + a.at - new.a[0] - b.at).abs() < 1e-7);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+        }
+    }
+    s.execute("interior.regularize", json!({"axes_deg":[0.]})).unwrap();
+    assert_eq!(s.doc.buildings, after.buildings);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert!(s.execute("interior.regularize", json!({"axes_deg":[0.],"tolerance_mm":-1})).is_err());
+    assert_eq!(s.doc, before);
 }
 
 #[test]
@@ -898,6 +1089,81 @@ fn dxf_count(pairs: &[(i32, String)], kind: &str) -> usize {
 }
 
 #[test]
+fn section_level_names_from_multiple_wings_stay_inside_the_sheet() {
+    let mut s = Session::new(Box::new(Canned));
+    for (id, name, y) in [("north", "North wing beside the crossing", 0.), ("south", "South wing beside the courtyard", 20000.)] {
+        s.execute(
+            "building.add",
+            json!({"id":id,"name":name,"footprint":[[0,y],[24000,y],[24000,y+12000.],[0,y+12000.]],"storeys":3,"storey_height_mm":3400}),
+        )
+        .unwrap();
+        s.execute("building.set_roof", json!({"building":id,"kind":"pitched","pitch_deg":35})).unwrap();
+        s.execute("building.set_attic", json!({"building":id,"floor":9450})).unwrap();
+    }
+    let section = crate::section::scene(
+        &s.doc,
+        [[6000., -1000.], [6000., 33000.]],
+        false,
+        1000.,
+        trigon_model::build::View::latest(&s.doc),
+        "Both wings",
+        "",
+        None,
+    )
+    .unwrap();
+    let texts: Vec<_> = section.scene.items.iter().filter_map(|i| if let crate::sheet::Item::Text(t) = i { Some(t.clone()) } else { None }).collect();
+    let ink = crate::plan_output::text_ink_bounds(&texts).unwrap();
+    assert!(texts.iter().any(|t| t.text.contains("North wing") && t.text.contains("South wing")));
+    for (text, bounds) in texts.iter().zip(ink) {
+        assert_eq!(text.size, 2.6, "datum lettering stays at its physical reading size");
+        let bounds = bounds.unwrap();
+        let lo = section.vp.px([text.at[0] + bounds[0] * section.scene.scale, text.at[1] + bounds[1] * section.scene.scale]);
+        let hi = section.vp.px([text.at[0] + bounds[2] * section.scene.scale, text.at[1] + bounds[3] * section.scene.scale]);
+        assert!(lo[0] >= 16. && hi[0] <= 1584. && hi[1] >= 120. && lo[1] <= 820., "{} at {lo:?}..{hi:?}", text.text);
+    }
+}
+
+#[test]
+fn configured_sections_separate_nearby_level_labels_at_actual_paper_scale() {
+    let mut s = Session::new(Box::new(Canned));
+    for (id, name, x0, x1, floor) in [("main", "Main wing", 0., 30000., 8250.), ("rear", "Rear wing", -16000., 0., 8130.)] {
+        s.execute("building.add", json!({"id":id,"name":name,"footprint":[[x0,0],[x1,0],[x1,12000],[x0,12000]],"storeys":3,"storey_height_mm":3000}))
+            .unwrap();
+        s.execute("building.set_roof", json!({"building":id,"kind":"pitched","pitch_deg":35})).unwrap();
+        s.execute("building.set_attic", json!({"building":id,"floor":floor,"name":format!("Roof {id}")})).unwrap();
+    }
+    s.execute(
+        "view.define",
+        json!({"id":"levels","name":"Nearby roof floors","kind":{"view":"section","from":[-17000,6000],"to":[31000,6000],"depth_mm":500}}),
+    )
+    .unwrap();
+    let glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+    for denominator in [250., 300.] {
+        s.execute("view.configure",json!({"id":"levels","template":{"name":"Public physical scale","sizing":{"mode":"fixed","denominator":denominator,"centre":[20000,6000]}}})).unwrap();
+        let before = s.doc.clone();
+        let audit = s.execute("view.audit", json!({"id":"levels"})).unwrap();
+        assert_eq!(audit["total_findings"], 0, "{denominator}: {}", audit["findings"]);
+        let labels = audit["labels"].as_array().unwrap();
+        assert!(labels.iter().any(|t| t["text"].as_str().unwrap().contains("Roof main")));
+        assert!(labels.iter().any(|t| t["text"].as_str().unwrap().contains("Roof rear")));
+        assert!(labels.iter().all(|t| t["size_mm_paper"] == 2.6), "physical lettering must not shrink to conceal overlap");
+        let sheet = crate::views::sheet_unclipped(&s.doc, "levels", trigon_model::build::View::latest(&s.doc)).unwrap();
+        for z in [0., 3000., 6000., 8130., 8250., 9000.] {
+            assert!(
+                sheet.scene.items.iter().any(|item| match item {
+                    crate::sheet::Item::Path(p) if p.layer == crate::sheet::Layer::Level && p.stroke.as_ref().is_some_and(|s| s.dashed) =>
+                        p.rings.iter().any(|r| r.len() == 2 && r.iter().all(|q| (q[1] - z).abs() < 1e-6)),
+                    _ => false,
+                }),
+                "datum witness {z} must stay at its true elevation"
+            );
+        }
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+    }
+}
+
+#[test]
 fn sections_cut_the_model_and_mark_the_levels() {
     let mut s = session();
     let facade = first_facade_facing(&mut s, "S");
@@ -1404,6 +1670,31 @@ fn a_3d_plan_cut_closes_the_walls_at_the_cut_and_leaves_out_what_is_above() {
 }
 
 #[test]
+fn explicit_yellow_brick_finish_is_undoable_without_changing_geometry_or_other_facades() {
+    let mut s = session();
+    let south = first_facade_facing(&mut s, "S");
+    let before = s.doc.clone();
+    let geometry = trigon_model::build(&s.doc).unwrap();
+    s.execute("facade.set_finish", json!({"facades":[south],"finish":"yellow_brick"})).unwrap();
+    let changed = trigon_model::build(&s.doc).unwrap();
+    for (a, b) in geometry[0].walls.iter().zip(&changed[0].walls) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.mesh, b.mesh, "a finish cannot change wall geometry");
+        if a.id == south {
+            assert_eq!(b.finish, trigon_model::Material::BrickYellow);
+        } else {
+            assert_eq!(a.finish, b.finish, "the finish is scoped to the requested facade");
+        }
+    }
+    assert_eq!(s.execute("edit.undo", json!({})).unwrap()["undone"], true);
+    assert_eq!(s.doc, before);
+    assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
+    assert_eq!(s.doc.buildings[0].facade(&south).unwrap().finish, Some(trigon_model::doc::WallFinish::YellowBrick));
+    let encoded = serde_json::to_value(&before).unwrap();
+    assert_eq!(serde_json::from_value::<trigon_model::Document>(encoded).unwrap(), before);
+}
+
+#[test]
 fn street_fronts_loggias_bands_finishes_and_cellar_stairs() {
     let mut s = session();
     s.execute("building.add_basement", json!({"floor": -2480})).unwrap();
@@ -1491,4 +1782,1096 @@ fn street_fronts_loggias_bands_finishes_and_cellar_stairs() {
         assert!(s.execute(cmd, bad.clone()).is_err(), "{cmd} {bad}");
     }
     assert_eq!(s.doc, before);
+}
+
+#[test]
+fn drawing_annotations_are_atomic_journaled_and_persisted() {
+    let mut s = session();
+    let start = s.doc.clone();
+    s.execute("view.define", json!({"id":"ground", "name":"Ground floor", "kind":{"view":"plan", "level":0}})).unwrap();
+    let note = json!({"id":"note", "view":"ground", "size_mm":2.5,
+        "kind":{"annotation":"text", "at":[1000.0,2000.0], "text":"Brick & <stone>", "rotation_deg":0.0}});
+    s.execute("annotation.define", note.clone()).unwrap();
+    let annotated = s.doc.clone();
+    assert!(s.dirty);
+    assert_eq!(s.doc.journal.last().unwrap().command, "annotation.define");
+    let listed = s.execute("annotation.list", json!({"view":"ground"})).unwrap();
+    assert_eq!(listed["annotations"][0], note);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.execute("annotation.list", json!({})).unwrap()["annotations"], json!([]));
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, annotated);
+    for bad in [
+        json!({"id":"note", "view":"missing", "kind":{"annotation":"text", "at":[0,0], "text":"x"}}),
+        json!({"id":"note", "view":"ground", "kind":{"annotation":"dimension", "from":[0,0], "to":[0,0], "offset_mm":100}}),
+        json!({"id":"note", "view":"ground", "kind":{"annotation":"text", "at":[1e300,0], "text":"x"}}),
+    ] {
+        assert!(s.execute("annotation.define", bad).is_err());
+        assert_eq!(s.doc, annotated);
+    }
+    assert!(s.execute("view.remove", json!({"id":"ground"})).is_err());
+    assert_eq!(s.doc, annotated);
+    let path = std::env::temp_dir().join(format!("trigon-annotation-roundtrip-{}.trigon", std::process::id()));
+    s.execute("document.save", json!({"path":path})).unwrap();
+    let loaded = crate::commands::read_document(&path).unwrap();
+    assert_eq!(loaded, annotated);
+    std::fs::remove_file(path).unwrap();
+    s.execute("annotation.remove", json!({"id":"note"})).unwrap();
+    s.execute("view.remove", json!({"id":"ground"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, annotated);
+    assert_eq!(s.doc.buildings, start.buildings);
+}
+
+#[test]
+fn saved_drawing_views_isolate_notes_and_share_every_export_format() {
+    use trigon_model::build::View;
+    let mut s = session();
+    let facade = first_facade_facing(&mut s, "S");
+    let kinds =
+        [json!({"view":"plan","level":0}), json!({"view":"facade","facade":facade}), json!({"view":"section","from":[-15000,0],"to":[15000,0]})];
+    let root = std::env::temp_dir().join(format!("trigon-annotation-export-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    for (i, kind) in kinds.into_iter().enumerate() {
+        let id = format!("view-{i}");
+        s.execute("view.define", json!({"id":id,"name":format!("Drawing {i}"),"kind":kind})).unwrap();
+        for (tag, kind) in [
+            ("note", json!({"annotation":"text","at":[1000,2000],"text":format!("Only view {i} & <stone>"),"rotation_deg":15})),
+            ("dim", json!({"annotation":"dimension","from":[1000,1000],"to":[4000,5000],"offset_mm":-500})),
+            ("tag", json!({"annotation":"leader","tip":[1000,2000],"elbow":[2000,3000],"at":[4000,3000],"text":"Wall type A"})),
+        ] {
+            s.execute("annotation.define", json!({"id":format!("{id}-{tag}"),"view":id,"kind":kind})).unwrap();
+        }
+        if i > 0 {
+            s.execute(
+                "annotation.define",
+                json!({"id":format!("{id}-level"),"view":id,
+                "kind":{"annotation":"level","at":[2000,3200],"datum_mm":200,"label":"FFL"}}),
+            )
+            .unwrap();
+        }
+        let preview = crate::drawing_view(&s.doc, &id, View::latest(&s.doc)).unwrap();
+        assert!(preview.svg.contains(&format!("Only view {i} &amp; &lt;stone&gt;")));
+        assert!(preview.svg.contains(">5000</text>"));
+        assert!(preview.svg.contains("Wall type A"));
+        if i > 0 {
+            assert!(preview.svg.contains("+3,00 FFL"));
+        }
+        for p in [[0.0, 0.0], [1234.5678, -9876.5432]] {
+            let q = preview.transform.to_model(preview.transform.to_sheet(p));
+            assert!((p[0] - q[0]).abs() < 1e-8 && (p[1] - q[1]).abs() < 1e-8);
+        }
+        for ext in ["svg", "png", "pdf", "dxf"] {
+            let path = root.join(format!("{id}.{ext}"));
+            let result = s.execute("view.export", json!({"id":id,"path":path})).unwrap();
+            assert_eq!(result["view"], id);
+            let bytes = std::fs::read(&path).unwrap();
+            match ext {
+                "svg" => assert_eq!(String::from_utf8(bytes).unwrap(), preview.svg),
+                "png" => assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n")),
+                "pdf" => {
+                    let pdf = lopdf::Document::load(&path).unwrap();
+                    assert_eq!(pdf.get_pages().len(), 1);
+                    // These remain vector sheets, not a whole-page raster image.
+                    assert!(!pdf.objects.values().any(|o| {
+                        let dict = match o {
+                            lopdf::Object::Dictionary(dict) => Some(dict),
+                            lopdf::Object::Stream(stream) => Some(&stream.dict),
+                            _ => None,
+                        };
+                        dict.and_then(|d| d.get(b"Subtype").ok()).is_some_and(|v| v.as_name().ok() == Some(b"Image"))
+                    }));
+                }
+                _ => {
+                    assert_eq!(ext, "dxf");
+                    let text = String::from_utf8_lossy(&bytes);
+                    assert!(text.contains("A-ANNO"));
+                    assert!(text.contains("Wall type A"));
+                    assert!(text.contains("5000"));
+                }
+            }
+        }
+    }
+    let notes = s.doc.annotations.clone();
+    // Projection depth does not change the section coordinate frame.
+    s.execute(
+        "view.define",
+        json!({"id":"view-2","name":"Deeper section","kind":{"view":"section","from":[-15000,0],"to":[15000,0],"depth_mm":45000}}),
+    )
+    .unwrap();
+    assert_eq!(s.doc.annotations, notes);
+    let before_snap = s.doc.clone();
+    let snapped=s.execute("view.snap",json!({"id":"view-0","point":[11001,5001],"tolerance_mm":10,"options":{"endpoints":false,"midpoints":false,"intersections":false,"grid_mm":100}})).unwrap();
+    assert_eq!(snapped["point"], json!([11000.0, 5000.0]));
+    assert_eq!(snapped["snap"]["kind"], "grid");
+    assert_eq!(s.doc, before_snap);
+    let plan = crate::drawing_view(&s.doc, "view-0", View::latest(&s.doc)).unwrap().svg;
+    assert!(!plan.contains("Only view 1") && !plan.contains("Only view 2"));
+    let before = s.doc.clone();
+    assert!(s.execute("view.define", json!({"id":"view-0","name":"Reframe","kind":{"view":"plan","level":1}})).is_err());
+    assert_eq!(s.doc, before);
+    assert!(s.execute("annotation.define", json!({"id":"bad-level","view":"view-0","kind":{"annotation":"level","at":[0,1000]}})).is_err());
+    assert_eq!(s.doc, before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn drawing_commands_refuse_hostile_values_without_changing_history() {
+    let mut s = session();
+    s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+    let before = s.doc.clone();
+    let bad = [
+        ("view.snap", json!({"id":"p","point":[1e300,0],"tolerance_mm":10})),
+        ("view.snap", json!({"id":"p","point":[0,0],"tolerance_mm":10,"options":{"grid_mm":0}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"plan","level":usize::MAX}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[1e300,0]}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[0,0]}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"section","from":[0,0],"to":[1000,0],"depth_mm":1e300}})),
+        ("view.define", json!({"id":"p","name":"x","kind":{"view":"facade","facade":"missing"}})),
+        ("annotation.define", json!({"id":"a","view":"p","size_mm":1e300,"kind":{"annotation":"text","at":[0,0],"text":"x"}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"dimension","from":[0,0],"to":[1000,0],"offset_mm":1e300}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"leader","tip":[0,0],"elbow":[0,0],"at":[1000,0],"text":"x"}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"text","at":[0,0],"text":"0\nSECTION\n"}})),
+        ("annotation.define", json!({"id":"a","view":"p","kind":{"annotation":"text","at":[0,0],"text":"x","rotation_deg":1e300}})),
+        ("view.export", json!({"id":"p","path":"/tmp/trigon-annotations-must-not-write.invalid"})),
+    ];
+    for (command, params) in bad {
+        let result = s.execute(command, params);
+        assert!(result.is_err() && !matches!(result, Err(EngineError::Internal(_))), "{command}: {result:?}");
+        assert_eq!(s.doc, before);
+    }
+    // Rejected edits did not consume a step in the undo history.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.doc.views.is_empty());
+}
+
+#[test]
+fn detailed_roof_drainage_is_explicit_atomic_and_undoable() {
+    let mut s = session();
+    s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":35,"gutters":true})).unwrap();
+    let before = s.doc.clone();
+    let legacy = trigon_model::build(&before).unwrap();
+    let facade = before.buildings[0].facades[0].id.clone();
+    let drainage = json!({"gutter_width_mm":160,"wall_mm":2,"joint_spacing_mm":3000,
+        "downpipes":[{"id":"rain-a","facade":facade,"along_mm":2000,"diameter_mm":80,"wall_offset_mm":100,"bottom_mm":150,"shoe_mm":200}]});
+    s.execute("element.set", json!({"id":"b1.roof","properties":{"drainage":drainage}})).unwrap();
+    let detailed = trigon_model::build(&s.doc).unwrap();
+    assert_eq!(legacy[0].roof.as_ref().unwrap().cover, detailed[0].roof.as_ref().unwrap().cover);
+    assert_eq!(legacy[0].roof.as_ref().unwrap().id, detailed[0].roof.as_ref().unwrap().id);
+    let mesh = &detailed[0].roof.as_ref().unwrap().gutters;
+    assert!(mesh.triangles.len() > legacy[0].roof.as_ref().unwrap().gutters.triangles.len());
+    assert!(mesh.bounds().unwrap().0[2] < 400.0, "only the explicit pipe reaches ground");
+    let text = serde_json::to_string(&s.doc).unwrap();
+    let restored: trigon_model::Document = serde_json::from_str(&text).unwrap();
+    assert_eq!(restored, s.doc);
+    assert_eq!(trigon_model::build(&restored).unwrap(), detailed);
+    let good = s.doc.clone();
+    for bad in [
+        json!({"gutter_width_mm":1e300}),
+        json!({"downpipes":[{"id":"x","facade":"absent","along_mm":0,"diameter_mm":80,"wall_offset_mm":100,"bottom_mm":0,"shoe_mm":200}]}),
+        json!({"joint_spacing_mm":0}),
+    ] {
+        assert!(s.execute("element.set", json!({"id":"b1.roof","properties":{"drainage":bad}})).is_err());
+        assert_eq!(s.doc, good);
+    }
+    assert!(s.undo());
+    assert_eq!(s.doc, before);
+    assert_eq!(trigon_model::build(&s.doc).unwrap(), legacy);
+}
+
+#[test]
+fn site_objects_are_real_sources_with_atomic_properties_and_exact_undo() {
+    let mut s = session();
+    let before = s.doc.clone();
+    let building = trigon_model::build(&s.doc).unwrap();
+    let object = json!({"id":"site.tree","name":"Proposed tree","intent":"proposal","geometry":{"kind":"tree","position_mm":[-18000,20000,0],"height_mm":4500,"crown_radius_mm":1500,"trunk_radius_mm":100}});
+    s.execute("site.add", json!({"object":object})).unwrap();
+    assert_eq!(trigon_model::build(&s.doc).unwrap(), building, "landscape is not another building or facade opening");
+    let added = s.doc.clone();
+    assert_eq!(s.execute("element.get", json!({"id":"site.tree"})).unwrap()["kind"], "tree");
+    s.execute("element.set", json!({"id":"site.tree","properties":{"height_mm":5000,"x_mm":-17000}})).unwrap();
+    assert_ne!(s.doc, added);
+    let changed = s.doc.clone();
+    for patch in
+        [json!({"height_mm":1e300}), json!({"crown_radius_mm":-1}), json!({"x_mm":1e300}), json!({"intent":"measured"}), json!({"unknown":42})]
+    {
+        assert!(s.execute("element.set", json!({"id":"site.tree","properties":patch})).is_err());
+        assert_eq!(s.doc, changed);
+    }
+    assert!(s.execute("site.add", json!({"object":object})).is_err());
+    assert_eq!(s.doc, changed);
+    let copy: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&s.doc).unwrap()).unwrap();
+    assert_eq!(copy, s.doc);
+    s.execute("site.delete", json!({"id":"site.tree"})).unwrap();
+    assert!(s.execute("element.get", json!({"id":"site.tree"})).is_err());
+    assert!(s.undo());
+    assert_eq!(s.doc, changed);
+    assert!(s.undo());
+    assert_eq!(s.doc, added);
+    assert!(s.undo());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn site_ground_plan_picks_only_displayed_objects_and_keeps_building_schedules() {
+    let mut s = session();
+    let schedule = crate::opening_schedule(&s.doc, trigon_model::build::View::latest(&s.doc)).unwrap();
+    let fixture: trigon_model::Document = serde_json::from_str(include_str!("../../model/tests/fixtures/courtyard.trigon")).unwrap();
+    for mut object in fixture.site_objects {
+        object.created = None;
+        match &mut object.geometry {
+            trigon_model::site::SiteGeometry::Ground { polygon, .. } => {
+                for p in polygon {
+                    p[1] -= 12000.;
+                }
+            }
+            trigon_model::site::SiteGeometry::Tree { position_mm, .. }
+            | trigon_model::site::SiteGeometry::Bench { position_mm, .. }
+            | trigon_model::site::SiteGeometry::Planter { position_mm, .. } => position_mm[1] -= 12000.,
+        }
+        s.execute("site.add", json!({"object":object})).unwrap();
+    }
+    let unchanged = crate::opening_schedule(&s.doc, trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert_eq!(serde_json::to_value(schedule).unwrap(), serde_json::to_value(unchanged).unwrap());
+    s.execute("view.define", json!({"id":"ground-site","name":"Ground","kind":{"view":"plan","level":0}})).unwrap();
+    s.execute("view.define", json!({"id":"upper-site","name":"Upper","kind":{"view":"plan","level":1}})).unwrap();
+    let ground = crate::drawing_view(&s.doc, "ground-site", trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert!(ground.element_segments.iter().any(|e| e.id == "site.paving"));
+    // The tree is outside the building footprint. Picking uses the actual ground-plan outline.
+    let hit = ground.pick_element([-5000., -17600.], 100.).unwrap();
+    assert_eq!(hit.id, "site.tree");
+    assert_eq!(hit.kind, crate::DrawingElementKind::Site);
+    let upper = crate::drawing_view(&s.doc, "upper-site", trigon_model::build::View::latest(&s.doc)).unwrap();
+    assert!(upper.element_segments.iter().all(|e| !e.id.starts_with("site.")));
+}
+
+#[test]
+fn each_site_family_add_replace_delete_and_properties_preserve_exact_sources() {
+    let mut s = session();
+    let fixture: trigon_model::Document = serde_json::from_str(include_str!("../../model/tests/fixtures/courtyard.trigon")).unwrap();
+    for mut object in fixture.site_objects {
+        object.created = None;
+        let before = s.doc.clone();
+        let id = object.id.clone();
+        s.execute("site.add", json!({"object":object})).unwrap();
+        let added = s.doc.clone();
+        object.name.push_str(" edited");
+        s.execute("site.set", json!({"id":id,"object":object})).unwrap();
+        let replaced = s.doc.clone();
+        s.execute("element.set", json!({"id":id,"properties":{"name":"Proposal under review"}})).unwrap();
+        let properties = s.doc.clone();
+        s.execute("site.delete", json!({"id":id})).unwrap();
+        assert!(s.undo());
+        assert_eq!(s.doc, properties);
+        assert!(s.undo());
+        assert_eq!(s.doc, replaced);
+        assert!(s.undo());
+        assert_eq!(s.doc, added);
+        assert!(s.undo());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn dtm_terrain_converts_map_samples_to_the_local_datum_and_undo_is_exact() {
+    let mut s = session();
+    let before = s.doc.clone();
+    s.execute("site.sample_terrain", json!({"origin":[-20000,-10000],"spacing_mm":[20000,10000],"columns":3,"rows":3})).unwrap();
+    let t = s.doc.terrain.as_ref().unwrap();
+    assert_eq!(t.origin, [-20000., -10000.]);
+    assert_eq!(t.source.as_deref(), Some("dhm:dhm_terraen"));
+    for row in 0..3 {
+        for col in 0..3 {
+            assert!((t.heights_mm[row][col] - (col as f64 * 100. + row as f64 * 200.)).abs() < 1e-6);
+        }
+    }
+    let built = trigon_model::build(&s.doc).unwrap();
+    assert!(built[0].terrain.is_some());
+    let ifc = trigon_io::ifc::write(&s.doc, &built, "terrain.ifc", "2026-01-01T00:00:00Z");
+    assert!(ifc.contains("IFCGEOGRAPHICELEMENT") && ifc.contains(".TERRAIN."));
+    for read in [trigon_ifcread::read_ifc_lite(&ifc).unwrap(), trigon_ifcread::read_bimifc(&ifc).unwrap()] {
+        assert!(read.failures.is_empty());
+        let actual = read.elements.iter().find(|e| e.global_id == trigon_io::ifc::guid("trigon:site.terrain")).unwrap();
+        assert!(trigon_ifcread::bounds_deviation(built[0].terrain.as_ref().unwrap().bounds().unwrap(), actual.mesh.bounds().unwrap()) < 0.01);
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+// Proposed public synthetic regression for crates/engine/src/tests.rs.
+// Read-only audit output: not inserted into source or run by this agent.
+// Uses the existing Canned test provider; no private model, source plan, account or network.
+#[test]
+fn moving_one_stair_storey_keeps_entrance_labels_units_other_floors_and_exact_undo() {
+    for selected in [1, 2] {
+        let mut s = Session::new(Box::new(Canned));
+        s.doc.buildings.push(
+            trigon_model::Building::new("b", "Synthetic entrance", &[[0., 0.], [20000., 0.], [20000., 16000.], [0., 16000.]], 4, 3000.).unwrap(),
+        );
+        s.execute(
+            "interior.add_stairs",
+            json!({"stairs":[{
+                "id":"core", "levels":[0,1,2],
+                "outline":[[4000,4000],[6000,4000],[6000,6000],[4000,6000]],
+                "kind":"u_turn", "rounded":false, "landing":1000, "well":150
+            }]}),
+        )
+        .unwrap();
+        let units: Vec<Value> =
+            ["st", "1", "2", "3"].into_iter().flat_map(|floor| ["tv", "th"].map(|door| json!({"floor":floor,"door":door}))).collect();
+        s.doc.buildings[0].entrances = serde_json::from_value(json!([{
+            "street":"Synthetic street", "number":"SYNTHETIC-731", "point":[0,5000],
+            "stair":"core", "units":units
+        }]))
+        .unwrap();
+        let render = |s: &Session, level| crate::plan::sheet_svg_text(&s.doc, level, trigon_model::build::View::latest(&s.doc)).unwrap();
+        let marker = ">TV  SYNTHETIC-731  TH<";
+        let before = s.doc.clone();
+        let plans: Vec<_> = (0..4).map(|level| render(&s, level)).collect();
+        assert!(plans.iter().all(|svg| svg.matches(marker).count() == 1));
+        let original = before.buildings[0].stairs[0].clone();
+        let out = s
+            .execute(
+                "edit.move",
+                json!({
+                    "targets":[format!("core.L{selected}")], "delta":[125.5,-75.25,0]
+                }),
+            )
+            .unwrap();
+        assert_eq!(out["targets"].as_array().unwrap().len(), 1);
+        let b = &s.doc.buildings[0];
+        assert_eq!(b.entrances.len(), 1);
+        assert_eq!(b.entrances[0].units, before.buildings[0].entrances[0].units);
+        assert_eq!(b.stairs.len(), 2);
+        let unchanged = b.stairs.iter().find(|stair| stair.id == "core").unwrap();
+        assert_eq!(unchanged.outline, original.outline);
+        assert_eq!(unchanged.levels, original.levels.iter().copied().filter(|l| *l != selected).collect::<Vec<_>>());
+        let moved = b.stairs.iter().find(|stair| stair.levels == [selected]).unwrap();
+        for (old, new) in original.outline.iter().zip(&moved.outline) {
+            assert_eq!(*new, [old[0] + 125.5, old[1] - 75.25]);
+        }
+        assert_eq!(out["targets"][0], json!(format!("{}.L{selected}", moved.id)));
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        // Confirmed current-source failure: the bound original is suppressed by the moved
+        // outgoing stair, while the entrance still references only that original source.
+        assert_eq!(render(&s, selected).matches(marker).count(), 1, "the physical entrance and its units must follow the selected stair occurrence");
+        if selected == 2 {
+            assert_eq!(render(&s, 3).matches(marker).count(), 1, "the receiving floor must resolve the moved previous departure");
+        }
+        for (level, plan) in plans.iter().enumerate().take(3) {
+            if level != selected {
+                assert_eq!(&render(&s, level), plan, "unselected floor {level}");
+            }
+        }
+        let changed = s.doc.clone();
+        let round_trip: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(round_trip, changed);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, changed);
+    }
+}
+
+#[test]
+fn stair_associations_survive_align_parameter_copy_replace_basement_and_cleanup() {
+    let setup = || {
+        let mut s = session();
+        s.execute(
+            "interior.add_stairs",
+            json!({"stairs":[{
+                "id":"core", "levels":[0,1,2], "kind":"u_turn", "rounded":false,
+                "outline":[[-6000,-2000],[-4000,-2000],[-4000,0],[-6000,0]], "landing":1000
+            }]}),
+        )
+        .unwrap();
+        s.doc.buildings[0].entrances = serde_json::from_value(json!([{
+            "street":"Synthetic street","number":"731","point":[-5000,-6000],"stair":"core",
+            "units":[{"floor":"st","door":"tv"},{"floor":"1","door":"th"}]
+        }]))
+        .unwrap();
+        // Legacy data round trips without a new empty key.
+        let entrance = &s.doc.buildings[0].entrances[0];
+        assert!(entrance.stair_by_level.is_empty());
+        assert!(serde_json::to_value(entrance).unwrap().get("stair_by_level").is_none());
+        s
+    };
+    for (command, params) in [
+        ("edit.align", json!({"targets":["core.L1"],"axis":"x","coordinate":-4900.125})),
+        ("element.set", json!({"id":"core.L1","properties":{"width_mm":2100.125}})),
+        ("edit.copy_to_levels", json!({"targets":["core.L0"],"levels":[1],"replace":true})),
+    ] {
+        let mut s = setup();
+        let before = s.doc.clone();
+        let result = s.execute(command, params).unwrap();
+        let building = &s.doc.buildings[0];
+        let entrance = &building.entrances[0];
+        let id = entrance.stair_at(1).unwrap().to_string();
+        assert_ne!(id, "core", "{command}: {result}");
+        assert!(building.stairs.iter().any(|stair| stair.id == id && stair.levels == [1]));
+        assert_eq!(entrance.stair_at(0), Some("core"));
+        assert_eq!(entrance.stair_at(2), Some("core"));
+        assert_eq!(entrance.units, before.buildings[0].entrances[0].units);
+        assert_eq!(building.entrances.len(), 1);
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        let edited = s.doc.clone();
+        s.execute("edit.copy", json!({"targets":["core.L0"],"delta":[12000,0,0]})).unwrap();
+        assert_eq!(s.doc.buildings[0].entrances, edited.buildings[0].entrances);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        s.execute("building.add_basement", json!({"floor":-2500})).unwrap();
+        assert_eq!(s.doc.buildings[0].entrances[0].stair_at(2), Some(id.as_str()));
+        assert_eq!(s.doc.buildings[0].entrances[0].stair_by_level.len(), 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        s.execute("edit.delete", json!({"targets":[format!("{id}.L1")]})).unwrap();
+        assert!(s.doc.buildings[0].entrances[0].stair_by_level.is_empty());
+        assert_eq!(s.doc.buildings[0].entrances[0].stair.as_deref(), Some("core"));
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("edit.delete", json!({"targets":["stair:core"]})).unwrap();
+        assert_eq!(s.doc.buildings[0].entrances[0].stair, None);
+        assert_eq!(s.doc.buildings[0].entrances[0].stair_at(1), Some(id.as_str()));
+        s.execute("edit.undo", json!({})).unwrap();
+        s.execute("interior.clear", json!({"what":"stairs"})).unwrap();
+        let entrance = &s.doc.buildings[0].entrances[0];
+        assert_eq!(entrance.stair, None);
+        assert!(entrance.stair_by_level.is_empty());
+        assert_eq!(entrance.units, before.buildings[0].entrances[0].units);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+    let mut s = setup();
+    s.doc.buildings[0].entrances[0].stair_by_level.insert(usize::MAX, "core".into());
+    let before = s.doc.clone();
+    assert!(s.doc.buildings[0].add_basement(-2500., "Basement").is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_preview_connect_apply_audit_preserves_doors_other_storeys_and_history() {
+    let mut s = Session::new(Box::new(Canned));
+    s.doc
+        .buildings
+        .push(trigon_model::Building::new("b", "Precision fixture", &[[0., 0.], [20000., 0.], [20000., 12000.], [0., 12000.]], 2, 3000.).unwrap());
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"west","levels":[0,1],"a":[1000,4000],"b":[5000,4000],"thickness":100,"doors":[{"at":2000,"width":800}]},
+            {"id":"east","levels":[0,1],"a":[5005,4000],"b":[10000,4000],"thickness":100,"doors":[{"at":2000,"width":800}]},
+            {"id":"door-gap","levels":[0,1],"a":[10800,4000],"b":[14000,4000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let before_dirty = s.dirty;
+    let audit = s.execute("precision.audit", json!({"levels":[0],"gap_tolerance_mm":10,"max_results":1})).unwrap();
+    assert_eq!(audit["total_findings"], 2);
+    assert_eq!(audit["truncated"], true);
+    assert_eq!(audit["findings"][0]["gap_mm"], 5.);
+    let action = json!({"command":"edit.connect_walls","params":{"endpoints":[
+        {"target":"west.L0","end":"b"},{"target":"east.L0","end":"a"}],"junction":[5002.5,4000],"max_move_mm":3}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(s.dirty, before_dirty);
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["validation"]["model_build"], "passed");
+    assert!(!preview["changes"].as_array().unwrap().is_empty());
+    assert_eq!(preview, s.execute("precision.preview", json!({"action":action})).unwrap());
+    let mut wrong = action.clone();
+    wrong["params"]["junction"] = json!([5002.6, 4000]);
+    assert!(s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":wrong})).is_err());
+    assert_eq!(s.doc, before);
+    s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.doc.journal.last().unwrap().command, "edit.connect_walls");
+    let walls = &s.doc.buildings[0].interior_walls;
+    let west = walls.iter().find(|w| w.levels == [0] && w.id.starts_with("west.")).unwrap();
+    let east = walls.iter().find(|w| w.levels == [0] && w.id.starts_with("east.")).unwrap();
+    assert_eq!(west.b, [5002.5, 4000.]);
+    assert_eq!(east.a, west.b);
+    assert_eq!(west.doors[0].at, 2000.);
+    assert_eq!(east.a[0] + east.doors[0].at, 7005.);
+    for original in &before.buildings[0].interior_walls {
+        let retained = walls.iter().find(|w| w.id == original.id).unwrap();
+        assert_eq!(retained.a, original.a);
+        assert_eq!(retained.b, original.b);
+        assert_eq!(retained.doors, original.doors);
+    }
+    let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    assert_eq!(audit["status"], "no_findings_in_scope", "{audit}");
+    assert!(s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).is_err());
+    let after = s.doc.clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    // Read-only previews and audits must also preserve a pending Redo.
+    s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+}
+
+#[test]
+fn precision_repairs_reject_wrong_scope_excess_motion_and_hosted_door_drift_atomically() {
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"one","levels":[0,1],"a":[-6000,0],"b":[-2000,0],"thickness":100,"doors":[{"at":2000,"width":800}]},
+            {"id":"two","levels":[0,1],"a":[-1995,0],"b":[2000,0],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    for params in [
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L0","end":"a"}],"junction":[-1998,1],"max_move_mm":10}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L1","end":"a"}],"junction":[-1998,0],"max_move_mm":10}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L0","end":"a"}],"junction":[-1998,0],"max_move_mm":1}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"one.L0","end":"a"}],"junction":[-1998,0],"max_move_mm":10}),
+        json!({"endpoints":[{"target":"one.L0","end":"b"},{"target":"two.L0","end":"a"}],"junction":[1e300,0],"max_move_mm":300}),
+    ] {
+        assert!(s.execute("edit.connect_walls", params.clone()).is_err());
+        assert_eq!(s.doc, before);
+        assert!(s.execute("precision.preview", json!({"action":{"command":"edit.connect_walls","params":params}})).is_err());
+        assert_eq!(s.doc, before);
+    }
+    assert!(s.execute("precision.preview", json!({"action":{"command":"document.open","params":{"path":"/etc/passwd"}}})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_label_moves_preserve_witnesses_styles_and_level_values() {
+    let mut s = session();
+    s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+    let facade = s.doc.buildings[0].facades[0].id.clone();
+    s.execute("view.define", json!({"id":"e","name":"Elevation","kind":{"view":"facade","facade":facade}})).unwrap();
+    for (id, kind, delta) in [
+        ("text", json!({"annotation":"text","at":[0,0],"text":"Kitchen","rotation_deg":30}), [0.125, -0.375]),
+        ("leader", json!({"annotation":"leader","tip":[0,0],"elbow":[1000,500],"at":[2000,500],"text":"Detail"}), [0.125, -0.375]),
+        ("dimension", json!({"annotation":"dimension","from":[0,0],"to":[4000,0],"offset_mm":300}), [0., 125.125]),
+        ("level", json!({"annotation":"level","at":[1000,3000],"datum_mm":1000,"label":"FFL"}), [125.125, 0.]),
+    ] {
+        s.execute(
+            "annotation.define",
+            json!({"id":id,"view":if id=="level" {"e"} else {"p"},"size_mm":2.5,"style":{"family":"serif","bold":true},"kind":kind}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let action = json!({"command":"annotation.move_label","params":{"id":id,"delta":delta}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+        let mut expected = before.annotations.last().unwrap().clone();
+        match &mut expected.kind {
+            trigon_model::annotation::AnnotationKind::Text { at, .. } | trigon_model::annotation::AnnotationKind::Leader { at, .. } => {
+                at[0] += delta[0];
+                at[1] += delta[1];
+            }
+            trigon_model::annotation::AnnotationKind::Dimension { offset_mm, .. } => *offset_mm += delta[1],
+            trigon_model::annotation::AnnotationKind::Level { at, .. } => at[0] += delta[0],
+            _ => assert_eq!(expected.id, "unsupported fixture"),
+        }
+        assert_eq!(s.doc.annotations.last().unwrap(), &expected);
+        let changed = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, changed);
+    }
+    let before = s.doc.clone();
+    for (id, delta) in [("dimension", [1., 0.]), ("level", [0., 1.]), ("text", [f64::MAX, 0.])] {
+        assert!(s.execute("annotation.move_label", json!({"id":id,"delta":delta})).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn precision_lettering_audit_measures_real_fonts_scale_rotation_crop_and_exact_values() {
+    let mut s = Session::new(Box::new(Canned));
+    s.doc
+        .buildings
+        .push(trigon_model::Building::new("b", "Lettering fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 2, 3000.).unwrap());
+    s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
+    s.execute("view.configure", json!({"id":"p","template":{"name":"100","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}))
+        .unwrap();
+    for (id, at) in [("wide-a", [2000, 4000]), ("wide-b", [3500, 4000])] {
+        s.execute(
+            "annotation.define",
+            json!({"id":id,"view":"p","size_mm":2.5,"kind":{"annotation":"text","at":at,"text":"WWWWWWWW","rotation_deg":0}}),
+        )
+        .unwrap();
+    }
+    s.execute(
+        "annotation.define",
+        json!({"id":"measured","view":"p","kind":{"annotation":"dimension","from":[2000,1000],"to":[4000.125,1000],"offset_mm":300}}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    let audit = s.execute("view.audit", json!({"id":"p"})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(audit, s.execute("view.audit", json!({"id":"p"})).unwrap());
+    let labels = audit["labels"].as_array().unwrap();
+    let a = labels.iter().find(|l| l["source"]["id"] == "wide-a").unwrap();
+    let b = labels.iter().find(|l| l["source"]["id"] == "wide-b").unwrap();
+    let points = a["ink_corners_mm"].as_array().unwrap();
+    let width = (points[1][0].as_f64().unwrap() - points[0][0].as_f64().unwrap()) / 100.;
+    assert!(width > 18. && width < 19.);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "potential_text_overlap"
+        && f["keys"].as_array().unwrap().contains(&a["key"])
+        && f["keys"].as_array().unwrap().contains(&b["key"])));
+    let measured = labels.iter().find(|l| l["source"]["id"] == "measured").unwrap();
+    assert_eq!(measured["measurement_mm"], 2000.125);
+    assert_eq!(measured["text"], "2000.1");
+    let action = json!({"command":"annotation.move_label","params":{"id":"wide-b","delta":[2000.125,0]}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    let fixed = s.execute("view.audit", json!({"id":"p"})).unwrap();
+    assert!(!fixed["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "potential_text_overlap"), "{fixed}");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("annotation.define",json!({"id":"wide-a","view":"p","size_mm":2.5,"style":{"family":"serif","bold":true,"italic":true},"kind":{"annotation":"text","at":[2000,4000],"text":"WWWWWWWW","rotation_deg":90}})).unwrap();
+    s.execute(
+        "view.configure",
+        json!({"id":"p","template":{"name":"crop","sizing":{"mode":"fixed","denominator":50,"centre":[6000,4000]},"crop":[1000,3000,11000,4500]}}),
+    )
+    .unwrap();
+    let audit = s.execute("view.audit", json!({"id":"p"})).unwrap();
+    let rotated = audit["labels"].as_array().unwrap().iter().find(|l| l["source"]["id"] == "wide-a").unwrap();
+    assert_eq!(rotated["rotation_deg"], 90.);
+    assert_eq!(rotated["clipped"], true);
+    let corners = rotated["ink_corners_mm"].as_array().unwrap();
+    let vertical = (corners[1][1].as_f64().unwrap() - corners[0][1].as_f64().unwrap()) / 50.;
+    assert!((vertical - 17.756).abs() < 0.005);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "clipped_label" && f["source"]["id"] == "wide-a"));
+}
+
+#[test]
+fn precision_audit_reports_overlapping_stair_sources_without_mutating_invalid_model() {
+    let mut s = session();
+    s.execute(
+        "interior.add_stairs",
+        json!({"stairs":[{"id":"core","levels":[0],"outline":[[-6000,-2000],[-4000,-2000],[-4000,0],[-6000,0]],"kind":"u_turn","rounded":false}]}),
+    )
+    .unwrap();
+    let mut duplicate = s.doc.buildings[0].stairs[0].clone();
+    duplicate.id = "other".into();
+    s.doc.buildings[0].stairs.push(duplicate);
+    let before = s.doc.clone();
+    let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    assert_eq!(audit["geometry_valid"], false);
+    assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "overlapping_stair_sources"));
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_registered_pixel_conversion_keeps_opt_in_decimals_and_legacy_array_output() {
+    let mut s = session();
+    s.doc.drawings.push(trigon_model::Drawing {
+        name: "synthetic".into(),
+        path: "/virtual/not-read.pdf".into(),
+        page: 1,
+        rotate: 0,
+        width: 1000,
+        height: 1000,
+        note: String::new(),
+        facades: Vec::new(),
+        plans: vec![trigon_model::PlanRegistration { levels: vec![0], a: 1.125, b: 0.25, tx: 1000.0625, ty: -500.125 }],
+    });
+    let before = s.doc.clone();
+    let exact = s.execute("drawing.to_site", json!({"name":"synthetic","level":0,"exact":true,"points":[[100.125,200.375]]})).unwrap();
+    assert_eq!(exact, json!([[1162.796875, -700.515625]]));
+    let old = s.execute("drawing.to_site", json!({"name":"synthetic","level":0,"points":[[100.125,200.375]]})).unwrap();
+    assert_eq!(old, json!([[1163., -701.]]));
+    assert!(s.execute("drawing.to_site", json!({"name":"synthetic","level":0,"exact":true,"points":[[1e300,0]]})).is_err());
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn precision_sanity_checks_find_kinks_misalignment_and_overlaps_without_straightening() {
+    for (other, thickness, kind) in [
+        (json!({"a":[5000,4000],"b":[9000,4200]}), 100., "sudden_wall_angle_change"),
+        (json!({"a":[5000,4000],"b":[7000,6000]}), 100., "sudden_wall_angle_change"),
+        (json!({"a":[5005,4005],"b":[9000,4005]}), 100., "misaligned_wall_run"),
+        (json!({"a":[1500,4000],"b":[4500,4000]}), 100., "near_parallel_wall_overlap"),
+    ] {
+        let mut s = Session::new(Box::new(Canned));
+        s.doc
+            .buildings
+            .push(trigon_model::Building::new("b", "Sanity fixture", &[[0., 0.], [12000., 0.], [12000., 8000.], [0., 8000.]], 1, 3000.).unwrap());
+        s.execute(
+            "interior.add_walls",
+            json!({"walls":[
+                {"id":"first","levels":[0],"a":[1000,4000],"b":[5000,4000],"thickness":100},
+                {"id":"second","levels":[0],"a":other["a"],"b":other["b"],"thickness":thickness}
+            ]}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+        assert!(audit["findings"].as_array().unwrap().iter().any(|f| f["kind"] == kind), "expected {kind}: {audit}");
+        assert_eq!(s.doc, before);
+        if other["b"] == json!([7000, 6000]) {
+            let reviewed = s.execute("precision.audit", json!({"levels":[0],"expected_joint_angles_deg":[0,45,90]})).unwrap();
+            assert!(!reviewed["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "sudden_wall_angle_change"));
+            assert_eq!(s.doc, before);
+        }
+    }
+    // Different-thickness walls can intentionally align one face while their axes differ.
+    let mut s = session();
+    s.execute(
+        "interior.add_walls",
+        json!({"walls":[
+            {"id":"thick","levels":[0],"a":[-6000,0],"b":[-2000,0],"thickness":200},
+            {"id":"thin","levels":[0],"a":[-1995,50],"b":[2000,50],"thickness":100},
+            {"id":"perpendicular","levels":[0],"a":[0,-2000],"b":[0,2000],"thickness":100}
+        ]}),
+    )
+    .unwrap();
+    let audit = s.execute("precision.audit", json!({"levels":[0]})).unwrap();
+    assert!(
+        !audit["findings"].as_array().unwrap().iter().any(|f| matches!(f["kind"].as_str(), Some("misaligned_wall_run" | "sudden_wall_angle_change"))),
+        "{audit}"
+    );
+}
+
+#[test]
+fn measured_local_buildings_keep_small_features_other_buildings_and_exact_undo() {
+    let mut s = Session::new(Box::new(Canned));
+    let outline = json!([[0, 0], [6000, 0], [6000, 4000], [3000, 4100], [0, 4000], [0, 0]]);
+    let before = s.doc.clone();
+    let params = json!({"id":"west","name":"Measured west","footprint":outline,"storeys":3,"storey_height_mm":3050.125,"ground_floor_mm":650.25,"wall_thickness_mm":480,"evidence":[{"source":"synthetic:plan","supplies":"measured footprint","attribution":"test"}]});
+    let action = json!({"command":"building.add","params":params});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    assert_eq!(s.doc, before);
+    let result = s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    assert_eq!(s.doc.buildings[0].footprint.len(), 5, "100 mm deviation must not be removed");
+    assert_eq!(s.doc.buildings[0].footprint[3], [3000., 4100.]);
+    assert_eq!(s.doc.buildings[0].storeys[1].elevation, 3700.375);
+    assert_eq!(result["facades"].as_array().unwrap().len(), 5);
+    let first = s.doc.clone();
+    s.execute(
+        "building.add",
+        json!({"id":"east","name":"Measured east","footprint":[[10000,0],[16000,0],[16000,4000],[10000,4000]],"storeys":2,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    assert_eq!(s.doc.buildings[0], first.buildings[0]);
+    let changed = s.doc.clone();
+    assert_eq!(s.doc.journal.len(), 2);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, first);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("edit.redo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, changed);
+    for params in [
+        json!({"id":"west","name":"Duplicate","footprint":outline,"storeys":1,"storey_height_mm":3000}),
+        json!({"id":"crossed","name":"Crossed","footprint":[[20000,0],[26000,0],[20000,4000],[26000,4000]],"storeys":1,"storey_height_mm":3000}),
+        json!({"id":"hostile","name":"Hostile","footprint":[[1e300,0],[26000,0],[26000,4000],[20000,4000]],"storeys":usize::MAX,"storey_height_mm":3000}),
+    ] {
+        assert!(s.execute("building.add", params).is_err());
+        assert_eq!(s.doc, changed);
+    }
+    let mut contextual = Session::new(Box::new(Canned));
+    contextual.execute("building.add",json!({"id":"context","name":"Explicit context simplification","footprint":outline,"storeys":1,"storey_height_mm":3000,"preserve_vertices":false})).unwrap();
+    assert_eq!(contextual.doc.buildings[0].footprint.len(), 4);
+}
+
+#[test]
+fn precision_journal_replays_underlying_actions_without_ephemeral_tokens() {
+    let mut s = Session::new(Box::new(Canned));
+    s.execute(
+        "building.add",
+        json!({"id":"b","name":"Replay fixture","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":2,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    s.execute("interior.add_walls", json!({"walls":[{"id":"wall","levels":[0,1],"a":[1000,3000],"b":[6000,3000],"thickness":100}]})).unwrap();
+    let action = json!({"command":"edit.move","params":{"targets":["wall.L0"],"delta":[0.125,0.375,0]}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.apply", json!({"preview_token":preview["preview_token"],"action":action})).unwrap();
+    assert!(s.doc.journal.iter().all(|entry| entry.command != "precision.apply"), "ephemeral conflict tokens must not be required for replay");
+    let persisted: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&s.doc).unwrap()).unwrap();
+    let mut replay = Session::new(Box::new(Canned));
+    for entry in persisted.journal {
+        replay.execute(&entry.command, entry.params).unwrap();
+    }
+    assert_eq!(replay.doc, s.doc);
+}
+
+#[test]
+fn multi_building_plans_keep_upper_floors_when_another_building_is_lower() {
+    for low_first in [false, true] {
+        let mut s = Session::new(Box::new(Canned));
+        let high =
+            json!({"id":"high","name":"High building","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":3,"storey_height_mm":3000});
+        let low =
+            json!({"id":"low","name":"Low building","footprint":[[20000,0],[25000,0],[25000,6000],[20000,6000]],"storeys":1,"storey_height_mm":3000});
+        for params in if low_first { [low, high] } else { [high, low] } {
+            s.execute("building.add", params).unwrap();
+        }
+        s.execute("view.define", json!({"id":"upper","name":"Upper floor","kind":{"view":"plan","level":2}})).unwrap();
+        for ranged in [false, true] {
+            if ranged {
+                s.execute(
+                    "view.configure",
+                    json!({"id":"upper","template":{"name":"Actual cut","range":{"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300}}}),
+                )
+                .unwrap();
+            }
+            let drawing = crate::drawing_view(&s.doc, "upper", trigon_model::build::View::latest(&s.doc)).unwrap();
+            assert!(drawing.element_regions.iter().any(|r| r.id.starts_with("high.")), "high building present");
+            assert!(!drawing.element_regions.iter().any(|r| r.id.starts_with("low.")), "absent floor must not be invented");
+            assert!(drawing.svg.contains("Upper floor"));
+        }
+        let before = s.doc.clone();
+        assert!(s.execute("view.define", json!({"id":"invalid","name":"Missing floor","kind":{"view":"plan","level":9}})).is_err());
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn multi_building_plan_headers_do_not_misidentify_crops_in_any_plan_path() {
+    let mut wrong = Vec::new();
+    for west_first in [true, false] {
+        for path in ["symbolic", "ranged", "attic", "attic-ranged"] {
+            let mut s = Session::new(Box::new(Canned));
+            let west =
+                trigon_model::Building::new("west", "West fixture", &[[0., 0.], [12000., 0.], [12000., 9000.], [0., 9000.]], 1, 3000.).unwrap();
+            let east = trigon_model::Building::new("east", "East fixture", &[[50000., 0.], [62000., 0.], [62000., 9000.], [50000., 9000.]], 2, 3000.)
+                .unwrap();
+            s.doc.buildings = if west_first { vec![west, east] } else { vec![east, west] };
+            let level = if path.starts_with("attic") {
+                s.execute("building.set_roof", json!({"building":"west","kind":"pitched","pitch_deg":35})).unwrap();
+                s.execute("building.set_attic", json!({"building":"west","floor":2250})).unwrap();
+                1
+            } else {
+                0
+            };
+            let mut template = json!({"name":"East detail","crop":[49000,-1000,63000,10000],"caption":"Public project",
+                "sizing":{"mode":"fixed","denominator":100,"centre":[56000,4500]}});
+            if path.ends_with("ranged") {
+                template["range"] = json!({"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300});
+            }
+            s.execute("view.define", json!({"id":"detail","name":"East review plan","kind":{"view":"plan","level":level},"template":template}))
+                .unwrap();
+            let sheet = crate::views::sheet(&s.doc, "detail", trigon_model::build::View::latest(&s.doc)).unwrap();
+            if !sheet.project.is_empty() {
+                wrong.push((west_first, path, sheet.project.clone()));
+            }
+            assert_eq!(sheet.caption, "Public project");
+            let drawing = crate::drawing_view(&s.doc, "detail", trigon_model::build::View::latest(&s.doc)).unwrap();
+            assert!(drawing.svg.contains("Public project"));
+            if drawing.svg.contains("West fixture") || drawing.svg.contains("East fixture") {
+                assert!(!sheet.project.is_empty(), "only the incorrect automatic project header may name a source building");
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "multi-building index-wide plans cannot use the first building as their project header: {wrong:?}");
+}
+
+#[test]
+fn plan_headers_preserve_the_sole_building_present_at_a_floor_index() {
+    let mut s = Session::new(Box::new(Canned));
+    s.doc
+        .buildings
+        .push(trigon_model::Building::new("west", "West fixture", &[[0., 0.], [12000., 0.], [12000., 9000.], [0., 9000.]], 1, 3000.).unwrap());
+    s.doc.buildings.push(
+        trigon_model::Building::new("east", "East fixture", &[[50000., 0.], [62000., 0.], [62000., 9000.], [50000., 9000.]], 2, 3000.).unwrap(),
+    );
+    for ranged in [false, true] {
+        let template =
+            if ranged { json!({"name":"Ranged","range":{"top_mm":3000,"cut_mm":1000,"bottom_mm":0,"depth_mm":-300}}) } else { Value::Null };
+        s.execute("view.define", json!({"id":"upper","name":"Upper","kind":{"view":"plan","level":1},"template":template})).unwrap();
+        let sheet = crate::views::sheet(&s.doc, "upper", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert_eq!(sheet.project, "East fixture");
+    }
+    s.doc.buildings.remove(1);
+    s.doc.views.clear();
+    s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":35})).unwrap();
+    s.execute("building.set_attic", json!({"floor":2250})).unwrap();
+    s.execute("view.define", json!({"id":"roof","name":"Roof","kind":{"view":"plan","level":1}})).unwrap();
+    assert_eq!(crate::views::sheet(&s.doc, "roof", trigon_model::build::View::latest(&s.doc)).unwrap().project, "West fixture");
+}
+
+mod rooflight_consumers_tests {
+    use super::*;
+
+    fn fixture() -> Session {
+        let mut s = Session::new(Box::new(Canned));
+        s.execute("building.add", json!({"id":"b","name":"Public rooflight consumers","footprint":[[0,0],[24000,0],[24000,12000],[0,12000]],"storeys":1,"storey_height_mm":3000})).unwrap();
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":220})).unwrap();
+        s.execute(
+            "rooflight.add",
+            json!({"rooflight":{"id":"light","facade":"b.f1","u_mm":10000,"run_mm":500,
+            "window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100}}),
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn rooflight_schedule_uses_actual_slope_plane_dimensions_and_roof_host() {
+        let s = fixture();
+        let before = s.doc.clone();
+        let schedule = crate::opening_schedule(&s.doc, trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert_eq!(schedule.rows.len(), 1, "one actual roof window, no flashing/void counted as fills");
+        let row = &schedule.rows[0];
+        assert_eq!(row.id, "b.rooflight.light");
+        assert_eq!(row.host_id, "b.roof");
+        assert_eq!((row.width_mm, row.height_mm, row.area_m2), (800., 1000., Some(0.8)));
+        assert_eq!(row.kind, crate::ScheduleOpeningKind::Window);
+        assert_eq!(row.quantity_basis, crate::OpeningQuantityBasis::OuterLining);
+        assert!(row.external);
+        assert_eq!((schedule.totals.instances, schedule.totals.windows, schedule.totals.area_excluded), (1, 1, 0));
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn rooflight_drawing_strokes_pick_the_same_editable_source_as_3d() {
+        let mut s = fixture();
+        s.execute("view.define", json!({"id":"front","name":"Rooflight facade","kind":{"view":"facade","facade":"b.f1"}})).unwrap();
+        let before = s.doc.clone();
+        let preview = crate::drawing_view(&s.doc, "front", trigon_model::build::View::latest(&s.doc)).unwrap();
+        let segment = preview
+            .element_segments
+            .iter()
+            .find(|s| s.id == "b.rooflight.light" && s.kind == crate::DrawingElementKind::Opening)
+            .expect("visible roof window owns drawing strokes");
+        let [a, b] = segment.segment;
+        let hit = preview.pick_element([(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.], 0.01).unwrap();
+        assert_eq!(hit.id, "b.rooflight.light");
+        assert!(preview.element_segments.iter().any(|s| s.id == "b.rooflight.light.flashing"));
+        s.execute("element.get", json!({"id":hit.id})).unwrap();
+        s.execute("element.get", json!({"id":"b.rooflight.light.flashing"})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn rooflight_preflights_apply_once_replay_and_keep_redo_after_failed_preview() {
+        let mut s = fixture();
+        let before = s.doc.clone();
+        let spec = json!({"id":"other","facade":"b.f1","u_mm":14000,"run_mm":500,
+            "window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100});
+        let action = json!({"command":"rooflight.add","params":{"rooflight":spec}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        let accepted = s.doc.clone();
+        assert_eq!(accepted.journal.len(), before.journal.len() + 1);
+        assert_eq!(accepted.journal.last().unwrap().command, "rooflight.add");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        let mut invalid = action.clone();
+        invalid["params"]["rooflight"]["run_mm"] = json!(-1);
+        assert!(s.execute("precision.preview", json!({"action":invalid})).is_err());
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        assert!(s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).is_err());
+        let remove = s.execute("precision.preview", json!({"action":{"command":"rooflight.remove","params":{"id":"other"}}})).unwrap();
+        assert_eq!(s.doc, accepted);
+        s.execute("precision.apply", json!({"action":remove["action"],"preview_token":remove["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.last().unwrap().command, "rooflight.remove");
+        let final_doc = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        let mut replay = Session::new(Box::new(Canned));
+        for entry in &final_doc.journal {
+            replay.execute(&entry.command, entry.params.clone()).unwrap();
+        }
+        assert_eq!(replay.doc, final_doc);
+    }
+}
+
+#[cfg(test)]
+mod rounded_dimension_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut s = Session::new(Box::new(Canned));
+        s.execute("building.add", json!({"id":"b","name":"Public dimension fixture","footprint":[[0,0],[40000,0],[40000,9000],[0,9000]],"storeys":1,"storey_height_mm":3000})).unwrap();
+        s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0},"template":{"name":"Dimensions","sizing":{"mode":"fixed","denominator":100,"centre":[10000,4000]}}})).unwrap();
+        s.execute(
+            "annotation.define",
+            json!({"id":"d","view":"p","kind":{"annotation":"dimension","from":[1000,1000],"to":[13345.67,1000],"offset_mm":-500}}),
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn dimension_rounding_is_opt_in_previewed_and_preserves_exact_source_geometry() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let baseline = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert!(baseline.svg().contains("12345.7"));
+        assert!(!serde_json::to_string(&s.doc).unwrap().contains("dimension_rounding_mm"));
+        let glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let action = json!({"command":"view.configure","params":{"id":"p","template":{"name":"Dimensions","dimension_rounding_mm":100,"sizing":{"mode":"fixed","denominator":100,"centre":[10000,4000]}}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        assert!(preview["drawing_feedback"].to_string().contains("≈12300"), "preflight must measure the actual printed glyphs");
+        assert_eq!(preview["validation"]["drawing_render"], "passed");
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        let rounded = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert!(rounded.svg().contains("≈12300"));
+        let paths = |scene: &crate::sheet::Scene| {
+            scene
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    crate::sheet::Item::Path(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&baseline.scene), paths(&rounded.scene), "fixed-scale witness and model paths stay exact");
+        assert_eq!(s.doc.annotations, before.annotations);
+        assert_eq!(s.doc.buildings, before.buildings);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        let dxf = crate::sheet::dxf::write(
+            &rounded.scene,
+            &crate::sheet::dxf::TitleBlock {
+                title: &rounded.title,
+                project: &rounded.project,
+                caption: &rounded.caption,
+                note: rounded.note.clone(),
+            },
+        );
+        assert!(dxf.contains("\\U+2248"), "approximation glyph must survive portable DXF lettering");
+        let accepted = s.doc.clone();
+        let reopened: trigon_model::Document = serde_json::from_slice(&serde_json::to_vec(&accepted).unwrap()).unwrap();
+        assert_eq!(reopened, accepted);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        for invalid in [json!(0), json!(-1), json!(1001), json!(1.5), json!(1e300), json!("100")] {
+            assert!(s.execute("view.configure", json!({"id":"p","template":{"name":"Invalid","dimension_rounding_mm":invalid}})).is_err());
+            assert_eq!(s.doc, before);
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted, "invalid settings must retain pending Redo");
+        s.execute("view.configure", json!({"id":"p","template":{"name":"Cleared","dimension_rounding_mm":null}})).unwrap();
+        assert!(!serde_json::to_string(&s.doc.views).unwrap().contains("dimension_rounding_mm"));
+    }
+
+    #[test]
+    fn dimension_fit_accounts_for_the_printed_rounded_label() {
+        let mut s = session();
+        s.execute(
+            "annotation.define",
+            json!({"id":"d","view":"p","kind":{"annotation":"dimension","from":[100000,3000],"to":[100013.4,3000],"offset_mm":500}}),
+        )
+        .unwrap();
+        s.execute("view.configure", json!({"id":"p","template":{"name":"Fit"}})).unwrap();
+        let before = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        let exact = s.doc.annotations.clone();
+        s.execute("view.configure", json!({"id":"p","template":{"name":"Fit","dimension_rounding_mm":10}})).unwrap();
+        let after = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert!(after.svg().contains("≈10"));
+        assert!(after.vp.mm < before.vp.mm, "fit must use the shorter actual rounded text rather than the discarded exact label");
+        assert_eq!(s.doc.annotations, exact);
+    }
 }

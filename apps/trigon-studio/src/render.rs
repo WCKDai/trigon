@@ -40,20 +40,48 @@ struct VOut {
     @location(0) normal: vec3<f32>,
     @location(1) color: vec4<f32>,
     @location(2) world: vec3<f32>,
+    @location(3) surface: vec3<f32>,
 };
 
 @vertex
-fn vs_face(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>) -> VOut {
+fn vs_face(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>, @location(3) surface: vec3<f32>) -> VOut {
     var o: VOut;
     o.pos = u.view_proj * vec4<f32>(p, 1.0);
     o.normal = n;
     o.color = c;
     o.world = p;
+    o.surface = surface;
     return o;
+}
+
+// Original running-bond masonry. One UV tile = 480 x 132 mm, two 240 x 66 modules;
+// 12 mm joints leave 228 x 54 mm brick faces. Derivatives fade subpixel courses.
+fn masonry_color(uv: vec2<f32>, base: vec3<f32>) -> vec3<f32> {
+    let course = uv * 2.0;
+    let row = floor(course.y);
+    let offset = fract(row * 0.5);
+    let brick = vec2<f32>(floor(course.x + offset), row);
+    let local = fract(vec2<f32>(course.x + offset, course.y));
+    let edge = min(local, vec2<f32>(1.0) - local) * vec2<f32>(0.240, 0.066);
+    let distance = min(edge.x - 0.006, edge.y - 0.006);
+    let aa = max(fwidth(distance), 0.00015);
+    let joint = 1.0 - smoothstep(-aa, aa, distance);
+    let variation = fract(sin(dot(brick, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    let grain = fract(sin(dot(floor(uv * vec2<f32>(960.0, 264.0)), vec2<f32>(39.346, 11.135))) * 47453.5453);
+    let clay = base * (0.91 + variation * 0.16 + grain * 0.035);
+    let mortar = vec3<f32>(0.43, 0.41, 0.36);
+    let detailed = mix(clay, mortar, joint);
+    let footprint = max(fwidth(course.x), fwidth(course.y));
+    let visible = 1.0 - smoothstep(0.35, 1.0, footprint);
+    // Area-weighted mean: (228*54)/(240*66) brick, remaining joint.
+    let average = mix(mortar, base, 0.7772727);
+    return mix(average, detailed, visible);
 }
 
 @fragment
 fn fs_face(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    // Evaluate derivatives before clipping/conditional flow, including on plain materials.
+    let textured = masonry_color(i.surface.xy, i.color.rgb);
     if (u.clip.y > 0.5 && i.world.z > u.clip.x) {
         discard;
     }
@@ -69,7 +97,11 @@ fn fs_face(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     let l2 = normalize(vec3<f32>(-l1.x, -l1.y, 0.5));
     let diffuse = max(dot(n, l1), 0.0) * 0.60 + max(dot(n, l2), 0.0) * 0.20;
     let ambient = u.light.w * (0.80 + 0.20 * n.z);
-    return vec4<f32>(i.color.rgb * (ambient + diffuse), i.color.a * u.clip.z);
+    var color = i.color.rgb;
+    if (i.surface.z > 0.5) {
+        color = textured;
+    }
+    return vec4<f32>(color * (ambient + diffuse), i.color.a * u.clip.z);
 }
 
 @fragment
@@ -244,7 +276,7 @@ impl Viewport3d {
         let face_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: (VERTEX_FLOATS * 4) as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x3],
         })];
         let edge_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: (EDGE_FLOATS * 4) as u64,

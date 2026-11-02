@@ -231,6 +231,8 @@ fn connections_beyond_the_limit_are_turned_away() {
     let mut c = Conn::open(app.port);
     let r = c.read().expect("a refusal");
     assert!(is_error(&r, "too many connections"), "{r}");
+    assert!(c.read().is_none(), "the excess connection is closed after its refusal");
+    drop(c);
     drop(_a);
     // A slot frees once a connection closes.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -243,6 +245,52 @@ fn connections_beyond_the_limit_are_turned_away() {
         assert!(std::time::Instant::now() < deadline, "{r}");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn an_excess_client_receives_its_refusal_even_if_it_already_sent_a_request() {
+    let app = start(Options { max_connections: 0, ..Options::default() });
+    let mut c = Conn::open(app.port);
+    c.send(format!("{}\n", json!({"id": 1, "method": "commands.list", "token": TOKEN})).as_bytes());
+    let mut line = String::new();
+    let read = c.lines.read_line(&mut line);
+    assert!(matches!(read, Ok(n) if n > 0), "the refusal must arrive before EOF/reset: {read:?}");
+    let reply = serde_json::from_str(&line).unwrap();
+    assert!(is_error(&reply, "too many connections"), "{reply}");
+    assert!(c.read().is_none(), "the excess connection is closed after its refusal");
+    assert!(app.seen.lock().unwrap().is_empty(), "an excess client's request never reaches the app");
+}
+
+#[test]
+fn saturated_refusal_permits_close_excess_sockets_without_dispatching_requests() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = sync_channel(MAX_QUEUE);
+    let shared = Arc::new(Shared {
+        token: TOKEN.into(),
+        tx,
+        waker: Arc::new(|| {}),
+        presence: Arc::new(Presence::default()),
+        open: AtomicUsize::new(0),
+        refusals: AtomicUsize::new(0),
+        connections: AtomicU64::new(0),
+        options: Options { max_connections: 0, ..Options::default() },
+    });
+    // Hold every permit directly, so the accept test does not race drain deadlines.
+    let permits: Vec<_> = (0..MAX_REFUSAL_DRAINS).map(|_| RefusalPermit::acquire(&shared).unwrap()).collect();
+    assert!(RefusalPermit::acquire(&shared).is_none());
+    let state = shared.clone();
+    std::thread::spawn(move || accept(listener, state));
+    let mut excess = Conn::open(port);
+    excess.send(format!("{}\n", json!({"id": 1, "method": "commands.list", "token": TOKEN})).as_bytes());
+    assert!(excess.read().is_none(), "a saturated refusal path closes without a reply worker");
+    assert_eq!(shared.refusals.load(Ordering::Relaxed), MAX_REFUSAL_DRAINS);
+    assert_eq!(shared.open.load(Ordering::Relaxed), 0);
+    assert!(matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    drop(permits);
+    assert_eq!(shared.refusals.load(Ordering::Relaxed), 0);
+    let mut resumed = Conn::open(port);
+    assert!(is_error(&resumed.read().expect("a released permit permits a refusal"), "too many connections"));
 }
 
 /// A request that outlasts its wait says it is still running; the connection keeps its reply for
@@ -352,4 +400,16 @@ fn the_client_authenticates_and_calls() {
     }
     let wrong = format!("{}0", &TOKEN[..TOKEN.len() - 1]);
     assert!(crate::Client::connect(&addr, &wrong).is_err(), "a wrong token fails at connect");
+}
+
+#[test]
+fn silent_refused_client_does_not_block_the_next_accept() {
+    let app = start(Options { max_connections: 0, ..Default::default() });
+    let mut first = Conn::open(app.port);
+    assert!(is_error(&first.read().expect("first refusal"), "too many connections"));
+    // Keep the refused stream's write half open and silent. Its 500 ms drain deadline
+    // must not delay a second connection's refusal on the independent accept thread.
+    let mut second = Conn::open(app.port);
+    second.lines.get_mut().set_read_timeout(Some(Duration::from_millis(350))).unwrap();
+    assert!(is_error(&second.read().expect("accept must continue while the first refused stream drains"), "too many connections"));
 }

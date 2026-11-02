@@ -276,7 +276,7 @@ fn centroid(p: &[[f64; 3]]) -> [f64; 3] {
 pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
     let mut up = Vec::new();
     let mut down = Vec::new();
-    for face in components(&r.cover, false) {
+    for face in components(&r.cover, false).into_iter().filter(|_| !r.compound) {
         let Some(polygon) = outline(&face) else { continue };
         // Which way the face looks, from its triangles; the outline is turned to run
         // counter-clockwise seen from above.
@@ -335,6 +335,30 @@ pub fn roof(r: &BuiltRoof, walls: &[BuiltWall]) -> Vec<RoofPiece> {
         out.push(RoofPiece { key, polygon, surface: face, rise: [0.0; 3], gable });
     }
     out
+}
+
+/// Declared normal thickness, not a guessed face-pair extrusion thickness.
+pub(super) fn source_roof_thickness(doc: &Document, b: &Built) -> Option<f64> {
+    let source = doc.buildings.iter().find(|source| source.id == b.building_id)?;
+    let thickness = match &source.roof {
+        trigon_model::Roof::Pitched { thickness_mm, .. } | trigon_model::Roof::HalfHipped { thickness_mm, .. } => *thickness_mm,
+        trigon_model::Roof::Mansard { parameters } => parameters.thickness_mm,
+        trigon_model::Roof::Flat => return None,
+    };
+    (thickness.is_finite() && thickness <= 1000. && (thickness * 1e6).round() > 0.).then_some(thickness)
+}
+
+/// Openings require the actual cover rather than heuristic face-pair reconstruction.
+/// Ordinary dormer-free and bare surface legacy sources retain their existing path.
+/// Solid certification is separate: the writer reports an unsupported actual shell as
+/// unverified and omits its quantities, rather than manufacturing replacement material.
+pub(super) fn opening_shell(doc: &Document, b: &Built) -> bool {
+    // Clipped gable roofs also need their actual mitred shell when they have no openings.
+    b.roof.as_ref().is_some_and(|r| {
+        !r.rooflights.is_empty()
+            || (!r.dormers.is_empty() && source_roof_thickness(doc, b).is_some())
+            || doc.buildings.iter().any(|source| source.id == b.building_id && !source.roof.half_hips().is_empty())
+    }) || doc.buildings.iter().find(|source| source.id == b.building_id).is_some_and(|source| source.roof.dormers().iter().any(|d| d.multi_plane))
 }
 
 /// A roof plane's frame: z up its normal, x level along the plane.
@@ -417,8 +441,21 @@ pub fn roof_solid(p: &RoofPiece, walls: &[BuiltWall]) -> Mesh {
     }
 }
 
+/// Explicit pipe assemblies, separate from gutter segments in exchange.
+pub fn downpipes(r: &BuiltRoof) -> Vec<(String, Mesh)> {
+    r.drainage.iter().filter(|p| p.class == trigon_model::roof::drainage::DrainClass::Downpipe).map(|p| (p.id.clone(), p.mesh.clone())).collect()
+}
+
 /// The gutters along the eaves, one per eave.
 pub fn gutters(r: &BuiltRoof) -> Vec<(String, Mesh)> {
+    if !r.drainage.is_empty() {
+        return r
+            .drainage
+            .iter()
+            .filter(|p| p.class == trigon_model::roof::drainage::DrainClass::Gutter)
+            .map(|p| (p.id.clone(), p.mesh.clone()))
+            .collect();
+    }
     if r.gutters.is_empty() {
         return Vec::new();
     }
@@ -504,7 +541,10 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
     };
     let kind_of = |e: &BuiltElement| doc.component(&e.type_id).ok().map(|t| t.kind.clone());
     for b in built {
-        for w in &b.walls {
+        if let Some(terrain) = &b.terrain {
+            out.push(("site.terrain".into(), terrain.clone()));
+        }
+        for w in b.exterior_walls() {
             for seg in &w.segments {
                 out.push((seg.id.clone(), seg.mesh.clone()));
             }
@@ -529,10 +569,32 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
             out.push((s.id.clone(), s.mesh.clone()));
         }
         if let Some(r) = &b.roof {
+            let exact_openings = opening_shell(doc, b);
+            if r.compound || exact_openings {
+                out.push((r.id.clone(), r.cover.clone()));
+            }
             for p in roof(r, &b.walls) {
+                if exact_openings && p.gable.is_none() {
+                    continue;
+                }
                 out.push((p.key.clone(), roof_solid(&p, &b.walls)));
             }
             out.extend(gutters(r));
+            out.extend(downpipes(r));
+            for (material, mesh) in &r.covering {
+                out.push((format!("{}.covering.{}", r.id, material.name()), mesh.clone()));
+            }
+            for d in &r.dormers {
+                out.push((format!("{}.roof", d.id), d.roof.clone()));
+                out.push((format!("{}.cheeks", d.id), d.cheeks.clone()));
+            }
+            for gable in &r.gable_walls {
+                out.push((gable.front.id.clone(), gable.front.mesh.clone()));
+            }
+            for light in &r.rooflights {
+                out.push((light.id.clone(), merged(&light.fill.parts)));
+                out.push((format!("{}.flashing", light.id), light.flashing.clone()));
+            }
         }
         for iw in &b.interior {
             out.push((iw.id.clone(), iw.mesh.clone()));
@@ -540,9 +602,13 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((d.fill.id.clone(), merged(&d.fill.parts)));
             }
         }
-        for w in &b.walls {
+        for w in b.exterior_walls() {
             out.push((format!("{}.plinth", w.id), w.plinth.clone()));
-            out.push((format!("{}.trim", w.id), w.trim.clone()));
+            if w.trim_parts.is_empty() {
+                out.push((format!("{}.trim", w.id), w.trim.clone()));
+            } else {
+                out.extend(w.trim_parts.iter().map(|(material, mesh)| (format!("{}.trim.{}", w.id, material.name()), mesh.clone())));
+            }
         }
         if let Some(bd) = doc.buildings.iter().find(|x| x.id == b.building_id) {
             for st in stairs(bd) {

@@ -1,0 +1,37 @@
+[
+  {
+    "command": "building.add",
+    "params": {
+      "id": "b",
+      "name": "Synthetic chamfer dormer",
+      "footprint": [[0, 0], [12000, 0], [12000, 8000], [10000, 10000], [0, 10000]],
+      "storeys": 3,
+      "storey_height_mm": 3400
+    }
+  },
+  {
+    "command": "building.set_roof",
+    "params": {
+      "kind": "pitched",
+      "pitch_deg": 46,
+      "thickness_mm": 200,
+      "overhang_mm": 180,
+      "straighten_mm": 0,
+      "dormers": [{
+        "id": "corner",
+        "facade": "b.f3",
+        "u_mm": 1414.213562373095,
+        "window_type": "window.casement.2",
+        "width_mm": 1400,
+        "height_mm": 1000,
+        "setback_mm": 350,
+        "cheek_mm": 100,
+        "head_mm": 130,
+        "sill_clearance_mm": 80,
+        "roof_pitch_deg": 6,
+        "roof_thickness_mm": 65,
+        "multi_plane": true
+      }]
+    }
+  }
+]

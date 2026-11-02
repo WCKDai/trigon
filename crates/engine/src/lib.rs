@@ -11,24 +11,54 @@ use trigon_data::{DataError, Provider};
 use trigon_model::doc::JournalEntry;
 use trigon_model::{Document, ModelError};
 
+mod alignment;
+mod annotation_style;
+mod attic;
+pub use alignment::{AlignedSnap, AlignmentOptions, snap_drawing_aligned};
 mod commands;
+#[cfg(test)]
+mod copenhagen_tests;
 mod drawings;
 mod edit;
+mod elements;
 mod elevation;
 mod facade_image;
+mod fbx;
+mod lettering_audit;
+mod libraries;
+mod local_building;
 mod plan;
 mod plan_output;
+mod plan_range;
+mod precision;
+mod precision_audit;
+mod rooflights;
 mod rooms;
+mod schedule_export;
+mod schedules;
 mod section;
 mod sheet;
+mod site;
+mod terrain;
 mod time;
+mod view_config;
+mod views;
 
 pub use commands::{CommandSpec, commands};
+pub use elements::{element_properties_from_built, room_element_id};
 /// For live views (Trigon Studio): one level's presentation plan as SVG text, the drawings' SVG
 /// parser and the renderer they use, so a view rasterizes exactly what the sheets show.
 pub use plan::sheet_svg_text as plan_sheet_svg;
 pub use plan_output::parse_svg;
 pub use resvg;
+pub use schedules::{
+    OpeningQuantityBasis, OpeningSchedule, OpeningScheduleRow, OpeningScheduleTotals, ScheduleOpeningKind, opening_schedule,
+    opening_schedule_from_built,
+};
+pub use views::{
+    DrawingDisplay, DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap,
+    DrawingTransform, SnapKind, SnapOptions, drawing_view, drawing_view_display, plan_drawing, plan_drawing_display, snap_drawing,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -77,10 +107,18 @@ impl Session {
         let params = if params.is_null() { Value::Object(Default::default()) } else { params };
         let before = spec.mutates.then(|| self.doc.clone());
         let outcome = catch_unwind(AssertUnwindSafe(|| (spec.run)(self, &params)));
-        let result = match outcome {
+        let mut result = match outcome {
             Ok(r) => r,
             Err(_) => Err(EngineError::Internal(id.to_string())),
         };
+        // Some source-authoring commands need no geometry build. They must still preserve
+        // the opt-in roof-level contract before their changes enter history.
+        if result.is_ok()
+            && spec.mutates
+            && let Err(error) = self.doc.buildings.iter().try_for_each(|b| b.validate_attic())
+        {
+            result = Err(error.into());
+        }
         match (&result, before) {
             (Err(_), Some(before)) => self.doc = before,
             (Ok(_), Some(before)) if spec.journaled => {
@@ -89,7 +127,16 @@ impl Session {
                     self.undo.remove(0);
                 }
                 self.redo.clear();
-                self.doc.journal.push(JournalEntry { command: id.to_string(), params });
+                // Preflight tokens are ephemeral conflict guards. Journal the actual typed
+                // operation so a saved model can be replayed without a preview from this build.
+                let entry = if id == "precision.apply" {
+                    params
+                        .get("action")
+                        .and_then(|a| Some(JournalEntry { command: a.get("command")?.as_str()?.to_string(), params: a.get("params")?.clone() }))
+                } else {
+                    None
+                };
+                self.doc.journal.push(entry.unwrap_or_else(|| JournalEntry { command: id.to_string(), params }));
                 self.dirty = true;
             }
             _ => {}

@@ -13,6 +13,19 @@ use crate::{EngineError, Result};
 
 const FONT: &[u8] = include_bytes!("../assets/liberation-sans/LiberationSans-Regular.ttf");
 const FONT_FAMILY: &str = "Liberation Sans";
+const ADDITIONAL_FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/liberation/LiberationSans-Bold.ttf"),
+    include_bytes!("../assets/liberation/LiberationSans-Italic.ttf"),
+    include_bytes!("../assets/liberation/LiberationSans-BoldItalic.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-Regular.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-Bold.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-Italic.ttf"),
+    include_bytes!("../assets/liberation/LiberationSerif-BoldItalic.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-Regular.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-Bold.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-Italic.ttf"),
+    include_bytes!("../assets/liberation/LiberationMono-BoldItalic.ttf"),
+];
 const MAX_DIMENSION: f32 = 6000.0;
 const MAX_PIXELS: u64 = 36_000_000;
 const MAX_PAGES: usize = 100;
@@ -31,9 +44,12 @@ fn options(blocked: Arc<AtomicBool>) -> usvg::Options<'static> {
     };
     let fonts = opt.fontdb_mut();
     fonts.load_font_data(FONT.to_vec());
+    for font in ADDITIONAL_FONTS {
+        fonts.load_font_data(font.to_vec());
+    }
     fonts.set_sans_serif_family(FONT_FAMILY);
-    fonts.set_serif_family(FONT_FAMILY);
-    fonts.set_monospace_family(FONT_FAMILY);
+    fonts.set_serif_family("Liberation Serif");
+    fonts.set_monospace_family("Liberation Mono");
     opt
 }
 
@@ -59,6 +75,42 @@ pub fn parse_svg(svg: &str) -> Result<usvg::Tree> {
     let blocked = Arc::new(AtomicBool::new(false));
     let opt = options(Arc::clone(&blocked));
     parse(svg, &opt, &blocked)
+}
+
+/// Unrotated glyph-ink boxes relative to each insertion point, in paper mm. Shape all
+/// labels together with the exporter's bundled fonts and SVG serialization, not a width guess.
+pub(crate) fn text_ink_bounds(texts: &[crate::sheet::Text]) -> Result<Vec<Option<[f64; 4]>>> {
+    use crate::sheet::{Item, MM_PER_PX, Scene, Viewport};
+    let vp = Viewport { x0: -100.0, y1: 100.0, mm: MM_PER_PX };
+    let mut svg = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900"><g font-family="Liberation Sans">"#);
+    for (i, text) in texts.iter().enumerate() {
+        let mut local = text.clone();
+        local.at = [0.0, 0.0];
+        local.deg = 0.0;
+        local.halo = crate::sheet::Halo::None;
+        let mut scene = Scene::new(1.0);
+        scene.items.push(Item::Text(local));
+        svg.push_str(&format!("<g id=\"metric-{i}\">"));
+        crate::sheet::svg::items(&mut svg, &scene, &vp);
+        svg.push_str("</g>");
+    }
+    svg.push_str("</g></svg>");
+    let tree = parse_svg(&svg)?;
+    fn ink(node: &usvg::Node) -> Option<usvg::Rect> {
+        match node {
+            usvg::Node::Text(t) => (!t.flattened().children().is_empty()).then(|| t.flattened().abs_bounding_box()),
+            usvg::Node::Group(g) => g.children().iter().find_map(ink),
+            _ => None,
+        }
+    }
+    Ok((0..texts.len())
+        .map(|i| {
+            let r = tree.node_by_id(&format!("metric-{i}")).and_then(ink)?;
+            let lo = vp.at([f64::from(r.left()), f64::from(r.bottom())]);
+            let hi = vp.at([f64::from(r.right()), f64::from(r.top())]);
+            Some([lo[0], lo[1], hi[0], hi[1]])
+        })
+        .collect())
 }
 
 /// Render the generated SVG with the bundled font. The returned bytes form a complete PNG.
@@ -141,6 +193,36 @@ mod tests {
     }
 
     #[test]
+    fn bundled_family_and_face_choices_render_distinct_pixels_and_embed_real_pdf_fonts() {
+        let styled = |family: &str, weight: &str, style: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="420" height="90"><rect width="420" height="90" fill="white"/><text x="8" y="60" font-family="{family}" font-weight="{weight}" font-style="{style}" font-size="38">Køkken ffi WWW 123</text></svg>"#
+            )
+        };
+        let mut rendered = Vec::new();
+        for family in ["Liberation Sans", "Liberation Serif", "Liberation Mono"] {
+            for (weight, style) in [("normal", "normal"), ("bold", "normal"), ("normal", "italic"), ("bold", "italic")] {
+                let image = pixels(&png(&styled(family, weight, style)).unwrap());
+                assert!(image.as_chunks::<4>().0.iter().any(|pixel| pixel[0] < 100));
+                assert!(rendered.iter().all(|previous| previous != &image), "{family}/{weight}/{style} must use its real face");
+                rendered.push(image);
+            }
+        }
+        let bytes = pdf(&[styled("Liberation Serif", "bold", "italic"), styled("Liberation Mono", "normal", "normal")], [148.0, 105.0]).unwrap();
+        let document = lopdf::Document::load_mem(&bytes).unwrap();
+        let names: Vec<_> = document
+            .objects
+            .values()
+            .filter_map(|object| object.as_dict().ok())
+            .filter_map(|dictionary| dictionary.get(b"BaseFont").ok()?.as_name().ok())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name.contains("LiberationSerif-BoldItalic")), "actual serif bold italic must be embedded: {names:?}");
+        assert!(names.iter().any(|name| name.contains("LiberationMono")), "actual mono must be embedded: {names:?}");
+        assert_eq!(document.extract_text(&[1]).unwrap().replace('\n', ""), "Køkken ffi WWW 123");
+    }
+
+    #[test]
     fn diagonal_lines_are_antialiased() {
         let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"><path d="M 3.2 4.1 L 36.4 23.7" fill="none" stroke="black" stroke-width="1"/></svg>"#;
         let image = pixels(&png(svg).unwrap());
@@ -209,5 +291,34 @@ mod tests {
         }
         assert!(pdf(&[], [297.0, 210.0]).is_err());
         assert!(pdf(&vec![pages[0].clone(); 101], [297.0, 210.0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lettering_metrics_tests {
+    use super::*;
+    use crate::sheet::{Layer, Text};
+
+    #[test]
+    fn bundled_metrics_distinguish_wide_narrow_and_styled_glyphs_in_paper_mm() {
+        let mut wide = Text::new(Layer::Annotation, [1000., 2000.], "WWWWWWWW", 2.5);
+        wide.middle = false;
+        let mut narrow = wide.clone();
+        narrow.text = "iiiiiiii".into();
+        let mut styled = wide.clone();
+        styled.style.family = trigon_model::annotation::FontFamily::Serif;
+        styled.style.bold = true;
+        styled.style.italic = true;
+        let b = text_ink_bounds(&[wide.clone(), narrow, styled, Text::new(Layer::Annotation, [0., 0.], "", 2.5)]).unwrap();
+        let width = |r: [f64; 4]| r[2] - r[0];
+        assert!(width(b[0].unwrap()) > 18.);
+        assert!(width(b[1].unwrap()) < 5.);
+        // Serif bold italic is narrower than Sans; measured ink is 17.756 mm.
+        assert!((width(b[2].unwrap()) - 17.756).abs() < 0.005);
+        assert_ne!(b[0], b[2]);
+        assert!(b[3].is_none());
+        wide.at = [-1e6, 2e6];
+        wide.deg = 90.;
+        assert_eq!(text_ink_bounds(&[wide]).unwrap()[0], b[0], "local glyph bounds are independent of model position/rotation");
     }
 }
