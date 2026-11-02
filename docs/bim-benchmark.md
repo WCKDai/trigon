@@ -32,6 +32,9 @@ redraw time or another product's unrelated benchmark.
 ## Equivalent user-run trials
 
 The default executable follows Cargo's platform naming, including `.exe` on Windows.
+Workflow subprocess output, verification JSON, logs and reports use UTF-8 explicitly,
+including Unicode output paths on Windows with legacy locale defaults.
+
 Report schema `trigon-benchmark/2` separates `checkout_context` from the selected
 executable. `binary_path` and `binary_sha256` identify the actual program. Its source
 revision, dirty state and profile remain `null` with `binary_provenance: unverified`;

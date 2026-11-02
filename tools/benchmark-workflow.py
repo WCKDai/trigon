@@ -60,12 +60,12 @@ def main():
             directory = output / ("warmup" if trial == 0 else f"trial-{trial:02}")
             start = time.perf_counter()
             result = subprocess.run([str(binary), str(directory)], cwd=root, env={"PATH": os.environ.get("PATH", "")},
-                                    capture_output=True, text=True, timeout=180, check=False)
+                                    capture_output=True, text=True, encoding="utf-8", timeout=180, check=False)
             elapsed = (time.perf_counter() - start) * 1000.0
-            (output / f"{directory.name}.log").write_text(result.stdout + result.stderr)
+            (output / f"{directory.name}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
             if result.returncode:
                 raise RuntimeError(f"{directory.name} failed with exit {result.returncode}; see its log")
-            verification = json.loads((directory / "verification.json").read_text())
+            verification = json.loads((directory / "verification.json").read_text(encoding="utf-8"))
             if verification.get("move_undo_exact") is not True or verification.get("copy_undo_schedule_exact") is not True:
                 raise RuntimeError(f"{directory.name} did not prove exact Undo and schedule restoration")
             readers = verification.get("ifc", {}).get("readers", [])
@@ -85,7 +85,7 @@ def main():
             "mad_ms": statistics.median(abs(value - median) for value in values), "tail_inference": "weak with five trials"})
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         report.update(status="FAIL", error=str(error))
-    (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+    (output / "results.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"status": report["status"], "summary": report.get("summary"), "results": str(output / "results.json")}))
     return 0 if report["status"] == "PASS" else 1
 
