@@ -46,8 +46,13 @@ fn headless_sessions_serve_every_command_and_no_studio_tools() {
     assert!(!names.iter().any(|n| n.starts_with("studio_")));
     let r = rpc(&mut s, 2, "tools/call", json!({"name": "document_info", "arguments": {}}));
     assert_eq!(r["result"]["isError"], false, "{r}");
-    let r = rpc(&mut s, 3, "tools/call", json!({"name": "studio_screenshot", "arguments": {}}));
-    assert!(r["error"]["message"].as_str().unwrap().contains("unknown tool"), "{r}");
+    let before = s.doc.clone();
+    for name in ["studio_view", "studio_screenshot", "studio_click", "studio_drag", "studio_key"] {
+        let r = rpc(&mut s, 3, "tools/call", json!({"name": name, "arguments": {}}));
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+        assert!(r["error"]["message"].as_str().unwrap().contains(&format!("unknown tool {name}")), "{r}");
+    }
+    assert_eq!(s.doc, before, "Studio requests cannot change a headless document");
     // Notifications get no reply.
     assert!(handle(&mut s, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
 }
@@ -73,7 +78,7 @@ fn serve_reads_lines_and_answers_garbage() {
 
 /// A stand-in Studio: a control server and an app thread that runs `command.run` through its own
 /// session and answers the `ui.*` methods with canned replies.
-fn studio() -> (u16, Arc<Mutex<Vec<String>>>, Arc<trigon_control::Presence>) {
+fn studio() -> (u16, Arc<Mutex<Vec<Value>>>, Arc<trigon_control::Presence>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let server = Server::start_with(listener, TOKEN.into(), Arc::new(|| {}), Options::default()).unwrap();
     let (port, presence) = (server.port(), server.presence());
@@ -82,14 +87,12 @@ fn studio() -> (u16, Arc<Mutex<Vec<String>>>, Arc<trigon_control::Presence>) {
     std::thread::spawn(move || {
         let mut s = session();
         while let Some(req) = server.recv_timeout(Duration::from_secs(60)) {
-            let what = match req.params.get("command").and_then(Value::as_str) {
-                Some(c) => format!("{} {c}", req.method),
-                None => req.method.clone(),
-            };
-            log.lock().unwrap().push(what);
+            log.lock().unwrap().push(json!({"method": req.method, "params": req.params}));
             let r = match req.method.as_str() {
                 "ui.view" => Ok(json!({"mode": req.params.get("mode").cloned().unwrap_or(json!("3d")), "level": null})),
                 "ui.screenshot" => Ok(json!({"width": 2, "height": 1, "target": req.params["target"], "png_base64": "iVBORw0KGgo="})),
+                "ui.drag" if req.params.get("steps") == Some(&json!(0)) => Err("ui.drag: `steps` must be an integer from 1 to 60".into()),
+                "ui.click" | "ui.drag" | "ui.key" => Ok(json!({"queued": 3, "window_hidden": false, "journal_len": s.doc.journal.len()})),
                 m => methods::session_method(&mut s, m, &req.params).unwrap_or_else(|| Err(methods::unknown_method(m))),
             };
             req.respond(r);
@@ -123,10 +126,104 @@ fn bridged_tool_calls_run_in_the_studio_session() {
 
     assert_eq!(
         *seen.lock().unwrap(),
-        ["command.run document.info", "command.run facade.place", "ui.view", "ui.screenshot"],
+        [
+            json!({"method": "command.run", "params": {"command": "document.info", "params": {}}}),
+            json!({"method": "command.run", "params": {"command": "facade.place", "params": {"facade": "nope"}}}),
+            json!({"method": "ui.view", "params": {"mode": "plan"}}),
+            json!({"method": "ui.screenshot", "params": {"target": "window", "raise": false}}),
+        ],
         "every call ran in the Studio's session"
     );
     assert_eq!(presence.clients().values().cloned().collect::<Vec<_>>(), ["claude-code"], "the owner sees who is working");
+}
+
+#[test]
+fn studio_input_tools_have_bounded_typed_schemas() {
+    let mut remote = Remote::new("127.0.0.1:1", None);
+    let listed = rpc(&mut remote, 1, "tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let schema = |name: &str| &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+    let coord = json!({"type": "number", "minimum": 0, "maximum": 20000});
+    let click = schema("studio_click");
+    assert_eq!(click["required"], json!(["x", "y"]));
+    assert_eq!(click["properties"]["x"], coord);
+    assert_eq!(click["properties"]["y"], coord);
+    assert_eq!(click["properties"]["button"]["enum"], json!(["left", "right", "middle"]));
+    assert_eq!(click["properties"]["button"]["default"], "left");
+    assert_eq!(click["properties"]["double"]["type"], "boolean");
+    let drag = schema("studio_drag");
+    assert_eq!(drag["required"], json!(["from", "to"]));
+    for point in ["from", "to"] {
+        assert_eq!(drag["properties"][point]["type"], "array");
+        assert_eq!(drag["properties"][point]["minItems"], 2);
+        assert_eq!(drag["properties"][point]["maxItems"], 2);
+        assert_eq!(drag["properties"][point]["items"], coord);
+    }
+    assert_eq!(drag["properties"]["steps"], json!({"type": "integer", "minimum": 1, "maximum": 60, "default": 8}));
+    let key = schema("studio_key");
+    assert_eq!(key["required"], json!(["key"]));
+    assert_eq!(key["properties"]["key"]["type"], "string");
+    for name in ["studio_click", "studio_drag", "studio_key"] {
+        let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+        assert!(!tool["description"].as_str().unwrap().is_empty());
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        for modifier in ["command", "shift", "alt", "ctrl"] {
+            assert_eq!(tool["inputSchema"]["properties"][modifier]["type"], "boolean");
+        }
+    }
+}
+
+#[test]
+fn studio_input_tools_forward_ui_methods_and_params_without_command_run() {
+    let (port, seen, _) = studio();
+    let mut remote = Remote::new(&format!("127.0.0.1:{port}"), Some(TOKEN));
+    remote.try_connect().unwrap();
+    let cases = [
+        (
+            "studio_click",
+            "ui.click",
+            json!({"x": 10.25, "y": 20.5, "button": "right", "double": true, "command": true, "shift": false, "alt": true, "ctrl": false}),
+        ),
+        ("studio_click", "ui.click", json!({"x": 0, "y": 20000, "button": "middle"})),
+        ("studio_click", "ui.click", json!({"x": 15, "y": 30})),
+        (
+            "studio_drag",
+            "ui.drag",
+            json!({"from": [10.25, 20.5], "to": [110.75, 220.5], "steps": 60, "command": false, "shift": true, "alt": false, "ctrl": true}),
+        ),
+        ("studio_drag", "ui.drag", json!({"from": [0, 0], "to": [20000, 20000], "steps": 1})),
+        ("studio_drag", "ui.drag", json!({"from": [10, 20], "to": [30, 40]})),
+        ("studio_key", "ui.key", json!({"key": "Z", "command": true, "shift": true, "alt": false, "ctrl": false})),
+        ("studio_key", "ui.key", json!({"key": "Escape"})),
+    ];
+    for (name, _, params) in &cases {
+        let r = rpc(&mut remote, 2, "tools/call", json!({"name": name, "arguments": params}));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["journal_len"], 0, "input reaches UI without a command journal entry");
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        cases.iter().map(|(_, method, params)| json!({"method": method, "params": params})).collect::<Vec<_>>(),
+        "only the named UI methods reach the authenticated Studio, with unchanged arguments"
+    );
+    let before = seen.lock().unwrap().len();
+    for name in ["studio_delete", "studio_ui_click", "ui.click"] {
+        let r = rpc(&mut remote, 3, "tools/call", json!({"name": name, "arguments": {"x": 10, "y": 20}}));
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
+    assert_eq!(seen.lock().unwrap().len(), before, "unknown tool names never become arbitrary UI methods");
+}
+
+#[test]
+fn studio_input_refusals_reach_mcp_without_retry() {
+    let (port, seen, _) = studio();
+    let mut remote = Remote::new(&format!("127.0.0.1:{port}"), Some(TOKEN));
+    let params = json!({"from": [0, 0], "to": [1, 1], "steps": 0});
+    let r = rpc(&mut remote, 1, "tools/call", json!({"name": "studio_drag", "arguments": params}));
+    assert_eq!(r["result"]["isError"], true, "{r}");
+    assert_eq!(r["result"]["content"][0]["text"], "ui.drag: `steps` must be an integer from 1 to 60");
+    assert_eq!(*seen.lock().unwrap(), [json!({"method": "ui.drag", "params": params})]);
 }
 
 #[test]

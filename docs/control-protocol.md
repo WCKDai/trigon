@@ -122,11 +122,16 @@ requests focus even if the window reports that it is already unoccluded.
 
 ## MCP
 
-`trigon mcp` serves MCP (JSON-RPC 2.0) on stdio. Bridged to Studio, every tool call becomes a
-`command.run` on this channel, the MCP client's name (from `initialize`) is sent with
-`control.hello`, and two more tools appear: `studio_view` (`ui.view`) and `studio_screenshot`
-(`ui.screenshot`, returned to the agent as an image). A call whose connection breaks is not sent
-again, since it may have run; the next call reconnects, also to a restarted Studio.
+`trigon mcp` serves MCP (JSON-RPC 2.0) on stdio. Bridged to Studio, engine tools become
+`command.run` on this channel and the MCP client's name (from `initialize`) is sent with
+`control.hello`. Five Studio-only tools call UI methods directly: `studio_view` (`ui.view`),
+`studio_screenshot` (`ui.screenshot`, returned to the agent as an image), `studio_click`
+(`ui.click`), `studio_drag` (`ui.drag`) and `studio_key` (`ui.key`). The input tools preserve the
+parameters and validation above, including window-point coordinates, click buttons, modifiers
+and drag steps from 1 to 60 (default 8). Read fresh `studio_view` coordinates and handles before
+picking or dragging; queued input is delivered one event per frame while the window is visible.
+Headless sessions do not list these tools and refuse calls to them. A call whose connection
+breaks is not sent again, since it may have run; the next call reconnects, also to a restarted Studio.
 
 ## Security notes
 

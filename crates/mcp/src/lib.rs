@@ -5,8 +5,8 @@
 //!
 //! The commands run on a [`Backend`]: a session of the server's own ([`Session`], headless), or
 //! a running Trigon Studio reached over its control channel ([`Remote`]), where the owner watches
-//! every call land. Bridged to Studio, two more tools let the agent steer and see the owner's
-//! view (`studio_view`, `studio_screenshot`).
+//! every call land. Bridged to Studio, five more tools let the agent see and steer the owner's
+//! view (`studio_view`, `studio_screenshot`, `studio_click`, `studio_drag`, `studio_key`).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::io::{BufRead, Write};
@@ -32,7 +32,9 @@ the project. Millimetre calculations do not establish the accuracy of incomplete
 
 const STUDIO_INSTRUCTIONS: &str = " You are connected to Trigon Studio: the owner watches every \
 command land in the model and in the activity feed. studio_view shows them a level, a phase or the \
-plan; studio_screenshot shows you what they see.";
+plan and returns window-point coordinates and dimensional handles; studio_screenshot shows you \
+what they see. studio_click, studio_drag and studio_key queue the same pointer and keyboard input \
+as the owner's. Use fresh studio_view coordinates for picking and handle drags.";
 
 /// Where tool calls run.
 pub trait Backend {
@@ -42,7 +44,7 @@ pub trait Backend {
     fn has_studio(&self) -> bool {
         false
     }
-    /// Answers a Studio method (`ui.view`, `ui.screenshot`).
+    /// Answers a Studio method (`ui.view`, `ui.screenshot`, `ui.click`, `ui.drag`, `ui.key`).
     fn studio(&mut self, method: &str, _params: Value) -> Result<Value, String> {
         Err(format!("{method} needs Trigon Studio; this MCP server runs a session of its own"))
     }
@@ -158,6 +160,54 @@ fn studio_tools() -> Value {
                 "target": {"type": "string", "enum": ["viewport", "window"]},
                 "raise": {"type": "boolean"}
             }, "additionalProperties": false}
+        },
+        {
+            "name": "studio_click",
+            "description": "Queue a real pointer click in Trigon Studio: x and y are window points from the top left, not image pixels. \
+                            Use fresh studio_view coordinates to pick an element or press a UI control. Button defaults to left; double \
+                            sends a double click. Optional command, shift, alt and ctrl modifiers apply to the click. Returns queued \
+                            event count and window_hidden; input is delivered one event per frame while the window is visible.",
+            "inputSchema": {"type": "object", "properties": {
+                "x": {"type": "number", "minimum": 0, "maximum": 20000},
+                "y": {"type": "number", "minimum": 0, "maximum": 20000},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "double": {"type": "boolean", "default": false},
+                "command": {"type": "boolean"},
+                "shift": {"type": "boolean"},
+                "alt": {"type": "boolean"},
+                "ctrl": {"type": "boolean"}
+            }, "required": ["x", "y"], "additionalProperties": false}
+        },
+        {
+            "name": "studio_drag",
+            "description": "Queue a real primary-button drag in Trigon Studio: from and to are [x,y] in window points from the top left, \
+                            not image pixels. Read fresh studio_view handles and their point coordinates before dragging a dimensional \
+                            handle, then read the updated properties. Steps is the number of bounded moves (1 to 60, default 8). Optional \
+                            command, shift, alt and ctrl modifiers apply throughout. Returns queued event count and window_hidden; input \
+                            is delivered one event per frame while the window is visible. Studio checks the whole request before queueing.",
+            "inputSchema": {"type": "object", "properties": {
+                "from": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 20000}, "minItems": 2, "maxItems": 2},
+                "to": {"type": "array", "items": {"type": "number", "minimum": 0, "maximum": 20000}, "minItems": 2, "maxItems": 2},
+                "steps": {"type": "integer", "minimum": 1, "maximum": 60, "default": 8},
+                "command": {"type": "boolean"},
+                "shift": {"type": "boolean"},
+                "alt": {"type": "boolean"},
+                "ctrl": {"type": "boolean"}
+            }, "required": ["from", "to"], "additionalProperties": false}
+        },
+        {
+            "name": "studio_key",
+            "description": "Queue a real key press and release in Trigon Studio. Key is an egui key name such as K, Escape, Enter or Z. \
+                            Optional command, shift, alt and ctrl modifiers apply to the key (for example key: K, command: true opens \
+                            the command palette). Returns queued event count and window_hidden; input is delivered one event per frame \
+                            while the window is visible.",
+            "inputSchema": {"type": "object", "properties": {
+                "key": {"type": "string"},
+                "command": {"type": "boolean"},
+                "shift": {"type": "boolean"},
+                "alt": {"type": "boolean"},
+                "ctrl": {"type": "boolean"}
+            }, "required": ["key"], "additionalProperties": false}
         }
     ])
 }
@@ -174,10 +224,14 @@ fn text_content(v: &Value) -> Value {
 fn call_studio_tool(backend: &mut dyn Backend, name: &str, args: Value) -> Value {
     let (method, args) = match name {
         "studio_view" => ("ui.view", args),
-        _ => (
+        "studio_screenshot" => (
             "ui.screenshot",
             json!({"target": args.get("target").cloned().unwrap_or(json!("viewport")), "raise": args.get("raise").cloned().unwrap_or(json!(false))}),
         ),
+        "studio_click" => ("ui.click", args),
+        "studio_drag" => ("ui.drag", args),
+        "studio_key" => ("ui.key", args),
+        _ => return json!({"content": [text_content(&Value::String(format!("unknown Studio tool {name}")))], "isError": true}),
     };
     match backend.studio(method, args) {
         Ok(mut v) => {
@@ -228,7 +282,7 @@ pub fn handle(backend: &mut dyn Backend, msg: &Value) -> Option<Value> {
         "tools/call" => {
             let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
             let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
-            if backend.has_studio() && matches!(name, "studio_view" | "studio_screenshot") {
+            if backend.has_studio() && matches!(name, "studio_view" | "studio_screenshot" | "studio_click" | "studio_drag" | "studio_key") {
                 return ok(call_studio_tool(backend, name, args));
             }
             let Some(spec) = commands().iter().find(|c| tool_name(c.id) == name) else {
