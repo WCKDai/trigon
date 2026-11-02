@@ -149,7 +149,7 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
         }
         crate::view_config::prepare(&mut sheet, template, bounds);
         crate::view_config::paper_clearances(&mut sheet)?;
-        crate::view_config::room_labels(&mut sheet, doc, view, template);
+        crate::view_config::room_labels(&mut sheet, doc, view, template)?;
     }
     let mut regions = Scene::new(sheet.scene.scale);
     for a in doc.annotations.iter().filter(|a| a.view == id && matches!(a.kind, AnnotationKind::Region { .. })) {

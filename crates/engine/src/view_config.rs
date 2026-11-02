@@ -163,12 +163,12 @@ pub(crate) fn finish(sheet: &mut Sheet, template: &DrawingTemplate) {
 }
 
 /// Add live room tags only after the actual physical sheet scale has been established.
-/// A conservative lettering box must fit the room's inscribed clearance and visible paper.
-pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view: &DrawingView, template: &DrawingTemplate) {
+/// Bundled glyph ink must fit the room's inscribed clearance and visible paper.
+pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view: &DrawingView, template: &DrawingTemplate) -> Result<()> {
     if template.room_labels == RoomLabels::Hidden {
-        return;
+        return Ok(());
     }
-    let DrawingViewKind::Plan { level } = view.kind else { return };
+    let DrawingViewKind::Plan { level } = view.kind else { return Ok(()) };
     let [x, y, w, h] = sheet.clip;
     let lo = sheet.vp.at([x, y + h]);
     let hi = sheet.vp.at([x + w, y]);
@@ -178,6 +178,8 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
     }
     let scale = sheet.scene.scale;
     let size = 2.5;
+    // Keep visible air around the actual ink, including a typical cut-line half-width.
+    let padding = 0.75 * scale;
     let stairs: Vec<[f64; 4]> = sheet
         .scene
         .element_regions
@@ -192,56 +194,77 @@ pub(crate) fn room_labels(sheet: &mut Sheet, doc: &trigon_model::Document, view:
                 .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
         })
         .collect();
-    let mut count = 0;
+    let mut candidates = Vec::new();
+    let mut texts = Vec::new();
     for building in &doc.buildings {
         let Some(storey) = building.storeys.get(level) else { continue };
-        if template.range.is_some_and(|range| range.cut_mm < 0.0 || range.cut_mm >= storey.height) {
+        // Another building's roof level must not suppress this building's full-storey tags.
+        // Roof rooms remain unsupported and are rejected by document/command validation.
+        if storey.roof_level || template.range.is_some_and(|range| range.cut_mm < 0.0 || range.cut_mm >= storey.height) {
             continue;
         }
         for (index, room) in building.rooms.iter().enumerate().filter(|(_, room)| room.levels.contains(&level)) {
             let Some((at, clearance)) = crate::plan::room_label_anchor(&room.polygon) else { continue };
             let area = format!("{:.1} m²", trigon_model::doc::polygon_area(&room.polygon) / 1e6);
-            let fits = |chars: usize, lines: usize| {
-                let half_width = chars as f64 * size * scale / 2.0;
-                let half_height = if lines == 2 { (1.75 + size) * scale } else { size * scale };
-                half_width.hypot(half_height) <= clearance
-                    && at[0] - half_width >= bounds[0]
-                    && at[0] + half_width <= bounds[2]
-                    && at[1] - half_height >= bounds[1]
-                    && at[1] + half_height <= bounds[3]
-                    && !stairs.iter().any(|b| {
-                        at[0] + half_width >= b[0] && at[0] - half_width <= b[2] && at[1] + half_height >= b[1] && at[1] - half_height <= b[3]
-                    })
-            };
-            let named = template.room_labels == RoomLabels::NameAndArea
-                && !room.name.trim().is_empty()
-                && fits(room.name.chars().count().max(area.chars().count()), 2);
-            if !named && !fits(area.chars().count(), 1) {
-                continue;
-            }
-            let id = crate::room_element_id(building, index, level);
-            if named {
-                let mut text = Text::new(Layer::Annotation, [at[0], at[1] + 1.75 * scale], &room.name, size);
-                text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_name" });
-                sheet.scene.items.push(Item::Text(text));
-            }
-            let area_at = if named { [at[0], at[1] - 1.75 * scale] } else { at };
-            let mut text = Text::new(Layer::Annotation, area_at, area, size);
-            text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_area" });
-            sheet.scene.items.push(Item::Text(text));
-            if !sheet.scene.element_regions.iter().any(|region| region.id == id) {
-                sheet.scene.element_regions.push(crate::DrawingElementRegion {
-                    id,
-                    kind: crate::DrawingElementKind::Room,
-                    rings: vec![room.polygon.clone()],
-                    depth_plane: template.range.map(|range| [-storey.elevation - range.cut_mm, 0.0, 0.0]),
-                });
-            }
-            count += 1;
+            texts.push(Text::new(Layer::Annotation, at, area, size));
+            texts.push(Text::new(Layer::Annotation, at, &room.name, size));
+            candidates.push((building, storey, index, room, at, clearance));
         }
+    }
+    // Shape once with the same bundled fonts, anchoring and physical size as export.
+    let ink = crate::plan_output::text_ink_bounds(&texts)?;
+    let mut count = 0;
+    for ((building, storey, index, room, at, clearance), [area_ink, name_ink]) in candidates.into_iter().zip(ink.as_chunks::<2>().0) {
+        let fits = |with_name: bool| {
+            let Some(mut box_mm) = *area_ink else { return false };
+            if with_name {
+                let Some(name_mm) = *name_ink else { return false };
+                box_mm = [
+                    box_mm[0].min(name_mm[0]),
+                    (box_mm[1] - 1.75).min(name_mm[1] + 1.75),
+                    box_mm[2].max(name_mm[2]),
+                    (box_mm[3] - 1.75).max(name_mm[3] + 1.75),
+                ];
+            }
+            let [x0, y0, x1, y1] = box_mm;
+            let lo = [at[0] + x0 * scale, at[1] + y0 * scale];
+            let hi = [at[0] + x1 * scale, at[1] + y1 * scale];
+            [[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]].iter().all(|p| {
+                (p[0] - at[0]).hypot(p[1] - at[1]) + padding <= clearance
+                    && p[0] >= bounds[0] + padding
+                    && p[0] <= bounds[2] - padding
+                    && p[1] >= bounds[1] + padding
+                    && p[1] <= bounds[3] - padding
+            }) && !stairs.iter().any(|b| hi[0] + padding >= b[0] && lo[0] - padding <= b[2] && hi[1] + padding >= b[1] && lo[1] - padding <= b[3])
+        };
+        let named = template.room_labels == RoomLabels::NameAndArea && !room.name.trim().is_empty() && fits(true);
+        if !named && !fits(false) {
+            continue;
+        }
+        let id = crate::room_element_id(building, index, level);
+        if named {
+            let mut text = Text::new(Layer::Annotation, [at[0], at[1] + 1.75 * scale], &room.name, size);
+            text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_name" });
+            sheet.scene.items.push(Item::Text(text));
+        }
+        let area_at = if named { [at[0], at[1] - 1.75 * scale] } else { at };
+        let area = format!("{:.1} m²", trigon_model::doc::polygon_area(&room.polygon) / 1e6);
+        let mut text = Text::new(Layer::Annotation, area_at, area, size);
+        text.source = Some(crate::sheet::TextSource { kind: "element", id: id.clone(), role: "room_area" });
+        sheet.scene.items.push(Item::Text(text));
+        if !sheet.scene.element_regions.iter().any(|region| region.id == id) {
+            sheet.scene.element_regions.push(crate::DrawingElementRegion {
+                id,
+                kind: crate::DrawingElementKind::Room,
+                rings: vec![room.polygon.clone()],
+                depth_plane: template.range.map(|range| [-storey.elevation - range.cut_mm, 0.0, 0.0]),
+            });
+        }
+        count += 1;
     }
     sheet.metrics["room_labels"] = json!(template.room_labels);
     sheet.metrics["room_tags_drawn"] = json!(count);
+    Ok(())
 }
 fn clip(sheet: &mut Sheet, crop: [f64; 4]) {
     sheet.scene.clip(crop);
@@ -268,6 +291,135 @@ mod room_label_tests {
         s.doc.buildings.push(b);
         s.execute("view.define", json!({"id":"plan","name":"Plan","kind":{"view":"plan","level":0}})).unwrap();
         s
+    }
+
+    #[test]
+    fn full_storey_room_tags_survive_a_neighbouring_roof_level() {
+        let mut s = session();
+        s.doc.buildings[0].rooms[0].levels = vec![1];
+        s.execute("view.define", json!({"id":"plan","name":"Plan","kind":{"view":"plan","level":1}})).unwrap();
+        configure(&mut s, "name_and_area", 100., None);
+        let tags = |doc: &trigon_model::Document| {
+            crate::views::sheet(doc, "plan", View::latest(doc))
+                .unwrap()
+                .scene
+                .items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Item::Text(text) if text.source.as_ref().is_some_and(|source| matches!(source.role, "room_name" | "room_area")) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = tags(&s.doc);
+        assert_eq!(before.len(), 2);
+        s.execute(
+            "building.add",
+            json!({"id":"rear","name":"Lower neighbour","footprint":[[15000,0],[23000,0],[23000,8000],[15000,8000]],
+                "storeys":1,"storey_height_mm":3000}),
+        )
+        .unwrap();
+        s.execute("building.set_roof", json!({"building":"rear","kind":"pitched","pitch_deg":35})).unwrap();
+        s.execute("building.set_attic", json!({"building":"rear","floor":2250})).unwrap();
+        assert_eq!(tags(&s.doc), before);
+        s.doc.buildings.swap(0, 1);
+        assert_eq!(tags(&s.doc), before, "building order does not hide full-storey tags");
+        let pick = crate::drawing_view(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert_eq!(pick.pick_element([4500., 3000.], 1.).unwrap().id, "room.space.L1");
+        let unchanged = s.doc.clone();
+        assert!(
+            s.execute(
+                "interior.add_rooms",
+                json!({"building":"rear","rooms":[{"id":"roof-room","levels":[1],"name":"Unsupported",
+                    "polygon":[[16000,1000],[20000,1000],[20000,5000],[16000,5000]]}]}),
+            )
+            .is_err()
+        );
+        assert_eq!(s.doc, unchanged, "the unsupported roof-room guard remains atomic");
+    }
+
+    #[test]
+    fn room_tags_fit_actual_bundled_glyphs_without_reducing_paper_size() {
+        let mut s = session();
+        s.doc.buildings[0].rooms[0].name = "WC".into();
+        s.doc.buildings[0].rooms[0].polygon = vec![[5000., 1000.], [6200., 1000.], [6200., 4500.], [5000., 4500.]];
+        configure(&mut s, "name_and_area", 100., None);
+        let before = s.doc.clone();
+        let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        assert_eq!(sheet.metrics["room_tags_drawn"], 1, "the current character-count guess incorrectly suppresses a fitting tag");
+        let labels: Vec<_> = sheet
+            .scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text(text) if text.source.as_ref().is_some_and(|source| source.id == "room.space.L0") => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.iter().any(|text| text.text == "WC" && text.size == 2.5));
+        assert!(labels.iter().any(|text| text.text == "4.2 m²" && text.size == 2.5));
+        let bounds = crate::plan_output::text_ink_bounds(&labels).unwrap();
+        for (text, bounds) in labels.iter().zip(bounds) {
+            let [x0, y0, x1, y1] = bounds.unwrap();
+            for p in [[x0, y0], [x1, y0], [x1, y1], [x0, y1]] {
+                let p = [text.at[0] + p[0] * sheet.scene.scale, text.at[1] + p[1] * sheet.scene.scale];
+                assert!((5000.0..=6200.0).contains(&p[0]) && (1000.0..=4500.0).contains(&p[1]));
+            }
+        }
+        assert_eq!(s.doc, before, "glyph fitting is read-only");
+        configure(&mut s, "name_and_area", 500., None);
+        assert_eq!(crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap().metrics["room_tags_drawn"], 0);
+    }
+
+    #[test]
+    fn fitting_room_ink_keeps_physical_clearance_instead_of_touching_the_wall() {
+        let label = Text::new(Layer::Annotation, [0., 0.], "4.2 m²", 2.5);
+        let [x0, y0, x1, y1] = crate::plan_output::text_ink_bounds(&[label]).unwrap()[0].unwrap();
+        let radius = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].into_iter().map(|[x, y]| x.hypot(y) * 100.0).fold(0.0_f64, f64::max);
+        for (air, expected) in [(37.5, 0), (85.0, 1)] {
+            let mut s = session();
+            let width = 2.0 * (radius + air);
+            let height = 4_200_000.0 / width;
+            s.doc.buildings[0].rooms[0].name.clear();
+            s.doc.buildings[0].rooms[0].polygon = vec![
+                [6000. - width / 2., 4000. - height / 2.],
+                [6000. + width / 2., 4000. - height / 2.],
+                [6000. + width / 2., 4000. + height / 2.],
+                [6000. - width / 2., 4000. + height / 2.],
+            ];
+            configure(&mut s, "area", 100., None);
+            let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+            assert_eq!(sheet.metrics["room_tags_drawn"], expected, "actual ink needs 0.75 mm paper air, not just mathematical containment");
+        }
+    }
+
+    #[test]
+    fn overview_room_tags_fit_actual_glyphs_with_full_size_and_room_clearance() {
+        let mut s = session();
+        configure(&mut s, "name_and_area", 250., None);
+        let sheet = crate::views::sheet(&s.doc, "plan", View::latest(&s.doc)).unwrap();
+        let labels: Vec<_> = sheet
+            .scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text(text) if text.source.as_ref().is_some_and(|source| source.id == "room.space.L0") => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels.len(), 2);
+        assert!(labels.iter().any(|text| text.text == "Living room" && text.size == 2.5));
+        assert!(labels.iter().any(|text| text.text == "28.0 m²" && text.size == 2.5));
+        let bounds = crate::plan_output::text_ink_bounds(&labels).unwrap();
+        let (anchor, clearance) = crate::plan::room_label_anchor(&s.doc.buildings[0].rooms[0].polygon).unwrap();
+        for (label, bounds) in labels.iter().zip(bounds) {
+            let [x0, y0, x1, y1] = bounds.unwrap();
+            for [x, y] in [[x0, y0], [x1, y0], [x1, y1], [x0, y1]] {
+                let at = [label.at[0] + x * sheet.scene.scale, label.at[1] + y * sheet.scene.scale];
+                assert!((at[0] - anchor[0]).hypot(at[1] - anchor[1]) + 0.75 * sheet.scene.scale <= clearance + 1e-6);
+            }
+        }
     }
 
     #[test]

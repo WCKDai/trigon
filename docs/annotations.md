@@ -12,9 +12,10 @@ geometry. A pale background replaces the former dotted shaft-only presentation.
 Saved plan templates can enable live room tags with `room_labels: "area"` or `"name_and_area"`
 through `view.configure` (also in Studio's view-template panel). Tags use the selected storey's
 room definitions, so a name or polygon edit updates the name and calculated square metres.
-Text stays 2.5 mm high on paper. A conservative lettering box must fit the room clearance and
-visible crop, clear of visible stair symbols; a long name falls back to area alone, and a crowded area tag is omitted. Blank
-names display only their area. Explicit view ranges show tags only when the cut crosses that
+Text stays 2.5 mm high on paper. Actual bundled-font glyph bounds must fit the room clearance and
+visible crop, with 0.75 mm of paper clearance and no overlap with visible stair symbols. A long
+name falls back to area alone, and a crowded area tag is omitted. Blank names display only their
+area. The inscribed-clearance test remains conservative for irregular rooms. Explicit view ranges show tags only when the cut crosses that
 room's storey volume. Clicking a tag's room area picks its exact source room.
 
 The default is `"hidden"`, omitted from serialized templates, preserving existing view output.
