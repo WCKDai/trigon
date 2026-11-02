@@ -1,6 +1,6 @@
 # Dormers on skew roof hosts (#27)
 
-A shed dormer must occupy one continuous, thick pitched or mansard roof plane. Eave
+A shed dormer defaults to one continuous, thick pitched or mansard roof plane. Eave
 straightening can make that plane oblique to its source facade. Choose its orientation
 explicitly with `yaw_deg` in the dormer source passed to `building.set_roof` or the roof's
 `dormers` property. The source is persisted and journalled through those existing commands.
@@ -73,7 +73,34 @@ uses the original unrounded values and tolerances. Text is diagnostic, not a str
 numeric API. Command schemas/defaults, JSON error envelopes and CLI exit codes are unchanged.
 Rejected preview/edit commands do not change source, geometry, journal, Undo or retained Redo.
 No feedback automatically moves, rotates or resizes a dormer. A host requiring multiple
-planes needs a separate reviewed modelling design or better roof evidence, not relaxed guards.
+planes needs the explicit construction below and supporting roof evidence.
+
+## Explicit multi-plane hosts
+
+Set `multi_plane: true` on an individual dormer only when its intended envelope spans a hip
+or adjoining roof planes. The default is `false`, omitted from native serialization; omitted
+values retain the legacy single-plane guard, numerical tolerances and geometry. This option
+does not choose a yaw, move the source anchor or infer a roof from a photograph.
+
+The opted-in builder follows the actual upper and lower host height fields. It constructs a
+real through-roof void and seats the front, cheeks and shed against those fields. Complete
+support, finite geometry, build-up, clearances, spacing and glazing checks still apply. It
+rejects unsupported, overlapping or outside envelopes atomically. Existing dimensions remain
+in the original/yawed millimetre frame described above. A valid multi-plane envelope does not
+establish that a particular building has that roof form.
+
+The same source works through `building.set_roof`, the roof's `dormers` property, or the
+dormer window's `multi_plane` property through `element.set`. Successful changes use the normal
+journal and Undo/Redo. The IFC front wall uses the actual shaped mesh for this opted-in case;
+nominal opening dimensions and IDs keep their source meaning.
+
+[`examples/roof-multiplane.json`](../examples/roof-multiplane.json) is a completely synthetic
+chamfer example. Without its explicit flag, the existing single-plane check rejects the crossing.
+Rust `Dormer` literals now initialize `multi_plane: false` for legacy behavior. Feature-bearing
+documents require an updated reader; old readers can ignore the flag and cannot preserve the
+intended geometry. Keep the original file before opting in. Reverting the code requires restoring
+that earlier copy or deliberately reworking the dormer through supported commands. Native format
+generation and writer behavior are unchanged by this feature.
 
 For nonzero yaw, front-wall polygon-overlay output is reconciled to its known source
 corner and opening vertices within the unchanged `1e-6` mm numerical epsilon. This

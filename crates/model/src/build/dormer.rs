@@ -1,5 +1,7 @@
-//! Shed dormers on a single straight pitched or mansard plane, with actual host-roof voids.
+//! Shed dormers with actual host-roof voids. Explicit multi-plane intent follows pitched hips;
+//! omitted intent retains the original single-plane pitched/mansard construction exactly.
 
+use super::roof_opening as opening;
 use super::*;
 use crate::roof::Dormer;
 use std::collections::BTreeSet;
@@ -10,19 +12,19 @@ const OVERHANG: f64 = 50.0;
 const EPS: f64 = 1e-6;
 
 #[derive(Clone, Copy)]
-struct Plane([f64; 3]);
+pub(super) struct Plane(pub(super) [f64; 3]);
 impl Plane {
-    fn z(self, u: f64, w: f64) -> f64 {
+    pub(super) fn z(self, u: f64, w: f64) -> f64 {
         self.0[0] * u + self.0[1] * w + self.0[2]
     }
 }
 
-fn local(fr: &FacadeFrame, p: [f64; 3]) -> [f64; 3] {
+pub(super) fn local(fr: &FacadeFrame, p: [f64; 3]) -> [f64; 3] {
     let d = [p[0] - fr.origin[0], p[1] - fr.origin[1]];
     [d[0] * fr.t[0] + d[1] * fr.t[1], -d[0] * fr.n[0] - d[1] * fr.n[1], p[2]]
 }
 
-fn plane(mesh: &Mesh, fr: &FacadeFrame, q: [f64; 2], top: bool) -> Result<Plane> {
+pub(super) fn plane(mesh: &Mesh, fr: &FacadeFrame, q: [f64; 2], top: bool) -> Result<Plane> {
     for tri in &mesh.triangles {
         let [a, b, c] = tri.map(|i| local(fr, mesh.positions.get(i as usize).copied().unwrap_or_default()));
         let det = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
@@ -63,7 +65,7 @@ fn clip(poly: &[[f64; 3]], axis: usize, value: f64, less: bool) -> Vec<[f64; 3]>
     out
 }
 
-fn polygon(mesh: &mut Mesh, points: &[[f64; 3]]) {
+pub(super) fn polygon(mesh: &mut Mesh, points: &[[f64; 3]]) {
     if points.len() < 3 {
         return;
     }
@@ -190,9 +192,15 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
     let mut ids = BTreeSet::new();
     let mut reserved = Vec::new();
     let mut holes = Vec::new();
+    let mut shapes: Vec<(String, bool, Vec<[f64; 2]>)> = Vec::new();
     let mut built = Vec::new();
     for spec in specs {
         spec.validate()?;
+        if spec.multi_plane && !matches!(b.roof, crate::Roof::Pitched { .. }) {
+            return Err(ModelError::Invalid(
+                "multi_plane dormers currently require a pitched hip host; mansard slope breaks remain unsupported".into(),
+            ));
+        }
         if !ids.insert(&spec.id) {
             return Err(ModelError::Invalid(format!("duplicate dormer id {}", spec.id)));
         }
@@ -268,15 +276,50 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         } else {
             0.0
         };
-        let sill = top.z(spec.u_mm, front + FRONT) + finished + spec.sill_clearance_mm;
+        let width = ty.width + 2.0 * spec.cheek_mm;
+        let sill = if spec.multi_plane {
+            opening::limits(&original, &fr, &opening::rect(left - spec.cheek_mm, right + spec.cheek_mm, front, front + FRONT), true)?.1
+                + spec.sill_clearance_mm
+        } else {
+            top.z(spec.u_mm, front + FRONT) + finished + spec.sill_clearance_mm
+        };
         let roof_bottom = sill + ty.height + spec.head_mm;
         let lift = spec.roof_thickness_mm / pitch.cos();
         let back = (roof_bottom + lift - slope * front - top.0[2]) / (top.0[1] - slope);
         if !back.is_finite() || back < front + FRONT + 200.0 || back > front + 5000.0 {
             return Err(ModelError::Invalid("dormer depth must be 200–5000 mm behind its front lining".into()));
         }
-        let width = ty.width + 2.0 * spec.cheek_mm;
         let extent = (spec.u_mm - width / 2.0 - OVERHANG, spec.u_mm + width / 2.0 + OVERHANG);
+        let high = Plane([0.0, slope, roof_bottom - slope * front]);
+        let rear = if spec.multi_plane {
+            Some(opening::rear(&original, &fr, extent.0, extent.1, front, Plane([0., slope, high.0[2] + lift]))?)
+        } else {
+            None
+        };
+        let back = rear.as_ref().map_or(back, |r| r.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max));
+        let envelope = match &rear {
+            Some(r) => opening::footprint(r, extent.0, extent.1, front - OVERHANG, UNDERLAP)?,
+            None => opening::rect(extent.0, extent.1, front - OVERHANG, back + UNDERLAP),
+        };
+        let world: Vec<_> = envelope
+            .iter()
+            .map(|p| {
+                let p = fr.point(p[0], p[1], 0.);
+                [p[0], p[1]]
+            })
+            .collect();
+        for (id, multi, shape) in &shapes {
+            if spec.multi_plane || *multi {
+                let overlap = opening::overlap(&world, shape)?;
+                if overlap > EPS {
+                    return Err(ModelError::Invalid(format!(
+                        "dormer {} overlaps dormer {id}: projected envelope intersection {overlap:.6} mm²",
+                        spec.id
+                    )));
+                }
+            }
+        }
+        shapes.push((spec.id.clone(), spec.multi_plane, world));
         let projection = if spec.yaw_deg == 0.0 {
             extent
         } else {
@@ -305,31 +348,33 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
             return Err(ModelError::Invalid("dormers need at least 100 mm between their roof projections".into()));
         }
         reserved.push((&spec.facade, projection.0, projection.1));
-        for u in [extent.0, spec.u_mm, extent.1] {
-            for w in [front - OVERHANG, front + FRONT, back, back + UNDERLAP] {
-                for (p, up) in [(top, true), (bottom, false)] {
-                    let found = sample(u, w, up)?;
-                    if (found.z(u, w) - p.z(u, w)).abs() > 0.01 {
-                        return Err(ModelError::Invalid(format!(
-                            "dormer crosses a hip or slope break; reduce its width, height or setback; dormer {} on {}: \
+        if !spec.multi_plane {
+            for u in [extent.0, spec.u_mm, extent.1] {
+                for w in [front - OVERHANG, front + FRONT, back, back + UNDERLAP] {
+                    for (p, up) in [(top, true), (bottom, false)] {
+                        let found = sample(u, w, up)?;
+                        if (found.z(u, w) - p.z(u, w)).abs() > 0.01 {
+                            return Err(ModelError::Invalid(format!(
+                                "dormer crosses a hip or slope break; reduce its width, height or setback; dormer {} on {}: \
                              sampled (u={u:.6} mm, w={w:.6} mm), surface={}; expected z={:.6} mm, found z={:.6} mm, \
                              found-expected={:.6} mm exceeds 0.010000 mm absolute tolerance. \
                              Expected height extends the front reference plane sampled at (u={:.6} mm, w={:.6} mm); \
                              this is a rejected sample, not a fit elsewhere",
-                            spec.id,
-                            spec.facade,
-                            if up { "top" } else { "underside" },
-                            p.z(u, w),
-                            found.z(u, w),
-                            found.z(u, w) - p.z(u, w),
-                            spec.u_mm,
-                            front + FRONT
-                        )));
+                                spec.id,
+                                spec.facade,
+                                if up { "top" } else { "underside" },
+                                p.z(u, w),
+                                found.z(u, w),
+                                found.z(u, w) - p.z(u, w),
+                                spec.u_mm,
+                                front + FRONT
+                            )));
+                        }
                     }
                 }
             }
         }
-        if spec.yaw_deg != 0.0 {
+        if spec.yaw_deg != 0.0 && !spec.multi_plane {
             let rear_height = roof_bottom + slope * (back + UNDERLAP - front) - bottom.z(spec.u_mm, back + UNDERLAP);
             if rear_height <= EPS {
                 return Err(ModelError::Invalid(format!(
@@ -340,8 +385,12 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
             }
         }
         let hole = Hole { fr, u0: left, u1: right, w0: front + FRONT, w1: back, top, bottom };
-        holes.push(hole);
-        *cover = cut(cover, hole);
+        if let Some(rear) = &rear {
+            *cover = opening::cut(cover, &original, &fr, &opening::footprint(rear, left, right, front + FRONT, 0.)?)?;
+        } else {
+            holes.push(hole);
+            *cover = cut(cover, hole);
+        }
         let id = format!("{}.dormer.{}", b.id, spec.id);
         let wall_id = format!("{id}.front");
         let start = fr.point(left - spec.cheek_mm, front, 0.0);
@@ -356,7 +405,11 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         let span = Span {
             level: b.storeys.len().saturating_sub(1),
             thickness: FRONT,
-            z0: bottom.z(spec.u_mm, front),
+            z0: if spec.multi_plane {
+                opening::limits(&original, &fr, &opening::rect(left - spec.cheek_mm, right + spec.cheek_mm, front, front + FRONT), false)?.0
+            } else {
+                bottom.z(spec.u_mm, front)
+            },
             z1: roof_bottom + slope * FRONT,
             in0: 0.0,
             in1: width,
@@ -383,6 +436,10 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
                     *p = *q;
                 }
             }
+        }
+        if spec.multi_plane {
+            let body = opening::volume(&original, &fr, &opening::rect(left - spec.cheek_mm, right + spec.cheek_mm, front, front + FRONT), high)?;
+            segment.mesh = opening::front_window(&body, &fr, Rect { u0: left, u1: right, v0: sill, v1: sill + ty.height }, front, FRONT)?;
         }
         let fill = BuiltElement {
             id: format!("{id}.window"),
@@ -416,7 +473,14 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
         let high = |w: f64| roof_bottom + slope * (w - front);
         let mut cheeks = sloped_box(&fr, (left - spec.cheek_mm, left), (front + FRONT, back + UNDERLAP), low, high);
         cheeks.append(&sloped_box(&fr, (right, right + spec.cheek_mm), (front + FRONT, back + UNDERLAP), low, high));
-        let roof = sloped_box(&fr, extent, (front - OVERHANG, back + UNDERLAP), high, |w| high(w) + lift);
+        let roof = if let Some(rear) = &rear {
+            let high = Plane([0., slope, roof_bottom - slope * front]);
+            cheeks = opening::volume(&original, &fr, &opening::footprint(rear, left - spec.cheek_mm, left, front + FRONT, UNDERLAP)?, high)?;
+            cheeks.append(&opening::volume(&original, &fr, &opening::footprint(rear, right, right + spec.cheek_mm, front + FRONT, UNDERLAP)?, high)?);
+            opening::prism(&fr, &envelope, high, Plane([0., slope, high.0[2] + lift]))?
+        } else {
+            sloped_box(&fr, extent, (front - OVERHANG, back + UNDERLAP), high, |w| high(w) + lift)
+        };
         built.push(BuiltDormer { id, front: front_wall, cheeks, roof });
     }
     *cover = conform(cover, &holes);
@@ -427,6 +491,101 @@ pub(super) fn build(doc: &Document, b: &Building, cover: &mut Mesh, specs: &[Dor
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn chamfer_multi_plane_has_closed_coordinated_solids_and_a_real_void() {
+        for rotation in [0.0_f64, 37.25, -118.] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let outline = [[0., 0.], [12000., 0.], [12000., 8000.], [10000., 10000.], [0., 10000.]]
+                .map(|[x, y]| [150000. + x * cos - y * sin, -270000. + x * sin + y * cos]);
+            let mut b = Building::new("b", "Public chamfer fixture", &outline, 3, 3400.).unwrap();
+            b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,
+                "thickness_mm":200,"overhang_mm":180,"straighten_mm":0}))
+            .unwrap();
+            let mut doc = Document::default();
+            doc.buildings.push(b);
+            let before = crate::build(&doc).unwrap();
+            let spec: Dormer = serde_json::from_value(serde_json::json!({"id":"corner","facade":"b.f3",
+                "u_mm":1414.213562373095,"window_type":"window.casement.2","width_mm":1400,
+                "height_mm":1000,"setback_mm":350,"cheek_mm":100,"head_mm":130,
+                "sill_clearance_mm":80,"roof_pitch_deg":6,"roof_thickness_mm":65,"multi_plane":true}))
+            .unwrap();
+            doc.buildings[0].roof.dormers_mut().unwrap().push(spec.clone());
+            let built = crate::build(&doc).unwrap();
+            let roof = built[0].roof.as_ref().unwrap();
+            let d = &roof.dormers[0];
+            for mesh in [&roof.cover, &d.front.mesh, &d.cheeks, &d.roof] {
+                closed(mesh);
+            }
+            let (a, e) = doc.buildings[0].edge(2).unwrap();
+            let fr = FacadeFrame::new(a, e).unwrap();
+            for top in [true, false] {
+                for u in [spec.u_mm - 600., spec.u_mm, spec.u_mm + 600.] {
+                    assert!(plane(&before[0].roof.as_ref().unwrap().cover, &fr, [u, 600.], top).is_ok());
+                    assert!(plane(&roof.cover, &fr, [u, 600.], top).is_err(), "both skins must have a through-void");
+                }
+            }
+            for (_, glass) in d.front.openings[0].fill.parts.iter().filter(|(m, _)| *m == Material::Glass) {
+                for &p in &glass.positions {
+                    let q = local(&fr, p);
+                    let host = plane(&before[0].roof.as_ref().unwrap().cover, &fr, [q[0], q[1]], true).unwrap();
+                    assert!(q[2] > host.z(q[0], q[1]) + spec.sill_clearance_mm - EPS);
+                }
+            }
+            let source = serde_json::to_vec(&doc).unwrap();
+            let reopened: Document = serde_json::from_slice(&source).unwrap();
+            assert_eq!(built, crate::build(&reopened).unwrap());
+        }
+    }
+
+    #[test]
+    fn multi_plane_follows_both_yaw_signs_with_adjacent_legacy_dormers() {
+        for positive in [false, true] {
+            for rotation in [0.0_f64, 71.] {
+                let middle = [11700., 9700.];
+                let raw = [[0., 0.], [14000., 0.], [14000., 8000.], middle, [10000., 12000.], [0., 12000.]];
+                let (sin, cos) = rotation.to_radians().sin_cos();
+                let outline = raw.map(|[x, y]| [150000. + x * cos - y * sin, -270000. + x * sin + y * cos]);
+                let mut b = Building::new("b", "Skew chamfer", &outline, 3, 3400.).unwrap();
+                // Only the reflex point is removed. The source wall tangent remains distinct.
+                b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,
+                    "thickness_mm":220,"overhang_mm":180,"straighten_mm":1200}))
+                .unwrap();
+                let facade = if positive { 3 } else { 2 };
+                assert_eq!(b.footprint.len(), 6);
+                let (a, e) = b.edge(facade).unwrap();
+                let source = FacadeFrame::new(a, e).unwrap();
+                let eave = FacadeFrame::new(outline[2], outline[4]).unwrap();
+                let yaw = (source.t[0] * eave.t[1] - source.t[1] * eave.t[0]).atan2(source.t[0] * eave.t[0] + source.t[1] * eave.t[1]).to_degrees();
+                assert!(if positive { yaw > 1. } else { yaw < -1. });
+                let spec: Dormer = serde_json::from_value(serde_json::json!({"id":"skew","facade":format!("b.f{}",facade+1),
+                    "u_mm":source.length/2.,"yaw_deg":yaw,"multi_plane":true,"window_type":"window.casement.2",
+                    "width_mm":1100,"height_mm":1100}))
+                .unwrap();
+                let adjacent: Dormer = serde_json::from_value(serde_json::json!({"id":"adjacent","facade":"b.f1",
+                    "u_mm":6000,"window_type":"window.casement.2","width_mm":1100,"height_mm":1100}))
+                .unwrap();
+                let mut doc = Document::default();
+                b.roof.dormers_mut().unwrap().extend([spec.clone(), adjacent]);
+                doc.buildings.push(b);
+                let built = crate::build(&doc).unwrap();
+                let roof = built[0].roof.as_ref().unwrap();
+                closed(&roof.cover);
+                for d in &roof.dormers {
+                    for m in [&d.front.mesh, &d.cheeks, &d.roof] {
+                        closed(m);
+                    }
+                }
+                let mut overlap = spec;
+                overlap.id = "overlap".into();
+                overlap.u_mm += 100.;
+                doc.buildings[0].roof.dormers_mut().unwrap().push(overlap);
+                let failed = doc.clone();
+                assert!(crate::build(&doc).unwrap_err().to_string().contains("overlap"));
+                assert_eq!(failed, doc);
+            }
+        }
+    }
 
     // A shallow reflex corner is straightened into an eave oblique to the original wall.
     // Mirroring the outline reverses yaw without changing the dimensions or host problem.

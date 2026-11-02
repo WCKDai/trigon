@@ -128,10 +128,23 @@ impl Ifc<'_> {
             return None;
         }
         let up = if dormer { catalog::dormer_front(t) } else { catalog::facade(t, wall.kind == FacadeKind::Party, wall.finish) };
+        let multi_plane = dormer
+            && self
+                .doc
+                .buildings
+                .iter()
+                .any(|b| b.roof.dormers().iter().any(|d| d.multi_plane && wall.id == format!("{}.dormer.{}.front", b.id, d.id)));
+        let standard = standard && !multi_plane;
         let placed = self.w.place(Some(fl.at(seg.level)), frame);
         let axis = self.w.polyline(&[[0.0, 0.0], [len, 0.0]], false);
-        let solid = self.extruded(&ring, &[], h, up.face());
-        let shape = self.shape("SweptSolid", &[solid], Some(axis), catalog::L_FACADE)?;
+        let shape = if multi_plane {
+            let item = self.w.faceset(&seg.mesh, &frame)?;
+            self.cat.paint(&mut self.w, item, up.face());
+            self.shape("Tessellation", &[item], Some(axis), catalog::L_FACADE)?
+        } else {
+            let solid = self.extruded(&ring, &[], h, up.face());
+            self.shape("SweptSolid", &[solid], Some(axis), catalog::L_FACADE)?
+        };
         let class = if standard { "IFCWALLSTANDARDCASE" } else { "IFCWALL" };
         let id = self.w.add(format!(
             "{class}({},$,{},$,$,#{},#{shape},{},.{}.)",
@@ -142,8 +155,10 @@ impl Ifc<'_> {
             up.predefined
         ));
         let cut = opening_area(wall, seg);
-        let side = (len + (p[2][0] - p[3][0]).max(0.0)) / 2.0 * h;
         let footprint = area(&ring);
+        let net = if multi_plane { super::part21::volume(&seg.mesh) } else { net_volume(wall, seg, footprint) };
+        let side = if multi_plane { net / t + cut } else { (len + (p[2][0] - p[3][0]).max(0.0)) / 2.0 * h };
+        let gross = if multi_plane { net + cut * t } else { footprint * h };
         let qs = [
             Qty::Length("Length", len),
             Qty::Length("Width", t),
@@ -152,8 +167,8 @@ impl Ifc<'_> {
             Qty::Area("NetFootprintArea", footprint / 1e6),
             Qty::Area("GrossSideArea", side / 1e6),
             Qty::Area("NetSideArea", (side - cut).max(0.0) / 1e6),
-            Qty::Volume("GrossVolume", footprint * h / 1e9),
-            Qty::Volume("NetVolume", net_volume(wall, seg, footprint) / 1e9),
+            Qty::Volume("GrossVolume", gross / 1e9),
+            Qty::Volume("NetVolume", net / 1e9),
         ];
         self.wall_data(id, &seg.id, &up, standard.then_some(0.0), wall.kind != FacadeKind::Party, true, &qs);
         fl.contain(seg.level, id);

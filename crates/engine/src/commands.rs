@@ -3064,3 +3064,50 @@ fn reference_meshes(doc: &Document) -> Result<Vec<(String, trigon_model::Mesh)>>
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod roof_opening_tests {
+    use super::*;
+    fn chamfer() -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Public synthetic chamfer",
+            "footprint":[[0,0],[12000,0],[12000,8000],[10000,10000],[0,10000]],"storeys":3,"storey_height_mm":3400}),
+        )
+        .unwrap();
+        s.execute("building.set_roof", json!({"kind":"pitched","pitch_deg":46,"thickness_mm":200,"overhang_mm":180,"straighten_mm":0})).unwrap();
+        s
+    }
+    #[test]
+    fn public_multi_plane_command_is_atomic_and_replays_exactly() {
+        let mut s = chamfer();
+        let before = s.doc.clone();
+        let legacy = json!({"id":"corner","facade":"b.f3","u_mm":1414.213562373095,
+            "window_type":"window.casement.2","width_mm":1400,"height_mm":1000,"setback_mm":350,
+            "cheek_mm":100,"head_mm":130,"sill_clearance_mm":80,"roof_pitch_deg":6,"roof_thickness_mm":65});
+        let error = s.execute("element.set", json!({"id":"b.roof","properties":{"dormers":[legacy.clone()]}})).unwrap_err().to_string();
+        assert!(error.contains("0.010000 mm"));
+        assert_eq!(s.doc, before);
+        let mut intent = legacy.clone();
+        intent["multi_plane"] = json!(true);
+        s.execute("element.set", json!({"id":"b.roof","properties":{"dormers":[intent.clone()]}})).unwrap();
+        let accepted = s.doc.clone();
+        let built = trigon_model::build(&accepted).unwrap();
+        let glb = trigon_io::glb::write(&built, &[]);
+        let ifc = trigon_io::ifc::write(&accepted, &built, "fixture.ifc", "fixed");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        let failure = s.doc.clone();
+        intent["u_mm"] = json!(1e300);
+        assert!(s.execute("element.set", json!({"id":"b.roof","properties":{"dormers":[intent]}})).is_err());
+        assert_eq!(s.doc, failure);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        assert_eq!(trigon_io::ifc::write(&s.doc, &trigon_model::build(&s.doc).unwrap(), "fixture.ifc", "fixed"), ifc);
+        let reopened: Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(s.doc, reopened);
+        assert_eq!(built, trigon_model::build(&reopened).unwrap());
+    }
+}

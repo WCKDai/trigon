@@ -28,6 +28,9 @@ pub struct Dormer {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[schemars(range(min = -45.0, max = 45.0))]
     pub yaw_deg: f64,
+    /// Explicitly follow adjoining pitched hip planes. False retains the single-plane contract.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub multi_plane: bool,
     pub window_type: String,
     pub width_mm: f64,
     pub height_mm: f64,

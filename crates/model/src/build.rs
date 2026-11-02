@@ -14,6 +14,7 @@ use crate::{ModelError, Result};
 mod balcony;
 mod dormer;
 mod opening;
+mod roof_opening;
 
 /// Window and door frames sit this far behind the outer wall face, mm.
 pub const REVEAL: f64 = 120.0;

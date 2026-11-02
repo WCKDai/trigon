@@ -375,3 +375,33 @@ fn curved_void_axes_and_wall_quantities_match_the_real_profiles() {
         }
     }
 }
+
+#[test]
+fn multi_plane_dormer_front_exports_its_real_underside_and_net_volume() {
+    let mut doc = Document::default();
+    let mut b =
+        trigon_model::Building::new("b", "Synthetic chamfer", &[[0., 0.], [12000., 0.], [12000., 8000.], [10000., 10000.], [0., 10000.]], 3, 3400.)
+            .unwrap();
+    b.roof = serde_json::from_value(serde_json::json!({"kind":"pitched","pitch_deg":46,"thickness_mm":200,"overhang_mm":180,"straighten_mm":0,
+        "dormers":[{"id":"corner","facade":"b.f3","u_mm":1414.213562373095,"window_type":"window.casement.2",
+        "width_mm":1400,"height_mm":1000,"setback_mm":350,"multi_plane":true}]}))
+    .unwrap();
+    doc.buildings.push(b);
+    let built = trigon_model::build(&doc).unwrap();
+    let text = export(&doc, &built);
+    let records = entities(&text);
+    let front = &built[0].roof.as_ref().unwrap().dormers[0].front;
+    let seg = &front.segments[0];
+    let (&id, wall) = records.iter().find(|(_, e)| e.kind == "IFCWALL" && e.attributes[0] == gid(&seg.id)).unwrap();
+    let shape = &records[&reference(wall.attributes[6])];
+    let body = &records[&references(shape.attributes[2])[1]];
+    assert_eq!(body.attributes[2], "'Tessellation'");
+    let qset = records
+        .values()
+        .filter(|e| e.kind == "IFCRELDEFINESBYPROPERTIES" && references(e.attributes[4]).contains(&id))
+        .map(|e| &records[&reference(e.attributes[5])])
+        .find(|e| e.kind == "IFCELEMENTQUANTITY")
+        .unwrap();
+    let quantity = references(qset.attributes[5]).into_iter().map(|k| &records[&k]).find(|e| e.attributes[0] == "'NetVolume'").unwrap();
+    assert!((quantity.attributes[3].parse::<f64>().unwrap() - crate::ifc::part21::volume(&seg.mesh) / 1e9).abs() < 1e-8);
+}
