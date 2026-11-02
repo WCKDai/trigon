@@ -2736,3 +2736,94 @@ mod rooflight_consumers_tests {
         assert_eq!(replay.doc, final_doc);
     }
 }
+
+#[cfg(test)]
+mod rounded_dimension_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut s = Session::new(Box::new(Canned));
+        s.execute("building.add", json!({"id":"b","name":"Public dimension fixture","footprint":[[0,0],[40000,0],[40000,9000],[0,9000]],"storeys":1,"storey_height_mm":3000})).unwrap();
+        s.execute("view.define", json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0},"template":{"name":"Dimensions","sizing":{"mode":"fixed","denominator":100,"centre":[10000,4000]}}})).unwrap();
+        s.execute(
+            "annotation.define",
+            json!({"id":"d","view":"p","kind":{"annotation":"dimension","from":[1000,1000],"to":[13345.67,1000],"offset_mm":-500}}),
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn dimension_rounding_is_opt_in_previewed_and_preserves_exact_source_geometry() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let baseline = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert!(baseline.svg().contains("12345.7"));
+        assert!(!serde_json::to_string(&s.doc).unwrap().contains("dimension_rounding_mm"));
+        let glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let action = json!({"command":"view.configure","params":{"id":"p","template":{"name":"Dimensions","dimension_rounding_mm":100,"sizing":{"mode":"fixed","denominator":100,"centre":[10000,4000]}}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        assert!(preview["drawing_feedback"].to_string().contains("≈12300"), "preflight must measure the actual printed glyphs");
+        assert_eq!(preview["validation"]["drawing_render"], "passed");
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        let rounded = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert!(rounded.svg().contains("≈12300"));
+        let paths = |scene: &crate::sheet::Scene| {
+            scene
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    crate::sheet::Item::Path(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&baseline.scene), paths(&rounded.scene), "fixed-scale witness and model paths stay exact");
+        assert_eq!(s.doc.annotations, before.annotations);
+        assert_eq!(s.doc.buildings, before.buildings);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        let dxf = crate::sheet::dxf::write(
+            &rounded.scene,
+            &crate::sheet::dxf::TitleBlock {
+                title: &rounded.title,
+                project: &rounded.project,
+                caption: &rounded.caption,
+                note: rounded.note.clone(),
+            },
+        );
+        assert!(dxf.contains("\\U+2248"), "approximation glyph must survive portable DXF lettering");
+        let accepted = s.doc.clone();
+        let reopened: trigon_model::Document = serde_json::from_slice(&serde_json::to_vec(&accepted).unwrap()).unwrap();
+        assert_eq!(reopened, accepted);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        for invalid in [json!(0), json!(-1), json!(1001), json!(1.5), json!(1e300), json!("100")] {
+            assert!(s.execute("view.configure", json!({"id":"p","template":{"name":"Invalid","dimension_rounding_mm":invalid}})).is_err());
+            assert_eq!(s.doc, before);
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted, "invalid settings must retain pending Redo");
+        s.execute("view.configure", json!({"id":"p","template":{"name":"Cleared","dimension_rounding_mm":null}})).unwrap();
+        assert!(!serde_json::to_string(&s.doc.views).unwrap().contains("dimension_rounding_mm"));
+    }
+
+    #[test]
+    fn dimension_fit_accounts_for_the_printed_rounded_label() {
+        let mut s = session();
+        s.execute(
+            "annotation.define",
+            json!({"id":"d","view":"p","kind":{"annotation":"dimension","from":[100000,3000],"to":[100013.4,3000],"offset_mm":500}}),
+        )
+        .unwrap();
+        s.execute("view.configure", json!({"id":"p","template":{"name":"Fit"}})).unwrap();
+        let before = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        let exact = s.doc.annotations.clone();
+        s.execute("view.configure", json!({"id":"p","template":{"name":"Fit","dimension_rounding_mm":10}})).unwrap();
+        let after = crate::views::sheet(&s.doc, "p", trigon_model::build::View::latest(&s.doc)).unwrap();
+        assert!(after.svg().contains("≈10"));
+        assert!(after.vp.mm < before.vp.mm, "fit must use the shorter actual rounded text rather than the discarded exact label");
+        assert_eq!(s.doc.annotations, exact);
+    }
+}

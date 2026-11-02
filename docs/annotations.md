@@ -166,6 +166,20 @@ at most 512 anchors are accepted. Its result includes drawing-plane `guides`.
 
 ## Persistent view templates, paper scale and plan ranges
 
+Saved view templates can opt into `dimension_rounding_mm`, a whole-number increment from 1
+to 1000 mm. For example, `100` prints a measured 12345.67 mm dimension as `≈12300`. Only the
+printed dimension annotation changes: model dimensions, witnesses, ticks, opening schedules
+and exchanges remain exact. Fit and lettering preflight use that same printed label. This
+setting is available in Studio's view-template panel and through `view.configure`,
+`view.define` and `view.apply_template`; all use the normal preview and Undo/Redo workflow.
+Generated balcony labels, room areas and level marks keep their separate conventions.
+
+Omitting the setting or supplying `null` retains existing lettering and omits the field on
+save. Fractional increments such as `1.5` are rejected. Existing files and default drawing
+fingerprints remain unchanged. Rust callers constructing a `DrawingTemplate` literal must
+provide `dimension_rounding_mm: None` for legacy behaviour; feature-bearing templates need
+a reader supporting this optional setting. Keep an independent copy before trying older readers.
+
 A saved view optionally owns a reusable `template`. Omitting it, or using
 `view.configure {"id":"ground","template":null}`, uses the unconfigured rendering path.
 An index-wide plan with multiple buildings at that level omits the automatic building-name

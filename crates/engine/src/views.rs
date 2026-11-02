@@ -113,6 +113,7 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
     annotation::validate_document(doc)?;
     let view = find(doc, id)?;
     view.validate_source(doc)?;
+    let dimension_rounding = view.template.as_ref().and_then(|t| t.dimension_rounding_mm);
     let mut sheet = match &view.kind {
         DrawingViewKind::Plan { level } => match view.template.as_ref().and_then(|t| t.range) {
             Some(range) => crate::plan_range::sheet(doc, *level, phase, range)?,
@@ -133,7 +134,7 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
     if let Some(template) = &view.template {
         let mut extent = sheet.scene.clone();
         for a in doc.annotations.iter().filter(|a| a.view == id) {
-            draw(&mut extent, a);
+            draw(&mut extent, a, dimension_rounding);
         }
         let mut bounds = extent.bounds();
         for item in &extent.items {
@@ -153,12 +154,12 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
     }
     let mut regions = Scene::new(sheet.scene.scale);
     for a in doc.annotations.iter().filter(|a| a.view == id && matches!(a.kind, AnnotationKind::Region { .. })) {
-        draw(&mut regions, a);
+        draw(&mut regions, a, dimension_rounding);
     }
     regions.items.append(&mut sheet.scene.items);
     sheet.scene.items = regions.items;
     for a in doc.annotations.iter().filter(|a| a.view == id && !matches!(a.kind, AnnotationKind::Region { .. })) {
-        draw(&mut sheet.scene, a);
+        draw(&mut sheet.scene, a, dimension_rounding);
     }
     if finish && let Some(template) = &view.template {
         crate::view_config::finish(&mut sheet, template);
@@ -420,8 +421,8 @@ mod tests {
         };
         let mut small = Scene::new(50.0);
         let mut large = Scene::new(100.0);
-        draw(&mut small, &a);
-        draw(&mut large, &a);
+        draw(&mut small, &a, None);
+        draw(&mut large, &a, None);
         let main =
             |s: &Scene| s.items.iter().filter_map(|i| if let Item::Path(p) = i { Some(p) } else { None }).next_back().unwrap().rings[0].clone();
         assert_eq!(main(&small), vec![[-300.0, 500.0], [2700.0, 4500.0]]);

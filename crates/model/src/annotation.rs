@@ -94,6 +94,10 @@ pub struct DrawingTemplate {
     /// Facade only. Hide generated balcony size labels and ticks; manual annotations remain.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_balcony_dimensions: bool,
+    /// Optional whole-mm rounding for printed dimension annotations. Witnesses remain exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub dimension_rounding_mm: Option<u32>,
     /// Printed below the viewport. None retains generated text; an empty string hides it.
     /// One line, at most MAX_FRAME_CAPTION_CHARS characters, fitting the existing paper frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +169,7 @@ impl Default for DrawingTemplate {
             range: None,
             room_labels: Default::default(),
             hide_balcony_dimensions: false,
+            dimension_rounding_mm: None,
             caption: None,
             note: None,
         }
@@ -184,6 +189,9 @@ impl PlanRange {
 impl DrawingTemplate {
     pub fn validate(&self) -> Result<()> {
         text(&self.name, false)?;
+        if let Some(quantum) = self.dimension_rounding_mm {
+            checked("dimension label rounding (whole mm)", f64::from(quantum), 1.0, 1000.0)?;
+        }
         if self.name.len() > 80 {
             return Err(ModelError::Invalid("template name is limited to 80 bytes".into()));
         }

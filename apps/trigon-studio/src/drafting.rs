@@ -707,6 +707,17 @@ impl Drafting {
                 ui.checkbox(&mut self.template.hide_balcony_dimensions, "Hide balcony size labels");
                 ui.weak("Presentation elevation · manual dimensions and notes stay visible.");
             }
+            let mut round_dimensions = self.template.dimension_rounding_mm.is_some();
+            if ui.checkbox(&mut round_dimensions, "Round printed dimension annotations").changed() {
+                self.template.dimension_rounding_mm = round_dimensions.then_some(100);
+            }
+            if let Some(quantum) = &mut self.template.dimension_rounding_mm {
+                ui.horizontal(|ui| {
+                    ui.label("Nearest");
+                    ui.add(egui::DragValue::new(quantum).range(1..=1000).suffix(" mm"));
+                });
+                ui.weak("Prints ≈ before rounded labels. Witness points and model dimensions remain exact.");
+            }
             let mut custom_caption = self.template.caption.is_some();
             if ui.checkbox(&mut custom_caption, "Custom caption").changed() {
                 self.template.caption = custom_caption.then(String::new);

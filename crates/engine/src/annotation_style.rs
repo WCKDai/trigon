@@ -14,7 +14,7 @@ fn lettering(scene: &mut Scene, at: [f64; 2], value: &str, size: f64, rotation: 
     scene.text(t);
 }
 
-pub(crate) fn draw(scene: &mut Scene, a: &Annotation) {
+pub(crate) fn draw(scene: &mut Scene, a: &Annotation, dimension_rounding_mm: Option<u32>) {
     let start = scene.items.len();
     let s = scene.scale;
     let pen = Stroke::new(0.18);
@@ -35,7 +35,13 @@ pub(crate) fn draw(scene: &mut Scene, a: &Annotation) {
                 scene.line(Layer::Annotation, shift(q, -1.2 * s, -1.2 * s), shift(q, 1.2 * s, 1.2 * s), pen);
             }
             scene.line(Layer::Annotation, a0, b0, pen);
-            let value = if (length - length.round()).abs() < 0.05 { format!("{length:.0}") } else { format!("{length:.1}") };
+            let value = if let Some(quantum) = dimension_rounding_mm {
+                format!("≈{:.0}", (length / f64::from(quantum)).round() * f64::from(quantum))
+            } else if (length - length.round()).abs() < 0.05 {
+                format!("{length:.0}")
+            } else {
+                format!("{length:.1}")
+            };
             let mut t = Text::new(Layer::Annotation, shift([(a0[0] + b0[0]) / 2.0, (a0[1] + b0[1]) / 2.0], 0.0, 1.0 * s), value, a.size_mm);
             let angle = d[1].atan2(d[0]).to_degrees();
             t.deg = if angle > 90.0 {
@@ -111,7 +117,7 @@ mod tests {
             annotation.validate().unwrap();
             let before = annotation.clone();
             let mut scene = Scene::new(100.0);
-            draw(&mut scene, &annotation);
+            draw(&mut scene, &annotation, None);
             let texts: Vec<_> = scene.items.iter().filter_map(|item| if let Item::Text(text) = item { Some(text) } else { None }).collect();
             assert_eq!(texts.len(), 1);
             assert_eq!(texts[0].style, style);
@@ -131,7 +137,7 @@ mod tests {
             let annotation:Annotation=serde_json::from_value(json!({"id":"region","view":"v","kind":{"annotation":"region","points":[[0,0],[3000,0],[3000,1000],[0,1000]],"fill":[220,230,240],"border":border}})).unwrap();
             annotation.validate().unwrap();
             let mut scene = Scene::new(100.0);
-            draw(&mut scene, &annotation);
+            draw(&mut scene, &annotation, None);
             let [Item::Path(path)] = scene.items.as_slice() else { panic!("one filled region path expected") };
             assert!(path.closed);
             assert_eq!(path.rings, vec![vec![[0.0, 0.0], [3000.0, 0.0], [3000.0, 1000.0], [0.0, 1000.0]]]);
