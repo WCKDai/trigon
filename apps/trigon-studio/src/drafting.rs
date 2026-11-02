@@ -52,6 +52,7 @@ pub struct Drafting {
     grid_step: f64,
     export_path: String,
     reveal_export: bool,
+    guide_mode: bool,
 }
 
 impl Default for Drafting {
@@ -91,6 +92,7 @@ impl Default for Drafting {
             grid_step: 100.0,
             export_path: "out/drawing.pdf".into(),
             reveal_export: false,
+            guide_mode: false,
         }
     }
 }
@@ -218,13 +220,41 @@ impl Drafting {
     }
 
     pub fn new_note(&mut self, doc: &Document) {
+        self.guide_mode = false;
         self.selected = None;
         self.note_id = unique_id("annotation", |id| doc.annotations.iter().any(|a| a.id == id));
         self.picking = None;
         self.region_points.clear();
     }
 
+    /// Start a saved plan datum with exact site coordinates; the shared preview
+    /// reviews its definition before it becomes an alignment reference.
+    pub fn reference_guide(&mut self, doc: &Document, view: &str, line: Option<[[f64; 2]; 2]>) -> bool {
+        if !doc.views.iter().any(|v| v.id == view && matches!(v.kind, DrawingViewKind::Plan { .. })) {
+            return false;
+        }
+        self.opened(doc, view);
+        self.new_note(doc);
+        self.note_id = unique_id("reference-guide", |id| doc.annotations.iter().any(|a| a.id == id));
+        self.kind = 5;
+        self.stroke = LineStyle { colour: [197, 63, 45], width_mm: 0.18, pattern: LinePattern::Dotted };
+        self.guide_mode = true;
+        if let Some(line) = line {
+            self.points[0] = line[0];
+            self.points[1] = line[1];
+            self.picking = None;
+        } else {
+            self.picking = Some(0);
+        }
+        true
+    }
+
+    pub fn guide_active(&self) -> bool {
+        self.guide_mode
+    }
+
     pub fn select(&mut self, a: &Annotation) {
+        self.guide_mode = a.id.starts_with("reference-guide-") && matches!(a.kind, AnnotationKind::Line { .. });
         self.selected = Some(a.id.clone());
         self.note_id = a.id.clone();
         self.size = a.size_mm;
@@ -553,7 +583,14 @@ impl Drafting {
             });
         }
         ui.horizontal_wrapped(|ui| {
-            if theme::primary(ui, if self.selected.is_some() { "Update annotation" } else { "Add annotation" }).clicked() {
+            let label = if self.guide_mode {
+                "Preview guide"
+            } else if self.selected.is_some() {
+                "Update annotation"
+            } else {
+                "Add annotation"
+            };
+            if theme::primary(ui, label).clicked() {
                 run = Some(Run {
                     command: "annotation.define",
                     params: json!({"id":self.note_id,"view":id,"size_mm":self.size,"style":self.style,"kind":self.annotation_kind()}),
@@ -782,6 +819,23 @@ impl Drafting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_preset_uses_exact_plan_coordinates_and_a_red_dotted_pen() {
+        let mut doc = Document::default();
+        doc.views.push(serde_json::from_value(json!({"id":"plan","name":"Coordination","kind":{"view":"plan","level":0}})).unwrap());
+        let line = [[-123.456789, 88.000001], [4567.891234, 999.123456]];
+        let mut tool = Drafting::default();
+        assert!(tool.reference_guide(&doc, "plan", Some(line)));
+        assert!(tool.guide_active());
+        assert_eq!(tool.points[0], line[0]);
+        assert_eq!(tool.points[1], line[1]);
+        assert_eq!(tool.stroke, LineStyle { colour: [197, 63, 45], width_mm: 0.18, pattern: LinePattern::Dotted });
+        assert!(doc.annotations.is_empty());
+        assert!(!tool.reference_guide(&doc, "missing", None));
+        tool.new_note(&doc);
+        assert!(!tool.guide_active());
+    }
 
     #[test]
     fn manual_line_selection_and_picking_preserve_paper_style_and_ownership() {

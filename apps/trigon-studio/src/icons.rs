@@ -28,6 +28,10 @@ pub enum Icon {
     Map,
     Box,
     Bookmark,
+    Guide,
+    Outline,
+    Entrance,
+    Terrain,
 }
 
 impl Icon {
@@ -56,6 +60,10 @@ impl Icon {
             Self::Map => include_bytes!("../assets/figma/LucideMap.svg"),
             Self::Box => include_bytes!("../assets/figma/LucideBox.svg"),
             Self::Bookmark => include_bytes!("../assets/figma/LucideBookmark.svg"),
+            Self::Guide => include_bytes!("../assets/figma/TrigonBimDatumGrid.svg"),
+            Self::Outline => include_bytes!("../assets/figma/LucideSpline.svg"),
+            Self::Entrance => include_bytes!("../assets/figma/LucideHouse.svg"),
+            Self::Terrain => include_bytes!("../assets/figma/LucideLandPlot.svg"),
         }
     }
 
@@ -96,6 +104,24 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> egu
     }
 }
 
+/// Native button interaction with a compact vertical ribbon arrangement.
+pub fn ribbon_button(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> egui::Response {
+    let response = ui.add(egui::Button::new("").selected(selected).min_size(egui::vec2(72.0, 54.0)));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    if let Some(texture) = icon.texture(ui) {
+        let rect = egui::Rect::from_center_size(response.rect.center_top() + egui::vec2(0.0, 18.0), egui::vec2(26.0, 26.0));
+        ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+    }
+    ui.painter().text(
+        response.rect.center_bottom() - egui::vec2(0.0, 5.0),
+        egui::Align2::CENTER_BOTTOM,
+        label,
+        egui::FontId::proportional(11.0),
+        if ui.is_enabled() { crate::theme::INK } else { crate::theme::MUTED },
+    );
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +152,10 @@ mod tests {
             Icon::Map,
             Icon::Box,
             Icon::Bookmark,
+            Icon::Guide,
+            Icon::Outline,
+            Icon::Entrance,
+            Icon::Terrain,
         ] {
             let image = raster(icon.source(), 2.0).unwrap();
             assert!(image.pixels.iter().any(|p| p.a() > 0), "empty {icon:?}");
