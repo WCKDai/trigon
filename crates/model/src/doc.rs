@@ -541,13 +541,19 @@ pub struct Unit {
 }
 
 impl Unit {
+    /// Explicit unknown register values share one interpretation in drawings and editors.
+    /// This classifies the value without rewriting the original source string.
+    pub fn is_unknown_door(door: &str) -> bool {
+        matches!(door.trim().to_lowercase().as_str(), "" | "?" | "unknown" | "ukendt" | "uoplyst" | "ikke oplyst")
+    }
+
     /// The storey index of the unit's floor, given the ground storey's index: "st" is the ground
     /// storey, "1" the one above, "kl" the one below.
     pub fn level(&self, ground: usize) -> Option<usize> {
         match self.floor.as_str() {
             "st" => Some(ground),
             "kl" => ground.checked_sub(1),
-            f => f.parse::<usize>().ok().map(|n| ground + n),
+            f => f.parse::<usize>().ok().and_then(|n| ground.checked_add(n)),
         }
     }
 }

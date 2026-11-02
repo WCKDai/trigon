@@ -89,10 +89,69 @@ is refused. Groups, overlapping source/occurrence selectors and ambiguous IDs ar
 A centre-line junction is explicit: this command does not decide which side of a thick wall
 should align. Use `edit.align_walls` for source axis/left/right face alignment first.
 
-Other preview actions are `building.add`, `edit.move`, `edit.align`, `edit.align_walls`, `element.set`,
-`annotation.move_label`, `edit.delete`, `view.define`, `view.configure` and `annotation.define`.
-These reuse the normal edit implementations. Drawing definitions/configuration and label moves
-also return `drawing_feedback`: the candidate's `view.audit` results at final physical scale,
+## Captured wall-alignment references
+
+`edit.align_walls` retains its interior-wall `reference` and `reference_face` / `target_face`
+defaults. Existing unique interior selectors retain precedence, including legacy source IDs
+containing colons; `wall:<source-id>` explicitly selects that source. When a selector does not
+name an existing editable element, it also accepts convenience datum prefixes. Explicit objects
+resolve only their stated kind and are unambiguous even if a legacy wall uses the same text ID:
+
+- `{"kind":"annotation","id":"<id>"}` (or `annotation:<id>`) uses an existing `line` annotation in a saved **plan**. Its coordinates are
+  site-local XY millimetres. Facade/section annotations are refused because their coordinates
+  are a different plane. The line itself is the datum, so `reference_face` must be `center`.
+- `{"kind":"facade","id":"<id>","level":1}` (or `facade:<id>:L1`) uses the represented facade
+  wall's actual material on one storey.
+  `left` is its inner line, `right` its outer line, and `center` the endpointwise midline.
+  This uses the actual built quadrilateral, including skewed inner faces; it does not substitute
+  an offset of the facade axis by nominal thickness. A missing, collapsed or ambiguous reference
+  is refused. Roof/gable-only faces are not admitted by this selector.
+
+Guide targets must be exact occurrences on the guide plan's storey. Material-face targets must
+also belong to its building. A shared source spanning other levels must be selected as a storey
+occurrence (`wall-id.L1`), so one floor's material cannot silently control different floors.
+The existing interior-reference scope rules and 15-degree direction limit are unchanged.
+
+Optional `max_move_mm` (0.001–100000 mm) bounds the largest source-endpoint displacement,
+including rotation. The entire batch is checked before source changes. Omitting it retains the
+legacy unbounded wall-alignment behavior. Lengths and door distances measured from source A
+remain unchanged; door world positions can move with the rigidly aligned wall. Use an explicitly
+reviewed movement bound appropriate to the source evidence.
+
+```json
+{"action":{"command":"edit.align_walls","params":{
+  "targets":["partition.L1"],"reference":{"kind":"annotation","id":"measured-axis"},
+  "target_face":"center","max_move_mm":10
+}},"sanity":{"building":"b","levels":[1]}}
+```
+
+The additive `alignment` result reports the resolved source/datum ID, exact line, reference kind/scope, affected
+levels and each target's before/after endpoints, signed rotation, maximum endpoint motion and
+reference-normal residuals. Resulting `targets` remain the authoritative IDs after storey splitting.
+These residuals describe source-axis/nominal target-face alignment, not a survey-accuracy claim
+or proof that every joined target face is coincident. Inspect the rebuilt material and sanity
+findings as well. `precision.preview` / `precision.apply` use these same edits. Changing a guide,
+material reference or document invalidates an earlier preview token.
+
+Use existing styled `annotation.define` lines for red dotted guides in a named coordination plan.
+They remain view annotations and export with that view; keep a separate presentation view for
+client drawings without them. They are not nonprinting reference planes or live constraints.
+Changing a guide after alignment does not automatically move walls. A supporting engine is
+required to replay journals containing the new selector forms; no native source-field migration
+is introduced.
+
+For source control points, `building.outline` now includes `point_mm: [x,y]` without rounding.
+Its established `x` and `y` fields retain their whole-mm values for compatibility. Reading the
+outline does not journal or change the stored footprint. Numeric precision remains separate from
+the measurement and registration uncertainty of that footprint.
+
+Other preview actions are `building.add`, `edit.move`, `edit.copy_to_levels`, `edit.align`,
+`edit.align_walls`, `element.set`, `annotation.move_label`, `edit.delete`, `view.define`, `view.configure` and `annotation.define`.
+These reuse the normal edit implementations. `edit.copy_to_levels` previews destination
+collisions and exact source changes with its existing `replace` behavior; success journals the
+underlying copy action once, and stale previews or invalid destinations leave source and Redo
+unchanged. Storey indices are explicit; copying does not infer measured heights.
+Drawing definitions/configuration and label moves also return `drawing_feedback`: the candidate's `view.audit` results at final physical scale,
 including glyph/halo bounds, source IDs, crop findings and potential overlaps. Moving an annotation
 between views audits both final views. Feedback does not change the source or repair the layout.
 `validation.drawing_render: "passed"` means those checks ran, not that the layout is acceptable;
@@ -253,6 +312,84 @@ from extending through the same branch and duplicating material. Thickness, comb
 length and source order resolve priority; the saved axes, source IDs and lifetimes remain
 unchanged. Intentional gaps and noncoincident source ends are not snapped by this correction.
 Mixed-thickness transitions and other audit candidates still need source and joint review.
+
+
+## Source-complete entrance lettering
+
+Plan presentation tags retain every source-known `TV`, `TH`, `MF` and numeric door
+designation. Case and surrounding whitespace are normalized for display only; unit
+records remain unchanged. Empty, `?`, `unknown`, `ukendt`, `uoplyst` and `ikke oplyst`
+designations share the inspector's unknown classification. Elevations show the union
+of known designations for the entrance, not an invented TV/TH pair or a promise that
+every storey has those sides. The unit register is not phase-specific evidence.
+
+Generated text carries transient ownership `{kind:"entrance", id:"b.entrance0",
+role:"unit_register"}`. The suffix is the entrance's **zero-based current-document
+index** within building `b`. This selector is not durable across provider replacement,
+insertion or reordering. It introduces no native schema or persisted stable ID.
+`view.audit` supplies `entrance.get {id}` inspection suggestions; the local entrance
+editor must verify expected address/unit data before a later edit. Generic element
+picking is unchanged by this lettering-only ownership.
+
+Default-scale `plan.sheet`, live presentation plans and elevation exports keep a
+preferred legacy anchor if the real bundled-font ink and exported halo fit. Colliding
+tags try bounded positions along their known outward axis, then an explicitly named
+legend in whitespace outside the drawing's geometry bounds. Font sizes are retained.
+Configured saved sheets repeat this placement after the final physical scale, crop,
+room tags and saved annotations are known. Missing explicit stair associations use a
+named legend and carry a placement note; no basement association or doorway is inferred.
+
+Drawing metrics and `view.audit.entrance_labels` include requested, placed, alternate,
+legend and unplaced counts, plus per-tag text, unit-record/unknown-door counts, source
+selector and result. If the bounded search or glyph comparison budget cannot place a
+complete label, it remains in the unclipped audit scene with `unplaced_entrance_tag`
+and a visible sheet note; it is never silently deleted or called successfully placed.
+Unplaced tags retain their original anchors; they are never pushed onto crop edges.
+A clipped export may show only part of nearby unresolved text. Resolve its source/layout
+before client delivery. Glyph shaping errors remain errors.
+
+The clearance check covers actual glyph boxes/halos against other text and filled
+wall material. Legends avoid the full model-geometry bounds. It is not a general
+line/leader routing solver, proof of the unit register, or a door-opening association.
+Ranged and roof-only plan consumers that do not yet generate entrance tags are outside
+this slice. Existing lettering/wall overlap findings remain visible. DXF applications
+may substitute fonts; final receiving-application review is still required.
+
+## Local entrance editing
+
+`entrance.list {building?}` and `entrance.get {id}` inspect the stored register without
+calling a provider. `entrance.set_unit` checks the exact `expected_address`, unit index
+and `expected_unit` before replacing one record. `entrance.bind_stair` checks that same
+address and the expected stored binding. Omitted `level` edits the ground-serving
+default; a level edits its explicit departing-flight override. Clearing an override
+resumes the default. These commands validate existing source stairs without using a
+nearest-stair heuristic. A valid binding does not establish its physical accuracy.
+
+Both writes support `precision.preview` and exact Undo/Redo. Their previews now audit
+affected saved plans and elevations before Apply. `validation.annotations` describes
+structural validity; `validation.drawing_quality` and `drawing_feedback` describe the
+actual lettering review. Missing views or failed bounded checks remain unverified.
+
+## Studio coordination controls
+
+Architecture's ribbon includes reference guides, source outline inspection, wall-face
+alignment and copying to named levels. The Project Browser exposes saved plan lines,
+entrances/apartment records and terrain. Properties uses the same typed commands as MCP.
+An active saved Plan supplies its actual storey; a facade or section does not silently
+become a plan datum. The outline inspector requires a floor choice when no plan plane
+is active.
+
+Guides use red dotted Line annotations on named coordination plans. Their captured
+endpoints retain source precision. Before Apply, Properties shows the captured action,
+reference, endpoint movement/rotation, source changes and verification status. Inputs
+are locked during that review; Cancel allows revision. A new preview request clears
+the previous Apply action even if the replacement fails. Document changes invalidate
+the preview token. These are one-time edits rather than persistent constraints.
+
+Terrain Properties exposes the existing DHM grid command and a bounded, validated local
+Terrain JSON import. Heights remain site-local millimetres relative to the existing
+site datum; source and attribution are retained. Import requires an explicit action.
+Coarse terrain samples are context, not a replacement for measured grading data.
 
 ## Material-bounded floors and rooms
 

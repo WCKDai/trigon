@@ -111,16 +111,39 @@ impl WallFace {
     }
 }
 
+/// Existing strings retain their interior-selector meaning. Explicit datum objects never
+/// fall back to an interior source, even when an old source ID contains a datum prefix.
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub(crate) enum WallAlignmentReference {
+    Selector(String),
+    Datum(WallAlignmentReferenceDatum),
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum WallAlignmentReferenceDatum {
+    Annotation { id: String },
+    Facade { id: String, level: usize },
+}
+
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AlignWalls {
     pub targets: Vec<String>,
-    /// One interior wall or displayed storey occurrence. It remains unchanged.
-    pub reference: String,
+    /// Interior selector string, or explicit {kind:annotation,id}/{kind:facade,id,level}.
+    /// Convenience strings annotation:<id> and facade:<id>:L<level> resolve only when no
+    /// existing editable selector matches. References remain unchanged. Datum targets must
+    /// be on the reference storey; facade references also require the same building.
+    pub reference: WallAlignmentReference,
     #[serde(default)]
     pub reference_face: WallFace,
     #[serde(default)]
     pub target_face: WallFace,
+    /// Optional maximum endpoint motion including rotation, 0.001..100000 mm.
+    /// Omission retains the established unbounded wall-alignment behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_move_mm: Option<f64>,
 }
 
 fn invalid(message: impl Into<String>) -> crate::EngineError {
@@ -863,11 +886,131 @@ fn anchor_value((lo, hi): (f64, f64), anchor: Anchor) -> f64 {
     }
 }
 
-/// Align nearly parallel walls rigidly, retaining door distances from A and run lengths.
-/// Unlike bounding-box alignment, both endpoints end on the same reference line/face.
-pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
-    let entries = selected(&s.doc, &p.targets)?;
-    let mut references = selected(&s.doc, std::slice::from_ref(&p.reference))?;
+struct WallAlignmentDatum {
+    id: String,
+    line: [[f64; 2]; 2],
+    t: [f64; 2],
+    normal: [f64; 2],
+    offset: f64,
+    source: Option<Entry>,
+    /// Guide lines have a storey but no single-building owner.
+    scope: Option<(Option<usize>, usize)>,
+    kind: &'static str,
+}
+
+fn line_datum(id: &str, line: [[f64; 2]; 2], scope: (Option<usize>, usize), kind: &'static str) -> Result<WallAlignmentDatum> {
+    for value in line.into_iter().flatten() {
+        checked("reference coordinate", value, -1e8, 1e8)?;
+    }
+    let [a, b] = line;
+    let length = checked("reference line length", (b[0] - a[0]).hypot(b[1] - a[1]), 0.001, 1_000_000.0)?;
+    let t = [(b[0] - a[0]) / length, (b[1] - a[1]) / length];
+    let normal = [-t[1], t[0]];
+    Ok(WallAlignmentDatum {
+        id: id.to_string(),
+        line,
+        t,
+        normal,
+        offset: a[0] * normal[0] + a[1] * normal[1],
+        source: None,
+        scope: Some(scope),
+        kind,
+    })
+}
+
+fn plan_guide_datum(doc: &Document, id: &str, face: WallFace) -> Result<WallAlignmentDatum> {
+    trigon_model::annotation::identifier(id)?;
+    let mut matches = doc.annotations.iter().filter(|annotation| annotation.id == id);
+    let annotation = matches.next().ok_or_else(|| invalid(format!("annotation {id} does not exist")))?;
+    if matches.next().is_some() {
+        return Err(invalid("wall alignment annotation is ambiguous"));
+    }
+    let mut views = doc.views.iter().filter(|view| view.id == annotation.view);
+    let view = views.next().ok_or_else(|| invalid("the alignment guide has no saved plan view"))?;
+    if views.next().is_some() {
+        return Err(invalid("the alignment guide's saved plan view is ambiguous"));
+    }
+    let trigon_model::annotation::DrawingViewKind::Plan { level } = &view.kind else {
+        return Err(invalid("a wall alignment guide must be in a saved plan view; facade/section coordinates are not site XY"));
+    };
+    if !doc.buildings.iter().any(|building| building.storeys.get(*level).is_some()) {
+        return Err(invalid("the alignment guide's plan storey does not exist"));
+    }
+    let trigon_model::annotation::AnnotationKind::Line { from, to, .. } = &annotation.kind else {
+        return Err(invalid("a wall alignment guide must be a saved plan Line annotation"));
+    };
+    if !matches!(face, WallFace::Center) {
+        return Err(invalid("a guide line is already the alignment datum; use reference_face center"));
+    }
+    line_datum(id, [*from, *to], (None, *level), "plan_annotation")
+}
+
+fn facade_material_datum(doc: &Document, id: &str, level: usize, face: WallFace) -> Result<WallAlignmentDatum> {
+    if id.is_empty() || id.len() > 512 {
+        return Err(invalid("the facade material reference needs an id of 1 to 512 bytes"));
+    }
+    let view = trigon_model::build::View { phase: doc.active_index(), filter: trigon_model::build::PhaseFilter::Complete };
+    let built = trigon_model::build::build_view(doc, view)?;
+    let mut matches: Vec<_> = built
+        .iter()
+        .enumerate()
+        .flat_map(|(bi, model)| {
+            model.walls.iter().filter(move |wall| wall.id == id).filter_map(move |wall| wall.segment(level).map(|segment| (bi, segment.plan)))
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err(invalid(format!("facade:{id}:L{level}: expected one represented facade material segment, found {}", matches.len())));
+    }
+    let (building, plan) = matches.pop().ok_or_else(|| invalid("missing facade material segment"))?;
+    let line = match face {
+        WallFace::Left => [plan[3], plan[2]],
+        WallFace::Right => [plan[0], plan[1]],
+        WallFace::Center => {
+            [[(plan[0][0] + plan[3][0]) / 2.0, (plan[0][1] + plan[3][1]) / 2.0], [(plan[1][0] + plan[2][0]) / 2.0, (plan[1][1] + plan[2][1]) / 2.0]]
+        }
+    };
+    line_datum(id, line, (Some(building), level), "facade_material")
+}
+
+fn wall_alignment_datum(doc: &Document, reference: &WallAlignmentReference, face: WallFace) -> Result<WallAlignmentDatum> {
+    let reference = match reference {
+        WallAlignmentReference::Datum(WallAlignmentReferenceDatum::Annotation { id }) => return plan_guide_datum(doc, id, face),
+        WallAlignmentReference::Datum(WallAlignmentReferenceDatum::Facade { id, level }) => return facade_material_datum(doc, id, *level, face),
+        WallAlignmentReference::Selector(reference) => reference,
+    };
+    if reference.is_empty() || reference.len() > 512 {
+        return Err(invalid("wall alignment reference must contain 1 to 512 bytes"));
+    }
+    // Raw interior source IDs historically accept colons. Keep every previously valid
+    // interior selector authoritative before interpreting convenience datum prefixes.
+    let legacy = selected(doc, std::slice::from_ref(reference));
+    // Duplicate legacy source IDs must keep their ambiguity error instead of falling through
+    // to a guide with the same text. Explicit datum objects bypass this compatibility path.
+    let names_source = |id: &str, levels: &[usize], room: bool| {
+        reference.as_str() == id
+            || reference
+                .strip_prefix(&format!("{id}.L"))
+                .or_else(|| if room { reference.strip_prefix(&format!("{id}.space.L")) } else { None })
+                .and_then(|level| level.parse::<usize>().ok())
+                .is_some_and(|level| levels.contains(&level))
+    };
+    let legacy_source = legacy.is_err()
+        && doc.buildings.iter().any(|building| {
+            building.interior_walls.iter().any(|wall| names_source(&wall.id, &wall.levels, false))
+                || building.stairs.iter().any(|stair| names_source(&stair.id, &stair.levels, false))
+                || building.rooms.iter().any(|room| names_source(&room.id, &room.levels, true))
+        });
+    if legacy.is_err() && !legacy_source {
+        if let Some(id) = reference.strip_prefix("annotation:") {
+            return plan_guide_datum(doc, id, face);
+        }
+        if let Some(selector) = reference.strip_prefix("facade:") {
+            let (id, level) = selector.rsplit_once(":L").ok_or_else(|| invalid("give facade:<id>:L<storey> as the material reference"))?;
+            let level = level.parse::<usize>().map_err(|_| invalid("the facade material reference needs a storey index"))?;
+            return facade_material_datum(doc, id, level, face);
+        }
+    }
+    let mut references = legacy?;
     if references.len() != 1 {
         return Err(invalid("wall alignment needs one reference wall"));
     }
@@ -880,14 +1023,39 @@ pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
     let length = checked("reference wall length", (wall.b[0] - wall.a[0]).hypot(wall.b[1] - wall.a[1]), 100.0, 200_000.0)?;
     let t = [(wall.b[0] - wall.a[0]) / length, (wall.b[1] - wall.a[1]) / length];
     let normal = [-t[1], t[0]];
-    let reference_offset = wall.a[0] * normal[0] + wall.a[1] * normal[1] + p.reference_face.sign() * wall.thickness / 2.0;
+    // Keep the old source-wall arithmetic: deriving offset from shifted endpoints
+    // instead would introduce roundoff into established wall-reference requests.
+    let offset = wall.a[0] * normal[0] + wall.a[1] * normal[1] + face.sign() * wall.thickness / 2.0;
+    let line = [wall.a, wall.b]
+        .map(|point| [point[0] + normal[0] * face.sign() * wall.thickness / 2.0, point[1] + normal[1] * face.sign() * wall.thickness / 2.0]);
+    let id = wall.id.clone();
+    Ok(WallAlignmentDatum { id, line, t, normal, offset, source: Some(reference), scope: None, kind: "interior_source" })
+}
+
+/// Align nearly parallel walls rigidly, retaining door distances from A and run lengths.
+/// A captured datum is a one-time edit, not a persistent/live geometric constraint.
+pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
+    let entries = selected(&s.doc, &p.targets)?;
+    if let Some(maximum) = p.max_move_mm {
+        checked("max_move_mm", maximum, 0.001, 100_000.0)?;
+    }
+    let reference = wall_alignment_datum(&s.doc, &p.reference, p.reference_face)?;
+    let (t, normal, reference_offset) = (reference.t, reference.normal, reference.offset);
     let mut changes = Vec::with_capacity(entries.len());
+    let mut feedback = Vec::with_capacity(entries.len());
+    let mut affected_levels = BTreeSet::new();
     for entry in &entries {
         let Item::Wall(wall) = &entry.item else { return Err(invalid("wall alignment targets must all be interior walls")) };
-        if entry.building == reference.building
-            && entry.original.id() == reference.original.id()
-            && wall.levels.iter().any(|level| reference.item.levels().contains(level))
+        if let Some((building, level)) = reference.scope
+            && (building.is_some_and(|building| building != entry.building) || wall.levels.iter().any(|value| *value != level))
         {
+            return Err(invalid("guide/material alignment targets must belong to the reference building/storey; select the exact storey occurrence"));
+        }
+        if reference.source.as_ref().is_some_and(|reference| {
+            entry.building == reference.building
+                && entry.original.id() == reference.original.id()
+                && wall.levels.iter().any(|level| reference.item.levels().contains(level))
+        }) {
             return Err(invalid("the reference wall cannot also be a target on the same storey"));
         }
         for value in wall.a.into_iter().chain(wall.b) {
@@ -909,6 +1077,22 @@ pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
             aligned.a[k] = checked("aligned wall endpoint", mid[k] - direction * t[k] * length / 2.0, -1e8, 1e8)?;
             aligned.b[k] = checked("aligned wall endpoint", mid[k] + direction * t[k] * length / 2.0, -1e8, 1e8)?;
         }
+        let max_move = (aligned.a[0] - wall.a[0]).hypot(aligned.a[1] - wall.a[1]).max((aligned.b[0] - wall.b[0]).hypot(aligned.b[1] - wall.b[1]));
+        if let Some(maximum) = p.max_move_mm
+            && max_move > maximum
+        {
+            return Err(invalid(format!("wall {} needs {max_move:.9} mm endpoint movement, exceeding max_move_mm {maximum}", wall.id)));
+        }
+        let a = [(wall.b[0] - wall.a[0]) / length, (wall.b[1] - wall.a[1]) / length];
+        let b = [direction * t[0], direction * t[1]];
+        let angle = (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1]).to_degrees();
+        let face_offset_before = p.target_face.sign() * wall.thickness / 2.0 * (a[0] * t[0] + a[1] * t[1]);
+        let face_offset_after = p.target_face.sign() * direction * wall.thickness / 2.0;
+        let residual = |point: [f64; 2], face_offset: f64| point[0] * normal[0] + point[1] * normal[1] + face_offset - reference_offset;
+        affected_levels.extend(wall.levels.iter().copied());
+        feedback.push(json!({"source_id":wall.id,"levels":wall.levels,"before":[wall.a,wall.b],"after":[aligned.a,aligned.b],
+            "rotation_deg":angle,"max_endpoint_move_mm":max_move,
+            "reference_normal_residual_mm":{"before":[residual(wall.a, face_offset_before),residual(wall.b, face_offset_before)],"after":[residual(aligned.a, face_offset_after),residual(aligned.b, face_offset_after)]}}));
         changes.push(Item::Wall(aligned));
     }
     let mut ids = Vec::with_capacity(entries.len());
@@ -918,7 +1102,17 @@ pub(crate) fn align_walls(s: &mut Session, p: AlignWalls) -> Result<Value> {
         remap_references(&mut s.doc, entry, &next, shared);
         ids.push(next);
     }
-    finish(s, ids)
+    for (change, id) in feedback.iter_mut().zip(&ids) {
+        change["target_id"] = json!(id);
+    }
+    let mut result = finish(s, ids)?;
+    let scope = reference.scope.map(
+        |(building, level)| json!({"building":building.and_then(|index| s.doc.buildings.get(index)).map(|building| &building.id),"level":level}),
+    );
+    result["alignment"] = json!({"reference":{"selector":p.reference,"id":reference.id,"kind":reference.kind,"face":p.reference_face,
+        "line_mm":reference.line,"scope":scope},"affected_levels":affected_levels,
+        "max_move_mm":p.max_move_mm,"changes":feedback,"constraint":"one_time_source_alignment"});
+    Ok(result)
 }
 
 pub(crate) fn align(s: &mut Session, p: Align) -> Result<Value> {

@@ -310,6 +310,23 @@ pub(crate) struct TextClearance {
     pub(crate) outward: [f64; 2],
 }
 
+/// Source-complete entrance tag input retained through crop/scale configuration.
+/// Current-document index selectors are transient; this is never native project data.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EntranceLabel {
+    pub(crate) source: TextSource,
+    /// Preferred drawing-plane insertion, orientation and outward direction.
+    pub(crate) at: [f64; 2],
+    pub(crate) deg: f64,
+    pub(crate) outward: [f64; 2],
+    pub(crate) text: String,
+    pub(crate) legend: String,
+    pub(crate) unit_records: usize,
+    pub(crate) unknown_door_units: usize,
+    /// Missing explicit source associations use a named legend, not an invented doorway.
+    pub(crate) placement_note: Option<&'static str>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Text {
     pub(crate) layer: Layer,
@@ -325,9 +342,11 @@ pub(crate) struct Text {
     pub(crate) colour: Rgb,
     pub(crate) halo: Halo,
     pub(crate) style: trigon_model::annotation::TextStyle,
-    /// Stable source/role for read-only diagnostics, not SVG attributes or document data.
+    /// Source/role for read-only diagnostics, not SVG attributes or document data.
+    /// Entrance selectors use current-document indices and are not durable IDs.
     pub(crate) source: Option<TextSource>,
     pub(crate) clearance: Option<TextClearance>,
+    pub(crate) entrance: Option<Box<EntranceLabel>>,
 }
 
 impl Text {
@@ -345,6 +364,7 @@ impl Text {
             style: Default::default(),
             source: None,
             clearance: None,
+            entrance: None,
         }
     }
 }

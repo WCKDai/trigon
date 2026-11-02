@@ -2897,3 +2897,396 @@ mod rounded_dimension_tests {
         assert_eq!(s.doc.annotations, exact);
     }
 }
+
+// Original local fixtures for captured precision datums. No external building or provider data.
+fn precision_reference_session() -> Session {
+    let mut s = Session::new(Box::new(Canned));
+    s.execute(
+        "building.add",
+        json!({"id":"b","name":"Public precision fixture","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],
+            "storeys":3,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    s.execute("view.define", json!({"id":"coord-L1","name":"Measured plan guides","kind":{"view":"plan","level":1}})).unwrap();
+    s.execute(
+        "annotation.define",
+        json!({"id":"axis","view":"coord-L1","kind":{"annotation":"line","from":[0,2000],"to":[12000,2000],
+            "stroke":{"colour":[184,65,44],"width_mm":0.13,"pattern":"dotted"}}}),
+    )
+    .unwrap();
+    s.execute(
+        "interior.add_walls",
+        json!({"building":"b","walls":[{"id":"target","levels":[1,2],"a":[1000,2050],"b":[5000,2250],"thickness":180,
+            "doors":[{"at":2000,"width":900,"height":2100}]}]}),
+    )
+    .unwrap();
+    s
+}
+
+fn precision_reference_glb(s: &Session) -> Vec<u8> {
+    trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[])
+}
+
+fn precision_reference_refuses_atomically(s: &mut Session, command: &str, params: Value, message: &str) {
+    let before = s.doc.clone();
+    let bytes = serde_json::to_vec(&s.doc).unwrap();
+    let glb = precision_reference_glb(s);
+    let history = (s.undo.len(), s.redo.len(), s.dirty);
+    let error = s.execute(command, params).unwrap_err();
+    assert!(!matches!(error, EngineError::Internal(_)), "{error}");
+    assert!(error.to_string().contains(message), "{command}: {error}");
+    assert_eq!(s.doc, before);
+    assert_eq!(serde_json::to_vec(&s.doc).unwrap(), bytes);
+    assert_eq!(precision_reference_glb(s), glb);
+    assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+}
+
+#[test]
+fn precision_reference_plan_guide_preview_apply_preserves_lengths_doors_other_storeys_and_exact_undo() {
+    let mut s = precision_reference_session();
+    let before = s.doc.clone();
+    let before_bytes = serde_json::to_vec(&s.doc).unwrap();
+    let before_glb = precision_reference_glb(&s);
+    let history = (s.undo.len(), s.redo.len(), s.dirty);
+    // No new optional parameter: this witnesses the new datum resolver itself on the old engine.
+    let action = json!({"command":"edit.align_walls","params":{"targets":["target.L1"],"reference":"annotation:axis"}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+    assert_eq!(precision_reference_glb(&s), before_glb);
+    assert!(!preview["changes"].as_array().unwrap().is_empty());
+    assert_eq!(preview["result"]["alignment"]["reference"]["kind"], "plan_annotation");
+    assert_eq!(preview["result"]["alignment"]["reference"]["id"], "axis");
+    assert_eq!(preview["result"]["alignment"]["reference"]["line_mm"], json!([[0.0, 2000.0], [12000.0, 2000.0]]));
+    assert_eq!(preview["result"]["alignment"]["affected_levels"], json!([1]));
+    let result = s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+    assert_eq!(result, preview["result"]);
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.doc.journal.last().unwrap().command, "edit.align_walls");
+    assert_eq!(s.doc.annotations, before.annotations);
+    let source = &before.buildings[0].interior_walls[0];
+    let original = s.doc.buildings[0].interior_walls.iter().find(|wall| wall.id == "target").unwrap();
+    assert_eq!(original.levels, [2]);
+    assert_eq!((original.a, original.b, original.thickness, &original.doors), (source.a, source.b, source.thickness, &source.doors));
+    let aligned = s.doc.buildings[0].interior_walls.iter().find(|wall| wall.levels == [1]).unwrap();
+    let length = 4000.0_f64.hypot(200.0);
+    assert!((aligned.a[0] - (3000.0 - length / 2.0)).abs() < 1e-9);
+    assert!((aligned.b[0] - (3000.0 + length / 2.0)).abs() < 1e-9);
+    assert_eq!((aligned.a[1], aligned.b[1]), (2000.0, 2000.0));
+    assert_eq!(aligned.doors, source.doors);
+    assert_eq!(aligned.thickness, source.thickness);
+    let feedback = &result["alignment"]["changes"][0];
+    assert_eq!(feedback["before"], json!([source.a, source.b]));
+    assert_eq!(feedback["after"], json!([aligned.a, aligned.b]));
+    assert_eq!(feedback["target_id"], result["targets"][0]);
+    assert!((feedback["rotation_deg"].as_f64().unwrap() + 200.0_f64.atan2(4000.0).to_degrees()).abs() < 1e-10);
+    assert!((feedback["max_endpoint_move_mm"].as_f64().unwrap() - 250.01248408766654).abs() < 1e-8);
+    for value in feedback["reference_normal_residual_mm"]["after"].as_array().unwrap() {
+        assert!(value.as_f64().unwrap().abs() < 1e-9);
+    }
+    let after = s.doc.clone();
+    let after_glb = precision_reference_glb(&s);
+    let reopened: trigon_model::Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+    assert_eq!(reopened, after);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(serde_json::to_vec(&s.doc).unwrap(), before_bytes);
+    assert_eq!(precision_reference_glb(&s), before_glb);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    assert_eq!(precision_reference_glb(&s), after_glb);
+}
+
+#[test]
+fn precision_reference_uses_skew_actual_facade_faces_instead_of_nominal_thickness_offsets() {
+    for face in ["left", "right", "center"] {
+        let mut s = Session::new(Box::new(Canned));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Public skew material fixture","footprint":[[0,0],[10000,0],[10000,6000],[5000,6000],[0,5990]],
+                "storeys":3,"storey_height_mm":3000}),
+        )
+        .unwrap();
+        // The almost-collinear corner and storey-specific thickness create a skew inner face.
+        s.execute("element.set", json!({"id":"b.f4","properties":{"thickness_mm.L1":800}})).unwrap();
+        s.execute(
+            "interior.add_walls",
+            json!({"building":"b","walls":[{"id":"target","levels":[1],"a":[6500,5300],"b":[8500,5300],"thickness":120}]}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let built = trigon_model::build(&s.doc).unwrap();
+        let wall = built[0].walls.iter().find(|wall| wall.id == "b.f3").unwrap();
+        let plan = wall.segment(1).unwrap().plan;
+        let other_storey = wall.segment(2).unwrap().plan;
+        assert!((plan[2][1] - plan[3][1]).abs() > 100.0, "fixture must contain an actual skew inner face");
+        assert_ne!(plan, other_storey, "datum must resolve the requested storey");
+        let line = match face {
+            "left" => [plan[3], plan[2]],
+            "right" => [plan[0], plan[1]],
+            _ => [
+                [(plan[0][0] + plan[3][0]) / 2.0, (plan[0][1] + plan[3][1]) / 2.0],
+                [(plan[1][0] + plan[2][0]) / 2.0, (plan[1][1] + plan[2][1]) / 2.0],
+            ],
+        };
+        let result = s
+            .execute("edit.align_walls", json!({"targets":["target.L1"],"reference":{"kind":"facade","id":"b.f3","level":1},"reference_face":face}))
+            .unwrap();
+        assert_eq!(result["alignment"]["reference"]["line_mm"], json!(line));
+        assert_eq!(result["alignment"]["reference"]["kind"], "facade_material");
+        assert_eq!(result["alignment"]["reference"]["id"], "b.f3");
+        assert_eq!(result["alignment"]["reference"]["scope"], json!({"building":"b","level":1}));
+        assert_eq!(s.doc.buildings[0].facades, before.buildings[0].facades);
+        let aligned = &s.doc.buildings[0].interior_walls[0];
+        let tangent = [line[1][0] - line[0][0], line[1][1] - line[0][1]];
+        for point in [aligned.a, aligned.b] {
+            let normal_distance = ((point[0] - line[0][0]) * -tangent[1] + (point[1] - line[0][1]) * tangent[0]) / tangent[0].hypot(tangent[1]);
+            assert!(normal_distance.abs() < 1e-8, "{face}: {normal_distance}");
+        }
+        assert!(((aligned.b[0] - aligned.a[0]).hypot(aligned.b[1] - aligned.a[1]) - 2000.0).abs() < 1e-8);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn precision_reference_refuses_other_drawing_planes_non_line_guides_and_wrong_storeys_atomically() {
+    let mut s = precision_reference_session();
+    s.execute("view.define", json!({"id":"facade","name":"Facade","kind":{"view":"facade","facade":"b.f1"}})).unwrap();
+    s.execute("view.define", json!({"id":"section","name":"Section","kind":{"view":"section","from":[0,1000],"to":[12000,1000]}})).unwrap();
+    for view in ["facade", "section"] {
+        s.execute(
+            "annotation.define",
+            json!({"id":format!("axis-{view}"),"view":view,
+            "kind":{"annotation":"line","from":[0,2000],"to":[12000,2000]}}),
+        )
+        .unwrap();
+    }
+    s.execute("annotation.define", json!({"id":"label","view":"coord-L1","kind":{"annotation":"text","at":[0,2000],"text":"Not a datum"}})).unwrap();
+    for (params, message) in [
+        (json!({"targets":["target.L1"],"reference":"annotation:axis-facade"}), "saved plan view"),
+        (json!({"targets":["target.L1"],"reference":{"kind":"annotation","id":"axis-section"}}), "saved plan view"),
+        (json!({"targets":["target.L1"],"reference":{"kind":"annotation","id":"label"}}), "Line annotation"),
+        (json!({"targets":["target.L1"],"reference":"annotation:axis","reference_face":"left"}), "reference_face center"),
+        (json!({"targets":["wall:target"],"reference":"annotation:axis"}), "storey"),
+        (json!({"targets":["target.L1"],"reference":{"kind":"facade","id":"b.f1","level":99}}), "represented facade material"),
+        (json!({"targets":["target.L1"],"reference":"facade:b.f1:Lnot-a-level"}), "storey index"),
+    ] {
+        precision_reference_refuses_atomically(&mut s, "edit.align_walls", params, message);
+    }
+    s.execute(
+        "building.add",
+        json!({"id":"b2","name":"Another building","footprint":[[20000,0],[32000,0],[32000,8000],[20000,8000]],
+        "storeys":3,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    s.execute("interior.add_walls", json!({"building":"b2","walls":[{"id":"other","levels":[1],"a":[22000,2000],"b":[26000,2000],"thickness":180}]}))
+        .unwrap();
+    precision_reference_refuses_atomically(
+        &mut s,
+        "edit.align_walls",
+        json!({"targets":["other.L1"],"reference":{"kind":"facade","id":"b.f1","level":1}}),
+        "building/storey",
+    );
+}
+
+#[test]
+fn precision_reference_explicit_datums_do_not_alias_legacy_colon_wall_ids() {
+    let mut s = precision_reference_session();
+    s.execute(
+        "interior.add_walls",
+        json!({"building":"b","walls":[
+            {"id":"annotation:axis","levels":[1],"a":[1000,1000],"b":[5000,1000],"thickness":180},
+            {"id":"annotation:missing","levels":[1],"a":[1000,1200],"b":[5000,1200],"thickness":180},
+            {"id":"facade:b.f1:L1","levels":[1],"a":[1000,1400],"b":[5000,1400],"thickness":180}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    for (reference, y) in [("annotation:axis", 1000.0), ("wall:annotation:axis", 1000.0), ("facade:b.f1:L1", 1400.0)] {
+        let result = s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":reference})).unwrap();
+        assert_eq!(result["alignment"]["reference"]["kind"], "interior_source");
+        assert_eq!(result["alignment"]["changes"][0]["after"][0][1], y);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+    let result = s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":{"kind":"annotation","id":"axis"}})).unwrap();
+    assert_eq!(result["alignment"]["reference"]["kind"], "plan_annotation");
+    assert_eq!(result["alignment"]["changes"][0]["after"][0][1], 2000.0);
+    s.execute("edit.undo", json!({})).unwrap();
+    precision_reference_refuses_atomically(
+        &mut s,
+        "edit.align_walls",
+        json!({"targets":["target.L1"],"reference":{"kind":"annotation","id":"missing"}}),
+        "does not exist",
+    );
+    let result = s
+        .execute("edit.align_walls", json!({"targets":["target.L1"],"reference":{"kind":"facade","id":"b.f1","level":1},"reference_face":"left"}))
+        .unwrap();
+    assert_eq!(result["alignment"]["reference"]["kind"], "facade_material");
+    assert!((result["alignment"]["changes"][0]["after"][0][1].as_f64().unwrap() - 400.0).abs() < 1e-9);
+}
+
+#[test]
+fn precision_reference_movement_bound_checks_the_whole_batch_and_preserves_retained_redo() {
+    let mut s = precision_reference_session();
+    s.execute(
+        "interior.add_walls",
+        json!({"building":"b","walls":[
+            {"id":"reference","levels":[1],"a":[0,1000],"b":[12000,1000],"thickness":180},
+            {"id":"near","levels":[1],"a":[1000,1010],"b":[3000,1010],"thickness":180}
+        ]}),
+    )
+    .unwrap();
+    let before = s.doc.clone();
+    s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":"reference.L1","max_move_mm":2000})).unwrap();
+    let after = s.doc.clone();
+    let after_glb = precision_reference_glb(&s);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert!(!s.redo.is_empty());
+    let limited = json!({"targets":["near.L1","target.L1"],"reference":"reference.L1","max_move_mm":500});
+    precision_reference_refuses_atomically(&mut s, "edit.align_walls", limited.clone(), "endpoint movement");
+    precision_reference_refuses_atomically(
+        &mut s,
+        "precision.preview",
+        json!({"action":{"command":"edit.align_walls","params":limited}}),
+        "endpoint movement",
+    );
+    for maximum in [0.0, -1.0, 1e300] {
+        precision_reference_refuses_atomically(
+            &mut s,
+            "edit.align_walls",
+            json!({"targets":["target.L1"],"reference":"reference.L1","max_move_mm":maximum}),
+            "max_move_mm",
+        );
+    }
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    assert_eq!(precision_reference_glb(&s), after_glb);
+}
+
+#[test]
+fn precision_reference_guide_changes_invalidate_a_captured_preview_atomically() {
+    let mut s = precision_reference_session();
+    let action =
+        json!({"command":"edit.align_walls","params":{"targets":["target.L1"],"reference":{"kind":"annotation","id":"axis"},"max_move_mm":500}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("annotation.define", json!({"id":"axis","view":"coord-L1","kind":{"annotation":"line","from":[0,2100],"to":[12000,2100]}})).unwrap();
+    precision_reference_refuses_atomically(
+        &mut s,
+        "precision.apply",
+        json!({"action":preview["action"],"preview_token":preview["preview_token"]}),
+        "stale",
+    );
+}
+
+#[test]
+fn precision_reference_outline_preserves_fractional_negative_points_and_legacy_rounded_coordinates() {
+    let mut s = Session::new(Box::new(Canned));
+    let footprint: [[f64; 2]; 4] = [[0.125, -0.375], [12000.75, -0.375], [12000.75, 8000.625], [0.125, 8000.625]];
+    s.execute("building.add", json!({"id":"b","name":"Public fractional outline","footprint":footprint,"storeys":2,"storey_height_mm":3000}))
+        .unwrap();
+    let before = s.doc.clone();
+    let history = (s.undo.len(), s.redo.len(), s.dirty);
+    let result = s.execute("building.outline", json!({"building":"b"})).unwrap();
+    assert_eq!(result.as_array().unwrap().len(), footprint.len());
+    for (corner, point) in result.as_array().unwrap().iter().zip(footprint) {
+        assert_eq!(corner["point_mm"], json!(point));
+        assert_eq!(corner["x"], json!(point[0].round()));
+        assert_eq!(corner["y"], json!(point[1].round()));
+    }
+    assert_eq!(s.doc.buildings[0].footprint, footprint);
+    assert_eq!(s.doc, before);
+    assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+}
+
+#[test]
+fn precision_reference_copy_to_levels_previews_and_journals_the_existing_command_once_with_exact_undo() {
+    let mut s = precision_reference_session();
+    let before = s.doc.clone();
+    let before_glb = precision_reference_glb(&s);
+    let history = (s.undo.len(), s.redo.len(), s.dirty);
+    let action = json!({"command":"edit.copy_to_levels","params":{"targets":["target.L1"],"levels":[0,0]}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+    assert_eq!(precision_reference_glb(&s), before_glb);
+    assert_eq!(preview["result"]["targets"].as_array().unwrap().len(), 1);
+    let result = s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+    assert_eq!(result, preview["result"]);
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.doc.journal.last().unwrap().command, "edit.copy_to_levels");
+    assert_eq!(s.undo.len(), history.0 + 1);
+    let source = s.doc.buildings[0].interior_walls.iter().find(|wall| wall.id == "target").unwrap();
+    assert_eq!(source, &before.buildings[0].interior_walls[0]);
+    let copied = s.doc.buildings[0].interior_walls.iter().find(|wall| wall.levels == [0]).unwrap();
+    assert_ne!(copied.id, source.id);
+    assert_eq!((copied.a, copied.b, copied.thickness, &copied.doors), (source.a, source.b, source.thickness, &source.doors));
+    let after = s.doc.clone();
+    let after_glb = precision_reference_glb(&s);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    assert_eq!(precision_reference_glb(&s), before_glb);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    assert_eq!(precision_reference_glb(&s), after_glb);
+}
+
+#[test]
+fn precision_reference_copy_to_levels_refuses_invalid_destinations_and_stale_previews_without_losing_redo() {
+    let mut s = precision_reference_session();
+    let action = json!({"command":"edit.copy_to_levels","params":{"targets":["target.L1"],"levels":[0]}});
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+    let after = s.doc.clone();
+    let after_glb = precision_reference_glb(&s);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!s.redo.is_empty());
+    // A valid destination precedes the invalid destination, exercising candidate partial work.
+    let invalid = json!({"command":"edit.copy_to_levels","params":{"targets":["target.L1"],"levels":[0,999]}});
+    precision_reference_refuses_atomically(&mut s, "precision.preview", json!({"action":invalid}), "storey 999");
+    precision_reference_refuses_atomically(&mut s, "precision.apply", json!({"action":action,"preview_token":"precision/1-invalid"}), "stale");
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+    assert_eq!(precision_reference_glb(&s), after_glb);
+    s.execute("edit.undo", json!({})).unwrap();
+    let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+    s.execute("annotation.define", json!({"id":"axis","view":"coord-L1","kind":{"annotation":"line","from":[0,2100],"to":[12000,2100]}})).unwrap();
+    precision_reference_refuses_atomically(
+        &mut s,
+        "precision.apply",
+        json!({"action":preview["action"],"preview_token":preview["preview_token"]}),
+        "stale",
+    );
+}
+
+#[test]
+fn precision_reference_ambiguous_legacy_source_ids_stay_errors_while_explicit_guide_objects_stay_unambiguous() {
+    let mut s = precision_reference_session();
+    s.execute("annotation.define", json!({"id":"ambiguous","view":"coord-L1","kind":{"annotation":"line","from":[0,2000],"to":[12000,2000]}}))
+        .unwrap();
+    s.execute(
+        "interior.add_walls",
+        json!({"building":"b","walls":[
+            {"id":"annotation:ambiguous","levels":[1],"a":[1000,1000],"b":[5000,1000],"thickness":180},
+            {"id":"annotation:ambiguous","levels":[1],"a":[1000,1500],"b":[5000,1500],"thickness":180}
+        ]}),
+    )
+    .unwrap();
+    precision_reference_refuses_atomically(
+        &mut s,
+        "edit.align_walls",
+        json!({"targets":["target.L1"],"reference":"annotation:ambiguous"}),
+        "2 matches",
+    );
+    precision_reference_refuses_atomically(
+        &mut s,
+        "edit.align_walls",
+        json!({"targets":["target.L1"],"reference":"annotation:ambiguous.L1"}),
+        "2 matches",
+    );
+    let result = s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":{"kind":"annotation","id":"ambiguous"}})).unwrap();
+    assert_eq!(result["alignment"]["reference"]["kind"], "plan_annotation");
+    assert_eq!(result["alignment"]["reference"]["id"], "ambiguous");
+}

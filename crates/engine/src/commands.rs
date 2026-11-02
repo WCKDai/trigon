@@ -83,6 +83,38 @@ pub(crate) fn add_interior_rooms(s: &mut Session, p: AddRooms) -> Result<Value> 
 
 static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: "entrance.list",
+        summary: "Inspect stored unphased entrance records offline, optionally within one building. Index locators belong to the current document and can change after provider replacement.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::entrances::List>,
+        run: |s, v| crate::entrances::list(s, parse("entrance.list", v)?),
+    },
+    CommandSpec {
+        id: "entrance.get",
+        summary: "Inspect one local entrance's exact address, unit records, unknown sides and source-stair bindings. No provider call or nearest-stair inference; metadata is unphased.",
+        mutates: false,
+        journaled: false,
+        schema: schema::<crate::entrances::Id>,
+        run: |s, v| crate::entrances::get(s, parse("entrance.get", v)?),
+    },
+    CommandSpec {
+        id: "entrance.set_unit",
+        summary: "Atomically replace one unphased unit record using its exact expected address and previous unit. Preserves unknown designations without inferring TH/TV, geometry or unrelated source records; undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::entrances::SetUnit>,
+        run: |s, v| crate::entrances::set_unit(s, parse("entrance.set_unit", v)?),
+    },
+    CommandSpec {
+        id: "entrance.bind_stair",
+        summary: "Bind a local entrance to an existing source stair using exact address and stored-slot guards. Omitted level edits the ground-serving default; a level edits its departing-flight override. Clearing an override resumes the default. No nearest-stair inference; undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::entrances::BindStair>,
+        run: |s, v| crate::entrances::bind_stair(s, parse("entrance.bind_stair", v)?),
+    },
+    CommandSpec {
         id: "site.add",
         summary: "Add a typed ground area, tree, bench or planter in site-local mm. Explicit design intent; validated, journaled and undoable.",
         mutates: true,
@@ -159,7 +191,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "precision.preview",
-        summary: "Preview a typed local model or drawing action, including interior.add_walls and interior.add_rooms, on a separate document. Returns exact source changes, validation and a same-build conflict token. Optional sanity scopes precision.audit to the candidate. Drawing changes include bounded glyph, crop and overlap feedback; unavailable checks are explicit. Read-only: no journal, files, credentials or network.",
+        summary: "Preview a typed local model or drawing action, including interior.add_walls, interior.add_rooms and edit.copy_to_levels, on a separate document. Returns exact source changes, validation and a same-build conflict token. Optional sanity scopes precision.audit to the candidate. Drawing changes include bounded glyph, crop and overlap feedback; unavailable checks are explicit. Read-only: no journal, files, credentials or network.",
         mutates: false,
         journaled: false,
         schema: schema::<crate::precision::Preview>,
@@ -419,7 +451,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "edit.align_walls",
-        summary: "Make nearly parallel interior walls exactly collinear, or align their left/right faces to a picked reference wall. Preserves length, door distances and unselected storeys. Atomic and undoable.",
+        summary: "Align nearly parallel interior walls to an interior selector string, {kind:annotation,id} saved Plan Line, or {kind:facade,id,level} actual material face. Explicit datum objects never resolve to an interior wall. Convenience strings annotation:<id> and facade:<id>:L<level> preserve existing interior-selector precedence. Left/right follow source direction (facades: inner/outer). Guide/material references require exact target storey scope. Optional max_move_mm bounds endpoint motion including rotation. Preserves length, along-wall door distances and unselected storeys; returns exact datum/endpoint/angle feedback. One-time, atomic, undoable alignment, not a live constraint.",
         mutates: true,
         journaled: true,
         schema: schema::<crate::edit::AlignWalls>,
@@ -1568,7 +1600,7 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "building.outline",
         summary: "The building's outline corners in site mm (x east, y north of the site origin) with the facades meeting at each, \
-                  for tying drawings to the site.",
+                  for tying drawings to the site. point_mm retains exact source coordinates; legacy x/y remain rounded to whole mm.",
         mutates: false,
         journaled: false,
         schema: schema::<BuildingParam>,
@@ -1584,6 +1616,7 @@ static COMMANDS: &[CommandSpec] = &[
                         "corner": i,
                         "x": c[0].round(),
                         "y": c[1].round(),
+                        "point_mm": c,
                         "ends": b.facades.iter().find(|f| (f.edge + 1) % n == i).map(|f| f.id.clone()),
                         "starts": b.facades.iter().find(|f| f.edge == i).map(|f| f.id.clone()),
                     }))

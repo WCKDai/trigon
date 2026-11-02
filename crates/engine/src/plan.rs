@@ -97,6 +97,7 @@ enum Prim {
         size: f64,
         angle: Option<f64>,
         away: Option<[f64; 2]>,
+        entrance: Option<crate::sheet::EntranceLabel>,
     },
 }
 
@@ -472,6 +473,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                         size: 280.0,
                         angle: presentation.then(|| fr.t[1].atan2(fr.t[0])),
                         away: Some([(out[0] - label_at[0]) / 1000.0, (out[1] - label_at[1]) / 1000.0]),
+                        entrance: None,
                     });
                 }
                 if let Some(owner) = owner {
@@ -586,19 +588,32 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
         }
         // Entrances: house number on the staircase's floor landing, the apartments' doors either side
         // ("TV" to the left and "TH" to the right as you arrive up the stairs).
-        for e in &b.entrances {
+        for (entrance_index, e) in b.entrances.iter().enumerate() {
+            let units: Vec<_> = e.units.iter().filter(|u| entrance_unit_level(u, b.ground_level) == Some(level)).collect();
             // Prefer the departing flight; on its receiving floor use the preceding departure.
             let Some(st) = [Some(level), level.checked_sub(1)].into_iter().flatten().find_map(|departure| {
                 let id = e.stair_at(departure)?;
                 visible.iter().copied().find(|s| s.id == id && s.levels.contains(&departure))
             }) else {
+                if presentation && !units.is_empty() {
+                    let mut tag = entrance_label(&b.id, entrance_index, e, &units, true, "  ");
+                    tag.placement_note = Some("missing_explicit_stair_association");
+                    prims.push(Prim::Text {
+                        at: e.point,
+                        text: tag.text.clone(),
+                        color: LINE,
+                        size: 380.0,
+                        angle: None,
+                        away: None,
+                        entrance: Some(tag),
+                    });
+                }
                 continue;
             };
             let Ok(f) = trigon_model::stair::frame(st) else { continue };
             let landing = f.at(-700.0, f.width / 2.0);
             // Arriving on the floor you walk back along the second flight: facing −run.
             let left = [f.run[1], -f.run[0]];
-            let units: Vec<&trigon_model::Unit> = e.units.iter().filter(|u| u.level(b.ground_level) == Some(level)).collect();
             if presentation {
                 // On the stair's axis, just outside the facade it meets on the entrance's side, and
                 // aligned with the wing (across the flights) so stepped facades don't tilt it.
@@ -608,24 +623,29 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                     .filter_map(|dir| {
                         let t = facade_crossing(&b.footprint, core, dir)?;
                         let hit = [core[0] + dir[0] * t, core[1] + dir[1] * t];
-                        Some(((hit[0] - e.point[0]).hypot(hit[1] - e.point[1]), [hit[0] + dir[0] * 1100.0, hit[1] + dir[1] * 1100.0]))
+                        Some(((hit[0] - e.point[0]).hypot(hit[1] - e.point[1]), [hit[0] + dir[0] * 1100.0, hit[1] + dir[1] * 1100.0], dir))
                     })
                     .min_by(|a, b| a.0.total_cmp(&b.0));
-                if let Some((_, at)) = label {
-                    let tv = if units.iter().any(|u| u.door == "tv") { "TV  " } else { "" };
-                    let th = if units.iter().any(|u| u.door == "th") { "  TH" } else { "" };
-                    prims.push(Prim::Text {
-                        at,
-                        text: format!("{tv}{}{th}", e.number),
-                        color: LINE,
-                        size: 380.0,
-                        angle: Some(f.across[1].atan2(f.across[0])),
-                        away: None,
-                    });
-                }
+                let mut tag = entrance_label(&b.id, entrance_index, e, &units, true, "  ");
+                let (at, outward) = match label {
+                    Some((_, at, dir)) => (at, Some(dir)),
+                    None => {
+                        tag.placement_note = Some("no_facade_crossing_for_stair_axis");
+                        (e.point, None)
+                    }
+                };
+                prims.push(Prim::Text {
+                    at,
+                    text: tag.text.clone(),
+                    color: LINE,
+                    size: 380.0,
+                    angle: Some(f.across[1].atan2(f.across[0])),
+                    away: outward,
+                    entrance: Some(tag),
+                });
                 continue;
             }
-            prims.push(Prim::Text { at: landing, text: e.number.clone(), color: LINE, size: 380.0, angle: None, away: None });
+            prims.push(Prim::Text { at: landing, text: e.number.clone(), color: LINE, size: 380.0, angle: None, away: None, entrance: None });
             let mut others = Vec::new();
             let mut unnamed = 0;
             for u in &units {
@@ -637,7 +657,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
                 match side {
                     Some(k) => {
                         let at = [landing[0] + left[0] * 1700.0 * k, landing[1] + left[1] * 1700.0 * k];
-                        prims.push(Prim::Text { at, text: u.door.to_uppercase(), color: LINE, size: 320.0, angle: None, away: None });
+                        prims.push(Prim::Text { at, text: u.door.to_uppercase(), color: LINE, size: 320.0, angle: None, away: None, entrance: None });
                     }
                     None if u.door.is_empty() => unnamed += 1,
                     None => others.push(u.door.to_uppercase()),
@@ -648,7 +668,7 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             }
             if !others.is_empty() {
                 let at = [landing[0] - f.run[0] * 450.0, landing[1] - f.run[1] * 450.0];
-                prims.push(Prim::Text { at, text: others.join(" "), color: LINE, size: 240.0, angle: None, away: None });
+                prims.push(Prim::Text { at, text: others.join(" "), color: LINE, size: 240.0, angle: None, away: None, entrance: None });
             }
         }
         for (index, r) in b.rooms.iter().enumerate() {
@@ -667,11 +687,26 @@ fn scene(doc: &Document, level: usize, view: View, presentation: bool) -> Result
             let Some((c, _)) = room_label_anchor(&r.polygon) else { continue };
             let area = trigon_model::doc::polygon_area(&r.polygon) / 1e6;
             if r.name.is_empty() {
-                prims.push(Prim::Text { at: c, text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None });
+                prims.push(Prim::Text { at: c, text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None, entrance: None });
             } else {
-                prims.push(Prim::Text { at: [c[0], c[1] + 220.0], text: r.name.clone(), color: LINE, size: 240.0, angle: None, away: None });
-                prims
-                    .push(Prim::Text { at: [c[0], c[1] - 150.0], text: format!("{area:.1} m²"), color: ROOM, size: 200.0, angle: None, away: None });
+                prims.push(Prim::Text {
+                    at: [c[0], c[1] + 220.0],
+                    text: r.name.clone(),
+                    color: LINE,
+                    size: 240.0,
+                    angle: None,
+                    away: None,
+                    entrance: None,
+                });
+                prims.push(Prim::Text {
+                    at: [c[0], c[1] - 150.0],
+                    text: format!("{area:.1} m²"),
+                    color: ROOM,
+                    size: 200.0,
+                    angle: None,
+                    away: None,
+                    entrance: None,
+                });
             }
         }
     }
@@ -795,6 +830,356 @@ fn region_corners(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     }
 }
 
+/// Current-document unit floors, with bounded arithmetic for hostile imported strings.
+fn entrance_unit_level(unit: &trigon_model::Unit, ground: usize) -> Option<usize> {
+    unit.level(ground)
+}
+
+/// One display formatter for plans and elevations. Absence is never filled from convention.
+pub(crate) fn entrance_label(
+    building: &str,
+    index: usize,
+    entrance: &trigon_model::Entrance,
+    units: &[&trigon_model::Unit],
+    front: bool,
+    separator: &str,
+) -> crate::sheet::EntranceLabel {
+    let mut known = Vec::new();
+    let mut unknown = 0;
+    for unit in units {
+        let door = unit.door.trim().to_uppercase();
+        if trigon_model::Unit::is_unknown_door(&unit.door) {
+            unknown += 1;
+        } else if !known.contains(&door) {
+            known.push(door);
+        }
+    }
+    let (left, right) = if front { ("TV", "TH") } else { ("TH", "TV") };
+    let mut text = if entrance.number.is_empty() { "Opgang (nummer ukendt)".into() } else { entrance.number.clone() };
+    if known.iter().any(|door| door == left) {
+        text = format!("{left}{separator}{text}");
+    }
+    if known.iter().any(|door| door == right) {
+        text.push_str(&format!("{separator}{right}"));
+    }
+    let others: Vec<_> = known.iter().filter(|door| !matches!(door.as_str(), "TV" | "TH")).cloned().collect();
+    if !others.is_empty() {
+        text.push_str(&format!(" · {}", others.join(" / ")));
+    }
+    let mut details = known;
+    if unknown > 0 {
+        details.push(format!("{unknown} ukendt dørbetegnelse"));
+    }
+    if details.is_empty() {
+        details.push("ingen dørbetegnelser registreret".into());
+    }
+    crate::sheet::EntranceLabel {
+        source: crate::sheet::TextSource { kind: "entrance", id: format!("{building}.entrance{index}"), role: "unit_register" },
+        at: entrance.point,
+        deg: 0.0,
+        outward: [0.0, 0.0],
+        text,
+        legend: format!("Opgang {} — {}", entrance.number, details.join(" / ")),
+        unit_records: units.len(),
+        unknown_door_units: unknown,
+        placement_note: None,
+    }
+}
+
+/// Repeat entrance placement after a saved template establishes the physical scale and crop.
+/// Original inputs survive this pass, so default-scale layout is not compounded on each reflow.
+pub(crate) fn layout_entrance_labels(sheet: &mut crate::sheet::Sheet, crop: Option<[f64; 4]>) -> Result<()> {
+    let old_note = sheet.metrics.get("entrance_labels").and_then(|coverage| coverage["note"].as_str()).map(String::from);
+    let coverage = layout_entrance_scene(&mut sheet.scene, &sheet.vp, sheet.clip, crop)?;
+    if let Some(old) = old_note {
+        sheet.note = sheet.note.take().and_then(|note| {
+            let parts: Vec<_> = note.split(" · ").filter(|part| *part != old).collect();
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        });
+    }
+    if let Some(note) = coverage["note"].as_str() {
+        sheet.note = Some(match sheet.note.take() {
+            Some(old) => format!("{old} · {note}"),
+            None => note.into(),
+        });
+    }
+    sheet.metrics["entrance_labels"] = coverage;
+    Ok(())
+}
+
+/// Filled wall rings in sheet pixels, with cheap bounds before exact material tests.
+struct EntranceWall {
+    bounds: [f64; 4],
+    rings: Vec<Vec<[f64; 2]>>,
+}
+
+fn entrance_bounds(points: &[[f64; 2]]) -> [f64; 4] {
+    points.iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |b, p| {
+        [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]
+    })
+}
+
+fn entrance_boxes_overlap(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
+    for poly in [a, b] {
+        for index in 0..poly.len() {
+            let (p, q) = (poly[index], poly[(index + 1) % poly.len()]);
+            let axis = [q[1] - p[1], p[0] - q[0]];
+            let span = |poly: &[[f64; 2]]| {
+                poly.iter()
+                    .map(|p| p[0] * axis[0] + p[1] * axis[1])
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| (lo.min(value), hi.max(value)))
+            };
+            let ((a0, a1), (b0, b1)) = (span(a), span(b));
+            if a1 <= b0 || b1 <= a0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn entrance_corners(text: &Text, mut bounds: [f64; 4], vp: &Viewport, padding: f64) -> [[f64; 2]; 4] {
+    if text.halo == Halo::Box {
+        // Match the exported white box, while retaining any glyph ink extending beyond it.
+        let width = 0.56 * text.size * text.text.chars().count() as f64 + 6.0 * MM_PER_PX;
+        let left = match text.anchor {
+            crate::sheet::Anchor::Start => -3.0 * MM_PER_PX,
+            crate::sheet::Anchor::Middle => -width / 2.0,
+            crate::sheet::Anchor::End => -width + 3.0 * MM_PER_PX,
+        };
+        let bottom = if text.middle { -0.62 * text.size } else { -0.34 * text.size };
+        bounds = [bounds[0].min(left), bounds[1].min(bottom), bounds[2].max(left + width), bounds[3].max(bottom + 1.24 * text.size)];
+    }
+    let pad = padding + if text.halo == Halo::Outline { 2.0 * MM_PER_PX } else { 0.0 };
+    let b = [bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad];
+    let at = vp.px(text.at);
+    let (sin, cos) = text.deg.to_radians().sin_cos();
+    [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
+        .map(|[x, y]| [at[0] + (x * cos - y * sin) / MM_PER_PX, at[1] - (x * sin + y * cos) / MM_PER_PX])
+}
+
+fn entrance_hits_wall(corners: &[[f64; 2]; 4], wall: &EntranceWall, budget: &mut usize) -> bool {
+    let b = entrance_bounds(corners);
+    if b[2] <= wall.bounds[0] || b[0] >= wall.bounds[2] || b[3] <= wall.bounds[1] || b[1] >= wall.bounds[3] {
+        return false;
+    }
+    let cost = wall.rings.iter().map(Vec::len).fold(0usize, usize::saturating_add).saturating_mul(5);
+    if *budget < cost {
+        *budget = 0;
+        return true;
+    }
+    *budget -= cost;
+    if corners.iter().any(|p| wall.rings.iter().filter(|ring| crate::drawings::inside(ring, *p)).count() % 2 == 1) {
+        return true;
+    }
+    let cross = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    for ring in &wall.rings {
+        if ring.iter().any(|p| crate::drawings::inside(corners, *p)) {
+            return true;
+        }
+        for index in 0..ring.len() {
+            if *budget < 4 {
+                *budget = 0;
+                return true;
+            }
+            *budget -= 4;
+            let (a, b) = (ring[index], ring[(index + 1) % ring.len()]);
+            for edge in 0..4 {
+                let (p, q) = (corners[edge], corners[(edge + 1) % 4]);
+                let ab = entrance_bounds(&[a, b]);
+                let pq = entrance_bounds(&[p, q]);
+                if ab[2] < pq[0] || ab[0] > pq[2] || ab[3] < pq[1] || ab[1] > pq[3] {
+                    continue;
+                }
+                if cross(a, b, p) * cross(a, b, q) <= 0.0 && cross(p, q, a) * cross(p, q, b) <= 0.0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn entrance_fits(corners: &[[f64; 2]; 4], clip: [f64; 4], occupied: &[[[f64; 2]; 4]], walls: &[EntranceWall], budget: &mut usize) -> bool {
+    let cost = occupied.len().saturating_mul(8).saturating_add(1);
+    if *budget < cost {
+        *budget = 0;
+        return false;
+    }
+    *budget -= cost;
+    corners.iter().all(|p| p[0] >= clip[0] && p[0] <= clip[2] && p[1] >= clip[1] && p[1] <= clip[3])
+        && !occupied.iter().any(|other| entrance_boxes_overlap(corners, other))
+        && !walls.iter().any(|wall| entrance_hits_wall(corners, wall, budget))
+}
+
+fn layout_entrance_scene(scene: &mut Scene, vp: &Viewport, area: [f64; 4], crop: Option<[f64; 4]>) -> Result<Value> {
+    use crate::sheet::Item;
+    let mut texts: Vec<_> = scene
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match item {
+            Item::Text(text) => Some((index, text.clone())),
+            _ => None,
+        })
+        .collect();
+    let entrances: Vec<_> = texts.iter().enumerate().filter_map(|(index, (_, text))| text.entrance.as_ref().map(|_| index)).collect();
+    if entrances.is_empty() {
+        return Ok(json!({"requested":0,"placed":0,"alternate":0,"legend":0,"unplaced":0,"records":[],"note":null}));
+    }
+    if texts.len() > 2000 {
+        return Err(ModelError::Invalid("entrance lettering exceeds 2000 labels; use a smaller drawing scope".into()).into());
+    }
+    for (_, text) in &mut texts {
+        if let Some(input) = &text.entrance {
+            text.at = input.at;
+            text.deg = input.deg;
+            text.text.clone_from(&input.text);
+        }
+    }
+    let mut measured: Vec<_> = texts.iter().map(|(_, text)| text.clone()).collect();
+    for index in &entrances {
+        let mut text = texts[*index].1.clone();
+        if let Some(input) = &text.entrance {
+            text.text.clone_from(&input.legend);
+        }
+        text.deg = 0.0;
+        measured.push(text);
+    }
+    let ink = crate::plan_output::text_ink_bounds(&measured)?;
+    let mut clip = [area[0], area[1], area[0] + area[2], area[1] + area[3]];
+    if let Some(crop) = crop {
+        let lo = vp.px([crop[0], crop[3]]);
+        let hi = vp.px([crop[2], crop[1]]);
+        clip = [clip[0].max(lo[0]), clip[1].max(lo[1]), clip[2].min(hi[0]), clip[3].min(hi[1])];
+    }
+    let mut occupied: Vec<_> = texts
+        .iter()
+        .zip(&ink)
+        .filter_map(|((_, text), bounds)| {
+            if text.entrance.is_some() {
+                return None;
+            }
+            bounds.map(|bounds| entrance_corners(text, bounds, vp, 0.0))
+        })
+        .collect();
+    let walls: Vec<_> = scene
+        .items
+        .iter()
+        .filter_map(|item| {
+            let Item::Path(path) = item else { return None };
+            if path.layer != Layer::WallCut || path.fill.is_none() || !path.closed {
+                return None;
+            }
+            let rings: Vec<Vec<_>> = path.rings.iter().map(|ring| ring.iter().map(|p| vp.px(*p)).collect()).collect();
+            let points: Vec<_> = rings.iter().flatten().copied().collect();
+            Some(EntranceWall { bounds: entrance_bounds(&points), rings })
+        })
+        .collect();
+    let geometry = scene.bounds().map(|bounds| {
+        let a = vp.px([bounds[0], bounds[3]]);
+        let b = vp.px([bounds[2], bounds[1]]);
+        [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]]
+    });
+    let mut records = Vec::new();
+    let mut placed = 0;
+    let mut alternate = 0;
+    let mut legends = 0;
+    // Bound all alternate/legend material comparisons; exhaustion is explicit coverage feedback.
+    let mut budget = 2_000_000usize;
+    for (rank, index) in entrances.iter().copied().enumerate() {
+        let (scene_index, mut text) = texts[index].clone();
+        let Some(input) = text.entrance.clone() else { continue };
+        let mut state = "unplaced";
+        let mut reason = "complete_glyph_halo_cannot_fit";
+        let mut chosen = None;
+        if let Some(bounds) = ink[index]
+            && input.placement_note.is_none()
+        {
+            let origin = vp.px(input.at);
+            let q = vp.px([input.at[0] + input.outward[0], input.at[1] + input.outward[1]]);
+            let length = (q[0] - origin[0]).hypot(q[1] - origin[1]);
+            let direction = if length > 1e-9 { [(q[0] - origin[0]) / length, (q[1] - origin[1]) / length] } else { [0.0, 0.0] };
+            let corners = entrance_corners(&text, bounds, vp, 0.5);
+            let span = corners
+                .iter()
+                .map(|p| p[0] * direction[0] + p[1] * direction[1])
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+            let step = (span.1 - span.0 + 0.5 / MM_PER_PX).max(1.0);
+            for row in 0..=8 {
+                if row > 0 && length <= 1e-9 {
+                    break;
+                }
+                text.at = vp.at([origin[0] + direction[0] * step * row as f64, origin[1] + direction[1] * step * row as f64]);
+                let corners = entrance_corners(&text, bounds, vp, 0.5);
+                if entrance_fits(&corners, clip, &occupied, &walls, &mut budget) {
+                    chosen = Some(corners);
+                    state = if row == 0 {
+                        "preferred"
+                    } else {
+                        alternate += 1;
+                        "alternate"
+                    };
+                    break;
+                }
+            }
+        } else if ink[index].is_none() {
+            reason = "no_shaped_glyph_ink";
+        }
+        if chosen.is_none()
+            && let Some(bounds) = ink[texts.len() + rank]
+        {
+            text.text.clone_from(&input.legend);
+            text.deg = 0.0;
+            text.at = vp.at([0.0, 0.0]);
+            let local = entrance_bounds(&entrance_corners(&text, bounds, vp, 0.5));
+            let step = [(local[2] - local[0] + 1.0 / MM_PER_PX).max(1.0), (local[3] - local[1] + 1.0 / MM_PER_PX).max(1.0)];
+            // At most 512 deterministic whitespace candidates; no font shrinking or clipping-as-fit.
+            for slot in 0..512 {
+                let columns = ((clip[2] - clip[0]) / step[0]).floor().max(1.0) as usize;
+                let at = [clip[0] - local[0] + (slot % columns) as f64 * step[0], clip[1] - local[1] + (slot / columns) as f64 * step[1]];
+                if at[1] + local[3] > clip[3] || budget == 0 {
+                    break;
+                }
+                text.at = vp.at(at);
+                let corners = entrance_corners(&text, bounds, vp, 0.5);
+                if geometry.as_ref().is_some_and(|geometry| entrance_boxes_overlap(&corners, geometry)) {
+                    continue;
+                }
+                if entrance_fits(&corners, clip, &occupied, &walls, &mut budget) {
+                    chosen = Some(corners);
+                    state = "legend";
+                    legends += 1;
+                    break;
+                }
+            }
+        }
+        if let Some(corners) = chosen {
+            occupied.push(corners);
+            placed += 1;
+        } else {
+            if budget == 0 {
+                reason = "lettering_comparison_budget_exceeded";
+            }
+            // Retain complete source text in the audit scene even when no complete box fits.
+            text.text.clone_from(&input.text);
+            text.deg = input.deg;
+            // Keep provenance without inventing a new placement on the crop edge.
+            // Ordinary drawing clipping excludes labels outside a detailed view.
+            text.at = input.at;
+        }
+        records.push(json!({"source":input.source,"text":input.text,"legend_text":input.legend,
+            "drawn_text":text.text,"state":state,"reason":if state=="unplaced" {Some(reason)} else {None},
+            "at_mm":text.at,"rotation_deg":text.deg,"unit_records":input.unit_records,
+            "unknown_door_units":input.unknown_door_units,"placement_note":input.placement_note,
+            "inspect_commands":[{"command":"entrance.get","params":{"id":input.source.id}}]}));
+        scene.items[scene_index] = Item::Text(text);
+    }
+    let unplaced = entrances.len() - placed;
+    Ok(json!({"requested":entrances.len(),"placed":placed,"alternate":alternate,"legend":legends,"unplaced":unplaced,
+        "records":records,"note":(unplaced>0).then(||format!("Opgange: {unplaced} mærkninger kræver placering"))}))
+}
+
 /// A sheet label in pixels: centre, rotation (degrees, clockwise) and font size.
 #[derive(Clone)]
 pub(crate) struct Label {
@@ -806,6 +1191,7 @@ pub(crate) struct Label {
     pub(crate) balcony: bool,
     pub(crate) source: Option<crate::sheet::TextSource>,
     pub(crate) clearance: Option<crate::sheet::TextClearance>,
+    pub(crate) entrance: Option<crate::sheet::EntranceLabel>,
 }
 
 impl Label {
@@ -918,6 +1304,7 @@ struct PlanSheet {
     project: String,
     caption: String,
     note: Option<String>,
+    entrance_labels: Value,
 }
 
 /// A level-index plan can include or crop any building at that level. Retain the
@@ -946,7 +1333,16 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
             Some(note) => format!("{note} · Roof-clipped interiors and habitable areas unsupported"),
             None => "Roof-clipped interiors and habitable areas unsupported".into(),
         });
-        return Ok(PlanSheet { scene: sheet.scene, vp: sheet.vp, clip: sheet.clip, floor: sheet.title, project: sheet.project, caption, note });
+        return Ok(PlanSheet {
+            scene: sheet.scene,
+            vp: sheet.vp,
+            clip: sheet.clip,
+            floor: sheet.title,
+            project: sheet.project,
+            caption,
+            note,
+            entrance_labels: json!(null),
+        });
     }
     let (prims, _, elements) = scene(doc, level, view, true)?;
     let f = sheet_frame(doc, region, rotation, level, view)?;
@@ -1055,9 +1451,9 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                     sc.attribute_last(&[element.segment([f.rot(*a), f.rot(*b)])]);
                 }
             }
-            Prim::Text { at, text, size, angle, away, .. } => {
+            Prim::Text { at, text, size, angle, away, entrance, .. } => {
                 let p = f.px(*at);
-                if !(80.0..=1520.0).contains(&p[0]) || !(140.0..=790.0).contains(&p[1]) {
+                if entrance.is_none() && (!(80.0..=1520.0).contains(&p[0]) || !(140.0..=790.0).contains(&p[1])) {
                     continue;
                 }
                 let mut deg = angle.map_or(0.0, |a| -(a.to_degrees() + rotation)).rem_euclid(360.0);
@@ -1094,14 +1490,23 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
                     fs,
                     text: text.replace(" x ", " × "),
                     balcony: text.starts_with("Ca. "),
-                    source: elements.get(&index).map(|e| crate::sheet::TextSource { kind: "element", id: e.id.clone(), role: "balcony_size" }),
+                    source: entrance.as_ref().map(|tag| tag.source.clone()).or_else(|| {
+                        elements.get(&index).map(|e| crate::sheet::TextSource { kind: "element", id: e.id.clone(), role: "balcony_size" })
+                    }),
                     clearance,
+                    entrance: entrance.as_ref().map(|input| {
+                        let mut tag = input.clone();
+                        tag.at = f.rot(*at);
+                        tag.deg = -deg;
+                        tag.outward = away.map_or([0.0, 0.0], |d| [f.cos * d[0] - f.sin * d[1], f.sin * d[0] + f.cos * d[1]]);
+                        tag
+                    }),
                 });
             }
         }
     }
-    // Labels never overlap: entrance labels first, then balcony sizes. When the balcony sizes don't
-    // fit side by side at this scale they move to one line under the drawing instead.
+    // Retain every entrance input for actual-glyph placement below. Balcony sizes retain their
+    // legacy collision/summary layout; an entrance is never discarded by this approximate pass.
     labels.sort_by_key(|l| l.balcony);
     let mut sizes: Vec<(String, usize)> = Vec::new();
     for l in labels.iter().filter(|l| l.balcony) {
@@ -1114,7 +1519,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
     let mut crowded = false;
     for l in labels {
         let fits = |l: &Label| !placed.iter().any(|q| q.overlaps(l));
-        if fits(&l) {
+        if l.entrance.is_some() || fits(&l) {
             placed.push(l);
             continue;
         }
@@ -1129,6 +1534,7 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         t.halo = Halo::Outline;
         t.source = l.source.clone();
         t.clearance = l.clearance.clone();
+        t.entrance = l.entrance.clone().map(Box::new);
         sc.text(t);
     }
     let mut notes = Vec::new();
@@ -1150,8 +1556,12 @@ fn sheet_scene(doc: &Document, level: usize, view: View, rotation: f64, region: 
         }
         notes.push("Roof-clipped interiors and habitable areas unsupported".into());
     }
+    let entrance_labels = layout_entrance_scene(&mut sc, &vp, clip, None)?;
+    if let Some(note) = entrance_labels["note"].as_str() {
+        notes.push(note.into());
+    }
     let note = (!notes.is_empty()).then(|| notes.join(" · "));
-    Ok(PlanSheet { scene: sc, vp, clip, floor, project, caption, note })
+    Ok(PlanSheet { scene: sc, vp, clip, floor, project, caption, note, entrance_labels })
 }
 
 /// A presentation drawing set: vector PDF pages, or one matching SVG/PNG sheet or DXF drawing.
@@ -1195,6 +1605,7 @@ pub(crate) fn sheet(
     write_output(&path, &bytes)?;
     if let Some(s) = sheets.first() {
         result["scale"] = json!(scale_text(s.scene.scale));
+        result["entrance_labels"] = s.entrance_labels.clone();
     }
     if ext == "png" {
         result["image_path"] = json!(path);
@@ -1204,7 +1615,7 @@ pub(crate) fn sheet(
 
 pub(crate) fn drawing_sheet(doc: &Document, level: usize, view: View) -> Result<crate::sheet::Sheet> {
     let s = sheet_scene(doc, level, view, 0.0, None, "")?;
-    let metrics = json!({"pages":1, "width_px":1600, "height_px":900, "underlay":null, "style":"presentation", "scale":scale_text(s.scene.scale)});
+    let metrics = json!({"pages":1, "width_px":1600, "height_px":900, "underlay":null, "style":"presentation", "scale":scale_text(s.scene.scale), "entrance_labels":s.entrance_labels});
     Ok(crate::sheet::Sheet { scene: s.scene, vp: s.vp, clip: s.clip, title: s.floor, project: s.project, caption: s.caption, note: s.note, metrics })
 }
 
@@ -1856,6 +2267,7 @@ mod tests {
             balcony: true,
             source: None,
             clearance: None,
+            entrance: None,
         };
         // Side by side 80 px apart: the 15-character labels overlap; 140 px apart they don't.
         assert!(label([100., 100.], 0.).overlaps(&label([180., 100.], 0.)));
@@ -1881,5 +2293,233 @@ mod tests {
         assert!(crate::drawings::inside(&p, at));
         assert!(at[0] > 500. && at[1] > 500.);
         assert!(at[0] < 1000. || at[1] < 1000.);
+    }
+    /// Original public fixture: separate enclosures with a real 200 mm gap, but colliding tags.
+    fn entrance_tag_fixture() -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Synthetic entrance tags",
+            "footprint":[[0,0],[20000,0],[20000,16000],[0,16000]],"storeys":2,"storey_height_mm":3000}),
+        )
+        .unwrap();
+        s.execute("interior.add_stairs", json!({"building":"b","stairs":[
+            {"id":"core-a","levels":[0],"outline":[[4000,3000],[4000,6000],[6000,6000],[6000,3000]],"kind":"u_turn","landing":1000,"well":150,"rounded":false},
+            {"id":"core-b","levels":[0],"outline":[[6200,3000],[6200,6000],[8200,6000],[8200,3000]],"kind":"u_turn","landing":1000,"well":150,"rounded":false}
+        ]})).unwrap();
+        s.doc.buildings[0].entrances = serde_json::from_value(json!([
+            {"street":"Synthetic street","number":"1A","point":[5000,0],"stair":"core-a","units":[{"floor":"st","door":"tv"},{"floor":"st","door":"th"},{"floor":"1","door":"tv"},{"floor":"1","door":"th"}]},
+            {"street":"Synthetic street","number":"1B","point":[7200,0],"stair":"core-b","units":[{"floor":"st","door":"tv"},{"floor":"st","door":"th"},{"floor":"1","door":"tv"},{"floor":"1","door":"th"}]}
+        ])).unwrap();
+        s
+    }
+
+    fn entrance_tag_texts(scene: &Scene) -> Vec<&Text> {
+        scene
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                crate::sheet::Item::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn neighboring_entrances_keep_every_source_known_side_without_mutating_units() {
+        let mut s = entrance_tag_fixture();
+        let before = s.doc.clone();
+        for reverse in [false, true] {
+            if reverse {
+                s.doc.buildings[0].entrances.reverse();
+            }
+            for level in [0, 1] {
+                let sheet = drawing_sheet(&s.doc, level, View::latest(&s.doc)).unwrap();
+                let texts = entrance_tag_texts(&sheet.scene);
+                for address in ["1A", "1B"] {
+                    assert!(
+                        texts.iter().any(|text| text.text.contains(address) && text.text.contains("TV") && text.text.contains("TH")),
+                        "source-known sides for {address} were lost on level {level}"
+                    );
+                }
+                assert_eq!(sheet.metrics["entrance_labels"]["requested"], 2);
+                assert_eq!(sheet.metrics["entrance_labels"]["placed"], 2);
+                assert_eq!(sheet.metrics["entrance_labels"]["unplaced"], 0);
+            }
+        }
+        s.doc.buildings[0].entrances.reverse();
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn configured_tags_use_final_scale_crop_and_real_glyph_clearance() {
+        let mut s = entrance_tag_fixture();
+        s.execute("view.define", json!({"id":"entrances","name":"Public entrance plan","kind":{"view":"plan","level":0}})).unwrap();
+        for denominator in [100.0, 150.0, 200.0] {
+            s.execute(
+                "view.configure",
+                json!({"id":"entrances","template":{"name":"Public fixed",
+                "sizing":{"mode":"fixed","denominator":denominator,"centre":[10000,4000]}}}),
+            )
+            .unwrap();
+            let before = s.doc.clone();
+            let sheet = crate::views::sheet_unclipped(&s.doc, "entrances", View::latest(&s.doc)).unwrap();
+            assert_eq!(sheet.scene.scale, denominator);
+            assert_eq!(sheet.metrics["entrance_labels"]["placed"], 2);
+            let report = s.execute("view.audit", json!({"id":"entrances"})).unwrap();
+            let labels = report["labels"].as_array().unwrap();
+            for id in ["b.entrance0", "b.entrance1"] {
+                let label = labels.iter().find(|label| label["source"]["id"] == id).unwrap();
+                assert_eq!(label["source"]["kind"], "entrance");
+                assert_eq!(label["source"]["role"], "unit_register");
+                assert_eq!(label["clipped"], false);
+                assert!(
+                    label["inspect_commands"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|command| command["command"] == "entrance.get" && command["params"]["id"] == id)
+                );
+            }
+            assert!(!report["findings"].as_array().unwrap().iter().any(|finding| {
+                finding["kind"] == "potential_text_overlap"
+                    && finding["sources"]
+                        .as_array()
+                        .is_some_and(|sources| sources.len() == 2 && sources.iter().all(|source| source["kind"] == "entrance"))
+            }));
+            assert_eq!(s.doc, before);
+        }
+    }
+
+    #[test]
+    fn presentation_tags_keep_numeric_and_middle_doors_and_do_not_fill_unknown_sides() {
+        let mut s = entrance_tag_fixture();
+        s.doc.buildings[0].entrances.truncate(1);
+        s.doc.buildings[0].entrances[0].units = serde_json::from_value(json!([
+            {"floor":"st","door":"42"},{"floor":"st","door":" mf "},{"floor":"st","door":""},
+            {"floor":"1","door":"th"}
+        ]))
+        .unwrap();
+        let before = s.doc.clone();
+        let ground = drawing_sheet(&s.doc, 0, View::latest(&s.doc)).unwrap();
+        let tag = entrance_tag_texts(&ground.scene).into_iter().find(|text| text.text.contains("1A")).unwrap();
+        assert!(tag.text.contains("42") && tag.text.contains("MF"));
+        assert!(!tag.text.contains("TV") && !tag.text.contains("TH"));
+        assert_eq!(ground.metrics["entrance_labels"]["records"][0]["unit_records"], 3);
+        assert_eq!(ground.metrics["entrance_labels"]["records"][0]["unknown_door_units"], 1);
+        let arrival = drawing_sheet(&s.doc, 1, View::latest(&s.doc)).unwrap();
+        let tag = entrance_tag_texts(&arrival.scene).into_iter().find(|text| text.text.contains("1A")).unwrap();
+        assert!(tag.text.contains("TH") && !tag.text.contains("TV") && !tag.text.contains("42"));
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn missing_stair_association_uses_an_explicit_register_legend() {
+        let mut s = entrance_tag_fixture();
+        s.doc.buildings[0].entrances.truncate(1);
+        s.doc.buildings[0].entrances[0].stair = None;
+        let before = s.doc.clone();
+        let sheet = drawing_sheet(&s.doc, 0, View::latest(&s.doc)).unwrap();
+        assert_eq!(sheet.metrics["entrance_labels"]["requested"], 1);
+        assert_eq!(sheet.metrics["entrance_labels"]["placed"], 1);
+        let record = &sheet.metrics["entrance_labels"]["records"][0];
+        assert_eq!(record["state"], "legend");
+        assert_eq!(record["placement_note"], "missing_explicit_stair_association");
+        assert!(
+            entrance_tag_texts(&sheet.scene)
+                .iter()
+                .any(|text| text.text.contains("Opgang 1A") && text.text.contains("TV") && text.text.contains("TH"))
+        );
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn impossible_complete_tag_remains_inspectable_and_is_reported_unplaced() {
+        let mut s = entrance_tag_fixture();
+        s.doc.buildings[0].entrances.truncate(1);
+        s.doc.buildings[0].entrances[0].number = "W".repeat(300);
+        s.execute("view.define", json!({"id":"too-wide","name":"Public too-wide tag","kind":{"view":"plan","level":0}})).unwrap();
+        let before = s.doc.clone();
+        let sheet = drawing_sheet(&s.doc, 0, View::latest(&s.doc)).unwrap();
+        assert_eq!(sheet.metrics["entrance_labels"]["requested"], 1);
+        assert_eq!(sheet.metrics["entrance_labels"]["placed"], 0);
+        assert_eq!(sheet.metrics["entrance_labels"]["unplaced"], 1);
+        assert!(sheet.note.as_ref().is_some_and(|note| note.contains("kræver placering")));
+        let tags: Vec<_> = entrance_tag_texts(&sheet.scene)
+            .into_iter()
+            .filter(|text| text.source.as_ref().is_some_and(|source| source.kind == "entrance"))
+            .collect();
+        assert_eq!(tags.len(), 1, "unplaced text stays in the audit scene");
+        assert!(tags[0].text.contains(&"W".repeat(300)) && tags[0].text.contains("TV") && tags[0].text.contains("TH"));
+        let report = s.execute("view.audit", json!({"id":"too-wide"})).unwrap();
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| finding["kind"] == "unplaced_entrance_tag" && finding["source"]["id"] == "b.entrance0")
+        );
+        assert_eq!(report["status"], "needs_review");
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn a_single_fitting_tag_retains_its_legacy_anchor_and_font_size() {
+        let mut s = entrance_tag_fixture();
+        s.doc.buildings[0].entrances.truncate(1);
+        let frame = sheet_frame(&s.doc, None, 0.0, 0, View::latest(&s.doc)).unwrap();
+        let sheet = drawing_sheet(&s.doc, 0, View::latest(&s.doc)).unwrap();
+        let tag = entrance_tag_texts(&sheet.scene).into_iter().find(|text| text.text.contains("1A")).unwrap();
+        assert_eq!(tag.text, "TV  1A  TH");
+        assert_eq!(tag.size, 18.0 * MM_PER_PX);
+        assert!((sheet.vp.px(tag.at)[0] - frame.px([5000.0, -1100.0])[0]).abs() < 1e-8);
+        assert!((sheet.vp.px(tag.at)[1] - frame.px([5000.0, -1100.0])[1]).abs() < 1e-8);
+    }
+
+    #[test]
+    fn unknown_register_designations_agree_between_labels_and_inspection() {
+        for marker in ["", "?", "Unknown", "Ukendt", "uoplyst", "ikke oplyst"] {
+            let mut s = entrance_tag_fixture();
+            let e = &mut s.doc.buildings[0].entrances[0];
+            e.units[0].door = "tv".into();
+            e.units[1].door = marker.into();
+            let before = s.doc.clone();
+            let info = s.execute("entrance.get", json!({"id":"b.entrance0"})).unwrap();
+            let sheet = drawing_sheet(&s.doc, 0, View::latest(&s.doc)).unwrap();
+            let record = sheet.metrics["entrance_labels"]["records"].as_array().unwrap().iter().find(|r| r["source"]["id"] == "b.entrance0").unwrap();
+            assert_eq!(record["unknown_door_units"], info["unknown_designations"], "{marker:?}");
+            assert_eq!(record["unknown_door_units"], 1);
+            assert!(!record["text"].as_str().unwrap().contains('?'));
+            assert!(record["legend_text"].as_str().unwrap().contains("ukendt dørbetegnelse"));
+            assert_eq!(s.doc, before);
+        }
+    }
+
+    #[test]
+    fn cropped_away_preferred_tags_stay_in_audit_coverage() {
+        let mut s = entrance_tag_fixture();
+        s.execute("view.define", json!({"id":"cropped-entrances","name":"Public cropped entrances","kind":{"view":"plan","level":0}})).unwrap();
+        s.execute(
+            "view.configure",
+            json!({"id":"cropped-entrances","template":{"name":"Public clipped facade edge",
+            "crop":[0,0,20000,12000],"sizing":{"mode":"fixed","denominator":100,"centre":[10000,6000]}}}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let sheet = crate::views::sheet_unclipped(&s.doc, "cropped-entrances", View::latest(&s.doc)).unwrap();
+        assert_eq!(sheet.metrics["entrance_labels"]["requested"], 2);
+        assert_eq!(sheet.metrics["entrance_labels"]["placed"], 0);
+        assert_eq!(sheet.metrics["entrance_labels"]["unplaced"], 2);
+        assert_eq!(
+            entrance_tag_texts(&sheet.scene).into_iter().filter(|text| text.source.as_ref().is_some_and(|source| source.kind == "entrance")).count(),
+            2
+        );
+        let report = s.execute("view.audit", json!({"id":"cropped-entrances"})).unwrap();
+        assert_eq!(report["finding_counts"]["unplaced_entrance_tag"], 2);
+        for text in entrance_tag_texts(&sheet.scene) {
+            let input = text.entrance.as_ref().unwrap();
+            assert_eq!(text.at, input.at, "unplaced source tags must not be moved onto the crop boundary");
+        }
+        assert_eq!(s.doc, before);
     }
 }

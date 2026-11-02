@@ -154,7 +154,12 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
                 b[3] = b[3].max(t.at[1] + pad);
             }
         }
+        // Crops may remove a preferred anchor. Keep complete tag inputs until final-scale
+        // reflow so audit can distinguish a placed legend from an unplaced source tag.
+        let entrances: Vec<_> = sheet.scene.items.iter().filter(|item| matches!(item, Item::Text(t) if t.entrance.is_some())).cloned().collect();
+        sheet.scene.items.retain(|item| !matches!(item, Item::Text(t) if t.entrance.is_some()));
         crate::view_config::prepare(&mut sheet, template, bounds);
+        sheet.scene.items.extend(entrances);
         crate::view_config::paper_clearances(&mut sheet)?;
         crate::view_config::room_labels(&mut sheet, doc, view, template)?;
     }
@@ -167,6 +172,9 @@ fn sheet_with_clipping(doc: &Document, id: &str, phase: View, finish: bool) -> R
     for a in doc.annotations.iter().filter(|a| a.view == id && !matches!(a.kind, AnnotationKind::Region { .. })) {
         draw(&mut sheet.scene, a, dimension_rounding);
     }
+    // All generated room tags and saved annotation text are now present. Reflow entrance
+    // lettering against their actual glyph bounds at this final scale and crop.
+    crate::plan::layout_entrance_labels(&mut sheet, view.template.as_ref().and_then(|t| t.crop))?;
     if finish && let Some(template) = &view.template {
         crate::view_config::finish(&mut sheet, template);
     }
