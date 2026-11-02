@@ -4,7 +4,7 @@
 //! intersection of the adjoining roof planes, preserving their pitch on oblique gables too.
 
 pub mod drainage;
-mod halfhip;
+pub(crate) mod halfhip;
 pub mod opening;
 pub use opening::Rooflight;
 

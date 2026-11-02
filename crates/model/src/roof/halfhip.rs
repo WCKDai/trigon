@@ -82,7 +82,7 @@ pub(super) fn remaining_ridge(under: &Mesh, outline: &[[f64; 2]], eaves: f64, pi
     Ok(())
 }
 
-pub(super) fn closed(mesh: &Mesh) -> Result<()> {
+pub(crate) fn closed(mesh: &Mesh) -> Result<()> {
     let mut edges = std::collections::BTreeMap::<_, (u32, i32)>::new();
     let reference = mesh.positions.first().ok_or_else(|| ModelError::Invalid("half-hip shell is empty".into()))?;
     let mut volume = 0.;

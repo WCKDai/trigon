@@ -34,7 +34,8 @@ See [the public command example](../examples/half-hipped.json).
 The actual cap is part of the closed top/soffit/fascia shell, including its real mitres.
 Existing dormers and rooflights must still pass their actual supporting-plane, hip and
 mutual-opening guards. Caps do not relocate or shrink an opening. A transverse gutter or
-an attic gable window is not inferred. Cap dimensions and facade appearance are modelling
+an attic gable window is not inferred. Explicit [attic gable windows](gable-windows.md) can
+be placed on eligible source facades. Cap dimensions and facade appearance are modelling
 inputs, not measured construction or structural verification.
 
 IFC exports the actual shell even when it has no openings, with `HIPPED_GABLE_ROOF` on
@@ -49,7 +50,9 @@ The new native kind deliberately requires a reader that supports it: older versi
 the unknown kind. This makes no global file-generation or writer/backup-policy change and
 does not protect other optional features from older readers. Keep pre-feature project copies
 for deliberate downgrade. Public Rust matches over `Roof` must handle the new `HalfHipped`
-variant; existing `Roof::Pitched` struct literals remain unchanged. `BuiltRoof` is unchanged.
+variant; existing `Roof::Pitched` struct literals remain unchanged. The separate gable-window
+feature adds `BuiltRoof.gable_walls`; external `BuiltRoof` literals must initialize this derived
+collection, usually empty. It introduces no native source field.
 
 Rollback code by reverting the feature commit. Use Undo or remove the explicit caps in a
 supporting version to return a project to an ordinary pitched roof; dependent openings

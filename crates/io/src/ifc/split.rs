@@ -588,6 +588,9 @@ pub fn model_shapes(doc: &Document, built: &[Built]) -> Vec<(String, Mesh)> {
                 out.push((format!("{}.roof", d.id), d.roof.clone()));
                 out.push((format!("{}.cheeks", d.id), d.cheeks.clone()));
             }
+            for gable in &r.gable_walls {
+                out.push((gable.front.id.clone(), gable.front.mesh.clone()));
+            }
             for light in &r.rooflights {
                 out.push((light.id.clone(), merged(&light.fill.parts)));
                 out.push((format!("{}.flashing", light.id), light.flashing.clone()));

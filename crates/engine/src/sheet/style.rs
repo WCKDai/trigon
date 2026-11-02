@@ -62,7 +62,8 @@ pub(crate) fn parts(built: &[Built], inside: bool) -> Vec<Part<'_>> {
         let walls = next();
         for w in b.exterior_walls() {
             let element = Element::new(&w.id, DrawingElementKind::FacadeWall);
-            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, Role::Seen, Some(element.clone())));
+            let gable = b.roof.iter().any(|r| r.gable_walls.iter().any(|g| g.front.id == w.id));
+            out.push(part(&w.mesh, Class::Wall, walls, Material::Wall, if gable { Role::Both } else { Role::Seen }, Some(element.clone())));
             for seg in &w.segments {
                 out.push(part(&seg.mesh, Class::Wall, next(), Material::Wall, Role::Cut, Some(element.clone())));
             }

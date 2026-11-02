@@ -23,6 +23,8 @@ pub(crate) enum Action {
     AddBuilding(crate::local_building::Add),
     #[serde(rename = "building.set_roof")]
     SetRoof(crate::commands::SetRoof),
+    #[serde(rename = "facade.place")]
+    Place(crate::commands::Place),
     #[serde(rename = "rooflight.add")]
     AddRooflight(crate::rooflights::Add),
     #[serde(rename = "rooflight.remove")]
@@ -81,6 +83,7 @@ fn run(s: &mut Session, action: Action) -> Result<Value> {
         Action::DefineAnnotation(p) => crate::views::define_annotation(s, p),
         Action::AddBuilding(p) => crate::local_building::add(s, p),
         Action::SetRoof(p) => crate::commands::set_roof(s, p),
+        Action::Place(p) => crate::commands::place(s, p),
         Action::AddRooflight(p) => crate::rooflights::add(s, p),
         Action::RemoveRooflight(p) => crate::rooflights::remove(s, p),
         Action::AddWalls(p) => crate::commands::add_interior_walls(s, p),

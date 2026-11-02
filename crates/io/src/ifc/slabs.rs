@@ -387,6 +387,11 @@ impl Ifc<'_> {
                 }
             }
         }
+        for gable in &r.gable_walls {
+            if let Some(id) = self.hosted_gable(gable, fl) {
+                fl.contain(gable.level, id);
+            }
+        }
         if !planes.is_empty() {
             self.w.add(format!("IFCRELAGGREGATES({},$,$,$,#{roof},({}))", gid(&format!("{}.parts", r.id)), refs(&planes)));
         }
@@ -515,6 +520,79 @@ impl Ifc<'_> {
             Qty::Volume("NetVolume", a * t / 1e9),
         ];
         self.cat.quantities(&mut self.w, &piece.key, "Qto_SlabBaseQuantities", &qs, id);
+        Some(id)
+    }
+
+    /// A real opened gable follows the roof underside through its mitred wall footprint.
+    /// Its net solid is authoritative; a rectangular storey extrusion cannot describe it.
+    fn hosted_gable(&mut self, g: &trigon_model::build::BuiltGable, fl: &mut Floors) -> Option<usize> {
+        let wall = &g.front;
+        if !g.thickness.is_finite() || g.thickness <= 0. {
+            return None;
+        }
+        let frame = Frame::plan([wall.frame.origin[0], wall.frame.origin[1], wall.bottom], wall.frame.t)?;
+        let placed = self.w.place(Some(fl.at(g.level)), frame);
+        let up = catalog::facade(g.thickness, wall.kind == trigon_model::FacadeKind::Party, wall.finish);
+        let representable = wall.mesh.positions.iter().all(|&p| frame.local(p).iter().all(|v| v.is_finite() && v.abs() <= 1e9))
+            && wall.mesh.triangles.iter().flatten().all(|&i| (i as usize) < wall.mesh.positions.len());
+        let definition = representable
+            .then(|| {
+                self.w.faceset(&wall.mesh, &frame).and_then(|item| {
+                    self.cat.paint(&mut self.w, item, up.face());
+                    self.shape("Tessellation", &[item], None, catalog::L_FACADE)
+                })
+            })
+            .flatten();
+        let shape = definition.map_or_else(|| "$".to_string(), |id| format!("#{id}"));
+        let id = self.w.add(format!(
+            "IFCWALL({},$,{},$,'Gavltrekant',#{},{shape},{},.{}.)",
+            gid(&wall.id),
+            string(&up.name),
+            placed.id,
+            string(&wall.id),
+            up.predefined
+        ));
+        let certified =
+            if definition.is_some() { roof_shell_quantities(&g.gross, &frame).zip(roof_shell_quantities(&wall.mesh, &frame)) } else { None };
+        let mut qs = Vec::new();
+        if let Some(((gross, _), (net, _))) = certified {
+            let ring: Vec<_> = g.profile.iter().map(|p| [p[0], p[1] - wall.bottom]).collect();
+            let gross_side = area(&ring).abs();
+            // Phase overlays can contain overlapping nominal openings. Measure the
+            // actual net front rather than double-counting their nominal areas.
+            let net_side = wall
+                .mesh
+                .triangles
+                .iter()
+                .filter_map(|t| {
+                    let [a, b, c] = [
+                        frame.local(*wall.mesh.positions.get(t[0] as usize)?),
+                        frame.local(*wall.mesh.positions.get(t[1] as usize)?),
+                        frame.local(*wall.mesh.positions.get(t[2] as usize)?),
+                    ];
+                    [a, b, c].iter().all(|p| p[1].abs() <= 1e-6).then_some(((b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0])).abs() / 2.)
+                })
+                .sum::<f64>();
+            let top = g.gross.positions.iter().map(|p| p[2]).fold(wall.bottom, f64::max);
+            qs.extend([
+                Qty::Length("Length", wall.frame.length),
+                Qty::Length("Width", g.thickness),
+                Qty::Length("Height", top - wall.bottom),
+                Qty::Area("GrossSideArea", gross_side / 1e6),
+                Qty::Area("NetSideArea", net_side / 1e6),
+                Qty::Volume("GrossVolume", gross / 1e9),
+                Qty::Volume("NetVolume", net / 1e9),
+            ]);
+        }
+        self.wall_data(id, &wall.id, &up, None, wall.kind != trigon_model::FacadeKind::Party, true, &qs);
+        self.cat.pset(&mut self.w,"Trigon_GableGeometry",&[
+            ("SourceFacade",Val::Text(g.source_facade.clone())),
+            ("Representation",Val::Text(if definition.is_some(){"Original opened gable solid below roof underside"}else{"Unavailable: unrepresentable source geometry; no substitute wall emitted"}.into())),
+            ("SolidCoverage",Val::Text(if certified.is_some(){"Verified closed, consistently oriented positive gross/net components at written precision; self-intersection is not certified"}else{"Unverified gross/net shell; solid quantities omitted"}.into())),
+        ],id);
+        if definition.is_some() {
+            self.gable_openings(g, id, placed, fl);
+        }
         Some(id)
     }
 

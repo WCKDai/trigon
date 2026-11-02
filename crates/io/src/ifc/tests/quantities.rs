@@ -6,6 +6,8 @@ use trigon_model::{Built, ComponentKind, ComponentType, Document, ElementClass};
 
 use crate::ifc::{fills, part21::gid, sample, write};
 
+#[path = "gable_windows.rs"]
+mod gable_windows;
 #[path = "stepped_walls.rs"]
 mod stepped_walls;
 
@@ -61,8 +63,7 @@ fn references(text: &str) -> Vec<usize> {
 fn filling_elements(built: &[Built]) -> impl Iterator<Item = &BuiltElement> {
     built.iter().flat_map(|building| {
         building
-            .walls
-            .iter()
+            .exterior_walls()
             .flat_map(|wall| &wall.openings)
             .chain(building.interior.iter().flat_map(|wall| &wall.doors))
             .map(|opening| &opening.fill)

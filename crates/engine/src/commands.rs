@@ -875,7 +875,8 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "facade.place",
         summary: "Place a component type in facade slots. `levels` and `bays` are lists of indices (omit for all). Replaces what was \
-                  in those slots. Optional width, height and sill (mm) override the type for these slots.",
+                  in those slots. Optional width, height and sill (mm) override the type. Optional facade-local u (mm) \
+                  requires exactly one explicitly selected level and bay; it preserves all other bay centres and placements.",
         mutates: true,
         journaled: true,
         schema: schema::<Place>,
@@ -2346,9 +2347,9 @@ struct SetBays {
     margin: Option<f64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct Place {
+pub(crate) struct Place {
     facade: String,
     /// Component type id, see types.list.
     #[serde(rename = "type")]
@@ -2357,6 +2358,8 @@ struct Place {
     levels: Option<Vec<usize>>,
     /// Bay indices; omit for all.
     bays: Option<Vec<usize>>,
+    /// Exact facade-local centre (mm); one explicitly selected level and bay only.
+    u: Option<f64>,
     width: Option<f64>,
     height: Option<f64>,
     /// mm above the storey's floor; may be negative down to the terrain.
@@ -2804,7 +2807,7 @@ fn end_in(doc_phases: &[trigon_model::Phase], pl: &mut Placement, k: usize) -> O
     }
 }
 
-fn place(s: &mut Session, p: Place) -> Result<Value> {
+pub(crate) fn place(s: &mut Session, p: Place) -> Result<Value> {
     let new_is_opening = s.doc.component(&p.type_id)?.kind.is_opening();
     let k = match p.phase.as_deref() {
         Some(id) => s.doc.phase_index(id)?,
@@ -2836,6 +2839,12 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
             return Err(ModelError::Invalid(format!("bay {bay} doesn't exist (facade {} has {} bays)", p.facade, f.bays.len())).into());
         }
     }
+    if let Some(u) = p.u {
+        trigon_model::checked("placement u", u, -1e8, 1e8)?;
+        if p.levels.is_none() || p.bays.is_none() || level_list.len() != 1 || bay_list.len() != 1 {
+            return Err(ModelError::Invalid("an explicit u requires one explicitly selected level and bay".into()).into());
+        }
+    }
     let (mut count, mut demolished) = (0, 0);
     for &level in &level_list {
         for &bay in &bay_list {
@@ -2853,7 +2862,7 @@ fn place(s: &mut Session, p: Place) -> Result<Value> {
             }
             f.placements = keep;
             f.placements.push(Placement {
-                u: None,
+                u: p.u,
                 level,
                 bay,
                 type_id: p.type_id.clone(),

@@ -338,6 +338,47 @@ pub(super) fn volume(host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]], high: 
     }
     Ok(conform_shared_edges(&conform(&out, fr, &lines)))
 }
+/// Closed masonry above a flat eave and below the actual unopened roof underside.
+/// Unlike a constant-height extrusion this retains all cap/side-plane intersections
+/// through a mitred wall band, including zero-height corners at the eaves.
+pub(super) fn below_roof(host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]], bottom: f64) -> Result<Mesh> {
+    if !bottom.is_finite() || outline.iter().flatten().any(|v| !v.is_finite()) || area(outline) <= EPS {
+        return Err(ModelError::Invalid("gable wall band is empty or nonfinite".into()));
+    }
+    let polys = patches(host, fr, outline, false)?;
+    let mut out = Mesh::default();
+    for p in polys {
+        for q in &p {
+            if q.iter().any(|v| !v.is_finite()) || q[2] < bottom - EPS {
+                return Err(ModelError::Invalid(format!(
+                    "gable wall roof underside is below its eaves at u={:.6} mm, w={:.6} mm: deficit {:.6} mm",
+                    q[0],
+                    q[1],
+                    bottom - q[2]
+                )));
+            }
+        }
+        // Host underside polygons face down; the masonry's top faces up.
+        polygon(&mut out, &p.iter().rev().map(|p| fr.point(p[0], p[1], p[2])).collect::<Vec<_>>());
+        polygon(&mut out, &p.iter().map(|p| fr.point(p[0], p[1], bottom)).collect::<Vec<_>>());
+    }
+    for (a, b) in edges(outline) {
+        let pts = boundary_stations(&out, fr, a, b);
+        for q in pts.windows(2) {
+            let mid = [(q[0][0] + q[1][0]) / 2., (q[0][1] + q[1][1]) / 2.];
+            let high = plane(host, fr, mid, false)?;
+            let top = |q: [f64; 2]| fr.point(q[0], q[1], high.z(q[0], q[1]));
+            polygon(&mut out, &[fr.point(q[0][0], q[0][1], bottom), fr.point(q[1][0], q[1][1], bottom), top(q[1]), top(q[0])]);
+        }
+    }
+    let mut lines = edges(outline);
+    for t in triangles(outline)? {
+        lines.extend(edges(&t));
+    }
+    let out = conform_shared_edges(&conform(&out, fr, &lines));
+    crate::roof::halfhip::closed(&out)?;
+    Ok(out)
+}
 pub(super) fn prism(fr: &FacadeFrame, outline: &[[f64; 2]], low: Plane, high: Plane) -> Result<Mesh> {
     // Intersections on one rear plane can differ from a straight line by floating
     // round-off. Remove only intermediate stations within the existing 1e-6 mm
@@ -476,6 +517,22 @@ pub(super) fn overlap(a: &[[f64; 2]], b: &[[f64; 2]]) -> Result<f64> {
 }
 /// Through-window subtraction in a front wall. Rotate its local (u,w,z) to (u,z,-w).
 pub(super) fn front_window(mesh: &Mesh, fr: &FacadeFrame, opening: Rect, front: f64, depth: f64) -> Result<Mesh> {
+    front_windows(mesh, fr, std::slice::from_ref(&opening), front, depth)
+}
+/// A phase view may show overlapping old/new replacement openings. Remove their
+/// union once, retaining each fill's separate identity outside this geometric helper.
+/// The exact source rectangle stations bound this to at most a 64 by 64 grid.
+pub(super) fn front_windows(mesh: &Mesh, fr: &FacadeFrame, openings: &[Rect], front: f64, depth: f64) -> Result<Mesh> {
+    if openings.is_empty() || openings.len() > 32 {
+        return Err(ModelError::Invalid("front wall cut requires one to 32 rectangular openings".into()));
+    }
+    if !front.is_finite()
+        || !depth.is_finite()
+        || depth <= EPS
+        || openings.iter().any(|r| [r.u0, r.u1, r.v0, r.v1].iter().any(|v| !v.is_finite()) || r.u1 - r.u0 <= EPS || r.v1 - r.v0 <= EPS)
+    {
+        return Err(ModelError::Invalid("front wall openings must be finite positive rectangles through a positive depth".into()));
+    }
     let identity = FacadeFrame::new([0., 0.], [1000., 0.]).ok_or_else(|| ModelError::Invalid("empty opening frame".into()))?;
     let transformed = Mesh {
         positions: mesh
@@ -488,15 +545,61 @@ pub(super) fn front_window(mesh: &Mesh, fr: &FacadeFrame, opening: Rect, front: 
             .collect(),
         triangles: mesh.triangles.clone(),
     };
-    let outline = rect(opening.u0, opening.u1, opening.v0, opening.v1);
-    let mut out = carve(&transformed, &identity, &outline)?;
-    for (a, b) in edges(&outline) {
+    let mut out = transformed;
+    let mut lines = Vec::new();
+    for opening in openings {
+        let outline = rect(opening.u0, opening.u1, opening.v0, opening.v1);
+        out = carve(&out, &identity, &outline)?;
+        lines.extend(edges(&outline));
+        for t in triangles(&outline)? {
+            lines.extend(edges(&t));
+        }
+    }
+    let boundary = if let [opening] = openings {
+        // Keep the established single-window geometry and subdivision order.
+        edges(&rect(opening.u0, opening.u1, opening.v0, opening.v1))
+    } else {
+        let mut us: Vec<_> = openings.iter().flat_map(|r| [r.u0, r.u1]).collect();
+        let mut zs: Vec<_> = openings.iter().flat_map(|r| [r.v0, r.v1]).collect();
+        us.sort_by(f64::total_cmp);
+        zs.sort_by(f64::total_cmp);
+        us.dedup();
+        zs.dedup();
+        let (nu, nz) = (us.len().saturating_sub(1), zs.len().saturating_sub(1));
+        let mut inside = vec![false; nu * nz];
+        for (i, u) in us.windows(2).enumerate() {
+            for (j, z) in zs.windows(2).enumerate() {
+                let (u, z) = ((u[0] + u[1]) / 2., (z[0] + z[1]) / 2.);
+                inside[i * nz + j] = openings.iter().any(|r| u > r.u0 && u < r.u1 && z > r.v0 && z < r.v1);
+            }
+        }
+        let mut boundary = Vec::new();
+        for i in 0..nu {
+            for j in 0..nz {
+                if !inside[i * nz + j] {
+                    continue;
+                }
+                let (u0, u1, z0, z1) = (us[i], us[i + 1], zs[j], zs[j + 1]);
+                if j == 0 || !inside[i * nz + j - 1] {
+                    boundary.push(([u0, z0], [u1, z0]));
+                }
+                if i + 1 == nu || !inside[(i + 1) * nz + j] {
+                    boundary.push(([u1, z0], [u1, z1]));
+                }
+                if j + 1 == nz || !inside[i * nz + j + 1] {
+                    boundary.push(([u1, z1], [u0, z1]));
+                }
+                if i == 0 || !inside[(i - 1) * nz + j] {
+                    boundary.push(([u0, z1], [u0, z0]));
+                }
+            }
+        }
+        boundary
+    };
+    for &(a, b) in &boundary {
         out.quad([a[0], a[1], -front - depth], [a[0], a[1], -front], [b[0], b[1], -front], [b[0], b[1], -front - depth]);
     }
-    let mut lines = edges(&outline);
-    for t in triangles(&outline)? {
-        lines.extend(edges(&t));
-    }
+    lines.extend(boundary);
     let out = conform_shared_edges(&conform(&out, &identity, &lines));
     Ok(Mesh { positions: out.positions.iter().map(|p| fr.point(p[0], -p[2], p[1])).collect(), triangles: out.triangles })
 }
@@ -509,6 +612,21 @@ pub(super) fn limits(host: &Mesh, fr: &FacadeFrame, outline: &[[f64; 2]], top: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn below_roof_requires_complete_support_and_a_noninverted_closed_band() {
+        let fr = FacadeFrame::new([0., 0.], [1000., 0.]).unwrap();
+        let mut underside = Mesh::default();
+        underside.quad([0., 0., 100.], [0., 1000., 100.], [1000., 1000., 100.], [1000., 0., 100.]);
+        let band = rect(0., 1000., 0., 1000.);
+        let gross = below_roof(&underside, &fr, &band, 0.).unwrap();
+        crate::roof::halfhip::closed(&gross).unwrap();
+        assert!(below_roof(&underside, &fr, &rect(0., 2000., 0., 1000.), 0.).unwrap_err().to_string().contains("incomplete"));
+        let err = below_roof(&underside, &fr, &band, 200.).unwrap_err().to_string();
+        assert!(err.contains("deficit 100.000000"), "{err}");
+        assert!(below_roof(&underside, &fr, &band, f64::NAN).is_err());
+        assert!(below_roof(&underside, &fr, &[[f64::NAN, 0.], [1., 0.], [0., 1.]], 0.).is_err());
+    }
+
     #[test]
     fn rear_crease_stations_keep_both_prism_skins_conforming() {
         let fr = FacadeFrame::new([150000., -270000.], [150999., -269963.]).unwrap();

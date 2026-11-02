@@ -187,8 +187,10 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
             terrain.data["reason"] = json!("Terrain is edited as a complete height grid.");
             result.push(terrain);
         }
-        for wall in &model.walls {
-            let Some(fi) = building.facades.iter().position(|f| f.id == wall.id) else {
+        for wall in model.walls.iter().chain(model.roof.iter().flat_map(|r| r.gable_walls.iter().map(|g| &g.front))) {
+            let gable = model.roof.iter().flat_map(|r| &r.gable_walls).find(|g| g.front.id == wall.id);
+            let source = gable.map_or(wall.id.as_str(), |g| g.source_facade.as_str());
+            let Some(fi) = building.facades.iter().position(|f| f.id == source) else {
                 result.push(record(
                     &wall.id,
                     "wall",
@@ -233,7 +235,7 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                 ),
                 field("bands", "Facade bands: levels, heights, projection and finish", json!(facade.bands), true),
                 field("length_mm", "Length", wall.frame.length, false),
-                field("height_mm", "Eaves height", wall.height, false),
+                field("height_mm", if gable.is_some() { "Gable head height" } else { "Eaves height" }, wall.height, false),
             ];
             let mut handles = Vec::new();
             for segment in &wall.segments {
@@ -248,6 +250,20 @@ fn records(doc: &Document, built: &[Built], view: View) -> Result<Vec<Record>> {
                     segment.thickness,
                     [100.0, 1500.0],
                     1.0,
+                ));
+            }
+            if let Some(g) = gable {
+                let key = format!("thickness_mm.L{}", g.level);
+                properties.push(number(&key, "Roof-level facade / gable thickness (shared)", g.thickness, "mm", 100., 1500.));
+                properties.push(field("source_facade", "Source facade (finish, endpoints and bands are shared)", g.source_facade.clone(), false));
+                handles.push(handle(
+                    &key,
+                    "Gable wall thickness",
+                    wall.frame.point(wall.frame.length / 2., g.thickness, (wall.bottom + wall.height) / 2.),
+                    [-wall.frame.n[0], -wall.frame.n[1], 0.],
+                    g.thickness,
+                    [100., 1500.],
+                    1.,
                 ));
             }
             result.push(record(&wall.id, "wall", building, (None, Status::Existing), Source::Facade(bi, fi), properties, handles));

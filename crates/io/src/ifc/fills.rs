@@ -54,6 +54,26 @@ pub(crate) fn facade_frame_at<'m>(fr: &FacadeFrame, meshes: impl Iterator<Item =
 }
 
 impl Ifc<'_> {
+    /// An above-eaves window belongs to the actual shaped gable wall, not a
+    /// fabricated rectangular storey piece. Preserve ordinary opening/fill identities.
+    pub(super) fn gable_openings(&mut self, g: &trigon_model::build::BuiltGable, host: usize, parent: Placed, fl: &mut Floors) {
+        for o in &g.front.openings {
+            let r = o.rect;
+            let (w, h) = (r.u1 - r.u0, r.v1 - r.v0);
+            let frame = parent.frame.shifted([r.u0, 0., r.v0 - g.front.bottom]);
+            let placed = self.w.place(Some(parent), frame);
+            let profile = self.w.add(format!("IFCRECTANGLEPROFILEDEF(.AREA.,$,$,{}, {})", real(w), real(h)));
+            let position = self.w.axis2([w / 2., 0., h / 2.], [0., 1., 0.], [1., 0., 0.]);
+            let solid = self.w.extrusion(profile, position, g.thickness);
+            let Some(shape) = self.shape("SweptSolid", &[solid], None, catalog::L_OPENING) else { continue };
+            let opening =
+                self.w.add(format!("IFCOPENINGELEMENT({},$,'Opening',$,$,#{},#{shape},{},.OPENING.)", gid(&o.id), placed.id, string(&o.id)));
+            self.w.add(format!("IFCRELVOIDSELEMENT({},$,$,$,#{host},#{opening})", gid(&format!("{}.voids", o.id))));
+            let fill = self.fill(&o.fill, placed, frame, true, fl);
+            self.w.add(format!("IFCRELFILLSELEMENT({},$,$,$,#{opening},#{fill})", gid(&format!("{}.fills", o.id))));
+        }
+    }
+
     /// The openings of one facade wall, their fills and what is attached to them.
     pub(super) fn openings(&mut self, wall: &BuiltWall, pieces: &[&Piece], fl: &mut Floors) {
         for (k, o) in wall.openings.iter().enumerate() {

@@ -52,6 +52,97 @@ mod tests {
         json!({"id":"light","facade":"b.f1","u_mm":10000,"run_mm":500,"window_type":"window.casement.2","width_mm":800,"height_mm":1000,"stand_off_mm":100,"flashing_mm":100})
     }
 
+    fn gable_session() -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Public attic gable","footprint":[[0,0],[30000,0],[30000,12000],[0,12000]],"storeys":3,"storey_height_mm":3000}),
+        )
+        .unwrap();
+        s.execute("building.set_roof",json!({"kind":"half_hipped","pitch_deg":45,"gables":["b.f2","b.f4"],"half_hips":[{"facade":"b.f4","drop_mm":1200}],"thickness_mm":200,"overhang_mm":180,"verge_mm":135})).unwrap();
+        s.execute("building.set_attic", json!({"floor":8250,"name":"Roof"})).unwrap();
+        s.execute("facade.set_bays", json!({"facade":"b.f4","centres":[4000,8000]})).unwrap();
+        s.execute("facade.place", json!({"facade":"b.f4","type":"window.casement.2","levels":[1],"bays":[1],"width":1200,"height":1500,"sill":800}))
+            .unwrap();
+        s
+    }
+    fn gable_action() -> Value {
+        json!({"command":"facade.place","params":{"facade":"b.f4","type":"window.casement.2","levels":[3],"bays":[0],"u":6000,"width":1200,"height":1000,"sill":2700}})
+    }
+
+    #[test]
+    fn attic_gable_authoring_is_precise_undoable_and_inspectable() {
+        let mut s = gable_session();
+        let before = s.doc.clone();
+        let before_glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let p = s.execute("precision.preview", json!({"action":gable_action(),"sanity":{"building":"b","levels":[3]}})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":p["action"],"preview_token":p["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        let accepted = s.doc.clone();
+        let facade = &s.doc.buildings[0].facades[3];
+        assert_eq!(facade.bays, before.buildings[0].facades[3].bays);
+        assert_eq!(facade.placements[0], before.buildings[0].facades[3].placements[0]);
+        assert_eq!(facade.placements[1].u, Some(6000.));
+        for id in ["b.f4.gable", "b.f4.L3.B0"] {
+            let record = s.execute("element.get", json!({"id":id})).unwrap();
+            assert_eq!(record["id"], id);
+            assert!(!record["handles"].as_array().unwrap().is_empty());
+        }
+        assert_eq!(s.doc, accepted, "inspection must be read-only");
+        s.execute("element.set", json!({"id":"b.f4.gable","properties":{"thickness_mm.L3":300}})).unwrap();
+        assert_eq!(s.doc.buildings[0].edge_thickness(3, 3), 300.);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        s.execute("element.set", json!({"id":"b.f4.L3.B0","properties":{"width_mm":1100,"u_mm":6200}})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), before_glb);
+        for change in [json!({"levels":null}), json!({"bays":[0,1]}), json!({"u":1e300}), json!({"sill":500,"height":1000}), json!({"height":4000})] {
+            let mut action = gable_action();
+            for (k, v) in change.as_object().unwrap() {
+                action["params"][k] = v.clone();
+            }
+            assert!(s.execute("precision.preview", json!({"action":action})).is_err(), "must reject {change}");
+            assert_eq!(s.doc, before);
+        }
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        let mut replay = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        for entry in &s.doc.journal {
+            replay.execute(&entry.command, entry.params.clone()).unwrap();
+        }
+        assert_eq!(s.doc, replay.doc);
+        let reopened: trigon_model::Document = serde_json::from_slice(&serde_json::to_vec(&s.doc).unwrap()).unwrap();
+        assert_eq!(reopened, s.doc);
+    }
+
+    #[test]
+    fn attic_gable_drawings_and_schedules_resolve_the_real_host_once() {
+        let mut s = gable_session();
+        let action = gable_action();
+        s.execute("facade.place", action["params"].clone()).unwrap();
+        s.execute("view.define", json!({"id":"gable","name":"Gable","kind":{"view":"facade","facade":"b.f4"}})).unwrap();
+        let view = trigon_model::build::View::latest(&s.doc);
+        let facade = crate::views::drawing_view(&s.doc, "gable", view).unwrap();
+        assert_eq!(facade.pick_element([6000., 10996.], 1.).unwrap().id, "b.f4.L3.B0");
+        assert_eq!(facade.pick_element([4000., 11000.], 1.).unwrap().id, "b.f4.gable");
+        let plan = crate::views::plan_drawing(&s.doc, 3, view).unwrap();
+        assert_eq!(
+            plan.pick_element([50., 6000.], 1.).unwrap().id,
+            "b.f4.gable",
+            "a shaped gable's actual masonry must be cut and pickable in roof plans"
+        );
+        let schedule = crate::schedules::opening_schedule(&s.doc, view).unwrap();
+        let rows: Vec<_> = schedule.rows.iter().filter(|row| row.id == "b.f4.L3.B0").collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host_id, "b.f4.gable");
+        assert_eq!(rows[0].level_name, "Roof");
+        assert_eq!(rows[0].area_m2, Some(1.2));
+    }
+
     #[test]
     fn clipped_roof_properties_preserve_sources_and_exact_atomic_history() {
         let mut s = session();

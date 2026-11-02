@@ -13,9 +13,11 @@ use crate::{ModelError, Result};
 
 mod balcony;
 mod dormer;
+mod gable;
 mod opening;
 mod roof_opening;
 mod rooflight;
+pub use gable::BuiltGable;
 pub use rooflight::{BuiltRooflight, RooflightFrame};
 
 /// Window and door frames sit this far behind the outer wall face, mm.
@@ -271,6 +273,9 @@ pub struct BuiltRoof {
     pub gables: Mesh,
     /// Explicit host finishes for display/export; empty retains the legacy default Wall path.
     pub gable_parts: Vec<(Material, Mesh)>,
+    /// Closed, roof-clipped masonry hosts for explicit above-eaves attic windows.
+    /// Empty keeps the legacy unopened gable geometry and display path.
+    pub gable_walls: Vec<BuiltGable>,
     pub covering: Vec<(Material, Mesh)>,
     /// Gutters along the eaves.
     pub gutters: Mesh,
@@ -294,9 +299,9 @@ pub struct BuiltDormer {
 }
 
 impl Built {
-    /// Facade walls and roof-dormer fronts share the same opening/export contracts.
+    /// Facade walls, attic gables and roof-dormer fronts share the opening/export contracts.
     pub fn exterior_walls(&self) -> impl Iterator<Item = &BuiltWall> {
-        self.walls.iter().chain(self.roof.iter().flat_map(|r| r.dormers.iter().map(|d| &d.front)))
+        self.walls.iter().chain(self.roof.iter().flat_map(|r| r.gable_walls.iter().map(|g| &g.front).chain(r.dormers.iter().map(|d| &d.front))))
     }
 }
 
@@ -553,8 +558,9 @@ pub fn resolve_facade(doc: &Document, b: &Building, f: &Facade) -> Result<Vec<Re
                     ty_eff.width
                 )));
             }
+            let gable_window = gable::validate_request(b, f, p, &ty_eff, rect)?;
             let top = if p.spans_storeys { b.height() } else { storey.elevation + storey.height };
-            if rect.v1 > top - LINTEL {
+            if !gable_window && rect.v1 > top - LINTEL {
                 return Err(ModelError::Invalid(if p.spans_storeys {
                     format!("{slot}: the opening runs to {:.0} mm, less than {LINTEL} mm below the eaves ({:.0} mm)", rect.v1, b.height())
                 } else {
@@ -667,7 +673,8 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
         // What this view shows, with each element's status.
         let shown: Vec<(&Resolved, Status)> =
             all.iter().filter(|r| !above(r.rect.v0)).filter_map(|r| view.status(r.lifetime).map(|s| (r, s))).collect();
-        let resolved: Vec<(&Resolved, Status)> = shown.iter().filter(|(r, _)| r.is_opening()).copied().collect();
+        let resolved: Vec<(&Resolved, Status)> =
+            shown.iter().filter(|(r, _)| r.is_opening() && !gable::candidate(b, r.placement.level, r.rect)).copied().collect();
         let mut holes: Vec<Rect> = resolved.iter().map(|(r, _)| r.rect).collect();
         // Outdoor cellar stairs along this facade: each opens a door into the basement.
         let cellars: Vec<(String, &crate::doc::CellarStair, usize, Rect)> = b
@@ -1021,6 +1028,9 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                     r.gutters.append(&part.mesh);
                 }
             }
+            // Gable hosts follow the actual unopened underside, before dormers or rooflights
+            // carve it. Remove their old flat faces before material grouping can retain them.
+            let gable_walls = gable::build(doc, b, view, cut, &r.cover, &mut r.gables)?;
             let dormers = dormer::build(doc, b, &mut r.cover, b.roof.dormers())?;
             let rooflights = rooflight::build(doc, b, &mut r.cover, &dormers)?;
             let mut gable_parts = std::collections::BTreeMap::<Material, Mesh>::new();
@@ -1057,6 +1067,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                 cover: r.cover,
                 gables: r.gables,
                 gable_parts: gable_parts.into_iter().collect(),
+                gable_walls,
                 covering,
                 gutters: r.gutters,
                 drainage: drain_parts,
@@ -1826,6 +1837,48 @@ pub fn even_bays(length: f64, count: usize, margin: f64) -> Vec<f64> {
 mod tests {
     use super::*;
     use crate::doc::Building;
+
+    #[test]
+    fn attic_gable_window_has_one_real_closed_host_and_through_void() {
+        let mut doc = Document::default();
+        let mut b = Building::new("b", "Public attic gable", &[[0., 0.], [30000., 0.], [30000., 12000.], [0., 12000.]], 3, 3000.).unwrap();
+        b.roof=serde_json::from_value(serde_json::json!({"kind":"half_hipped","pitch_deg":45,"gables":["b.f2","b.f4"],"half_hips":[{"facade":"b.f4","drop_mm":1200}],"thickness_mm":200,"overhang_mm":180,"verge_mm":135})).unwrap();
+        b.set_attic(Some(8250.), Some("Roof")).unwrap();
+        b.facades[3].bays = vec![4000.];
+        doc.buildings.push(b);
+        let baseline = crate::build(&doc).unwrap();
+        let baseline_glb_shape = baseline[0].roof.as_ref().unwrap().gables.clone();
+        doc.buildings[0].facades[3].placements = serde_json::from_value(
+            serde_json::json!([{"level":3,"bay":0,"type":"window.casement.2","u":6000,"width":1200,"height":1000,"sill":2700}]),
+        )
+        .unwrap();
+        let before = doc.clone();
+        let built = crate::build(&doc).unwrap();
+        assert_eq!(doc, before);
+        let hosts: Vec<_> = built[0].exterior_walls().filter(|w| w.openings.iter().any(|o| o.fill.id == "b.f4.L3.B0")).collect();
+        assert_eq!(hosts.len(), 1);
+        let host = hosts[0];
+        assert_eq!(host.id, "b.f4.gable");
+        assert!(host.segments.is_empty(), "a shaped gable must not manufacture a rectangular storey segment");
+        roof_shell_is_closed_and_outward(&host.mesh);
+        let local = Mesh {
+            positions: host
+                .mesh
+                .positions
+                .iter()
+                .map(|p| {
+                    let q = dormer::local(&host.frame, *p);
+                    [q[0], q[2], q[1]]
+                })
+                .collect(),
+            triangles: host.mesh.triangles.clone(),
+        };
+        assert_eq!(roof_vertical_hits(&local, [6077., 11511., 0.]), 0, "no masonry inside the window void");
+        assert!(roof_vertical_hits(&local, [5100., 11511., 0.]) >= 2, "material must remain beside the window");
+        assert_eq!(built[0].walls, baseline[0].walls, "ordinary wall geometry/placements stay fixed");
+        doc.buildings[0].facades[3].placements.clear();
+        assert_eq!(crate::build(&doc).unwrap()[0].roof.as_ref().unwrap().gables, baseline_glb_shape);
+    }
 
     #[test]
     fn a_chamfer_shorter_than_the_wall_collapses_to_a_point() {
