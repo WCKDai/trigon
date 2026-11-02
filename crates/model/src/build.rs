@@ -822,8 +822,7 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
                         | crate::Roof::HalfHipped { eave_facades: None, straighten_mm, .. }
                             if b.roof.fascia_depth().is_none() =>
                         {
-                            let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
-                            kept.iter().enumerate().any(|(k, &i)| i == f.edge && kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len())
+                            retained_by_straightening(b, f.edge, *straighten_mm)
                         }
                         _ => true,
                     };
@@ -1157,6 +1156,13 @@ fn build_building(doc: &Document, b: &Building, view: View, cut: Option<f64>) ->
 /// The plinth runs this far below the terrain, mm.
 const PLINTH_FOOT: f64 = 300.0;
 
+/// A source eave survives only if both endpoints stay consecutive in the straightened roof
+/// outline. Keeping its first endpoint alone does not retain the original facade edge.
+fn retained_by_straightening(b: &Building, edge: usize, straighten_mm: f64) -> bool {
+    let kept = crate::roof::eave_outline(&b.footprint, straighten_mm);
+    kept.iter().enumerate().any(|(k, &i)| i == edge && kept[(k + 1) % kept.len()] == (edge + 1) % b.footprint.len())
+}
+
 /// A cap explicitly ending at the wall bearing on a detailed pitched roof follows the soffit.
 /// Its declared height remains the height at the wall; projection consumes height at tan(pitch).
 /// Moving only the upper face preserves a closed solid and all opening edges/material ownership.
@@ -1180,11 +1186,8 @@ fn seat_cornice(piece: &mut Mesh, b: &Building, f: &Facade, fr: &FacadeFrame, to
                 f.id
             )));
         }
-    } else {
-        let kept = crate::roof::eave_outline(&b.footprint, *straighten_mm);
-        if !kept.iter().enumerate().any(|(k, &i)| i == f.edge && kept[(k + 1) % kept.len()] == (f.edge + 1) % b.footprint.len()) {
-            return Err(ModelError::Invalid("a roof-bearing cornice needs an eave facade retained by roof straightening".into()));
-        }
+    } else if !retained_by_straightening(b, f.edge, *straighten_mm) {
+        return Err(ModelError::Invalid("a roof-bearing cornice needs an eave facade retained by roof straightening".into()));
     }
     let rise = crate::checked("cornice roof pitch", *pitch_deg, 5.0, 75.0)?.to_radians().tan();
     let overhang = crate::checked("cornice roof overhang", *overhang_mm, 0.0, 2000.0)?;
