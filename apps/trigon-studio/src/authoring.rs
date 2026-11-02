@@ -4,9 +4,13 @@ use std::collections::BTreeSet;
 
 use eframe::egui;
 use serde_json::{Value, json};
-use trigon_model::{ComponentType, Document};
+use trigon_model::{Building, ComponentType, Document};
 
-use crate::{scene::Element, theme};
+use crate::{
+    icons::{self, Icon},
+    scene::Element,
+    theme,
+};
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Tab {
@@ -25,6 +29,14 @@ enum Tool {
     Align,
     Levels,
     Delete,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum WallReference {
+    #[default]
+    Interior,
+    PlanGuide,
+    Facade,
 }
 
 pub struct Run {
@@ -48,6 +60,12 @@ pub struct Authoring {
     reference: String,
     wall_reference_face: usize,
     wall_target_face: usize,
+    wall_reference: WallReference,
+    wall_guide: String,
+    wall_facade: String,
+    wall_level: Option<usize>,
+    wall_max_move_mm: f64,
+    copy_scope: Option<(String, Vec<trigon_model::doc::Storey>)>,
     line: [[f64; 2]; 2],
     group_id: String,
     group_name: String,
@@ -80,6 +98,12 @@ impl Default for Authoring {
             reference: String::new(),
             wall_reference_face: 0,
             wall_target_face: 0,
+            wall_reference: WallReference::Interior,
+            wall_guide: String::new(),
+            wall_facade: String::new(),
+            wall_level: None,
+            wall_max_move_mm: 10.0,
+            copy_scope: None,
             line: [[0.0, 0.0], [1000.0, 0.0]],
             group_id: "selection".into(),
             group_name: "Selection group".into(),
@@ -223,25 +247,340 @@ impl Authoring {
         }
     }
 
-    fn align_walls(&self, targets: &[String]) -> Option<Run> {
-        let reference = self.reference.trim();
-        if reference.is_empty() || targets.is_empty() || targets.iter().any(|id| id == reference) {
+    /// Entry points for the ribbon/browser. The form still only emits a read-only preflight;
+    /// the application owns reviewing and applying its unchanged returned action/token.
+    pub(crate) fn choose_wall_alignment(&mut self) {
+        self.tab = Tab::Project;
+        self.tool = Tool::Align;
+        self.align_mode = 3;
+    }
+
+    pub(crate) fn choose_copy_to_levels(&mut self) {
+        self.tab = Tab::Project;
+        self.tool = Tool::Levels;
+    }
+
+    fn guide_level(doc: &Document, id: &str) -> Option<usize> {
+        let mut annotations = doc.annotations.iter().filter(|annotation| annotation.id == id);
+        let annotation = annotations.next()?;
+        if annotations.next().is_some() || !matches!(annotation.kind, trigon_model::annotation::AnnotationKind::Line { .. }) {
+            return None;
+        }
+        let mut views = doc.views.iter().filter(|view| view.id == annotation.view);
+        let view = views.next()?;
+        if views.next().is_some() {
+            return None;
+        }
+        let trigon_model::annotation::DrawingViewKind::Plan { level } = view.kind else { return None };
+        doc.buildings.iter().any(|building| building.storeys.get(level).is_some()).then_some(level)
+    }
+
+    fn material_building<'a>(&self, doc: &'a Document) -> Option<&'a Building> {
+        let mut matches =
+            doc.buildings.iter().flat_map(|building| building.facades.iter().filter(|facade| facade.id == self.wall_facade).map(move |_| building));
+        let building = matches.next()?;
+        matches.next().is_none().then_some(building)
+    }
+
+    /// Only establishes the owner for naming destination levels. The engine remains the
+    /// authority for occurrence validity, slot collisions, phases and exact geometry.
+    fn targets_building<'a>(doc: &'a Document, targets: &[String]) -> Option<&'a Building> {
+        if targets.is_empty() || targets.len() > 256 {
+            return None;
+        }
+        let mut expanded = Vec::new();
+        for target in targets {
+            if let Some(id) = target.strip_prefix("group:") {
+                let mut groups = doc.groups.iter().filter(|group| group.id == id);
+                let group = groups.next()?;
+                if groups.next().is_some() || group.targets.iter().any(|target| target.starts_with("group:")) {
+                    return None;
+                }
+                expanded.extend(group.targets.iter().map(String::as_str));
+            } else {
+                expanded.push(target.as_str());
+            }
+            if expanded.len() > 256 {
+                return None;
+            }
+        }
+        if expanded.is_empty() {
+            return None;
+        }
+        let mut owner = None;
+        for target in expanded {
+            let source = |id: &str, levels: &[usize], kind: &str| {
+                target == id
+                    || target == format!("{kind}:{id}")
+                    || target
+                        .strip_prefix(&format!("{id}.L"))
+                        .or_else(|| if kind == "room" { target.strip_prefix(&format!("{id}.space.L")) } else { None })
+                        .and_then(|level| level.parse::<usize>().ok())
+                        .is_some_and(|level| levels.contains(&level))
+            };
+            let mut matches = doc.buildings.iter().enumerate().filter(|(_, building)| {
+                building.interior_walls.iter().any(|wall| source(&wall.id, &wall.levels, "wall"))
+                    || building.stairs.iter().any(|stair| source(&stair.id, &stair.levels, "stair"))
+                    || building.rooms.iter().any(|room| source(&room.id, &room.levels, "room"))
+                    || building.facades.iter().any(|facade| {
+                        let exact = target.strip_prefix(&format!("placement:{}:", facade.id)).and_then(|index| index.parse::<usize>().ok());
+                        let native = target
+                            .strip_prefix(&format!("{}.L", facade.id))
+                            .and_then(|value| value.split_once(".B"))
+                            .and_then(|(level, rest)| Some((level.parse::<usize>().ok()?, rest.split('.').next()?.parse::<usize>().ok()?)));
+                        facade.placements.iter().enumerate().any(|(index, placement)| {
+                            exact == Some(index) || native.is_some_and(|(level, bay)| placement.level == level && placement.bay == bay)
+                        })
+                    })
+            });
+            let (index, _) = matches.next()?;
+            if matches.next().is_some() || owner.is_some_and(|owner| owner != index) {
+                return None;
+            }
+            owner = Some(index);
+        }
+        doc.buildings.get(owner?)
+    }
+
+    fn align_walls(&self, doc: &Document, targets: &[String]) -> Option<Run> {
+        if targets.is_empty() || !self.wall_max_move_mm.is_finite() || !(0.001..=100_000.0).contains(&self.wall_max_move_mm) {
             return None;
         }
         let faces = ["center", "left", "right"];
+        let mut reference_face = *faces.get(self.wall_reference_face)?;
+        let target_face = *faces.get(self.wall_target_face)?;
+        let (reference, mut sanity) = match self.wall_reference {
+            WallReference::Interior => {
+                let reference = self.reference.trim();
+                if reference.is_empty() || reference.len() > 512 || targets.iter().any(|id| id == reference) {
+                    return None;
+                }
+                (json!(reference), None)
+            }
+            WallReference::PlanGuide => {
+                let level = Self::guide_level(doc, &self.wall_guide)?;
+                reference_face = "center";
+                (json!({"kind":"annotation","id":self.wall_guide}), Some(json!({"levels":[level]})))
+            }
+            WallReference::Facade => {
+                let building = self.material_building(doc)?;
+                let level = self.wall_level?;
+                building.storeys.get(level)?;
+                (json!({"kind":"facade","id":self.wall_facade,"level":level}), Some(json!({"building":building.id,"levels":[level]})))
+            }
+        };
+        if let Some(building) = Self::targets_building(doc, targets) {
+            let scope = sanity.get_or_insert_with(|| json!({}));
+            if scope.get("building").is_none() {
+                scope["building"] = json!(building.id);
+            }
+        }
+        let mut params = json!({"action":{"command":"edit.align_walls","params":{"targets":targets,"reference":reference,
+            "reference_face":reference_face,"target_face":target_face,"max_move_mm":self.wall_max_move_mm}}});
+        if let Some(mut sanity) = sanity {
+            sanity["max_results"] = json!(200);
+            params["sanity"] = sanity;
+        }
+        Some(Run { command: "precision.preview", params })
+    }
+
+    fn copy_building<'a>(&mut self, doc: &'a Document, targets: &[String]) -> Option<&'a Building> {
+        let building = Self::targets_building(doc, targets);
+        let scope = building.map(|building| (building.id.clone(), building.storeys.clone()));
+        if self.copy_scope != scope {
+            self.levels.clear();
+            self.replace = false;
+            self.copy_scope = scope;
+        }
+        building
+    }
+
+    fn copy_to_levels(&self, doc: &Document, targets: &[String]) -> Option<Run> {
+        let building = Self::targets_building(doc, targets)?;
+        let (owner, storeys) = self.copy_scope.as_ref()?;
+        if *owner != building.id || *storeys != building.storeys || self.levels.is_empty() || self.levels.iter().any(|level| *level >= storeys.len())
+        {
+            return None;
+        }
         Some(Run {
-            command: "edit.align_walls",
-            params: json!({"targets":targets,"reference":reference,
-            "reference_face":faces[self.wall_reference_face],"target_face":faces[self.wall_target_face]}),
+            command: "precision.preview",
+            params: json!({"action":{"command":"edit.copy_to_levels",
+            "params":{"targets":targets,"levels":self.levels,"replace":self.replace}},
+            "sanity":{"building":building.id,"levels":self.levels,"max_results":200}}),
         })
     }
 
-    pub fn ribbon(&mut self, ui: &mut egui::Ui) {
-        for (tool, label) in
-            [(Tool::Move, "Move"), (Tool::Copy, "Copy"), (Tool::Align, "Align"), (Tool::Levels, "To levels"), (Tool::Delete, "Delete")]
-        {
-            ui.selectable_value(&mut self.tool, tool, label);
+    fn wall_reference_controls(&mut self, ui: &mut egui::Ui, doc: &Document, current: Option<&Element>) {
+        ui.label("Alignment reference");
+        let label = match self.wall_reference {
+            WallReference::Interior => "Interior wall",
+            WallReference::PlanGuide => "Saved plan guide",
+            WallReference::Facade => "Actual facade material",
+        };
+        egui::ComboBox::from_id_salt("wall-reference-kind").width(ui.available_width()).truncate().selected_text(label).show_ui(ui, |ui| {
+            for (kind, label) in [
+                (WallReference::Interior, "Interior wall"),
+                (WallReference::PlanGuide, "Saved plan guide"),
+                (WallReference::Facade, "Actual facade material"),
+            ] {
+                ui.selectable_value(&mut self.wall_reference, kind, label);
+            }
+        });
+        match self.wall_reference {
+            WallReference::Interior => {
+                if ui.add_enabled(current.is_some_and(|element| element.kind == "interior wall"), egui::Button::new("Capture picked wall")).clicked()
+                    && let Some(wall) = current
+                {
+                    self.reference = wall.id.clone();
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.reference)
+                        .hint_text("Reference wall occurrence, e.g. core.L1")
+                        .char_limit(512)
+                        .desired_width(ui.available_width()),
+                );
+                ui.add(egui::Label::new("Capture the reference, then pick the targets. The reference stays in place.").wrap());
+            }
+            WallReference::PlanGuide => {
+                let selected = doc
+                    .annotations
+                    .iter()
+                    .find(|annotation| annotation.id == self.wall_guide)
+                    .map_or("Choose a saved Plan line", |annotation| annotation.id.as_str());
+                egui::ComboBox::from_id_salt("wall-plan-guide").width(ui.available_width()).truncate().selected_text(selected).show_ui(ui, |ui| {
+                    let views: std::collections::BTreeMap<_, _> = doc
+                        .views
+                        .iter()
+                        .filter_map(|view| match &view.kind {
+                            trigon_model::annotation::DrawingViewKind::Plan { level } => Some((view.id.as_str(), (view.name.as_str(), *level))),
+                            _ => None,
+                        })
+                        .collect();
+                    let storeys = doc.buildings.iter().map(|building| building.storeys.len()).max().unwrap_or(0);
+                    for annotation in &doc.annotations {
+                        if matches!(annotation.kind, trigon_model::annotation::AnnotationKind::Line { .. })
+                            && let Some((name, level)) = views.get(annotation.view.as_str())
+                            && *level < storeys
+                        {
+                            ui.selectable_value(&mut self.wall_guide, annotation.id.clone(), format!("{name} · L{level} · {}", annotation.id));
+                        }
+                    }
+                });
+                if let Some(level) = Self::guide_level(doc, &self.wall_guide) {
+                    ui.add(egui::Label::new(format!("Site XY guide · target occurrences on L{level}")).wrap());
+                    egui::CollapsingHeader::new("Exact guide endpoints").show(ui, |ui| {
+                        if let Some(annotation) = doc.annotations.iter().find(|annotation| annotation.id == self.wall_guide)
+                            && let trigon_model::annotation::AnnotationKind::Line { from, to, .. } = &annotation.kind
+                        {
+                            for (name, point) in [("A", from), ("B", to)] {
+                                ui.add(egui::Label::new(format!("{name} [{}, {}] mm", point[0], point[1])).wrap().selectable(true));
+                            }
+                        }
+                    });
+                } else {
+                    ui.add(egui::Label::new("Save a Line in a Plan view first. Facade and section coordinates cannot guide plan walls.").wrap());
+                }
+                if ui.add(egui::Button::new("Create or edit guides in Drawings").wrap()).clicked() {
+                    self.tab = Tab::Drawings;
+                }
+            }
+            WallReference::Facade => {
+                let picked = current.and_then(|element| {
+                    let id = if doc.buildings.iter().any(|building| building.facades.iter().any(|facade| facade.id == element.id)) {
+                        Some(element.id.as_str())
+                    } else {
+                        element.props.iter().find(|(key, _)| *key == "facade").map(|(_, id)| id.as_str())
+                    }?;
+                    Some((id, element.level))
+                });
+                if ui.add_enabled(picked.is_some(), egui::Button::new("Capture picked facade host")).clicked()
+                    && let Some((id, level)) = picked
+                {
+                    self.wall_facade = id.to_string();
+                    self.wall_level = level;
+                }
+                let before = self.wall_facade.clone();
+                egui::ComboBox::from_id_salt("wall-material-facade")
+                    .width(ui.available_width())
+                    .truncate()
+                    .selected_text(if self.wall_facade.is_empty() { "Choose a facade" } else { &self.wall_facade })
+                    .show_ui(ui, |ui| {
+                        for building in &doc.buildings {
+                            for facade in &building.facades {
+                                ui.selectable_value(&mut self.wall_facade, facade.id.clone(), format!("{} · {}", building.name, facade.id));
+                            }
+                        }
+                    });
+                if self.wall_facade != before {
+                    self.wall_level = None;
+                }
+                if let Some(building) = self.material_building(doc) {
+                    let label = self
+                        .wall_level
+                        .and_then(|level| building.storeys.get(level).map(|storey| format!("{} · L{level}", storey.name)))
+                        .unwrap_or_else(|| "Choose the material's storey".into());
+                    egui::ComboBox::from_id_salt("wall-material-level").width(ui.available_width()).truncate().selected_text(label).show_ui(
+                        ui,
+                        |ui| {
+                            for (level, storey) in building.storeys.iter().enumerate() {
+                                ui.selectable_value(&mut self.wall_level, Some(level), format!("{} · L{level}", storey.name))
+                                    .on_hover_text(format!("Floor Z {} mm", storey.elevation));
+                            }
+                        },
+                    );
+                } else {
+                    ui.add(
+                        egui::Label::new(
+                            "Choose one uniquely identified facade. Its actual material and selected storey are checked in the preview.",
+                        )
+                        .wrap(),
+                    );
+                }
+            }
         }
+        let target_labels = ["Centreline", "Left face", "Right face"];
+        let reference_labels =
+            if self.wall_reference == WallReference::Facade { ["Midline", "Inner material", "Outer material"] } else { target_labels };
+        if self.wall_reference != WallReference::PlanGuide {
+            ui.label("Reference face");
+            egui::ComboBox::from_id_salt("wall-reference-face")
+                .width(ui.available_width())
+                .truncate()
+                .selected_text(reference_labels.get(self.wall_reference_face).copied().unwrap_or("Choose a face"))
+                .show_ui(ui, |ui| {
+                    for (index, label) in reference_labels.iter().enumerate() {
+                        ui.selectable_value(&mut self.wall_reference_face, index, *label);
+                    }
+                });
+        }
+        ui.label("Target wall face");
+        egui::ComboBox::from_id_salt("wall-target-face")
+            .width(ui.available_width())
+            .truncate()
+            .selected_text(target_labels.get(self.wall_target_face).copied().unwrap_or("Choose a face"))
+            .show_ui(ui, |ui| {
+                for (index, label) in target_labels.iter().enumerate() {
+                    ui.selectable_value(&mut self.wall_target_face, index, *label);
+                }
+            });
+        ui.label("Maximum endpoint movement");
+        ui.add(egui::DragValue::new(&mut self.wall_max_move_mm).range(0.001..=100_000.0).speed(0.1).max_decimals(3).suffix(" mm"));
+        ui.add(egui::Label::new("Choose a movement cap from your evidence; this is not a measurement tolerance.").wrap());
+        ui.add(egui::Label::new("One-time alignment within 15°. Lengths and door distances along each wall stay fixed. Use exact storey occurrences for guides or facade material.").wrap());
+    }
+
+    pub fn ribbon(&mut self, ui: &mut egui::Ui) {
+        for (tool, icon, label) in [
+            (Tool::Move, Icon::Move, "Move"),
+            (Tool::Copy, Icon::Copy, "Copy"),
+            (Tool::Align, Icon::Align, "Align"),
+            (Tool::Levels, Icon::Levels, "To levels"),
+        ] {
+            if icons::ribbon_button(ui, icon, label, self.tool == tool).clicked() {
+                self.tool = tool;
+            }
+        }
+        ui.selectable_value(&mut self.tool, Tool::Delete, "Delete");
     }
 
     pub(crate) fn command_controls_first(&self) -> bool {
@@ -267,13 +606,16 @@ impl Authoring {
         });
         ui.add_space(4.0);
         let targets = self.selected(current);
-        ui.label(
-            egui::RichText::new(if self.targets.trim().is_empty() {
-                current.map_or("Pick an element", |e| e.id.as_str()).to_string()
-            } else {
-                format!("{} selected targets", targets.len())
-            })
-            .strong(),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(if self.targets.trim().is_empty() {
+                    current.map_or("Pick an element", |e| e.id.as_str()).to_string()
+                } else {
+                    format!("{} selected targets", targets.len())
+                })
+                .strong(),
+            )
+            .wrap(),
         );
         let facade_frame = current
             .and_then(|e| e.props.iter().find(|(k, _)| *k == "facade"))
@@ -285,7 +627,9 @@ impl Authoring {
                     matches!(e.kind, "stair" | "interior wall")
                         || (facade_frame.is_some() && matches!(e.kind, "window" | "door" | "balcony" | "railing"))
                 }));
-        ui.add_enabled_ui(editable, |ui| match self.tool {
+        // Reference capture must remain usable when a facade host (rather than a target
+        // interior wall) is picked. Only a valid editable target can request the preflight.
+        ui.add_enabled_ui(editable || self.wall_alignment_active(), |ui| match self.tool {
             Tool::Move | Tool::Copy => {
                 let can_along = facade_frame.is_some() && self.targets.trim().is_empty();
                 if !can_along {
@@ -370,29 +714,14 @@ impl Authoring {
                             field(ui, "End Y", &mut self.line[1][1]);
                         });
                     }
-                    _ => {
-                        ui.label("Pick the reference wall, capture it, then pick the wall to align.");
-                        if ui.add_enabled(current.is_some_and(|e|e.kind == "interior wall"),egui::Button::new("Use picked wall as reference")).clicked()
-                            && let Some(wall)=current {
-                            self.reference=wall.id.clone();
-                        }
-                        ui.add(egui::TextEdit::singleline(&mut self.reference).hint_text("Reference wall id").char_limit(512));
-                        let labels=["Centreline","Left face","Right face"];
-                        for (name,id,selected) in [("Reference", "wall-reference-face", &mut self.wall_reference_face),
-                            ("Target", "wall-target-face", &mut self.wall_target_face)] {
-                            ui.horizontal(|ui| {
-                                ui.label(name);
-                                egui::ComboBox::from_id_salt(id).selected_text(labels[*selected]).show_ui(ui,|ui| {
-                                    for (index,label) in labels.iter().enumerate() { ui.selectable_value(selected,index,*label); }
-                                });
-                            });
-                        }
-                        ui.weak("Left/right follow each wall's start-to-end direction. Aligns walls within 15°, keeping lengths and door positions along the wall.");
-                    }
+                    _ => self.wall_reference_controls(ui, doc, current),
                 }
                 if self.align_mode == 3 {
-                    let alignment=self.align_walls(&targets);
-                    if ui.add_enabled(alignment.is_some(),egui::Button::new("Align wall selection")).clicked() { run=alignment; }
+                    let alignment = self.align_walls(doc, &targets);
+                    if ui.add_enabled(editable && alignment.is_some(), egui::Button::new("Preview wall alignment").wrap()).clicked() {
+                        run = alignment;
+                    }
+                    ui.add(egui::Label::new("Review the exact reference, endpoint changes, angle and affected levels before applying.").wrap());
                 } else if ui.button("Align selection").clicked() {
                     let mut params = json!({"targets":targets,"anchor":anchors[self.anchor]});
                     if self.align_mode == 2 {
@@ -410,27 +739,29 @@ impl Authoring {
             }
             Tool::Levels => {
                 ui.label("Destination storeys");
-                let building = current
-                    .and_then(|e| e.props.iter().find(|(k, _)| *k == "building"))
-                    .and_then(|(_, id)| doc.buildings.iter().find(|b| b.id == *id))
-                    .or_else(|| doc.buildings.first());
-                if let Some(b) = building {
-                    for (i, storey) in b.storeys.iter().enumerate() {
-                        let mut selected = self.levels.contains(&i);
-                        if ui.checkbox(&mut selected, &storey.name).changed() {
-                            if selected {
-                                self.levels.insert(i);
-                            } else {
-                                self.levels.remove(&i);
+                if let Some(building) = self.copy_building(doc, &targets) {
+                    ui.add(egui::Label::new(format!("{} · {}",building.name,building.id)).wrap());
+                    egui::ScrollArea::vertical().id_salt("copy-level-list").max_height(220.0).show(ui, |ui| {
+                        for (level, storey) in building.storeys.iter().enumerate() {
+                            let mut selected = self.levels.contains(&level);
+                            if ui.checkbox(&mut selected, format!("{} · L{level}",storey.name))
+                                .on_hover_text(format!("Floor Z {} mm · floor spacing {} mm",storey.elevation,storey.height)).changed()
+                            {
+                                if selected {self.levels.insert(level);} else {self.levels.remove(&level);}
                             }
                         }
-                    }
+                    });
+                    ui.checkbox(&mut self.replace, "Replace matching destinations")
+                        .on_hover_text("Explicitly replace matching geometry or facade slots; unrelated elements stay in place.");
+                    ui.add(egui::Label::new("Source storeys are skipped. Plan coordinates stay fixed; destination heights come from the model's levels.").wrap());
+                } else {
+                    ui.add(egui::Label::new("Select identifiable elements from one building to choose its named storeys. Unknown or mixed-building sets need a scoped selection.").wrap());
                 }
-                ui.checkbox(&mut self.replace, "Copy over matching elements");
-                if ui.add_enabled(!self.levels.is_empty(), egui::Button::new("Copy to storeys")).clicked() {
-                    run =
-                        Some(Run { command: "edit.copy_to_levels", params: json!({"targets":targets,"levels":self.levels,"replace":self.replace}) });
+                let preview = self.copy_to_levels(doc, &targets);
+                if ui.add_enabled(preview.is_some(),egui::Button::new("Preview copies to levels").wrap()).clicked() {
+                    run = preview;
                 }
+                ui.add(egui::Label::new("Review destination collisions and exact source changes before applying. Changing the building or its level schedule clears these choices.").wrap());
             }
             Tool::Delete => {
                 ui.weak("Removes the selected source instances in every phase. You can undo this batch.");
@@ -440,7 +771,14 @@ impl Authoring {
             }
         });
         if !editable {
-            ui.weak("Select a window, balcony, interior wall, stair or saved group. Exterior wall hosts use their facade tools.");
+            ui.add(
+                egui::Label::new(if self.wall_alignment_active() {
+                    "Capture the reference, then select the target interior-wall occurrences."
+                } else {
+                    "Select a window, balcony, interior wall, stair or saved group. Exterior wall hosts use their facade tools."
+                })
+                .wrap(),
+            );
         }
         ui.separator();
         egui::CollapsingHeader::new("Selection sets & groups").show(ui, |ui| {
@@ -608,17 +946,23 @@ impl Authoring {
 mod library_tests {
     use super::*;
     #[test]
-    fn wall_alignment_form_keeps_the_captured_reference_separate_from_the_picked_target() {
+    fn wall_alignment_form_keeps_the_captured_reference_and_only_requests_a_preflight() {
+        let doc = Document::default();
         let mut form = Authoring::default();
-        assert!(form.align_walls(&["target.L1".into()]).is_none());
+        assert!(form.align_walls(&doc, &["target.L1".into()]).is_none());
         form.reference = "reference.L1".into();
-        assert!(form.align_walls(&["reference.L1".into()]).is_none());
+        assert!(form.align_walls(&doc, &["reference.L1".into()]).is_none());
         form.wall_reference_face = 1;
         form.wall_target_face = 2;
-        let run = form.align_walls(&["target.L1".into()]).unwrap();
-        assert_eq!(run.command, "edit.align_walls");
-        assert_eq!(run.params, json!({"reference":"reference.L1","targets":["target.L1"],"reference_face":"left","target_face":"right"}));
-        assert!(run.params.get("axis").is_none(), "wall face alignment must not fall back to bounding-box translation");
+        let run = form.align_walls(&doc, &["target.L1".into()]).unwrap();
+        assert_eq!(run.command, "precision.preview");
+        assert_eq!(
+            run.params["action"],
+            json!({"command":"edit.align_walls","params":{
+            "reference":"reference.L1","targets":["target.L1"],"reference_face":"left","target_face":"right","max_move_mm":10.0}})
+        );
+        assert!(run.params["action"]["params"].get("axis").is_none(), "wall face alignment must not fall back to bounding-box translation");
+        assert!(run.params.get("preview_token").is_none(), "the form cannot invent an Apply token");
     }
 
     #[test]
@@ -680,5 +1024,214 @@ mod library_tests {
             assert!(form.export_library().is_none(), "Export must not enable a path the engine rejects: {invalid:?}");
         }
         assert_eq!(doc, Document::default(), "form choices never mutate type definitions or instances");
+    }
+
+    fn precision_document() -> Document {
+        let mut doc = Document::default();
+        let mut building =
+            Building::new("b", "Public UI fixture", &[[0.0, 0.0], [12000.0, 0.0], [12000.0, 8000.0], [0.0, 8000.0]], 3, 3000.0).unwrap();
+        building
+            .interior_walls
+            .push(serde_json::from_value(json!({"id":"target","levels":[1,2],"a":[1000,2050],"b":[5000,2250],"thickness":180})).unwrap());
+        doc.buildings.push(building);
+        doc.views.push(serde_json::from_value(json!({"id":"coord","name":"Coordination","kind":{"view":"plan","level":1}})).unwrap());
+        doc.annotations.push(
+            serde_json::from_value(json!({"id":"axis","view":"coord","kind":{"annotation":"line","from":[0.125,2000.375],"to":[12000.625,2010.875],
+            "stroke":{"colour":[184,65,44],"width_mm":0.13,"pattern":"dotted"}}}))
+            .unwrap(),
+        );
+        doc
+    }
+
+    #[test]
+    fn precision_form_plan_guides_use_explicit_datum_objects_with_exact_occurrences_and_movement_bound() {
+        let doc = precision_document();
+        let before = doc.clone();
+        let mut form = Authoring { wall_reference: WallReference::PlanGuide, ..Default::default() };
+        form.wall_guide = "axis".into();
+        form.wall_reference_face = 1; // A stale interior choice must never offset a guide.
+        form.wall_target_face = 2;
+        form.wall_max_move_mm = 2.75;
+        let run = form.align_walls(&doc, &["target.L1".into()]).unwrap();
+        assert_eq!(run.command, "precision.preview");
+        assert_eq!(
+            run.params["action"],
+            json!({"command":"edit.align_walls","params":{"targets":["target.L1"],
+            "reference":{"kind":"annotation","id":"axis"},"reference_face":"center","target_face":"right","max_move_mm":2.75}})
+        );
+        assert_eq!(run.params["sanity"], json!({"building":"b","levels":[1],"max_results":200}));
+        assert_eq!(doc, before, "control choices cannot move walls or rewrite measured guide endpoints");
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 100_000.1] {
+            form.wall_max_move_mm = invalid;
+            assert!(form.align_walls(&doc, &["target.L1".into()]).is_none());
+        }
+    }
+
+    #[test]
+    fn precision_form_only_admits_saved_plan_lines_as_guides() {
+        let mut doc = precision_document();
+        let mut form = Authoring { wall_reference: WallReference::PlanGuide, ..Default::default() };
+        for (id, kind) in [("facade", json!({"view":"facade","facade":"b.f1"})), ("section", json!({"view":"section","from":[0,0],"to":[12000,0]}))] {
+            doc.views.push(serde_json::from_value(json!({"id":id,"name":id,"kind":kind})).unwrap());
+            doc.annotations
+                .push(serde_json::from_value(json!({"id":id,"view":id,"kind":{"annotation":"line","from":[0,2000],"to":[12000,2000]}})).unwrap());
+            form.wall_guide = id.into();
+            assert!(form.align_walls(&doc, &["target.L1".into()]).is_none());
+        }
+        doc.annotations
+            .push(serde_json::from_value(json!({"id":"text","view":"coord","kind":{"annotation":"text","at":[0,0],"text":"Not a line"}})).unwrap());
+        for id in ["text", "missing"] {
+            form.wall_guide = id.into();
+            assert!(form.align_walls(&doc, &["target.L1".into()]).is_none());
+        }
+        form.wall_guide = "axis".into();
+        assert!(form.align_walls(&doc, &["target.L1".into()]).is_some());
+        doc.annotations.push(doc.annotations[0].clone());
+        assert!(form.align_walls(&doc, &["target.L1".into()]).is_none(), "ambiguous guides cannot preflight");
+    }
+
+    #[test]
+    fn precision_form_material_reference_requires_an_explicit_real_storey_and_never_uses_an_interior_alias() {
+        let doc = precision_document();
+        let mut form = Authoring { wall_reference: WallReference::Facade, ..Default::default() };
+        form.wall_facade = "b.f1".into();
+        form.reference = "facade:b.f1:L1".into();
+        assert!(form.align_walls(&doc, &["target.L1".into()]).is_none(), "no guessed current or first storey");
+        form.wall_level = Some(1);
+        form.wall_reference_face = 1;
+        let run = form.align_walls(&doc, &["target.L1".into()]).unwrap();
+        assert_eq!(run.command, "precision.preview");
+        assert_eq!(run.params["action"]["params"]["reference"], json!({"kind":"facade","id":"b.f1","level":1}));
+        assert_eq!(run.params["action"]["params"]["reference_face"], "left");
+        assert_eq!(run.params["sanity"], json!({"building":"b","levels":[1],"max_results":200}));
+        form.wall_level = Some(999);
+        assert!(form.align_walls(&doc, &["target.L1".into()]).is_none());
+        form.wall_level = Some(1);
+        form.wall_facade = "missing".into();
+        assert!(form.align_walls(&doc, &["target.L1".into()]).is_none());
+    }
+
+    #[test]
+    fn precision_form_level_copy_has_no_direct_mutation_bypass_and_keeps_replace_explicit() {
+        let doc = precision_document();
+        let before = doc.clone();
+        let targets = ["target.L1".into()];
+        let mut form = Authoring::default();
+        assert!(form.copy_to_levels(&doc, &targets).is_none());
+        assert_eq!(form.copy_building(&doc, &targets).unwrap().id, "b");
+        assert!(form.levels.is_empty(), "no destinations selected implicitly");
+        form.levels.insert(0);
+        let run = form.copy_to_levels(&doc, &targets).unwrap();
+        assert_eq!(run.command, "precision.preview");
+        assert_eq!(run.params["action"], json!({"command":"edit.copy_to_levels","params":{"targets":["target.L1"],"levels":[0],"replace":false}}));
+        assert_eq!(run.params["sanity"], json!({"building":"b","levels":[0],"max_results":200}));
+        form.replace = true;
+        assert_eq!(form.copy_to_levels(&doc, &targets).unwrap().params["action"]["params"]["replace"], true);
+        assert_eq!(doc, before);
+        form.levels.insert(999);
+        assert!(form.copy_to_levels(&doc, &targets).is_none());
+    }
+
+    #[test]
+    fn precision_form_copy_owner_is_not_the_first_building_and_level_schedule_changes_clear_choices() {
+        let mut doc = precision_document();
+        let mut other =
+            Building::new("other", "Another building", &[[20000.0, 0.0], [32000.0, 0.0], [32000.0, 8000.0], [20000.0, 8000.0]], 2, 3400.0).unwrap();
+        other
+            .interior_walls
+            .push(serde_json::from_value(json!({"id":"other-wall","levels":[1],"a":[22000,2000],"b":[26000,2000],"thickness":180})).unwrap());
+        doc.buildings.insert(0, other);
+        let mut form = Authoring::default();
+        assert_eq!(form.copy_building(&doc, &["target.L1".into()]).unwrap().id, "b");
+        form.levels.insert(0);
+        form.replace = true;
+        doc.buildings[1].storeys[0].elevation = -50.5;
+        assert!(form.copy_to_levels(&doc, &["target.L1".into()]).is_none(), "stale named level choices cannot preflight");
+        form.copy_building(&doc, &["target.L1".into()]);
+        assert!(form.levels.is_empty());
+        assert!(!form.replace);
+        form.levels.insert(0);
+        form.copy_building(&doc, &["other-wall.L1".into()]);
+        assert!(form.levels.is_empty(), "moving to another building requires new destination choices");
+        assert!(form.copy_building(&doc, &["target.L1".into(), "other-wall.L1".into()]).is_none());
+        assert!(form.copy_building(&doc, &["unknown".into()]).is_none());
+    }
+
+    #[test]
+    fn precision_form_named_level_scope_supports_flat_groups_and_refuses_ambiguous_building_ownership() {
+        let mut doc = precision_document();
+        doc.groups.push(serde_json::from_value(json!({"id":"g","name":"Wall group","targets":["target.L1"]})).unwrap());
+        assert_eq!(Authoring::targets_building(&doc, &["group:g".into()]).unwrap().id, "b");
+        doc.groups[0].targets = vec!["group:g".into()];
+        assert!(Authoring::targets_building(&doc, &["group:g".into()]).is_none());
+        let mut duplicate = doc.buildings[0].clone();
+        duplicate.id = "other".into();
+        doc.buildings.push(duplicate);
+        assert!(Authoring::targets_building(&doc, &["target.L1".into()]).is_none());
+    }
+
+    #[test]
+    fn precision_form_entry_points_select_the_actual_authoring_flows() {
+        let mut form = Authoring { tab: Tab::Families, ..Default::default() };
+        form.choose_wall_alignment();
+        assert!(form.tab == Tab::Project && form.wall_alignment_active() && form.command_controls_first());
+        form.choose_copy_to_levels();
+        assert!(form.tab == Tab::Project && form.tool == Tool::Levels && form.command_controls_first());
+    }
+
+    #[test]
+    fn precision_form_primary_controls_fit_narrow_columns_for_all_reference_modes_and_copy() {
+        fn text(shapes: &[egui::Shape]) -> Vec<(String, egui::Rect)> {
+            shapes
+                .iter()
+                .flat_map(|shape| match shape {
+                    egui::Shape::Text(text) => vec![(text.galley.text().to_string(), egui::Rect::from_min_size(text.pos, text.galley.size()))],
+                    egui::Shape::Vec(shapes) => text(shapes),
+                    _ => Vec::new(),
+                })
+                .collect()
+        }
+        let doc = precision_document();
+        for width in [240.0, 340.0, 780.0] {
+            for mode in [0, 1, 2, 3] {
+                let mut form = Authoring { targets: "target.L1".into(), ..Default::default() };
+                if mode == 3 {
+                    form.choose_copy_to_levels();
+                    form.copy_building(&doc, &["target.L1".into()]);
+                    form.levels.insert(0);
+                } else {
+                    form.choose_wall_alignment();
+                    form.wall_reference = [WallReference::Interior, WallReference::PlanGuide, WallReference::Facade][mode];
+                    form.reference = "reference.L1".into();
+                    form.wall_guide = "axis".into();
+                    form.wall_facade = "b.f1".into();
+                    form.wall_level = Some(1);
+                }
+                let ctx = egui::Context::default();
+                theme::apply(&ctx);
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 2200.0))),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            assert!(form.ui(ui, &doc, None, 0).is_none());
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                let labels = text(&output.shapes.into_iter().map(|shape| shape.shape).collect::<Vec<_>>());
+                let button = if mode == 3 { "Preview copies to levels" } else { "Preview wall alignment" };
+                let bounds = labels.iter().find(|(label, _)| label == button).unwrap().1;
+                assert!(bounds.left() >= 0.0 && bounds.right() <= width, "{button} overflows {width} px: {bounds:?}");
+                for (label, bounds) in &labels {
+                    if ["Alignment reference", "Target wall face", "Maximum endpoint movement"].contains(&label.as_str()) {
+                        assert!(bounds.left() >= 0.0 && bounds.right() <= width, "{label} overflows {width} px");
+                    }
+                }
+                assert!(!labels.iter().any(|(label, _)| label == "Align wall selection" || label == "Copy to storeys"));
+            }
+        }
     }
 }

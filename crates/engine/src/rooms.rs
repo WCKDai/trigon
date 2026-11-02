@@ -4,7 +4,7 @@
 //! wall or the outer walls' inside face (that closes door openings without inventing walls across
 //! rooms); then the free space inside the outer walls is flood-filled on a 50 mm grid.
 
-use trigon_model::{Building, Room};
+use trigon_model::{Building, ModelError, Room};
 
 /// Widest door gap closed, mm.
 const DOOR: f64 = 1100.0;
@@ -25,8 +25,8 @@ fn seg_hit(p: [f64; 2], d: [f64; 2], a: [f64; 2], b: [f64; 2]) -> Option<f64> {
 /// Extra blocking from a drawing: true where the site point (mm) is on drawn line work.
 pub(crate) type Ink<'a> = Option<&'a dyn Fn([f64; 2]) -> bool>;
 
-pub(crate) fn detect(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>) -> Vec<(Vec<[f64; 2]>, f64)> {
-    let inner = b.storey_inner(level);
+pub(crate) fn detect(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>) -> crate::Result<Vec<(Vec<[f64; 2]>, f64)>> {
+    let inner = b.storey_usable_outline(level)?;
     let walls: Vec<&trigon_model::InteriorWall> = b.interior_walls.iter().filter(|w| w.levels.contains(&level)).collect();
     // Lines that block: outer faces, interior walls as their two faces, door closers.
     let n = inner.len();
@@ -60,12 +60,12 @@ pub(crate) fn detect(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>)
     // Rasterise.
     let first = match inner.first() {
         Some(p) => *p,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let (lo, hi) = inner.iter().fold((first, first), |(lo, hi), p| ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])]));
     let (w, h) = (((hi[0] - lo[0]) / CELL).ceil() as usize + 2, ((hi[1] - lo[1]) / CELL).ceil() as usize + 2);
-    if w * h > 30_000_000 {
-        return Vec::new();
+    if w.checked_mul(h).is_none_or(|cells| cells > 30_000_000) {
+        return Err(ModelError::Invalid("room detection exceeds 30 million grid cells; use a smaller source scope".into()).into());
     }
     let centre = |i: usize, j: usize| [lo[0] + (i as f64 - 0.5) * CELL, lo[1] + (j as f64 - 0.5) * CELL];
     let mut blocked = vec![true; w * h];
@@ -231,14 +231,52 @@ pub(crate) fn detect(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>)
     }
     let mut rooms = Vec::new();
     for (id, cells) in cells_of {
-        let area = cells.len() as f64 * CELL * CELL / 1e6;
         if let Some(poly) = outline(&label, w, h, id, &cells) {
             let poly: Vec<[f64; 2]> = poly.into_iter().map(|(i, j)| [lo[0] + (i as f64 - 1.0) * CELL, lo[1] + (j as f64 - 1.0) * CELL]).collect();
-            rooms.push((simplify(&poly, 60.0), area));
+            rooms.extend(clip_room(&simplify(&poly, 60.0), &inner, min_area_m2)?);
         }
     }
     rooms.sort_by(|a, b| b.1.total_cmp(&a.1));
-    rooms
+    Ok(rooms)
+}
+
+// The 50 mm grid and 60 mm simplification locate candidate regions. Their final
+// source polygons must remain inside the exact usable boundary. Never round that
+// boundary, move a wall, take only the largest intersecting piece, or subtract stair
+// openings as though they were exterior masonry.
+fn clip_room(poly: &[[f64; 2]], inner: &[[f64; 2]], minimum_m2: f64) -> crate::Result<Vec<(Vec<[f64; 2]>, f64)>> {
+    use i_overlay::core::{fill_rule::FillRule, overlay_rule::OverlayRule};
+    use i_overlay::float::overlay::FloatOverlay;
+    if poly.len().saturating_add(inner.len()) > 10_000 {
+        return Err(ModelError::Invalid("room boundary clipping exceeds 10000 input vertices; use a smaller source scope".into()).into());
+    }
+    if poly.len() < 3 {
+        return Ok(Vec::new());
+    }
+    let subject = vec![poly.to_vec()];
+    let boundary = vec![inner.to_vec()];
+    if FloatOverlay::with_subj_and_clip(&subject, &boundary).overlay(OverlayRule::Difference, FillRule::NonZero).is_empty() {
+        // Keep original points, orientation and start corner when no clipping is
+        // necessary, preserving established rectangular room output exactly.
+        let area = trigon_model::doc::polygon_area(poly) / 1e6;
+        return Ok(if area >= minimum_m2 { vec![(poly.to_vec(), area)] } else { Vec::new() });
+    }
+    let shapes = FloatOverlay::with_subj_and_clip(&subject, &boundary).overlay(OverlayRule::Intersect, FillRule::NonZero);
+    let mut out = Vec::with_capacity(shapes.len());
+    for mut shape in shapes {
+        if shape.len() != 1 {
+            return Err(ModelError::Invalid("detected room clipping requires unsupported interior holes; use explicit room boundaries".into()).into());
+        }
+        let Some(mut ring) = shape.pop() else { continue };
+        if trigon_model::footprint::signed_area2(&ring) < 0.0 {
+            ring.reverse();
+        }
+        let area = trigon_model::doc::polygon_area(&ring) / 1e6;
+        if area >= minimum_m2 {
+            out.push((ring, area));
+        }
+    }
+    Ok(out)
 }
 
 /// The outer boundary of a labelled region as grid corners (square tracing along cell edges).
@@ -317,12 +355,121 @@ fn simplify(ring: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
     out
 }
 
-pub(crate) fn rooms_for(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>) -> Vec<Room> {
+pub(crate) fn rooms_for(b: &Building, level: usize, min_area_m2: f64, ink: Ink<'_>) -> crate::Result<Vec<Room>> {
     let mut out = Vec::new();
     {
-        for (k, (poly, _)) in detect(b, level, min_area_m2, ink).into_iter().enumerate() {
+        for (k, (poly, _)) in detect(b, level, min_area_m2, ink)?.into_iter().enumerate() {
             out.push(Room { id: format!("{}.L{level}.r{k}", b.id), levels: vec![level], name: String::new(), polygon: poly });
         }
     }
-    out
+    Ok(out)
+}
+
+#[cfg(test)]
+mod precision_boundary_tests {
+    use super::*;
+    use crate::Session;
+    use serde_json::json;
+
+    fn session(footprint: &[[f64; 2]], thickness: &[f64]) -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        let mut b = Building::new("b", "Original public room-boundary fixture", footprint, 2, 3000.).unwrap();
+        let prototype = b.facades[0].clone();
+        // Same preserved-corner source structure as building.add(preserve_vertices=true).
+        b.footprint = footprint.to_vec();
+        b.facades = thickness
+            .iter()
+            .enumerate()
+            .map(|(edge, d)| {
+                let mut facade = prototype.clone();
+                facade.id = format!("b.f{}", edge + 1);
+                facade.edge = edge;
+                facade.wall_schedule = vec![*d; 2];
+                facade
+            })
+            .collect();
+        s.doc.buildings.push(b);
+        s
+    }
+
+    #[test]
+    fn detected_rooms_follow_the_material_boundary_instead_of_a_folded_reference_loop() {
+        let footprint = [[0., 0.], [10000., 0.], [10000., 11820.], [10180., 11820.], [10180., 12000.], [0., 12000.]];
+        let mut s = session(&footprint, &[700., 1500., 1000., 600., 700., 360.]);
+        assert!(trigon_model::build(&s.doc).is_ok(), "the canonical floor already builds");
+        let named = Room {
+            id: "named-upper".into(),
+            levels: vec![1],
+            name: "Preserved upper room".into(),
+            polygon: vec![[1000., 1000.], [2000., 1000.], [2000., 2000.], [1000., 2000.]],
+        };
+        s.doc.buildings[0].rooms.push(named.clone());
+        let before = s.doc.clone();
+        let raw = s.doc.buildings[0].storey_inner(0);
+        s.execute("interior.detect_rooms", json!({"building":"b","levels":[0],"min_area_m2":0.2,"use_scan":false})).unwrap();
+        let rooms: Vec<_> = s.doc.buildings[0].rooms.iter().filter(|room| room.levels.contains(&0)).collect();
+        assert_eq!(rooms.len(), 1, "raw even-odd filling must not create an exterior room");
+        for point in &rooms[0].polygon {
+            assert!(point[0] >= 360. - 1e-6 && point[0] <= 8500. + 1e-6 && point[1] >= 700. - 1e-6);
+            let top = 11300. + 760. * (point[0] - 360.) / 9220.;
+            assert!(point[1] <= top + 1e-6, "room point {point:?} enters facade material");
+        }
+        assert!(trigon_model::doc::polygon_area(&rooms[0].polygon) <= 89_014_872.886);
+        assert!(s.doc.buildings[0].rooms.contains(&named));
+        assert_eq!(s.doc.buildings[0].storey_inner(0), raw, "indexed facade references are unchanged");
+        let after = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after);
+    }
+
+    #[test]
+    fn rectangular_detected_rooms_keep_the_legacy_polygon_bytes() {
+        let mut s = session(&[[0., 0.], [12000., 0.], [12000., 9000.], [0., 9000.]], &[400.; 4]);
+        s.execute("interior.detect_rooms", json!({"building":"b","levels":[0],"min_area_m2":0.2,"use_scan":false})).unwrap();
+        let rooms = &s.doc.buildings[0].rooms;
+        assert_eq!(rooms.len(), 1);
+        let expected = vec![Room {
+            id: "b.L0.r0".into(),
+            levels: vec![0],
+            name: String::new(),
+            polygon: vec![[400., 400.], [11600., 400.], [11600., 8600.], [400., 8600.]],
+        }];
+        assert_eq!(serde_json::to_vec(rooms).unwrap(), serde_json::to_vec(&expected).unwrap());
+    }
+
+    #[test]
+    fn invalid_material_boundary_refuses_detection_without_clearing_rooms_or_redo() {
+        let footprint = [
+            [0., 0.],
+            [4000., 0.],
+            [4000., 1700.],
+            [6000., 1700.],
+            [6000., 0.],
+            [10000., 0.],
+            [10000., 4000.],
+            [6000., 4000.],
+            [6000., 2300.],
+            [4000., 2300.],
+            [4000., 4000.],
+            [0., 4000.],
+        ];
+        let mut s = session(&footprint, &[400.; 12]);
+        s.doc.buildings[0].rooms.push(Room {
+            id: "old-detected".into(),
+            levels: vec![0, 1],
+            name: String::new(),
+            polygon: vec![[500., 500.], [1500., 500.], [1500., 1500.], [500., 1500.]],
+        });
+        s.execute("view.define", json!({"id":"retained","name":"Retained redo","kind":{"view":"plan","level":0}})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        let before = s.doc.clone();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        assert!(s.execute("interior.detect_rooms", json!({"building":"b","levels":[0],"use_scan":false})).is_err());
+        assert_eq!(s.doc, before);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+        assert_eq!(s.execute("edit.redo", json!({})).unwrap()["redone"], true);
+        assert!(s.doc.views.iter().any(|v| v.id == "retained"));
+    }
 }

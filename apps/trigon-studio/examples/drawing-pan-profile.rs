@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         stalls += 1;
                     }
                     let before = Instant::now();
-                    if shown != Some(key) {
+                    if shown.is_none_or(|previous| !drawing_raster::covers_viewport(previous, key, centre, zoom, [1000.0, 700.0])) {
                         let (image, times) =
                             drawing_raster::profiled(&trees[usize::from(key.detail)], key.origin, key.scale, key.size).ok_or("raster failed")?;
                         if !drawing_raster::accept_result(key, key) {

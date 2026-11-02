@@ -156,13 +156,14 @@ pub(crate) fn scene(
                 balcony: true,
                 source: None,
                 clearance: None,
+                entrance: None,
             });
             ticks.push((px(c - width / 2.0, r.rect.v0 - 330.0), px(c + width / 2.0, r.rect.v0 - 330.0)));
         }
     }
     // Entrances above the roof, named as seen from this side: "TV 7 TH" from the street the stair
     // is entered from, "TH 7 TV" from behind.
-    for e in &doc.buildings.iter().find(|x| x.id == b.building_id).map(|x| x.entrances.clone()).unwrap_or_default() {
+    for (entrance_index, e) in doc.buildings.iter().find(|x| x.id == b.building_id).into_iter().flat_map(|x| x.entrances.iter().enumerate()) {
         let Some(source) = doc.buildings.iter().find(|x| x.id == b.building_id) else { continue };
         let Some(st) = e
             .stair_at(source.ground_level)
@@ -190,13 +191,28 @@ pub(crate) fn scene(
             (Some(ahead), Some(behind)) => ahead <= behind,
             (ahead, _) => ahead.is_some(),
         };
-        let text = if front { format!("TV {} TH", e.number) } else { format!("TH {} TV", e.number) };
-        labels.push(Label { at: px(u, top + 900.0), alt: None, deg: 0.0, fs: 18.0, text, balcony: false, source: None, clearance: None });
+        // An elevation names only designations actually present in this entrance's unit register.
+        // The union spans storeys; it does not claim that every floor has every listed side.
+        let units: Vec<_> = e.units.iter().collect();
+        let mut tag = crate::plan::entrance_label(&b.building_id, entrance_index, e, &units, front, " ");
+        tag.at = [u, top + 900.0];
+        tag.outward = [0.0, 1.0];
+        labels.push(Label {
+            at: px(u, top + 900.0),
+            alt: None,
+            deg: 0.0,
+            fs: 18.0,
+            text: tag.text.clone(),
+            balcony: false,
+            source: Some(tag.source.clone()),
+            clearance: None,
+            entrance: Some(tag),
+        });
     }
     let mut placed: Vec<Label> = Vec::new();
     for l in labels {
         let fits = |l: &Label| !placed.iter().any(|q| q.overlaps(l));
-        if fits(&l) {
+        if l.entrance.is_some() || fits(&l) {
             placed.push(l);
         } else if let Some(at) = l.alt.filter(|at| fits(&Label { at: *at, alt: None, text: l.text.clone(), ..l.clone() })) {
             placed.push(Label { at, alt: None, ..l });
@@ -214,11 +230,14 @@ pub(crate) fn scene(
         if l.balcony {
             t.halo = Halo::Box;
         }
+        t.source = l.source.clone();
+        t.clearance = l.clearance.clone();
+        t.entrance = l.entrance.clone().map(Box::new);
         scene.text(t);
     }
     let floor = doc.buildings.iter().find(|source| source.id == b.building_id).map(|source| source.name.as_str()).unwrap_or_default();
     let metrics = json!({"triangles": projection.triangles, "lines": projection.edges.len(), "mm_per_px": mm, "scale": scale_text(scene.scale), "balcony_labels": placed.iter().filter(|l| l.balcony).count()});
-    Ok(Sheet {
+    let mut sheet = Sheet {
         scene,
         vp,
         clip: [0.0, 120.0, 1600.0, 700.0],
@@ -227,7 +246,9 @@ pub(crate) fn scene(
         caption: caption.into(),
         note: None,
         metrics,
-    })
+    };
+    crate::plan::layout_entrance_labels(&mut sheet, None)?;
+    Ok(sheet)
 }
 
 #[cfg(test)]
@@ -254,5 +275,45 @@ mod tests {
         let sheet = scene(&s.doc, Side::Along([[0., 0.], [12000., 0.]]), view, (None, None), "Along", "", false).unwrap();
         assert_eq!(sheet.project, "West wing", "an unscoped along view retains its first visible building");
         assert_eq!(s.doc, before, "drawing captions never rewrite source names or geometry");
+    }
+    #[test]
+    fn elevation_does_not_invent_tv_th_for_numeric_middle_or_unknown_only_units() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Public side evidence",
+            "footprint":[[0,0],[20000,0],[20000,16000],[0,16000]],"storeys":2,"storey_height_mm":3000}),
+        )
+        .unwrap();
+        s.execute("interior.add_stairs", json!({"building":"b","stairs":[
+            {"id":"core","levels":[0],"outline":[[4000,3000],[4000,6000],[6000,6000],[6000,3000]],"kind":"u_turn","landing":1000,"well":150,"rounded":false}
+        ]})).unwrap();
+        s.doc.buildings[0].entrances = serde_json::from_value(json!([
+            {"street":"Synthetic street","number":"4C","point":[5000,0],"stair":"core","units":[
+                {"floor":"st","door":"42"},{"floor":"1","door":"mf"},{"floor":"st","door":""}]}
+        ]))
+        .unwrap();
+        let before = s.doc.clone();
+        for facade in ["b.f1", "b.f3"] {
+            let sheet = scene(&s.doc, Side::Facade(facade), View::latest(&s.doc), (None, None), "Public elevation", "", false).unwrap();
+            let tags: Vec<_> = sheet
+                .scene
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    crate::sheet::Item::Text(text) if text.text.contains("4C") => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tags.len(), 1);
+            assert!(!tags[0].text.contains("TV") && !tags[0].text.contains("TH"), "absent apartment sides must not be fabricated");
+            assert!(tags[0].text.contains("42") && tags[0].text.contains("MF"));
+            let source = tags[0].source.as_ref().unwrap();
+            assert_eq!((source.kind, source.id.as_str(), source.role), ("entrance", "b.entrance0", "unit_register"));
+            assert_eq!(sheet.metrics["entrance_labels"]["requested"], 1);
+            assert_eq!(sheet.metrics["entrance_labels"]["placed"], 1);
+            assert_eq!(sheet.metrics["entrance_labels"]["records"][0]["unknown_door_units"], 1);
+        }
+        assert_eq!(s.doc, before);
     }
 }

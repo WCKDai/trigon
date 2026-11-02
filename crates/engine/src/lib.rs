@@ -22,6 +22,7 @@ mod drawings;
 mod edit;
 mod elements;
 mod elevation;
+mod entrances;
 mod facade_image;
 mod fbx;
 mod lettering_audit;

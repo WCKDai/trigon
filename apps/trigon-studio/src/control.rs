@@ -330,6 +330,7 @@ impl StudioApp {
             "model_box_m": self.scene.bounds,
             "window_hidden": self.window_hidden,
             "viewport_window_points": self.viewport_rect.map(|r|[r.left(),r.top(),r.width(),r.height()]),
+            "project_browser_window_points": self.browser_rect.map(|r|[r.left(),r.top(),r.width(),r.height()]),
             "handles": self.viewport_rect.map(|rect|self.projected_handles(rect).into_iter().filter_map(|handle|{
                 handle.mapping.screen(0.0).filter(|point|rect.contains(*point)).map(|point|json!({"key":handle.handle.key,"label":handle.handle.label,"point":[point.x,point.y],"value_mm":handle.handle.value}))
             }).collect::<Vec<_>>()).unwrap_or_default(),
@@ -343,6 +344,12 @@ impl StudioApp {
             return;
         }
         let ready = !self.building() && !(self.mode != Mode::ThreeD && self.drawing_plan());
+        if ready && self.mode != Mode::ThreeD {
+            // Logic continues while the native window is hidden and no egui pass runs.
+            // Progress CPU-only preparation here; PlanView::ui alone uploads textures.
+            let rect = self.viewport_rect.unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)));
+            self.plan.prepare(rect, self.ppp);
+        }
         let now = Instant::now();
         let mut keep = Vec::new();
         for mut shot in std::mem::take(&mut self.shots) {
@@ -356,6 +363,16 @@ impl StudioApp {
             }
             match shot.target {
                 ShotTarget::Viewport => {
+                    if self.mode != Mode::ThreeD
+                        && self.plan.error.is_none()
+                        && !self.plan.snapshot_ready(
+                            self.viewport_rect.unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                            self.ppp,
+                        )
+                    {
+                        keep.push(shot);
+                        continue;
+                    }
                     let r = self.viewport_png().and_then(|(size, png)| shot_reply(size, png, shot.path.as_deref(), "viewport"));
                     shot.responder.send(r);
                 }
@@ -373,7 +390,10 @@ impl StudioApp {
                 ShotTarget::Window => {
                     if self.mode != Mode::ThreeD
                         && self.plan.error.is_none()
-                        && !self.viewport_rect.is_some_and(|rect| self.plan.ready(rect, self.ppp))
+                        && !self.plan.snapshot_ready(
+                            self.viewport_rect.unwrap_or(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+                            self.ppp,
+                        )
                     {
                         keep.push(shot);
                         continue;

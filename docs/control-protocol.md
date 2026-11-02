@@ -109,6 +109,10 @@ to operate one through the same input path as a pointer, then read the refreshed
 Handle drags cancel on lost focus; an explicitly requested window screenshot with `raise: true`
 requests focus even if the window reports that it is already unoccluded.
 
+`project_browser_window_points: [x,y,width,height]` reports the visible browser scroll
+region in the stacked left dock, or null before its first layout. Like viewport
+coordinates, it changes when the window or dock is resized; read it again before input.
+
 ## Example
 
 ```text
@@ -155,3 +159,11 @@ The 3D appearance choice is ephemeral UI state: it does not alter the model, its
 For native drawing performance investigation, `ui.view` includes `drawing_raster` upload/discard
 counters and last CPU allocation/render/conversion/texture-enqueue times. GPU upload and frame
 pacing require native profiling; the response sets `gpu_upload_measured: false`.
+
+Plan and Drawing viewport screenshots also work while the window is minimized or occluded:
+logic-only servicing prepares the matching source and stroke bucket without waiting for an egui
+pass or uploading a texture. One accepted CPU raster may remain pending for the next visible pass.
+A screen-styling fallback uses the valid base tree with paper pens and is reported under
+`drawing_raster.last_style_warning`; it does not make the drawing invalid. Genuine drawing/model
+errors still block edits. `pending_rasters` and `prepared_stroke_zoom_bucket` distinguish CPU-ready
+snapshot data from the visible texture's `shown_stroke_zoom_bucket` and `uploads` counter.

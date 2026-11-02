@@ -541,13 +541,19 @@ pub struct Unit {
 }
 
 impl Unit {
+    /// Explicit unknown register values share one interpretation in drawings and editors.
+    /// This classifies the value without rewriting the original source string.
+    pub fn is_unknown_door(door: &str) -> bool {
+        matches!(door.trim().to_lowercase().as_str(), "" | "?" | "unknown" | "ukendt" | "uoplyst" | "ikke oplyst")
+    }
+
     /// The storey index of the unit's floor, given the ground storey's index: "st" is the ground
     /// storey, "1" the one above, "kl" the one below.
     pub fn level(&self, ground: usize) -> Option<usize> {
         match self.floor.as_str() {
             "st" => Some(ground),
             "kl" => ground.checked_sub(1),
-            f => f.parse::<usize>().ok().map(|n| ground + n),
+            f => f.parse::<usize>().ok().and_then(|n| ground.checked_add(n)),
         }
     }
 }
@@ -1012,6 +1018,18 @@ impl Building {
     pub fn storey_inner(&self, level: usize) -> Vec<[f64; 2]> {
         let (ring, kept) = self.storey_ring(level);
         crate::build::inner_ring_by(&ring, |i| kept.get(i).map_or(self.wall_thickness, |&e| self.edge_thickness(e, level)))
+    }
+
+    /// A simple material-bounded usable outline on one storey, before stair openings.
+    /// Unlike `storey_inner`, it is not indexed by source facade corner. Derivation is
+    /// shared with floor slabs; no source coordinates or wall identities are changed.
+    pub fn storey_usable_outline(&self, level: usize) -> Result<Vec<[f64; 2]>> {
+        if self.storeys.get(level).is_none() {
+            return Err(ModelError::Invalid("usable outline needs an existing storey".into()));
+        }
+        let (outer, _) = self.storey_ring(level);
+        let inner = self.storey_inner(level);
+        crate::build::floor_outline(&outer, &inner).map_err(|e| ModelError::Invalid(format!("storey {level}: {e}")))
     }
 
     /// Whether footprint edge `edge` has its own wall on a storey (not where a straight basement

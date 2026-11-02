@@ -25,7 +25,8 @@ pub enum DrawingRequest {
 
 pub struct PreparedDrawing {
     pub tree: Arc<usvg::Tree>,
-    pub display_trees: Vec<Arc<usvg::Tree>>,
+    /// Exact, reduced and overview display sources; screen styling is parsed on the raster thread.
+    pub display_svgs: [Arc<str>; 3],
     pub transform: DrawingTransform,
     pub segments: Vec<[[f64; 2]; 2]>,
     /// Visible model linework, in drawing-plane mm, with the built element id that owns each stroke.
@@ -103,12 +104,9 @@ pub fn run(job: &Job) -> Done {
             }
             .map_err(|e| e.to_string())?;
             let DrawingPreview { svg, transform, segments, element_segments, element_regions } = display.exact;
-            let display_trees = [display.reduced_svg, display.overview_svg]
-                .iter()
-                .map(|svg| trigon_engine::parse_svg(svg).map(Arc::new).map_err(|e| e.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
             let tree = trigon_engine::parse_svg(&svg).map(Arc::new).map_err(|e| e.to_string())?;
-            Ok(PreparedDrawing { tree, display_trees, transform, segments, element_segments, element_regions })
+            let display_svgs = [Arc::from(svg), Arc::from(display.reduced_svg), Arc::from(display.overview_svg)];
+            Ok(PreparedDrawing { tree, display_svgs, transform, segments, element_segments, element_regions })
         });
         plan_ms = ms(t);
         (request.clone(), tree)
@@ -316,7 +314,18 @@ mod tests {
             let (actual, drawing) = result.drawing.unwrap();
             assert_eq!(actual, request);
             let drawing = drawing.unwrap();
-            assert_eq!(drawing.display_trees.len(), 2);
+            assert_eq!(drawing.display_svgs.len(), 3);
+            let exact = match &request {
+                DrawingRequest::Plan(level) => trigon_engine::plan_drawing(&session.doc, *level, request_job.view).unwrap(),
+                DrawingRequest::Saved(id) => trigon_engine::drawing_view(&session.doc, id, request_job.view).unwrap(),
+            };
+            assert_eq!(drawing.display_svgs[0].as_ref(), exact.svg, "the raster worker receives unchanged exact SVG");
+            assert_eq!(drawing.transform, exact.transform);
+            assert_eq!(drawing.element_segments, exact.element_segments);
+            assert_eq!(drawing.element_regions, exact.element_regions);
+            for source in &drawing.display_svgs {
+                assert!(trigon_engine::parse_svg(source).is_ok(), "each generated display preset parses");
+            }
             assert!(!drawing.element_segments.is_empty());
             for line in &drawing.element_segments {
                 assert!(scene.find(&line.id).is_some(), "{request:?}: {} must resolve to a real scene element", line.id);

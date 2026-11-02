@@ -18,6 +18,7 @@ use crate::activity::{Action, Changes, Feed, Who};
 use crate::authoring::{Authoring, Tab};
 use crate::camera::Orbit;
 use crate::drafting::{Action as DrawingAction, Drafting};
+use crate::icons::{self, Icon};
 use crate::palette::Palette;
 use crate::plan_view::PlanView;
 use crate::properties::{self, Mapping, ProjectedHandle, Properties};
@@ -58,6 +59,27 @@ impl Mode {
             Mode::Drawing => "drawing",
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ViewTarget {
+    ThreeD(Option<usize>),
+    Plan(usize),
+    Drawing(String),
+}
+
+struct OpenView {
+    target: ViewTarget,
+    navigation: Option<crate::plan_view::Navigation>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Inspector {
+    #[default]
+    Elements,
+    Entrance,
+    Terrain,
+    Outline,
 }
 
 pub fn filter_name(f: PhaseFilter) -> &'static str {
@@ -161,6 +183,18 @@ pub struct StudioApp {
     diff: scene::Diff,
     pub(crate) selection: Option<usize>,
     authoring: Authoring,
+    inspector: Inspector,
+    entrances: crate::entrances::Editor,
+    terrain_panel: crate::terrain_panel::TerrainPanel,
+    outline_panel: crate::outline_panel::OutlinePanel,
+    precision_review: crate::precision_review::Review,
+    open_views: Vec<OpenView>,
+    active_view: Option<ViewTarget>,
+    view_ribbon: bool,
+    browser_query: String,
+    pub(crate) browser_rect: Option<egui::Rect>,
+    command_query: String,
+    show_activity: bool,
     schedules: Schedules,
     properties: Properties,
     pending_selection: Option<String>,
@@ -172,7 +206,6 @@ pub struct StudioApp {
     status: Option<(String, bool)>,
     title: String,
     /// Where Open and Save as… go on systems without native dialogs here.
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     path_text: String,
 }
 
@@ -256,6 +289,18 @@ impl StudioApp {
             diff: scene::Diff::default(),
             selection: None,
             authoring: Authoring::default(),
+            inspector: Inspector::Elements,
+            entrances: crate::entrances::Editor::default(),
+            terrain_panel: crate::terrain_panel::TerrainPanel::default(),
+            outline_panel: crate::outline_panel::OutlinePanel::default(),
+            precision_review: crate::precision_review::Review::default(),
+            open_views: Vec::new(),
+            active_view: None,
+            view_ribbon: false,
+            browser_query: String::new(),
+            browser_rect: None,
+            command_query: String::new(),
+            show_activity: false,
             schedules: Schedules::default(),
             properties: Properties::default(),
             pending_selection: None,
@@ -266,7 +311,6 @@ impl StudioApp {
             allow_close: false,
             status: None,
             title: String::new(),
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             path_text: String::new(),
         }
     }
@@ -305,22 +349,39 @@ impl StudioApp {
 
     /// Runs one command, logs it in the feed and, if it may have changed the model, rebuilds.
     pub(crate) fn run(&mut self, who: Who, id: &str, params: Value) -> Result<Value, String> {
+        if id == "precision.preview" {
+            self.precision_review.clear();
+        }
         let t = Instant::now();
         let r = self.session.execute(id, params.clone()).map_err(|e| e.to_string());
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let seq = self.feed.push(who, id, params, r.clone(), ms);
         let mutates = commands().iter().find(|c| c.id == id).is_some_and(|c| c.mutates);
         let undo_redo = matches!(id, "edit.undo" | "edit.redo");
+        if let Ok(value) = &r
+            && id == "precision.preview"
+        {
+            self.precision_review.set(value.clone());
+        }
         if let Ok(v) = &r
             && (mutates || undo_redo)
         {
             if undo_redo && (v.get("undone") == Some(&json!(false)) || v.get("redone") == Some(&json!(false))) {
                 return r;
             }
+            self.precision_review.clear();
             if matches!(id, "document.open" | "document.new" | "document.from_template") {
                 self.fit_pending = true;
                 self.selection = None;
                 self.authoring = Authoring::default();
+                self.inspector = Inspector::Elements;
+                self.entrances.clear();
+                self.terrain_panel = crate::terrain_panel::TerrainPanel::default();
+                self.outline_panel = crate::outline_panel::OutlinePanel::default();
+                self.open_views.clear();
+                self.active_view = None;
+                self.browser_query.clear();
+                self.view_ribbon = false;
                 self.schedules = Schedules::default();
                 self.properties = Properties::default();
                 self.drafting = Drafting::default();
@@ -700,9 +761,15 @@ impl StudioApp {
         let wide = ui.available_width() > 1100.0;
         ui.horizontal(|ui| {
             theme::wordmark(ui);
-            ui.label(egui::RichText::new("STUDIO").monospace().size(12.0).color(theme::MUTED));
             ui.separator();
-            let project = self.session.doc.buildings.first().map(|b| b.name.clone()).unwrap_or_else(|| "Untitled project".into());
+            let project = self
+                .session
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .or_else(|| self.session.doc.buildings.first().map(|building| building.name.clone()))
+                .unwrap_or_else(|| "Untitled project".into());
             let short = if project.chars().count() > 24 { format!("{}…", project.chars().take(24).collect::<String>()) } else { project.clone() };
             ui.menu_button(short, |ui| {
                 ui.strong(&project);
@@ -727,32 +794,28 @@ impl StudioApp {
             });
             if wide {
                 ui.separator();
-                if ui.button("Undo").on_hover_text("Undo the last model or annotation change (⌘Z)").clicked() {
+                if icons::button(ui, Icon::Undo, "", false).on_hover_text("Undo the last model or annotation change (⌘Z)").clicked() {
                     self.undo_redo(Action::Undo);
                 }
-                if ui.button("Redo").on_hover_text("Redo (⇧⌘Z)").clicked() {
+                if icons::button(ui, Icon::Redo, "", false).on_hover_text("Redo (⇧⌘Z)").clicked() {
                     self.undo_redo(Action::Redo);
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(self.mode == Mode::Drawing, egui::Button::new("Export drawing"))
+                    .add_enabled_ui(self.mode == Mode::Drawing, |ui| icons::button(ui, Icon::Export, "Export", false))
+                    .inner
                     .on_hover_text("Open the saved drawing's PDF, SVG, PNG and DXF export settings")
                     .clicked()
                 {
                     self.authoring.tab = Tab::Drawings;
                     self.drafting.show_export();
                 }
-                if theme::primary(ui, "Save").on_hover_text("Save project (⌘S)").clicked() {
+                if icons::button(ui, Icon::Save, "Save", false).on_hover_text("Save project (⌘S)").clicked() {
                     if self.session.path.is_some() { self.save(None) } else { self.pick_save_as() }
                 }
                 ui.separator();
-                let search = if wide { "Search commands…    ⌘ K" } else { "Commands…" };
-                if ui
-                    .add_sized([if wide { 230.0 } else { 100.0 }, 30.0], egui::Button::new(egui::RichText::new(search).color(theme::MUTED)))
-                    .on_hover_text("Search and run any command (⌘K)")
-                    .clicked()
-                {
+                if icons::button(ui, Icon::Search, "⌘ K", false).on_hover_text("Search and run any command (⌘K)").clicked() {
                     self.palette.show();
                 }
             });
@@ -761,27 +824,329 @@ impl StudioApp {
 
     fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(Tab::Project, "Model"), (Tab::Families, "Families"), (Tab::Drawings, "Document"), (Tab::Schedules, "Schedules")] {
-                if theme::workspace_tab(ui, label, self.authoring.tab == tab).clicked() {
+            for (tab, label) in
+                [(Tab::Project, "Architecture"), (Tab::Families, "Components"), (Tab::Drawings, "Annotate"), (Tab::Schedules, "Schedules")]
+            {
+                if theme::workspace_tab(ui, label, self.authoring.tab == tab && !self.view_ribbon).clicked() {
+                    self.inspect_elements();
                     self.authoring.tab = tab;
+                    self.view_ribbon = false;
                     self.drafting.picking = None;
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.presence_chip(ui));
+            if theme::workspace_tab(ui, "View", self.view_ribbon).clicked() {
+                self.view_ribbon = true;
+            }
         });
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
+    fn ribbon(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::horizontal().id_salt("ribbon-scroll").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(78.0);
+                if self.view_ribbon {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            if icons::button(ui, Icon::Map, "Floor plan", self.mode == Mode::Plan).clicked() {
+                                self.mode = Mode::Plan;
+                                self.view_changed(false);
+                            }
+                            if icons::button(ui, Icon::Box, "3D view", self.mode == Mode::ThreeD).clicked() {
+                                self.mode = Mode::ThreeD;
+                                self.level = None;
+                                self.view_changed(false);
+                            }
+                            if icons::button(ui, Icon::Bookmark, "Saved views", false).clicked() {
+                                self.authoring.tab = Tab::Drawings;
+                            }
+                        });
+                        theme::eyebrow(ui, "OPEN VIEWS");
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            if icons::button(ui, Icon::Align, "Fit view", false).clicked() {
+                                self.fit();
+                            }
+                            ui.toggle_value(&mut self.show_activity, "Activity");
+                        });
+                        theme::eyebrow(ui, "WORKSPACE");
+                    });
+                } else {
+                    match self.authoring.tab {
+                        Tab::Project => {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| self.authoring.ribbon(ui));
+                                });
+                                theme::eyebrow(ui, "MODIFY SELECTION");
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    let level = self.reference_level();
+                                    if ui
+                                        .add_enabled_ui(level.is_some(), |ui| icons::ribbon_button(ui, Icon::Guide, "Guide", false))
+                                        .inner
+                                        .on_hover_text("Create a red dotted plan reference with exact endpoints")
+                                        .clicked()
+                                        && let Some(level) = level
+                                    {
+                                        self.begin_reference_guide(level, None);
+                                    }
+                                    if icons::ribbon_button(ui, Icon::Outline, "Outline", self.inspector == Inspector::Outline)
+                                        .on_hover_text("Inspect exact source edges and use them as alignment guides")
+                                        .clicked()
+                                    {
+                                        self.inspect_project(Inspector::Outline);
+                                    }
+                                    if icons::ribbon_button(ui, Icon::Align, "Wall face", false)
+                                        .on_hover_text("Align selected walls to a guide or actual wall face, with a movement bound")
+                                        .clicked()
+                                    {
+                                        self.inspect_elements();
+                                        self.authoring.choose_wall_alignment();
+                                    }
+                                    if icons::ribbon_button(ui, Icon::Levels, "Copy levels", false)
+                                        .on_hover_text("Preview an exact transfer to named destination storeys")
+                                        .clicked()
+                                    {
+                                        self.inspect_elements();
+                                        self.authoring.choose_copy_to_levels();
+                                    }
+                                });
+                                theme::eyebrow(ui, "SET OUT / COORDINATION");
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    for (icon, label, query) in [
+                                        (Icon::Window, "Windows", "window"),
+                                        (Icon::Door, "Doors", "door"),
+                                        (Icon::Railing, "Balconies", "balcony"),
+                                        (Icon::Component, "All types", ""),
+                                    ] {
+                                        if icons::ribbon_button(ui, icon, label, false)
+                                            .on_hover_text("Open shared project types and placement controls")
+                                            .clicked()
+                                        {
+                                            self.authoring.tab = Tab::Families;
+                                            self.authoring.search = query.into();
+                                        }
+                                    }
+                                });
+                                theme::eyebrow(ui, "COMPONENT LIBRARY");
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    for (icon, label, query) in [
+                                        (Icon::Wall, "Walls", "interior"),
+                                        (Icon::Stair, "Stairs", "stair"),
+                                        (Icon::Roof, "Roof", "roof"),
+                                        (Icon::Slab, "Slabs", "slab"),
+                                    ] {
+                                        if icons::ribbon_button(ui, icon, label, false)
+                                            .on_hover_text("Find the typed modelling commands and their parameters")
+                                            .clicked()
+                                        {
+                                            self.palette.show_query(query);
+                                        }
+                                    }
+                                });
+                                theme::eyebrow(ui, "BUILD / COMMANDS");
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    if icons::ribbon_button(ui, Icon::Entrance, "Entrances", self.inspector == Inspector::Entrance).clicked() {
+                                        let id = self
+                                            .session
+                                            .doc
+                                            .buildings
+                                            .iter()
+                                            .find(|b| !b.entrances.is_empty())
+                                            .map(|b| format!("{}.entrance0", b.id));
+                                        if let Some(id) = id {
+                                            self.select_entrance(id);
+                                        } else {
+                                            self.status = Some(("This project has no stored entrance records.".into(), true));
+                                        }
+                                    }
+                                    if icons::ribbon_button(ui, Icon::Terrain, "Terrain", self.inspector == Inspector::Terrain).clicked() {
+                                        self.inspect_project(Inspector::Terrain);
+                                    }
+                                });
+                                theme::eyebrow(ui, "SITE / PROJECT DATA");
+                            });
+                        }
+                        Tab::Families => {
+                            ui.vertical(|ui| {
+                                icons::show(ui, Icon::Component, 24.0);
+                                ui.label("Shared types · variants · placement · portable libraries");
+                                theme::eyebrow(ui, "EDIT EVERY REFERENCING INSTANCE THROUGH TYPE PROPERTIES");
+                            });
+                        }
+                        Tab::Drawings => {
+                            ui.vertical(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if icons::button(ui, Icon::Select, "Edit elements", false).clicked() {
+                                        self.authoring.tab = Tab::Project;
+                                        self.drafting.picking = None;
+                                    }
+                                    ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| {
+                                        self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" })
+                                    });
+                                });
+                                theme::eyebrow(ui, "ANNOTATION / DRAWING TOOLS");
+                            });
+                        }
+                        Tab::Schedules => {
+                            ui.label("Window & door inventory · select a row to edit in Properties");
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    fn command_strip(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("TRIGON").strong().size(11.0).color(theme::ACCENT));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.command_query)
+                    .char_limit(256)
+                    .hint_text("Find a modelling command…")
+                    .desired_width((ui.available_width() * 0.45).clamp(140.0, 500.0)),
+            );
+            let enter = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if icons::button(ui, Icon::Search, "Commands", false).clicked() || enter {
+                self.palette.show_query(&self.command_query);
+            }
+            ui.toggle_value(&mut self.show_activity, "Activity");
+            if ui.available_width() > 250.0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.presence_chip(ui));
+            }
+        });
+    }
+
+    fn view_target(&self) -> ViewTarget {
+        match self.mode {
+            Mode::ThreeD => ViewTarget::ThreeD(self.level),
+            Mode::Plan => ViewTarget::Plan(self.plan_level),
+            Mode::Drawing => ViewTarget::Drawing(self.drawing.clone()),
+        }
+    }
+
+    fn sync_open_views(&mut self) {
+        let target = self.view_target();
+        if self.active_view.as_ref() == Some(&target) {
+            return;
+        }
+        if let Some(previous) = &self.active_view
+            && !matches!(previous, ViewTarget::ThreeD(_))
+            && let Some(tab) = self.open_views.iter_mut().find(|tab| &tab.target == previous)
+        {
+            tab.navigation = Some(self.plan.navigation());
+        }
+        if let Some(navigation) = self.open_views.iter().find(|tab| tab.target == target).and_then(|tab| tab.navigation) {
+            self.plan.restore_navigation(navigation);
+        } else {
+            if !matches!(target, ViewTarget::ThreeD(_)) {
+                self.plan.fit();
+            }
+            if !self.open_views.iter().any(|tab| tab.target == target) {
+                self.open_views.push(OpenView { target: target.clone(), navigation: None });
+            }
+        }
+        self.active_view = Some(target);
+    }
+
+    fn activate_view(&mut self, target: ViewTarget) {
+        match target {
+            ViewTarget::ThreeD(level) => {
+                self.mode = Mode::ThreeD;
+                self.level = level;
+            }
+            ViewTarget::Plan(level) => {
+                self.mode = Mode::Plan;
+                self.plan_level = level;
+            }
+            ViewTarget::Drawing(id) => {
+                self.open_drawing(id);
+                return;
+            }
+        }
+        self.drafting.picking = None;
+        self.view_changed(false);
+    }
+
+    fn view_tabs(&mut self, ui: &mut egui::Ui) {
+        self.sync_open_views();
+        let levels = self.levels();
+        self.open_views.retain(|tab| match &tab.target {
+            ViewTarget::ThreeD(level) => level.is_none_or(|level| level < levels.len()),
+            ViewTarget::Plan(level) => *level < levels.len(),
+            ViewTarget::Drawing(id) => self.session.doc.views.iter().any(|view| &view.id == id),
+        });
+        if !self.open_views.iter().any(|tab| Some(&tab.target) == self.active_view.as_ref()) {
+            self.activate_view(ViewTarget::ThreeD(None));
+        }
+        let targets = self.open_views.iter().map(|tab| tab.target.clone()).collect::<Vec<_>>();
+        let mut close = None;
+        egui::ScrollArea::horizontal().id_salt("view-tabs-scroll").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for target in targets {
+                    let (icon, label) = match &target {
+                        ViewTarget::ThreeD(level) => {
+                            (Icon::Box, level.and_then(|level| levels.get(level)).map_or("3D / Coordination".into(), |name| format!("3D / {name}")))
+                        }
+                        ViewTarget::Plan(level) => (Icon::Map, levels.get(*level).cloned().unwrap_or_else(|| "Floor plan".into())),
+                        ViewTarget::Drawing(id) => {
+                            (Icon::Section, self.session.doc.views.iter().find(|v| &v.id == id).map_or(id.clone(), |v| v.name.clone()))
+                        }
+                    };
+                    ui.push_id(format!("{target:?}"), |ui| {
+                        let selected = self.active_view.as_ref() == Some(&target);
+                        let response = icons::button(ui, icon, &label, selected);
+                        if selected {
+                            ui.painter()
+                                .line_segment([response.rect.left_bottom(), response.rect.right_bottom()], egui::Stroke::new(2.0, theme::ACCENT));
+                        }
+                        if response.clicked() {
+                            self.activate_view(target.clone());
+                        }
+                        if ui.small_button("×").on_hover_text("Close this view tab; the saved drawing stays in the project").clicked() {
+                            close = Some(target.clone());
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(target) = close {
+            self.open_views.retain(|tab| tab.target != target);
+            if self.active_view.as_ref() == Some(&target) {
+                let next = self.open_views.last().map_or(ViewTarget::ThreeD(None), |tab| tab.target.clone());
+                self.active_view = None;
+                self.activate_view(next);
+            }
+        }
+    }
+
+    fn view_controls(&mut self, ui: &mut egui::Ui) {
+        if !matches!(ui.ctx().os(), egui::os::OperatingSystem::Mac | egui::os::OperatingSystem::Windows) {
+            // Keep the file-path fallback out of the wrapping view controls: its
+            // text-edit width otherwise expands the canvas after a narrow resize.
+            ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(ui.available_width()));
+        }
         ui.horizontal_wrapped(|ui| {
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            ui.add(egui::TextEdit::singleline(&mut self.path_text).hint_text("path/to/model.trigon").desired_width(180.0));
             let before = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone(), self.phase_colors);
             ui.selectable_value(&mut self.mode, Mode::ThreeD, "3D");
             ui.selectable_value(&mut self.mode, Mode::Plan, "Plan");
             if ui.add_enabled(!self.session.doc.views.is_empty(), egui::Button::selectable(self.mode == Mode::Drawing, "Drawing")).clicked() {
                 self.mode = Mode::Drawing;
                 self.authoring.tab = Tab::Drawings;
-                if self.drawing.is_empty() {
+                if !self.session.doc.views.iter().any(|view| view.id == self.drawing) {
                     self.drawing = self.session.doc.views.first().map(|v| v.id.clone()).unwrap_or_default();
                 }
             }
@@ -840,27 +1205,9 @@ impl StudioApp {
             if ui.button("Fit").on_hover_text("Frame the whole model (F)").clicked() {
                 self.fit();
             }
-            ui.separator();
-            match self.authoring.tab {
-                Tab::Project => self.authoring.ribbon(ui),
-                Tab::Families => {
-                    ui.weak("Select a component type to edit, create a variant or place instances.");
-                }
-                Tab::Drawings => {
-                    if ui.button("Edit elements").on_hover_text("Pick model lines, then move, copy or align the selected element").clicked() {
-                        self.authoring.tab = Tab::Project;
-                        self.drafting.picking = None;
-                    }
-                    self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" });
-                }
-                Tab::Schedules => {
-                    ui.weak("Window & door inventory · select a row to edit in Properties");
-                }
-            }
             let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone(), self.phase_colors);
             if before != after {
                 if before.5 != after.5 {
-                    self.plan.fit();
                     self.drafting.picking = None;
                 }
                 self.view_changed(before.3 != after.3 || before.4 != after.4 || before.6 != after.6);
@@ -870,6 +1217,13 @@ impl StudioApp {
 
     /// The view settings changed: rebuild what the new view needs.
     pub(crate) fn view_changed(&mut self, phase_changed: bool) {
+        if self.mode == Mode::Drawing
+            && let Some(trigon_model::annotation::DrawingViewKind::Plan { level }) =
+                self.session.doc.views.iter().find(|view| view.id == self.drawing).map(|view| &view.kind)
+        {
+            self.plan_level = *level;
+        }
+        self.sync_open_views();
         self.properties.gizmo.cancel();
         self.redraw = true;
         if !phase_changed && self.authoring.tab == Tab::Schedules {
@@ -984,31 +1338,88 @@ impl StudioApp {
     }
 
     fn authoring_controls(&mut self, ui: &mut egui::Ui, selected: Option<&crate::scene::Element>) {
-        let run =
-            ui.add_enabled_ui(self.edit_block_reason().is_none(), |ui| self.authoring.ui(ui, &self.session.doc, selected, self.plan_level)).inner;
+        let enabled = self.edit_block_reason().is_none() && !self.precision_review.is_pending();
+        let run = ui.add_enabled_ui(enabled, |ui| self.authoring.ui(ui, &self.session.doc, selected, self.plan_level)).inner;
         if let Some(run) = run
             && self.edit_block_reason().is_none()
         {
-            match self.run(Who::Owner, run.command, run.params) {
-                Ok(value) => {
-                    if let Some(targets) = value.get("targets").and_then(Value::as_array) {
-                        let ids = targets.iter().filter_map(Value::as_str).collect::<Vec<_>>();
-                        self.pending_selection = ids.first().map(|s| s.to_string());
-                        if !self.authoring.targets.is_empty() {
-                            self.authoring.targets = ids.join("\n");
-                        }
-                    }
-                    self.status = Some((format!("{} completed", run.command), false));
+            self.run_form(run);
+        }
+    }
+
+    fn run_form(&mut self, run: crate::authoring::Run) {
+        if self.edit_block_reason().is_some() {
+            self.status = Some(("Wait for the active model view before applying this change.".into(), true));
+            return;
+        }
+        match self.run(Who::Owner, run.command, run.params) {
+            Ok(value) => {
+                if run.command == "precision.preview" {
+                    self.status = Some(("Preview ready · review and apply in Properties".into(), false));
+                    return;
                 }
-                Err(error) => self.status = Some((error, true)),
+                if let Some(targets) = value.get("targets").and_then(Value::as_array) {
+                    let ids = targets.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                    self.pending_selection = ids.first().map(|s| s.to_string());
+                    if !self.authoring.targets.is_empty() {
+                        self.authoring.targets = ids.join("\n");
+                    }
+                }
+                if let Some(annotation) = value.get("annotation").and_then(|a| serde_json::from_value(a.clone()).ok()) {
+                    self.drafting.select(&annotation);
+                }
+                self.status = Some((format!("{} completed", run.command), false));
             }
+            Err(error) => self.status = Some((error, true)),
         }
     }
 
     fn selection_panel(&mut self, ui: &mut egui::Ui) {
+        let blocked = self.edit_block_reason();
+        if self.precision_review.is_pending() {
+            if let Some(run) = self.precision_review.ui(ui, blocked) {
+                self.run_form(run);
+            }
+            ui.add_space(8.0);
+        }
+        let blocked =
+            self.edit_block_reason().or_else(|| self.precision_review.is_pending().then_some("Apply or cancel the preview to revise the inputs."));
+        if self.authoring.tab == Tab::Project {
+            match self.inspector {
+                Inspector::Entrance => {
+                    if !self.entrances.is_selected() {
+                        ui.weak("Choose an entrance from the Project Browser.");
+                        return;
+                    }
+                    let run = ui.add_enabled_ui(blocked.is_none(), |ui| self.entrances.ui(ui, &self.session.doc)).inner;
+                    if let Some(run) = run {
+                        self.run_form(run);
+                    }
+                    return;
+                }
+                Inspector::Terrain => {
+                    let run = ui.add_enabled_ui(blocked.is_none(), |ui| self.terrain_panel.ui(ui, &self.session.doc)).inner;
+                    if let Some(run) = run {
+                        self.run_form(run);
+                    }
+                    return;
+                }
+                Inspector::Outline => {
+                    let level = self.reference_level();
+                    let guide = ui.add_enabled_ui(blocked.is_none(), |ui| self.outline_panel.ui(ui, &self.session.doc, level)).inner;
+                    if let Some(guide) = guide {
+                        self.begin_reference_guide(guide.level, Some(guide.line));
+                    }
+                    return;
+                }
+                Inspector::Elements => {}
+            }
+        }
         if self.authoring.tab == Tab::Drawings {
             if self.mode == Mode::Drawing {
-                if let Some(run) = self.drafting.properties(ui, &self.session.doc, &self.drawing) {
+                let run =
+                    ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| self.drafting.properties(ui, &self.session.doc, &self.drawing)).inner;
+                if let Some(run) = run {
                     self.run_drafting(run);
                 }
             } else {
@@ -1019,7 +1430,6 @@ impl StudioApp {
         }
         ui.heading(if self.authoring.tab == Tab::Families { "Type properties" } else { "Properties" });
         let selected = self.selection.and_then(|i| self.scene.elements.get(i)).cloned();
-        let blocked = self.edit_block_reason();
         if let Some(reason) = blocked {
             ui.label(egui::RichText::new(reason).color(theme::ACCENT));
         }
@@ -1090,6 +1500,84 @@ impl StudioApp {
         });
     }
 
+    pub(crate) fn inspect_elements(&mut self) {
+        self.inspector = Inspector::Elements;
+        self.entrances.clear();
+        self.precision_review.clear();
+        self.properties.gizmo.cancel();
+    }
+
+    fn inspect_project(&mut self, inspector: Inspector) {
+        if inspector == Inspector::Outline {
+            self.outline_panel.start(self.reference_level());
+        }
+        self.inspect_elements();
+        self.authoring.tab = Tab::Project;
+        self.view_ribbon = false;
+        self.inspector = inspector;
+        self.drafting.picking = None;
+        self.selection = None;
+        self.pending_selection = None;
+        self.authoring.targets.clear();
+        self.selection_dirty = true;
+    }
+
+    fn select_entrance(&mut self, id: String) {
+        if self.inspector == Inspector::Entrance && self.entrances.selected_id() == Some(&id) {
+            return;
+        }
+        self.inspect_project(Inspector::Entrance);
+        self.entrances.select(id);
+    }
+
+    fn reference_level(&self) -> Option<usize> {
+        match self.mode {
+            Mode::Plan => Some(self.plan_level),
+            Mode::ThreeD => self.level,
+            Mode::Drawing => self.session.doc.views.iter().find(|v| v.id == self.drawing).and_then(|v| match v.kind {
+                trigon_model::annotation::DrawingViewKind::Plan { level } => Some(level),
+                _ => None,
+            }),
+        }
+    }
+
+    fn begin_reference_guide(&mut self, level: usize, line: Option<[[f64; 2]; 2]>) {
+        if let Some(reason) = self.edit_block_reason() {
+            self.status = Some((reason.into(), true));
+            return;
+        }
+        if !self.session.doc.buildings.iter().any(|b| b.storeys.get(level).is_some()) {
+            self.status = Some(("Choose a real floor before creating a plan guide.".into(), true));
+            return;
+        }
+        let stem = format!("coordination-L{level}");
+        let id = (0..256).map(|i| if i == 0 { stem.clone() } else { format!("{stem}-{i}") }).find(|id| {
+            !self.session.doc.views.iter().any(|v| &v.id == id)
+                || self
+                    .session
+                    .doc
+                    .views
+                    .iter()
+                    .any(|v| &v.id == id && matches!(v.kind, trigon_model::annotation::DrawingViewKind::Plan { level: l } if l == level))
+        });
+        let Some(id) = id else {
+            self.status = Some(("No free coordination view ID is available.".into(), true));
+            return;
+        };
+        if !self.session.doc.views.iter().any(|v| v.id == id) {
+            let params = json!({"id":id,"name":format!("Coordination · {}",self.levels().get(level).map_or("Floor", String::as_str)),"kind":{"view":"plan","level":level}});
+            if let Err(error) = self.run(Who::Owner, "view.define", params) {
+                self.status = Some((error, true));
+                return;
+            }
+        }
+        self.inspect_elements();
+        self.open_drawing(id.clone());
+        if self.drafting.reference_guide(&self.session.doc, &id, line) {
+            self.status = Some(("Reference guide · set exact endpoints, then Preview guide".into(), false));
+        }
+    }
+
     fn pick_template(&mut self, save: bool) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let path = {
@@ -1137,7 +1625,8 @@ impl StudioApp {
             }
             return;
         }
-        theme::eyebrow(ui, "PROJECT BROWSER");
+        ui.add(egui::TextEdit::singleline(&mut self.browser_query).char_limit(256).hint_text("Search project…").desired_width(f32::INFINITY));
+        let query = self.browser_query.trim().to_lowercase();
         let project = self.session.doc.buildings.first().map_or("Untitled project", |b| b.name.as_str());
         ui.heading(project);
         let before = (self.mode, self.level, self.plan_level);
@@ -1148,15 +1637,15 @@ impl StudioApp {
         }
         let levels = self.levels();
         egui::CollapsingHeader::new("Floor plans").default_open(true).show(ui, |ui| {
-            for (i, name) in levels.iter().enumerate() {
+            for (i, name) in levels.iter().enumerate().filter(|(_, name)| name.to_lowercase().contains(&query)) {
                 if ui.selectable_label(self.mode == Mode::Plan && self.plan_level == i, name).clicked() {
                     self.mode = Mode::Plan;
                     self.plan_level = i;
                 }
             }
         });
-        egui::CollapsingHeader::new("3D cut views").default_open(true).show(ui, |ui| {
-            for (i, name) in levels.iter().enumerate() {
+        egui::CollapsingHeader::new("3D cut views").show(ui, |ui| {
+            for (i, name) in levels.iter().enumerate().filter(|(_, name)| name.to_lowercase().contains(&query)) {
                 if ui.selectable_label(self.mode == Mode::ThreeD && self.level == Some(i), format!("{name} · cut")).clicked() {
                     self.mode = Mode::ThreeD;
                     self.level = Some(i);
@@ -1164,10 +1653,87 @@ impl StudioApp {
                 }
             }
         });
+        let mut project_inspector = None;
+        egui::CollapsingHeader::new("Set out & site").show(ui, |ui| {
+            for (inspector, label) in [(Inspector::Outline, "Building outline / reference guides"), (Inspector::Terrain, "Terrain / survey context")]
+            {
+                if ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(self.inspector == inspector, label).truncate()).clicked() {
+                    project_inspector = Some(inspector);
+                }
+            }
+        });
+        if let Some(inspector) = project_inspector {
+            self.inspect_project(inspector);
+        }
+        let entrances = self
+            .session
+            .doc
+            .buildings
+            .iter()
+            .flat_map(|b| {
+                b.entrances
+                    .iter()
+                    .enumerate()
+                    .map(|(index, e)| (format!("{}.entrance{index}", b.id), e.number.clone(), e.street.clone(), e.units.len()))
+            })
+            .collect::<Vec<_>>();
+        let mut entrance = None;
+        egui::CollapsingHeader::new(format!("Entrances / apartments ({})", entrances.len())).show(ui, |ui| {
+            for (id, number, street, count) in
+                entrances.iter().filter(|(id, number, street, _)| format!("{id} {number} {street}").to_lowercase().contains(&query))
+            {
+                let selected = self.inspector == Inspector::Entrance && self.entrances.selected_id() == Some(id);
+                if ui
+                    .add_sized([ui.available_width(), 28.0], egui::Button::selectable(selected, format!("{number} · {street}")).truncate())
+                    .on_hover_text(format!("{street} {number} · {count} unit records"))
+                    .clicked()
+                {
+                    entrance = Some(id.clone());
+                }
+            }
+            if entrances.is_empty() {
+                ui.weak("No stored entrance records in this project.");
+            }
+        });
+        if let Some(id) = entrance {
+            self.select_entrance(id);
+        }
+        let guides = self
+            .session
+            .doc
+            .annotations
+            .iter()
+            .filter(|a| {
+                matches!(a.kind, trigon_model::annotation::AnnotationKind::Line { .. })
+                    && self
+                        .session
+                        .doc
+                        .views
+                        .iter()
+                        .any(|v| v.id == a.view && matches!(v.kind, trigon_model::annotation::DrawingViewKind::Plan { .. }))
+            })
+            .map(|a| (a.id.clone(), a.view.clone()))
+            .collect::<Vec<_>>();
+        let mut open_guide = None;
+        egui::CollapsingHeader::new(format!("Plan lines / guides ({})", guides.len())).show(ui, |ui| {
+            for (id, view) in guides.iter().filter(|(id, view)| format!("{id} {view}").to_lowercase().contains(&query)) {
+                if ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(false, id).truncate()).on_hover_text(view).clicked() {
+                    open_guide = Some((id.clone(), view.clone()));
+                }
+            }
+        });
+        if let Some((id, view)) = open_guide {
+            self.inspect_elements();
+            self.open_drawing(view);
+            if let Some(annotation) = self.session.doc.annotations.iter().find(|a| a.id == id) {
+                self.drafting.select(annotation);
+            }
+            return;
+        }
         let facades = self.session.doc.buildings.iter().flat_map(|b| b.facades.iter().map(|f| (f.id.clone(), f.kind))).collect::<Vec<_>>();
         let mut open_facade = None;
         egui::CollapsingHeader::new("Facade elevations").show(ui, |ui| {
-            for (id, kind) in facades {
+            for (id, kind) in facades.into_iter().filter(|(id, _)| id.to_lowercase().contains(&query)) {
                 if ui.selectable_label(false, format!("{id} · {kind:?}")).clicked() {
                     open_facade = Some(id);
                 }
@@ -1201,7 +1767,7 @@ impl StudioApp {
         if groups.is_empty() {
             ui.weak("Collect elements in Properties to save a group.");
         }
-        for (id, name, n) in groups {
+        for (id, name, n) in groups.into_iter().filter(|(id, name, _)| format!("{id} {name}").to_lowercase().contains(&query)) {
             if ui.selectable_label(self.authoring.targets == format!("group:{id}"), format!("{name} · {n}")).clicked() {
                 self.authoring.targets = format!("group:{id}");
             }
@@ -1212,12 +1778,13 @@ impl StudioApp {
             .elements
             .iter()
             .enumerate()
-            .filter(|(_, e)| !e.host && e.level == Some(self.plan_level))
+            .filter(|(_, e)| !e.host && e.level == Some(self.plan_level) && format!("{} {}", e.id, e.kind).to_lowercase().contains(&query))
             .map(|(i, e)| (i, e.id.clone(), e.kind))
             .collect::<Vec<_>>();
         for (i, id, kind) in elements {
             let response = ui.selectable_label(self.selection == Some(i), &id).on_hover_text(kind);
             if response.clicked() {
+                self.inspect_elements();
                 self.pending_selection = None;
                 self.selection = Some(i);
                 self.selection_dirty = true;
@@ -1243,6 +1810,7 @@ impl StudioApp {
             return;
         };
         self.selection = Some(index);
+        self.inspect_elements();
         self.pending_selection = None;
         self.selection_dirty = true;
         self.redraw = true;
@@ -1267,15 +1835,24 @@ impl StudioApp {
     }
 
     pub(crate) fn open_drawing(&mut self, id: String) {
+        if let Some(trigon_model::annotation::DrawingViewKind::Plan { level }) = self.session.doc.views.iter().find(|v| v.id == id).map(|v| &v.kind) {
+            self.plan_level = *level;
+        }
         self.mode = Mode::Drawing;
         self.drawing = id;
         self.authoring.tab = Tab::Drawings;
         self.drafting.opened(&self.session.doc, &self.drawing);
-        self.plan.fit();
-        self.request_plan();
+        self.view_changed(false);
     }
 
     fn run_drafting(&mut self, mut run: crate::authoring::Run) {
+        if run.command == "annotation.define" && self.drafting.guide_active() {
+            self.run_form(crate::authoring::Run {
+                command: "precision.preview",
+                params: json!({"action":{"command":run.command,"params":run.params}}),
+            });
+            return;
+        }
         if run.command == "view.export" {
             if let Some(p) = self.session.doc.phases.get(self.phase) {
                 run.params["phase"] = json!(p.id);
@@ -1340,7 +1917,9 @@ impl StudioApp {
     }
 
     pub(crate) fn projected_handles(&self, rect: egui::Rect) -> Vec<ProjectedHandle> {
-        if self.authoring.tab == Tab::Drawings
+        if self.precision_review.is_pending()
+            || self.inspector != Inspector::Elements
+            || self.authoring.tab == Tab::Drawings
             || self.authoring.tab == Tab::Families
             || self.authoring.wall_alignment_active()
             || self.edit_block_reason().is_some()
@@ -1425,6 +2004,7 @@ impl StudioApp {
                 .cloned();
             self.selection = None;
             self.pending_selection = None;
+            self.inspect_elements();
             if let Some(annotation) = annotation {
                 self.drafting.select(&annotation);
             } else {
@@ -1555,6 +2135,7 @@ impl StudioApp {
         {
             let ndc = [(p.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (p.y - rect.top()) / rect.height() * 2.0];
             let (o, dir) = self.camera.ray(ndc, aspect);
+            self.inspect_elements();
             self.pending_selection = None;
             self.selection = self.scene.pick(o, dir, self.clip_z());
             self.selection_dirty = true;
@@ -1671,6 +2252,75 @@ impl StudioApp {
     }
 }
 
+impl StudioApp {
+    fn workspace_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.ppp = ctx.pixels_per_point();
+        self.collect_window_shots(&ctx);
+        self.shortcuts(&ctx);
+        self.update_title(&ctx);
+        egui::Panel::top("studio-title")
+            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(16, 8)))
+            .show(ui, |ui| self.app_bar(ui));
+        egui::Panel::top("workspace-tabs")
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 0)))
+            .show(ui, |ui| self.workspace_tabs(ui));
+        egui::Panel::top("ribbon")
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show(ui, |ui| self.ribbon(ui));
+        egui::Panel::top("command-strip")
+            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(12, 3)))
+            .show(ui, |ui| self.command_strip(ui));
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::left("project-dock")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(250.0..=520.0)
+            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(12))
+            .show(ui, |ui| {
+                let properties_max = (ui.available_height() - 150.0).max(80.0);
+                egui::Panel::top("properties-pane").resizable(true).default_size(322.0).size_range(80.0..=properties_max).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("properties-scroll").show(ui, |ui| self.selection_panel(ui));
+                });
+                let browser = egui::ScrollArea::vertical().id_salt("project-scroll").show(ui, |ui| self.project_browser(ui));
+                self.browser_rect = Some(browser.inner_rect);
+            });
+        if self.show_activity {
+            egui::Panel::right("activity").resizable(true).default_size(280.0).min_size(220.0).show(ui, |ui| {
+                if let Some(action) = self.feed.ui(ui, true, true) {
+                    self.undo_redo(action);
+                }
+            });
+        }
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            if self.authoring.tab == Tab::Schedules {
+                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::PANEL);
+                if let Some(action) = self.schedules.ui(ui, &self.scene, self.selection) {
+                    self.schedule_action(action);
+                }
+                return;
+            }
+            egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(10, 3)).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.view_tabs(ui);
+            });
+            egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 3)).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                self.view_controls(ui);
+            });
+            match self.mode {
+                Mode::ThreeD => self.viewport_3d(ui),
+                Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
+            }
+        });
+        if let Some(run) = self.palette.ui(&ctx) {
+            let r = self.run(Who::Owner, run.command, run.params);
+            self.palette.set_outcome(r.map(|v| crate::activity::pretty(&v)));
+        }
+        self.confirm_close_dialog(&ctx);
+    }
+}
+
 impl eframe::App for StudioApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if let Some(event) = self.synthetic.pop_front() {
@@ -1693,73 +2343,7 @@ impl eframe::App for StudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.ppp = ctx.pixels_per_point();
-        self.collect_window_shots(&ctx);
-        self.shortcuts(&ctx);
-        self.update_title(&ctx);
-        egui::Panel::top("studio-title")
-            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(16, 8)))
-            .show(ui, |ui| self.app_bar(ui));
-        egui::Panel::top("workspace-tabs")
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 0)))
-            .show(ui, |ui| self.workspace_tabs(ui));
-        egui::Panel::top("toolbar").frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 6))).show(ui, |ui| {
-            ui.add_space(4.0);
-            self.toolbar(ui);
-            ui.add_space(2.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("project-browser").resizable(true).default_size(235.0).min_size(180.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("project-scroll").show(ui, |ui| self.project_browser(ui));
-        });
-        egui::Panel::right("side").resizable(true).default_size(350.0).min_size(300.0).show(ui, |ui| {
-            egui::Panel::bottom("activity-panel").resizable(true).default_size(170.0).min_size(80.0).show(ui, |ui| {
-                if let Some(a) = self.feed.ui(ui, true, true) {
-                    self.undo_redo(a);
-                }
-            });
-            egui::ScrollArea::vertical().id_salt("properties-scroll").show(ui, |ui| self.selection_panel(ui));
-        });
-        egui::CentralPanel::no_frame().show(ui, |ui| {
-            if self.authoring.tab == Tab::Schedules {
-                ui.painter().rect_filled(ui.max_rect(), 0.0, theme::PANEL);
-                if let Some(action) = self.schedules.ui(ui, &self.scene, self.selection) {
-                    self.schedule_action(action);
-                }
-                return;
-            }
-            let label = match self.mode {
-                Mode::ThreeD => "3D / Coordination".to_string(),
-                Mode::Plan => format!("{} / Floor plan", self.levels().get(self.plan_level).map_or("Level", String::as_str)),
-                Mode::Drawing => self.session.doc.views.iter().find(|v| v.id == self.drawing).map_or("Drawing", |v| &v.name).to_string(),
-            };
-            egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 7)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let active = ui.label(egui::RichText::new(label).strong());
-                    ui.painter().line_segment(
-                        [active.rect.left_bottom() + egui::vec2(0.0, 6.0), active.rect.right_bottom() + egui::vec2(0.0, 6.0)],
-                        egui::Stroke::new(2.0, theme::ACCENT),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(if self.mode == Mode::ThreeD { "SITE LOCAL / mm / Z up" } else { "DRAWING PLANE / mm" })
-                                .size(10.0)
-                                .color(theme::MUTED),
-                        );
-                    });
-                });
-            });
-            match self.mode {
-                Mode::ThreeD => self.viewport_3d(ui),
-                Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
-            }
-        });
-        if let Some(run) = self.palette.ui(&ctx) {
-            let r = self.run(Who::Owner, run.command, run.params);
-            self.palette.set_outcome(r.map(|v| crate::activity::pretty(&v)));
-        }
-        self.confirm_close_dialog(&ctx);
+        self.workspace_ui(ui);
     }
 }
 
@@ -1796,6 +2380,362 @@ mod tests {
     fn window(app: &StudioApp) -> usize {
         let row = app.schedules.data().unwrap().rows.iter().find(|r| r.kind == trigon_engine::ScheduleOpeningKind::Window).unwrap();
         schedules::resolve_row(&app.scene, row).unwrap()
+    }
+
+    /// Exercise the actual control screenshot queue using a synthetic loopback request.
+    /// No discovery files or real credentials are read, and no egui pass runs here.
+    fn hidden_viewport_capture(app: &mut StudioApp, ctx: &egui::Context) -> serde_json::Value {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "synthetic-drawing-screenshot-test".repeat(2);
+        let server = Server::start_with(
+            listener,
+            token.clone(),
+            Arc::new(|| {}),
+            trigon_control::Options { reply_wait: Duration::from_secs(4), ..Default::default() },
+        )
+        .unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            writeln!(stream, "{}", json!({"id":1,"method":"ui.screenshot","params":{"target":"viewport"},"token":token})).unwrap();
+            stream.flush().unwrap();
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply).unwrap();
+            serde_json::from_str::<serde_json::Value>(&reply).unwrap()
+        });
+        let request = server.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.handle_request(request, ctx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.shots.is_empty() && Instant::now() < deadline {
+            app.poll_worker();
+            app.serve_shots(ctx);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.shots.is_empty(), "hidden drawing screenshots must finish through logic/control work without an egui pass");
+        let reply = client.join().unwrap();
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(app.plan.diagnostics()["uploads"], 0, "offscreen preparation must not enqueue GPU texture uploads");
+        reply
+    }
+
+    fn hidden_drawing_fixture(app: &mut StudioApp, request: DrawingRequest) {
+        app.window_hidden = true;
+        app.viewport_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 220.0)));
+        app.ppp = 1.0;
+        app.generation += 1;
+        app.plan_wanted = app.generation;
+        let done = crate::worker::run(&Job {
+            generation: app.generation,
+            doc: Arc::new(app.session.doc.clone()),
+            view: app.view(),
+            want_scene: false,
+            phase_colors: false,
+            drawing: Some(request),
+        });
+        app.apply_done(done);
+        assert!(!app.building() && !app.drawing_plan());
+    }
+
+    #[test]
+    fn hidden_plan_viewport_screenshot_progresses_without_a_ui_frame() {
+        let mut app = app(false);
+        app.mode = Mode::Plan;
+        app.plan_level = 0;
+        hidden_drawing_fixture(&mut app, DrawingRequest::Plan(0));
+        let ctx = egui::Context::default();
+        let reply = hidden_viewport_capture(&mut app, &ctx);
+        assert_eq!(reply["result"]["width"], 320);
+        assert_eq!(reply["result"]["height"], 220);
+        assert!(app.window_hidden);
+        assert!(app.plan.snapshot_ready(app.viewport_rect.unwrap(), 1.0));
+    }
+
+    #[test]
+    fn hidden_saved_drawing_and_refit_prepare_the_matching_style_without_ui() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"hidden-upper","name":"Hidden upper","kind":{"view":"plan","level":1}})).unwrap();
+        app.mode = Mode::Drawing;
+        app.drawing = "hidden-upper".into();
+        hidden_drawing_fixture(&mut app, DrawingRequest::Saved("hidden-upper".into()));
+        let ctx = egui::Context::default();
+        hidden_viewport_capture(&mut app, &ctx);
+        let first = app.plan.diagnostics()["stroke_zoom_bucket"].clone();
+        app.viewport_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 440.0)));
+        app.fit();
+        let reply = hidden_viewport_capture(&mut app, &ctx);
+        assert_eq!(reply["result"]["width"], 640);
+        assert_eq!(reply["result"]["height"], 440);
+        assert_ne!(app.plan.diagnostics()["stroke_zoom_bucket"], first, "hidden refit changes its logical pen bucket");
+        assert!(app.window_hidden);
+    }
+
+    #[test]
+    fn optional_screen_style_failure_does_not_block_edits_but_drawing_failure_does() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        app.mode = Mode::Plan;
+        app.plan_level = 0;
+        hidden_drawing_fixture(&mut app, DrawingRequest::Plan(0));
+        let mut done = crate::worker::run(&Job {
+            generation: app.generation,
+            doc: Arc::new(app.session.doc.clone()),
+            view: app.view(),
+            want_scene: false,
+            phase_colors: false,
+            drawing: Some(DrawingRequest::Plan(0)),
+        });
+        let drawing = done.drawing.as_mut().unwrap().1.as_mut().unwrap();
+        // Keep the already parsed engine base and exact pick/snap metadata, but reject the
+        // optional screen source. A failure here cannot become a model-editing lock.
+        drawing.display_svgs = [Arc::from("<svg>"), Arc::from("<svg>"), Arc::from("<svg>")];
+        app.apply_done(done);
+        let ctx = egui::Context::default();
+        hidden_viewport_capture(&mut app, &ctx);
+        assert!(app.plan.error.is_none());
+        assert!(app.plan.diagnostics()["last_style_warning"].as_str().unwrap().contains("using paper pens"));
+        assert!(app.edit_block_reason().is_none());
+        app.plan.fail("synthetic drawing generation failure".into());
+        assert!(app.edit_block_reason().is_some(), "genuine drawing errors retain the editing guard");
+        assert!(!app.plan.snapshot_ready(app.viewport_rect.unwrap(), 1.0));
+    }
+
+    #[test]
+    fn local_metadata_and_precision_review_share_the_real_command_path() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let id = app.session.doc.buildings[0].id.clone();
+        app.session.doc.buildings[0].entrances.push(
+            serde_json::from_value(json!({"street":"Synthetic street","number":"1A",
+            "point":[0,0],"units":[{"floor":"st","door":"tv"}]}))
+            .unwrap(),
+        );
+        let locator = format!("{id}.entrance0");
+        app.select_entrance(locator.clone());
+        assert!(app.inspector == Inspector::Entrance);
+        assert_eq!(app.entrances.selected_id(), Some(locator.as_str()));
+        assert!(app.selection.is_none());
+        let info = app.session.execute("entrance.get", json!({"id":locator})).unwrap();
+        let action = json!({"command":"entrance.set_unit","params":{"id":locator,"expected_address":info["expected_address"],
+            "unit_index":0,"expected_unit":info["units"][0]["unit"],"unit":{"floor":"st","door":"th"}}});
+        let before = app.session.doc.clone();
+        app.run_form(crate::authoring::Run { command: "precision.preview", params: json!({"action":action}) });
+        assert!(app.precision_review.is_pending());
+        assert_eq!(app.session.doc, before, "review must not apply the metadata edit");
+        app.inspect_elements();
+        assert!(!app.precision_review.is_pending(), "switching selection cancels the old proposal");
+        assert!(!app.entrances.is_selected());
+        app.run_form(crate::authoring::Run { command: "precision.preview", params: json!({"action":action}) });
+        assert!(app.precision_review.is_pending());
+        let mut invalid_action = action.clone();
+        invalid_action["params"]["unit"]["door"] = json!("W".repeat(65));
+        app.run_form(crate::authoring::Run { command: "precision.preview", params: json!({"action":invalid_action}) });
+        assert!(!app.precision_review.is_pending(), "a failed replacement preview must never leave the previous Apply action available");
+        assert_eq!(app.session.doc, before);
+        app.run_form(crate::authoring::Run { command: "precision.preview", params: json!({"action":action}) });
+        assert!(app.precision_review.is_pending());
+        app.run(Who::Owner, "view.define", json!({"id":"new-plan","name":"New plan","kind":{"view":"plan","level":0}})).unwrap();
+        assert!(!app.precision_review.is_pending(), "a document mutation invalidates the displayed proposal");
+        assert_eq!(app.session.doc.buildings[0].entrances[0].units[0].door, "tv");
+    }
+
+    #[test]
+    fn outline_guides_preserve_exact_points_and_create_only_a_coordination_frame() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let before = app.session.doc.buildings.clone();
+        let line = [[1234.567891, -0.125678], [6543.210987, 99.123456]];
+        app.begin_reference_guide(0, Some(line));
+        assert_eq!(app.mode, Mode::Drawing);
+        assert!(app.drafting.guide_active());
+        assert!(app.session.doc.annotations.is_empty(), "a reference starts as an unsaved draft");
+        assert!(
+            app.session
+                .doc
+                .views
+                .iter()
+                .any(|v| v.id == app.drawing && matches!(v.kind, trigon_model::annotation::DrawingViewKind::Plan { level: 0 }))
+        );
+        assert_eq!(app.session.doc.buildings, before);
+        assert_eq!(app.session.doc.journal.last().unwrap().command, "view.define");
+    }
+
+    #[test]
+    fn guide_floor_follows_the_active_saved_plan_and_refuses_other_planes() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"upper","name":"Upper","kind":{"view":"plan","level":1}})).unwrap();
+        app.plan_level = 0;
+        app.open_drawing("upper".into());
+        assert_eq!(app.plan_level, 1, "opening an upper saved plan synchronizes the active floor");
+        assert_eq!(app.reference_level(), Some(1));
+        app.plan_level = 0;
+        app.drawing = "upper".into(); // Same state transition as the saved-view dropdown.
+        assert_eq!(app.reference_level(), Some(1), "a guide resolves the active drawing plane, not the remembered plain plan");
+        let facade = app.session.doc.buildings[0].facades[0].id.clone();
+        app.session.execute("view.define", json!({"id":"front","name":"Front","kind":{"view":"facade","facade":facade}})).unwrap();
+        app.drawing = "front".into();
+        assert_eq!(app.reference_level(), None, "facade coordinates cannot silently become plan coordinates");
+        app.mode = Mode::ThreeD;
+        app.level = None;
+        assert_eq!(app.reference_level(), None);
+        app.level = Some(1);
+        assert_eq!(app.reference_level(), Some(1));
+    }
+
+    #[test]
+    fn control_and_dropdown_saved_plan_changes_report_the_actual_active_floor() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"upper-control","name":"Upper control","kind":{"view":"plan","level":1}})).unwrap();
+        app.plan_level = 0;
+        app.mode = Mode::Drawing;
+        app.drawing = "upper-control".into();
+        app.view_changed(false);
+        let state = app.view_state();
+        assert_eq!(state["plan_level"], 1, "MCP feedback must describe the active saved plan's floor");
+        app.plan_level = 0;
+        app.drawing = "upper-control".into();
+        app.view_changed(false); // The same transition as the saved-view dropdown.
+        assert_eq!(app.plan_level, 1);
+        assert_eq!(app.reference_level(), Some(1));
+    }
+
+    #[test]
+    fn view_tabs_preserve_plan_navigation_selection_and_shared_document() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        app.selection = Some(window(&app));
+        let selected = app.selection;
+        let document = app.session.doc.clone();
+        app.sync_open_views();
+        let camera = app.camera;
+        app.activate_view(ViewTarget::Plan(0));
+        let ctx = egui::Context::default();
+        app.plan.set_tree(
+            1,
+            Arc::new(
+                trigon_engine::parse_svg(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900"><path d="M10 10L1500 800" stroke="black"/></svg>"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut frame = 0;
+        let mut draw = |plan: &mut PlanView, events| {
+            frame += 1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                    time: Some(f64::from(frame) * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    plan.ui(ui, false);
+                },
+            );
+            output.textures_delta.clear();
+        };
+        draw(&mut app.plan, Vec::new());
+        let initial = app.plan.navigation();
+        for event in crate::control::parse_input("ui.drag", &json!({"from":[600,400],"to":[640,420],"steps":8})).unwrap() {
+            draw(&mut app.plan, vec![event]);
+        }
+        let first = app.plan.navigation();
+        assert_ne!(first, initial, "exercise a real drawing pan before switching tabs");
+        app.activate_view(ViewTarget::ThreeD(None));
+        app.plan.restore_navigation(crate::plan_view::PlanView::new(egui::Context::default()).navigation());
+        app.activate_view(ViewTarget::Plan(0));
+        assert_eq!(app.plan.navigation(), first);
+        assert_eq!(app.camera, camera);
+        assert_eq!(app.selection, selected);
+        assert_eq!(app.session.doc, document, "view navigation must not create modelling transactions");
+        assert_eq!(app.open_views.len(), 2);
+        app.activate_view(ViewTarget::ThreeD(None));
+        assert_eq!(app.open_views.len(), 2, "returning to a view reuses its tab");
+        app.run(Who::Owner, "document.new", json!({})).unwrap();
+        assert!(app.open_views.is_empty());
+        assert!(app.active_view.is_none(), "views and their navigation cannot leak into another project");
+    }
+
+    #[test]
+    fn stacked_workspace_keeps_a_usable_canvas_at_minimum_and_reference_sizes() {
+        for os in [egui::os::OperatingSystem::Mac, egui::os::OperatingSystem::Windows, egui::os::OperatingSystem::Nix] {
+            let mut app = app(false);
+            app.authoring.tab = Tab::Project;
+            let document = app.session.doc.clone();
+            let ctx = egui::Context::default();
+            ctx.set_os(os);
+            theme::apply(&ctx);
+            for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1600.0, 1076.0), egui::vec2(820.0, 520.0)] {
+                let mut output = ctx
+                    .run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
+                        app.workspace_ui(ui)
+                    });
+                output.textures_delta.clear();
+                let canvas = app.viewport_rect.unwrap();
+                assert!(app.browser_rect.unwrap().height() >= 100.0, "project browser must remain usable at {size:?}: {:?}", app.browser_rect);
+                assert!(app.browser_rect.unwrap().bottom() <= size.y, "browser must remain inside the resized window");
+                assert!(canvas.width() >= 450.0 && canvas.height() >= 100.0, "unusable canvas at {size:?}: {canvas:?}");
+                assert!(canvas.right() <= size.x + 1.0 && canvas.bottom() <= size.y + 1.0, "canvas leaves {os:?} window {size:?}: {canvas:?}");
+                assert_eq!(app.session.doc, document);
+            }
+            ctx.data_mut(|data| data.clear());
+        }
+    }
+
+    #[test]
+    fn drawing_shortcut_recovers_after_the_active_saved_view_is_removed() {
+        let mut app = app(false);
+        for id in ["a", "b"] {
+            app.run(Who::Owner, "view.define", json!({"id":id,"name":id,"kind":{"view":"plan","level":0}})).unwrap();
+        }
+        app.open_drawing("a".into());
+        app.run(Who::Owner, "view.remove", json!({"id":"a"})).unwrap();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut frame = 0;
+        let mut draw = |app: &mut StudioApp, events| {
+            frame += 1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 300.0))),
+                    time: Some(f64::from(frame) * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        app.view_tabs(ui);
+                        app.view_controls(ui);
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes.into_iter().map(|shape| shape.shape).collect::<Vec<_>>()
+        };
+        let shapes = draw(&mut app, Vec::new());
+        assert_eq!(app.mode, Mode::ThreeD);
+        fn find(shapes: &[egui::Shape]) -> Option<egui::Pos2> {
+            shapes.iter().find_map(|shape| match shape {
+                egui::Shape::Text(text) if text.galley.text() == "Drawing" => Some(text.pos + text.galley.size() * 0.5),
+                egui::Shape::Vec(shapes) => find(shapes),
+                _ => None,
+            })
+        }
+        let point = find(&shapes).unwrap();
+        for event in [
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ] {
+            draw(&mut app, vec![event]);
+        }
+        assert_eq!(app.drawing, "b", "the shortcut must choose a remaining saved drawing rather than reopen a deleted ID");
+        assert_eq!(app.mode, Mode::Drawing);
+        ctx.data_mut(|data| data.clear());
     }
 
     #[test]

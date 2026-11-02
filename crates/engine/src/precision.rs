@@ -35,6 +35,8 @@ pub(crate) enum Action {
     AddRooms(crate::commands::AddRooms),
     #[serde(rename = "edit.move")]
     Move(edit::Move),
+    #[serde(rename = "edit.copy_to_levels")]
+    CopyToLevels(edit::CopyToLevels),
     #[serde(rename = "edit.align")]
     Align(edit::Align),
     #[serde(rename = "edit.align_walls")]
@@ -43,6 +45,10 @@ pub(crate) enum Action {
     ConnectWalls(edit::ConnectWalls),
     #[serde(rename = "element.set")]
     Set(crate::elements::Set),
+    #[serde(rename = "entrance.set_unit")]
+    SetEntranceUnit(Box<crate::entrances::SetUnit>),
+    #[serde(rename = "entrance.bind_stair")]
+    BindEntranceStair(Box<crate::entrances::BindStair>),
     #[serde(rename = "annotation.move_label")]
     MoveLabel(MoveLabel),
     #[serde(rename = "edit.delete")]
@@ -89,10 +95,13 @@ fn run(s: &mut Session, action: Action) -> Result<Value> {
         Action::AddWalls(p) => crate::commands::add_interior_walls(s, p),
         Action::AddRooms(p) => crate::commands::add_interior_rooms(s, p),
         Action::Move(p) => edit::move_elements(s, p),
+        Action::CopyToLevels(p) => edit::copy_to_levels(s, p),
         Action::Align(p) => edit::align(s, p),
         Action::AlignWalls(p) => edit::align_walls(s, p),
         Action::ConnectWalls(p) => edit::connect_walls(s, p),
         Action::Set(p) => crate::elements::set(s, p),
+        Action::SetEntranceUnit(p) => crate::entrances::set_unit(s, *p),
+        Action::BindEntranceStair(p) => crate::entrances::bind_stair(s, *p),
         Action::MoveLabel(p) => move_label(s, p),
         Action::Delete(p) => edit::delete(s, p),
     }?;
@@ -151,6 +160,27 @@ pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
         }
         _ => {}
     }
+    // Entrance edits can change the size and position of generated tags even though
+    // they do not change building geometry. Check their affected saved drawing planes.
+    let entrance = match &p.action {
+        Action::SetEntranceUnit(p) => Some(p.id.as_str()),
+        Action::BindEntranceStair(p) => Some(p.id.as_str()),
+        _ => None,
+    };
+    if let Some((building, _)) = entrance.and_then(|id| id.rsplit_once(".entrance"))
+        && let Some(source) = s.doc.buildings.iter().find(|b| b.id == building)
+    {
+        for view in &s.doc.views {
+            let affected = match &view.kind {
+                trigon_model::annotation::DrawingViewKind::Plan { level } => source.storeys.get(*level).is_some(),
+                trigon_model::annotation::DrawingViewKind::Facade { facade } => source.facades.iter().any(|f| &f.id == facade),
+                trigon_model::annotation::DrawingViewKind::Section { .. } => false,
+            };
+            if affected {
+                drawings.insert(view.id.clone());
+            }
+        }
+    }
     // No environment credentials are loaded. The closed action list cannot access this
     // provider, files or the network; no command execution/journaling is nested here.
     let mut candidate = Session::new(Box::new(trigon_data::Live::new(Default::default())));
@@ -164,7 +194,7 @@ pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
         return Err(ModelError::Invalid("placement action makes no source change".into()).into());
     }
     let mut response = json!({"preview_token":preview_token,"action":action,"changes":diff,"result":result,
-        "validation":{"model_build":"passed","annotations":"passed"},"applied":false});
+        "validation":{"model_build":"passed","annotations":"passed","drawing_quality":"unverified"},"applied":false});
     if let Some(scope) = p.sanity {
         let feedback = match crate::precision_audit::audit(&candidate, scope) {
             Ok(audit) => audit,
@@ -203,6 +233,13 @@ pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
             .collect();
         response["drawing_feedback"] = json!(feedback);
         response["validation"]["drawing_render"] = json!(if rendered { "passed" } else { "unverified" });
+        response["validation"]["drawing_quality"] = json!(if !rendered {
+            "unverified"
+        } else if feedback.iter().any(|report| report["status"] != "no_findings_in_scope") {
+            "needs_review"
+        } else {
+            "no_findings_in_scope"
+        });
     }
     Ok(response)
 }

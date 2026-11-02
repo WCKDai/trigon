@@ -10,12 +10,18 @@ mod camera;
 mod control;
 mod drafting;
 mod drawing_raster;
+mod entrances;
+mod icons;
+mod outline_panel;
 mod palette;
 mod plan_view;
+mod precision_review;
 mod properties;
 mod render;
 mod scene;
 mod schedules;
+mod screen_lines;
+mod terrain_panel;
 mod theme;
 mod worker;
 

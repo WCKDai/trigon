@@ -82,6 +82,18 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
             findings.push(value);
         }
     };
+    let entrance_labels = sheet.metrics.get("entrance_labels").cloned().unwrap_or(Value::Null);
+    if let Some(records) = entrance_labels["records"].as_array() {
+        for record in records.iter().filter(|record| record["state"] == "unplaced") {
+            finding(json!({"kind":"unplaced_entrance_tag","source":record["source"],
+                "text":record["text"],"reason":record["reason"],"review_required":true,
+                "inspect_commands":record["inspect_commands"]}));
+        }
+    }
+    let inspect = |source: Option<&crate::sheet::TextSource>| match source {
+        Some(source) if source.kind == "entrance" => json!({"command":"entrance.get","params":{"id":source.id}}),
+        _ => json!({"command":"annotation.list","params":{"view":p.id}}),
+    };
     for (index, (text, bounds)) in texts.iter().zip(bounds).enumerate() {
         let Some(b) = bounds else { continue };
         let corners = |b: [f64; 4]| {
@@ -127,7 +139,8 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         labels.push(json!({"key":key,"source":text.source,"text":text.text,"at_mm":text.at,"size_mm_paper":text.size,
             "rotation_deg":text.deg,"style":text.style,"measurement_mm":measurement,
             "ink_corners_mm":ink.map(|q|q.map(|v|v*scale)),"halo_corners_mm":natural.map(|q|q.map(|v|v*scale)),
-            "visible_polygon_mm":visible.iter().map(|q|q.map(|v|v*scale)).collect::<Vec<_>>(),"clipped":clipped||outside_anchor}));
+            "visible_polygon_mm":visible.iter().map(|q|q.map(|v|v*scale)).collect::<Vec<_>>(),"clipped":clipped||outside_anchor,
+            "inspect_commands":[inspect(text.source.as_ref())]}));
         if clipped || outside_anchor {
             finding(json!({"kind":"clipped_label","key":key,"source":text.source,"anchor_outside":outside_anchor}));
         }
@@ -148,18 +161,22 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         for (wall_id, area) in wall_overlaps {
             finding(json!({"kind":"text_over_wall","key":key,"source":text.source,"wall_id":wall_id,
                 "halo_overlap_mm2_drawing":area,"review_required":true,
-                "inspect_commands":[{"command":"annotation.list","params":{"view":p.id}},
+                "inspect_commands":[inspect(text.source.as_ref()),
                     {"command":"element.get","params":{"id":wall_id}}]}));
         }
         polygons.push((key, text.source.clone(), visible));
     }
+    let mut inspect_commands = vec![json!({"command":"annotation.list","params":{"view":p.id}})];
+    let entrance_ids: std::collections::BTreeSet<_> =
+        texts.iter().filter_map(|text| text.source.as_ref()).filter(|source| source.kind == "entrance").map(|source| source.id.as_str()).collect();
+    inspect_commands.extend(entrance_ids.into_iter().map(|id| json!({"command":"entrance.get","params":{"id":id}})));
     let mut report = json!({"view":p.id,"scale":scale,"status":if count==0 && wall_check_error.is_none() {"no_findings_in_scope"} else {"needs_review"},
         "labels":labels,"findings":findings,"total_findings":count,"finding_counts":counts,"truncated":count>p.max_results,
-        "inspect_commands":[{"command":"annotation.list","params":{"view":p.id}}],
+        "inspect_commands":inspect_commands, "entrance_labels":entrance_labels,
         "mutation_workflow":["precision.preview","precision.apply"],
         "clearance_mm_paper":p.clearance_mm_paper,"visible_bounds_mm":crop.map(|v|v*scale),
         "scope":"bundled SVG glyph ink and exported halos; generated labels present in the view plus saved annotations",
-        "limitations":["Box intersections are potential collisions, not a pixel-level glyph collision test.","DXF consumers may substitute fonts. Suppressed generated labels and generic text/model-line clashes are not audited."]});
+        "limitations":["Box intersections are potential collisions, not a pixel-level glyph collision test.","DXF consumers may substitute fonts. Entrance coverage is explicit; other suppressed generated labels and generic text/model-line clashes are not audited."]});
     if p.check_wall_overlap {
         report["wall_overlap_check"] = json!({"status":if wall_check_error.is_some() {"unverified"} else {"checked"},"wall_sources":walls.len(),"scope":"visible glyph halo boxes against filled WallCut material, unioned per source; excludes picking-only faces, wall strokes and other model lines"});
         if let Some(error) = wall_check_error {
