@@ -272,6 +272,7 @@ fn cap(m: &mut Mesh, fr: &FacadeFrame, s: &Span, z: f64, up: bool, holes: &[Rect
 
 /// The mitred ends of a span, facing away from it.
 fn ends(m: &mut Mesh, fr: &FacadeFrame, s: &Span, holes: &[Vec<[f64; 2]>]) -> bool {
+    let first_triangle = m.triangles.len();
     let (a, e) = (fr.point(0.0, 0.0, 0.0), fr.point(fr.length, 0.0, 0.0));
     let mid = [(a[0] + e[0] + s.qs[0] + s.qe[0]) / 4.0, (a[1] + e[1] + s.qs[1] + s.qe[1]) / 4.0];
     let mut ok = true;
@@ -310,7 +311,44 @@ fn ends(m: &mut Mesh, fr: &FacadeFrame, s: &Span, holes: &[Vec<[f64; 2]>]) -> bo
             );
         }
     }
+    conform_end_edges(m, first_triangle);
     ok
+}
+
+/// A void can touch only the edge of an otherwise uncut mitre. Its head still
+/// divides that edge on the neighbouring face. Reuse those existing vertices in
+/// the end triangles, preserving coordinates and winding without adding a seam
+/// through the wall or changing unaffected triangulations.
+fn conform_end_edges(m: &mut Mesh, first_triangle: usize) {
+    let mut pending: Vec<_> = m.triangles.drain(first_triangle..).rev().collect();
+    while let Some(tri) = pending.pop() {
+        let split = (0..3).find_map(|edge| {
+            let (a, b) = (m.positions[tri[edge] as usize], m.positions[tri[(edge + 1) % 3] as usize]);
+            let ab = std::array::from_fn::<_, 3, _>(|i| b[i] - a[i]);
+            let length2: f64 = ab.iter().map(|v| v * v).sum();
+            if length2 < 1e-12 {
+                return None;
+            }
+            m.positions.iter().enumerate().find_map(|(i, p)| {
+                if tri.contains(&(i as u32)) {
+                    return None;
+                }
+                let t: f64 = (0..3).map(|i| (p[i] - a[i]) * ab[i]).sum::<f64>() / length2;
+                if !(0.0..1.0).contains(&t) || t * t * length2 <= 1e-12 || (1.0 - t).powi(2) * length2 <= 1e-12 {
+                    return None;
+                }
+                let distance2: f64 = (0..3).map(|i| (p[i] - a[i] - t * ab[i]).powi(2)).sum();
+                (distance2 <= 1e-12).then_some((edge, i as u32))
+            })
+        });
+        if let Some((i, p)) = split {
+            let (a, b, c) = (tri[i], tri[(i + 1) % 3], tri[(i + 2) % 3]);
+            pending.push([p, b, c]);
+            pending.push([a, p, c]);
+        } else {
+            m.triangles.push(tri);
+        }
+    }
 }
 
 /// One storey's closed piece of the wall. `None` if a face can't be triangulated.
@@ -753,6 +791,23 @@ mod tests {
                     }
                 }
                 assert!((area - 600.0 * (right_height - 2100.0)).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn a_door_touching_a_mitred_end_keeps_the_remaining_wedge_conforming() {
+        for (angle, offset, z0) in [(0_f64, [0.0, 0.0], 0.0), (37.0, [12345.0, -54321.0], 5000.0)] {
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let at = |[x, y]: [f64; 2]| [offset[0] + x * cos - y * sin, offset[1] + x * sin + y * cos];
+            let fr = FacadeFrame::new(at([0.0, 0.0]), at([800.0, 0.0])).unwrap();
+            let s = Span { level: 0, thickness: 100.0, in0: -50.0, in1: 800.0, qs: at([-50.0, 100.0]), qe: at([800.0, 100.0]), z0, z1: z0 + 3000.0 };
+            let r = Rect { u0: 0.0, u1: 800.0, v0: z0, v1: z0 + 2100.0 };
+            let p = rect(r.u0, r.u1, r.v0, r.v1);
+            for mesh in [segment(&fr, "test", &s, &[r]).unwrap().mesh, segment_profiles(&fr, "test", &s, &[p]).unwrap().mesh] {
+                assert_closed(&mesh);
+                let expected = (800.0 + 850.0) / 2.0 * 100.0 * 3000.0 - 800.0 * 100.0 * 2100.0;
+                assert!((volume(&mesh) - expected).abs() < 1.0);
             }
         }
     }
