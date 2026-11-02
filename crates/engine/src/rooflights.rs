@@ -144,6 +144,41 @@ mod tests {
     }
 
     #[test]
+    fn direct_gable_placement_refuses_invalid_roof_geometry_before_history_and_save() {
+        let mut s = gable_session();
+        let action = gable_action();
+        s.execute("facade.place", action["params"].clone()).unwrap();
+        let accepted = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        let before = s.doc.clone();
+        let glb = trigon_io::glb::write(&trigon_model::build(&before).unwrap(), &[]);
+        let mut bad = action["params"].clone();
+        bad["height"] = json!(4000);
+        let error = s.execute("facade.place", bad).expect_err("a direct command must validate the actual roof head before succeeding");
+        assert!(error.to_string().contains("deficit"), "{error}");
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted, "the rejected command must retain Redo");
+    }
+
+    #[test]
+    fn direct_bay_moves_validate_existing_implicit_gable_windows_atomically() {
+        let mut s = gable_session();
+        let mut params = gable_action()["params"].clone();
+        params.as_object_mut().unwrap().remove("u");
+        s.execute("facade.place", params).unwrap();
+        let before = s.doc.clone();
+        let glb = trigon_io::glb::write(&trigon_model::build(&before).unwrap(), &[]);
+        let error = s
+            .execute("facade.set_bays", json!({"facade":"b.f4","centres":[1500,8000]}))
+            .expect_err("a bay move must not persist an aperture crossing the sloping roof");
+        assert!(error.to_string().contains("deficit"), "{error}");
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), glb);
+    }
+
+    #[test]
     fn clipped_roof_properties_preserve_sources_and_exact_atomic_history() {
         let mut s = session();
         s.execute(

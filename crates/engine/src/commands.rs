@@ -2416,6 +2416,15 @@ fn check_building(doc: &Document, id: Option<&str>) -> Result<()> {
     for f in &b.facades {
         resolve_facade(doc, b, f)?;
     }
+    // Above-eaves gable apertures depend on the actual roof underside, which cannot
+    // be certified by rectangular facade resolution. Cover every direct caller
+    // (placement, bay/level/thickness edits and phase changes), before history commits.
+    // Layouts without half-hipped roof-level placements keep their existing path.
+    if matches!(b.roof, trigon_model::Roof::HalfHipped { .. })
+        && b.attic_level().is_some_and(|level| b.facades.iter().any(|f| f.placements.iter().any(|p| p.level == level)))
+    {
+        trigon_model::build(doc)?;
+    }
     Ok(())
 }
 
