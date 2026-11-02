@@ -180,3 +180,48 @@ fn precision_workflow_is_discoverable_and_atomic_through_mcp() {
     assert_eq!(undone["result"]["isError"], false);
     assert_eq!(s.doc, before);
 }
+
+#[test]
+fn drawing_preflight_schema_and_shaped_feedback_reach_mcp_clients() {
+    let mut s = session();
+    s.execute(
+        "building.add",
+        json!({"id":"b","name":"MCP drawing fixture","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":1,"storey_height_mm":3000}),
+    )
+    .unwrap();
+    let listed = rpc(&mut s, 1, "tools/list", json!({}));
+    let schema =
+        listed["result"]["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "precision_preview").unwrap()["inputSchema"].to_string();
+    for action in ["view.define", "view.configure", "annotation.define"] {
+        assert!(schema.contains(action), "discoverable action {action}");
+    }
+    let actions = [
+        json!({"command":"view.define","params":{"id":"p","name":"Plan","kind":{"view":"plan","level":0}}}),
+        json!({"command":"view.configure","params":{"id":"p","template":{"name":"100","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}}),
+        json!({"command":"annotation.define","params":{"id":"contract-note","view":"p","kind":{"annotation":"text","at":[2000,4000],"text":"MCP label"}}}),
+    ];
+    for action in actions {
+        let before = s.doc.clone();
+        let reply = rpc(&mut s, 2, "tools/call", json!({"name":"precision_preview","arguments":{"action":action}}));
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let preview: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(preview["validation"]["drawing_render"], "passed");
+        assert_eq!(preview["drawing_feedback"][0]["view"], "p");
+        if action["command"] == "annotation.define" {
+            let label =
+                preview["drawing_feedback"][0]["labels"].as_array().unwrap().iter().find(|label| label["source"]["id"] == "contract-note").unwrap();
+            assert_eq!(label["text"], "MCP label");
+            assert_eq!(label["ink_corners_mm"].as_array().unwrap().len(), 4);
+        }
+        let reply = rpc(
+            &mut s,
+            3,
+            "tools/call",
+            json!({"name":"precision_apply","arguments":{"action":preview["action"],"preview_token":preview["preview_token"]}}),
+        );
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        assert_eq!(s.doc.buildings, before.buildings);
+    }
+}

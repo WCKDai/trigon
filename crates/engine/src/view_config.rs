@@ -3,14 +3,14 @@
 use crate::sheet::{Item, Layer, MM_PER_PX, PAGE_MM, Sheet, Text, Viewport, scale_text};
 use crate::{Result, Session};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use trigon_model::{
     ModelError,
     annotation::{DrawingTemplate, DrawingView, DrawingViewKind, LineWeightProfile, RoomLabels, ViewSizing},
 };
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Configure {
     pub id: String,

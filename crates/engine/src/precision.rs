@@ -13,6 +13,12 @@ use crate::{Result, Session, edit};
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "command", content = "params", deny_unknown_fields)]
 pub(crate) enum Action {
+    #[serde(rename = "view.define")]
+    DefineView(trigon_model::annotation::DrawingView),
+    #[serde(rename = "view.configure")]
+    ConfigureView(crate::view_config::Configure),
+    #[serde(rename = "annotation.define")]
+    DefineAnnotation(trigon_model::annotation::Annotation),
     #[serde(rename = "building.add")]
     AddBuilding(crate::local_building::Add),
     #[serde(rename = "edit.move")]
@@ -57,6 +63,9 @@ fn token(s: &Session, action: &Action) -> Result<String> {
 
 fn run(s: &mut Session, action: Action) -> Result<Value> {
     let result = match action {
+        Action::DefineView(p) => crate::views::define_view(s, p),
+        Action::ConfigureView(p) => crate::view_config::configure(s, p),
+        Action::DefineAnnotation(p) => crate::views::define_annotation(s, p),
         Action::AddBuilding(p) => crate::local_building::add(s, p),
         Action::Move(p) => edit::move_elements(s, p),
         Action::Align(p) => edit::align(s, p),
@@ -100,6 +109,27 @@ fn changes(before: &Value, after: &Value, path: &str, out: &mut Vec<Value>) -> R
 pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
     let preview_token = token(s, &p.action)?;
     let action = serde_json::to_value(&p.action).map_err(|_| ModelError::Invalid("cannot serialize placement action".into()))?;
+    let mut drawings = std::collections::BTreeSet::new();
+    match &p.action {
+        Action::DefineView(p) => {
+            drawings.insert(p.id.clone());
+        }
+        Action::ConfigureView(p) => {
+            drawings.insert(p.id.clone());
+        }
+        Action::DefineAnnotation(p) => {
+            drawings.insert(p.view.clone());
+            if let Some(old) = s.doc.annotations.iter().find(|a| a.id == p.id) {
+                drawings.insert(old.view.clone());
+            }
+        }
+        Action::MoveLabel(p) => {
+            if let Some(old) = s.doc.annotations.iter().find(|a| a.id == p.id) {
+                drawings.insert(old.view.clone());
+            }
+        }
+        _ => {}
+    }
     // No environment credentials are loaded. The closed action list cannot access this
     // provider, files or the network; no command execution/journaling is nested here.
     let mut candidate = Session::new(Box::new(trigon_data::Live::new(Default::default())));
@@ -112,8 +142,31 @@ pub(crate) fn preview(s: &Session, p: Preview) -> Result<Value> {
     if diff.is_empty() {
         return Err(ModelError::Invalid("placement action makes no source change".into()).into());
     }
-    Ok(json!({"preview_token":preview_token,"action":action,"changes":diff,"result":result,
-        "validation":{"model_build":"passed","annotations":"passed"},"applied":false}))
+    let mut response = json!({"preview_token":preview_token,"action":action,"changes":diff,"result":result,
+        "validation":{"model_build":"passed","annotations":"passed"},"applied":false});
+    if !drawings.is_empty() {
+        let mut rendered = true;
+        let feedback: Vec<_> = drawings
+            .into_iter()
+            .map(|id| {
+                match crate::lettering_audit::audit(
+                    &candidate,
+                    crate::lettering_audit::Audit { id: id.clone(), clearance_mm_paper: 0.5, max_results: 1000 },
+                ) {
+                    Ok(audit) => audit,
+                    Err(error) => {
+                        // A stale view or bounded audit can be unavailable during a repair.
+                        // Keep structural/model validity separate and never report it as passed.
+                        rendered = false;
+                        json!({"view":id,"status":"unverified","error":error.to_string()})
+                    }
+                }
+            })
+            .collect();
+        response["drawing_feedback"] = json!(feedback);
+        response["validation"]["drawing_render"] = json!(if rendered { "passed" } else { "unverified" });
+    }
+    Ok(response)
 }
 
 pub(crate) fn apply(s: &mut Session, p: Apply) -> Result<Value> {
@@ -193,4 +246,177 @@ pub(crate) fn measure_stair(s: &mut Session, p: MeasureStair) -> Result<Value> {
         "run_mm":fit.length_mm,"width_mm":fit.width_mm,"well_mm":fit.well_mm,"lines_across_mm":fit.lines_across,
         "mm_per_pixel":(b[0]-a[0]).hypot(b[1]-a[1]),"applied":false,
         "basis":"registered source pixels; full-precision calculation is not a claim of physical or registration accuracy"}))
+}
+
+#[cfg(test)]
+mod drawing_preview_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Public preview fixture","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],"storeys":1,"storey_height_mm":3000}),
+        )
+        .unwrap();
+        s
+    }
+
+    fn plan(s: &mut Session) {
+        s.execute(
+            "view.define",
+            json!({"id":"p","name":"Plan","kind":{"view":"plan","level":0},
+            "template":{"name":"100","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}),
+        )
+        .unwrap();
+        s.execute(
+            "annotation.define",
+            json!({"id":"a","view":"p","size_mm":2.5,
+            "kind":{"annotation":"text","at":[2000,4000],"text":"WWWWWWWW"}}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn drawing_actions_preview_real_lettering_apply_once_and_replay() {
+        let mut s = session();
+        let actions = [
+            json!({"command":"view.define","params":{"id":"p","name":"Plan","kind":{"view":"plan","level":0}}}),
+            json!({"command":"view.configure","params":{"id":"p","template":{"name":"100","caption":"Public preview fixture",
+                "sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}}),
+            json!({"command":"annotation.define","params":{"id":"label","view":"p","size_mm":2.5,
+                "kind":{"annotation":"text","at":[3000,4000],"text":"Public label"}}}),
+        ];
+        for action in actions {
+            let before = s.doc.clone();
+            let history = (s.undo.len(), s.redo.len(), s.dirty);
+            let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+            assert_eq!(s.doc, before);
+            assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+            assert_eq!(preview, s.execute("precision.preview", json!({"action":action})).unwrap());
+            assert_eq!(preview["validation"]["drawing_render"], "passed");
+            assert_eq!(preview["drawing_feedback"].as_array().unwrap().len(), 1);
+            assert_eq!(preview["drawing_feedback"][0]["view"], "p");
+            s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+            assert_eq!(s.doc.buildings, before.buildings, "drawing changes cannot alter geometry sources");
+            assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+            assert_eq!(preview["drawing_feedback"][0], s.execute("view.audit", json!({"id":"p"})).unwrap());
+            let applied = s.doc.clone();
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.doc, before);
+            s.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(s.doc, applied);
+        }
+        let label = s.execute("view.audit", json!({"id":"p"})).unwrap()["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|label| label["source"]["id"] == "label")
+            .unwrap()
+            .clone();
+        assert_eq!(label["text"], "Public label");
+        assert_eq!(label["size_mm_paper"], 2.5);
+        assert_eq!(label["ink_corners_mm"].as_array().unwrap().len(), 4);
+        let mut replay = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        for entry in &s.doc.journal {
+            assert_ne!(entry.command, "precision.apply");
+            replay.execute(&entry.command, entry.params.clone()).unwrap();
+        }
+        assert_eq!(replay.doc, s.doc);
+    }
+
+    #[test]
+    fn drawing_previews_report_overlap_and_crop_without_claiming_layout_acceptance() {
+        let mut s = session();
+        plan(&mut s);
+        let before = s.doc.clone();
+        for (id, at, expected) in [("b", [2000, 4000], "potential_text_overlap"), ("outside", [6000, 100000], "clipped_label")] {
+            let action = json!({"command":"annotation.define","params":{"id":id,"view":"p","size_mm":2.5,
+                "kind":{"annotation":"text","at":at,"text":"WWWWWWWW"}}});
+            let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+            let audit = &preview["drawing_feedback"][0];
+            assert_eq!(preview["validation"]["model_build"], "passed");
+            assert_eq!(audit["status"], "needs_review");
+            assert!(audit["finding_counts"][expected].as_u64().unwrap() > 0);
+            assert!(audit["labels"].as_array().unwrap().iter().any(|label| label["source"]["id"] == id));
+            assert_eq!(s.doc, before);
+        }
+        let preview =
+            s.execute("precision.preview", json!({"action":{"command":"annotation.move_label","params":{"id":"a","delta":[0,100000]}}})).unwrap();
+        assert!(preview["drawing_feedback"][0]["finding_counts"]["clipped_label"].as_u64().unwrap() > 0);
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn invalid_and_stale_drawing_preflights_leave_document_dirty_state_and_redo_intact() {
+        let mut s = session();
+        plan(&mut s);
+        s.execute("annotation.move_label", json!({"id":"a","delta":[100,0]})).unwrap();
+        let edited = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        let before = s.doc.clone();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        let action = json!({"command":"view.configure","params":{"id":"p","template":{"name":"Changed","caption":"Changed"}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        for invalid in [
+            json!({"command":"document.save","params":{"path":"forbidden.trigon"}}),
+            json!({"command":"view.define","params":{"id":"bad","name":"Missing floor","kind":{"view":"plan","level":9}}}),
+            json!({"command":"view.configure","params":{"id":"p","template":{"name":"Invalid","sizing":{"mode":"fixed","denominator":0,"centre":[0,0]}}}}),
+            json!({"command":"annotation.define","params":{"id":"bad","view":"missing","kind":{"annotation":"text","at":[0,0],"text":"Absent view"}}}),
+        ] {
+            assert!(s.execute("precision.preview", json!({"action":invalid})).is_err());
+            assert!(s.execute("precision.apply", json!({"action":invalid,"preview_token":preview["preview_token"]})).is_err());
+            assert_eq!(s.doc, before);
+            assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+        }
+        let mut changed_action = preview["action"].clone();
+        changed_action["params"]["template"]["caption"] = json!("Changed action");
+        assert!(s.execute("precision.apply", json!({"action":changed_action,"preview_token":preview["preview_token"]})).is_err());
+        assert_eq!(s.doc, before);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, edited);
+        let after = s.doc.clone();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        assert!(s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).is_err());
+        assert_eq!(s.doc, after);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+    }
+
+    #[test]
+    fn moving_an_annotation_between_views_audits_both_final_drawings() {
+        let mut s = session();
+        plan(&mut s);
+        s.execute("view.define", json!({"id":"q","name":"Other plan","kind":{"view":"plan","level":0}})).unwrap();
+        let before = s.doc.clone();
+        let action = json!({"command":"annotation.define","params":{"id":"a","view":"q","size_mm":2.5,
+            "kind":{"annotation":"text","at":[2000,4000],"text":"Moved label"}}});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        let feedback = preview["drawing_feedback"].as_array().unwrap();
+        assert_eq!(feedback.iter().map(|audit| audit["view"].as_str().unwrap()).collect::<Vec<_>>(), ["p", "q"]);
+        assert!(!feedback[0]["labels"].as_array().unwrap().iter().any(|label| label["source"]["id"] == "a"));
+        assert!(feedback[1]["labels"].as_array().unwrap().iter().any(|label| label["source"]["id"] == "a"));
+        assert_eq!(s.doc, before);
+    }
+
+    #[test]
+    fn unavailable_lettering_feedback_is_explicit_without_changing_existing_repair_contracts() {
+        let mut s = session();
+        plan(&mut s);
+        let annotation = s.doc.annotations[0].clone();
+        s.doc.annotations.extend((0..2000).map(|i| trigon_model::annotation::Annotation { id: format!("extra{i}"), ..annotation.clone() }));
+        let before = s.doc.clone();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        let preview =
+            s.execute("precision.preview", json!({"action":{"command":"annotation.move_label","params":{"id":"a","delta":[100,0]}}})).unwrap();
+        assert_eq!(preview["validation"]["model_build"], "passed");
+        assert_eq!(preview["validation"]["annotations"], "passed");
+        assert_eq!(preview["validation"]["drawing_render"], "unverified");
+        assert_eq!(preview["drawing_feedback"][0]["status"], "unverified");
+        assert!(preview["drawing_feedback"][0]["error"].as_str().unwrap().contains("2000 labels"));
+        assert_eq!(s.doc, before);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    }
 }

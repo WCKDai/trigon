@@ -90,7 +90,16 @@ A centre-line junction is explicit: this command does not decide which side of a
 should align. Use `edit.align_walls` for source axis/left/right face alignment first.
 
 Other preview actions are `building.add`, `edit.move`, `edit.align`, `edit.align_walls`, `element.set`,
-`annotation.move_label` and `edit.delete`. These reuse the normal edit implementations.
+`annotation.move_label`, `edit.delete`, `view.define`, `view.configure` and `annotation.define`.
+These reuse the normal edit implementations. Drawing definitions/configuration and label moves
+also return `drawing_feedback`: the candidate's `view.audit` results at final physical scale,
+including glyph/halo bounds, source IDs, crop findings and potential overlaps. Moving an annotation
+between views audits both final views. Feedback does not change the source or repair the layout.
+`validation.drawing_render: "passed"` means those checks ran, not that the layout is acceptable;
+inspect each audit's status, findings and truncation. A stale view or the 2,000-label audit limit
+returns explicit `unverified` feedback and an error, with `drawing_render: "unverified"`. Model and
+annotation validity are separate. Existing repair actions remain available in that case; inspect
+the drawing separately before accepting it. The action list still excludes file/provider operations.
 A zero-change or overly large (>4096 changed fields) preview is refused; split the work.
 
 ## Sanity checks and interpretation

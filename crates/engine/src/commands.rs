@@ -120,7 +120,7 @@ static COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: "precision.preview",
-        summary: "Preview a typed local placement/repair action on a separate document. Returns exact source changes, validation and an opaque same-build token bound to the complete document and action. Read-only: no journal, files, credentials or network.",
+        summary: "Preview a typed local model or drawing action on a separate document. Returns exact source changes, validation and an opaque same-build token bound to the complete document and action. Drawing changes include bounded glyph, crop and overlap feedback for affected views; unavailable checks are explicit. Read-only: no journal, files, credentials or network.",
         mutates: false,
         journaled: false,
         schema: schema::<crate::precision::Preview>,
