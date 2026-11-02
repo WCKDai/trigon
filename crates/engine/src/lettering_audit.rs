@@ -28,6 +28,7 @@ fn limit() -> usize {
     1000
 }
 
+/// Retain shaped lettering findings even when optional wall comparisons are unavailable.
 pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
     checked("lettering clearance (paper mm)", p.clearance_mm_paper, 0., 10.)?;
     if !(1..=10_000).contains(&p.max_results) {
@@ -54,7 +55,14 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
     }
     let bounds = crate::plan_output::text_ink_bounds(&texts)?;
     let scale = sheet.scene.scale;
-    let walls = if p.check_wall_overlap { visible_wall_material(&sheet.scene, texts.len())? } else { Vec::new() };
+    let (walls, wall_check_error) = if p.check_wall_overlap {
+        match visible_wall_material(&sheet.scene, texts.len()) {
+            Ok(walls) => (walls, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        }
+    } else {
+        (Vec::new(), None)
+    };
     let [x, y, w, h] = sheet.clip;
     let (lo, hi) = (sheet.vp.at([x, y + h]), sheet.vp.at([x + w, y]));
     let mut crop = [lo[0] / scale, lo[1] / scale, hi[0] / scale, hi[1] / scale];
@@ -145,7 +153,7 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         }
         polygons.push((key, text.source.clone(), visible));
     }
-    let mut report = json!({"view":p.id,"scale":scale,"status":if count==0 {"no_findings_in_scope"} else {"needs_review"},
+    let mut report = json!({"view":p.id,"scale":scale,"status":if count==0 && wall_check_error.is_none() {"no_findings_in_scope"} else {"needs_review"},
         "labels":labels,"findings":findings,"total_findings":count,"finding_counts":counts,"truncated":count>p.max_results,
         "inspect_commands":[{"command":"annotation.list","params":{"view":p.id}}],
         "mutation_workflow":["precision.preview","precision.apply"],
@@ -153,11 +161,15 @@ pub(crate) fn audit(s: &Session, p: Audit) -> Result<Value> {
         "scope":"bundled SVG glyph ink and exported halos; generated labels present in the view plus saved annotations",
         "limitations":["Box intersections are potential collisions, not a pixel-level glyph collision test.","DXF consumers may substitute fonts. Suppressed generated labels and generic text/model-line clashes are not audited."]});
     if p.check_wall_overlap {
-        report["wall_overlap_check"] = json!({"status":"checked","wall_sources":walls.len(),"scope":"visible glyph halo boxes against filled WallCut material, unioned per source; excludes picking-only faces, wall strokes and other model lines"});
+        report["wall_overlap_check"] = json!({"status":if wall_check_error.is_some() {"unverified"} else {"checked"},"wall_sources":walls.len(),"scope":"visible glyph halo boxes against filled WallCut material, unioned per source; excludes picking-only faces, wall strokes and other model lines"});
+        if let Some(error) = wall_check_error {
+            report["wall_overlap_check"]["error"] = json!(error);
+        }
     }
     Ok(report)
 }
 
+/// Intersect semantic wall regions with printed fills, within the fixed comparison budget.
 fn visible_wall_material(scene: &crate::sheet::Scene, texts: usize) -> Result<Vec<(String, Vec<Vec<[f64; 2]>>)>> {
     use i_overlay::core::{fill_rule::FillRule, overlay_rule::OverlayRule};
     use i_overlay::float::overlay::FloatOverlay;
@@ -273,6 +285,57 @@ fn clip_rect(mut poly: Vec<[f64; 2]>, b: [f64; 4]) -> Vec<[f64; 2]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_wall_budget_preserves_lettering_findings_and_reports_partial_coverage() {
+        let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+        let mut b =
+            trigon_model::Building::new("b", "Many separate wall fills", &[[0., 0.], [100000., 0.], [100000., 80000.], [0., 80000.]], 1, 3000.)
+                .unwrap();
+        b.interior_walls = (0..1500)
+            .map(|i| {
+                let x = 1000 + (i % 50) * 1500;
+                let y = 1000 + (i / 50) * 1500;
+                serde_json::from_value(json!({"id":format!("wall{i}"),"levels":[0],"a":[x,y],"b":[x+500,y],"thickness":100})).unwrap()
+            })
+            .collect();
+        s.doc.buildings.push(b);
+        s.execute("view.define", json!({"id":"p","name":"Budget plan","kind":{"view":"plan","level":0}})).unwrap();
+        s.execute("view.configure", json!({"id":"p","template":{"name":"100","sizing":{"mode":"fixed","denominator":100,"centre":[6000,4000]}}}))
+            .unwrap();
+        for (id, at) in [("wide-a", [2000, 4000]), ("wide-b", [3500, 4000]), ("outside", [6000, 100000])] {
+            s.execute("annotation.define", json!({"id":id,"view":"p","size_mm":2.5,"kind":{"annotation":"text","at":at,"text":"WWWWWWWW"}})).unwrap();
+        }
+        s.execute("annotation.move_label", json!({"id":"wide-a","delta":[100,0]})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        let before = s.doc.clone();
+        let history = (s.undo.len(), s.redo.len(), s.dirty);
+        let legacy = s.execute("view.audit", json!({"id":"p"})).unwrap();
+        assert_eq!(legacy["finding_counts"], json!({"clipped_label":1,"potential_text_overlap":1}));
+        let report = s.execute("view.audit", json!({"id":"p","check_wall_overlap":true})).unwrap();
+        assert_eq!(report["labels"], legacy["labels"]);
+        assert_eq!(report["findings"], legacy["findings"]);
+        assert_eq!(report["finding_counts"], legacy["finding_counts"]);
+        assert_eq!(report["wall_overlap_check"]["status"], "unverified");
+        assert!(report["wall_overlap_check"]["error"].as_str().unwrap().contains("comparison budget exceeded"));
+        let limited = s.execute("view.audit", json!({"id":"p","check_wall_overlap":true,"max_results":1})).unwrap();
+        assert_eq!(limited["truncated"], true);
+        assert_eq!(limited["total_findings"], 2);
+        assert_eq!(limited["finding_counts"], report["finding_counts"]);
+        assert_eq!(limited["wall_overlap_check"], report["wall_overlap_check"]);
+        let preview =
+            s.execute("precision.preview", json!({"action":{"command":"annotation.move_label","params":{"id":"wide-a","delta":[10,0]}}})).unwrap();
+        assert_eq!(preview["validation"]["drawing_render"], "passed");
+        assert_eq!(preview["drawing_feedback"][0]["finding_counts"], report["finding_counts"]);
+        assert_eq!(preview["drawing_feedback"][0]["wall_overlap_check"]["status"], "unverified");
+        assert_eq!(s.doc, before);
+        assert_eq!((s.undo.len(), s.redo.len(), s.dirty), history);
+        s.doc.annotations.retain(|a| a.id == "wide-a");
+        let report = s.execute("view.audit", json!({"id":"p","check_wall_overlap":true})).unwrap();
+        assert_eq!(report["total_findings"], 0);
+        assert_eq!(report["status"], "needs_review", "unverified wall coverage cannot claim a clear audit");
+        assert_eq!(report["wall_overlap_check"]["status"], "unverified");
+    }
 
     #[test]
     fn opt_in_plan_wall_check_reports_printed_label_halos_and_exact_wall_sources() {

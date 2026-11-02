@@ -39,6 +39,10 @@ not pixel-level glyph tests. Wall strokes and other model lines are excluded. Th
 check is plan-only; omitting it retains the existing direct audit behavior. Drawing actions in
 `precision.preview` enable it for plans, so a misplaced label gets feedback before applying it.
 Neither command moves, clips or suppresses the label in response to a finding.
+If the wall comparison exceeds its fixed budget, clipping and text-overlap findings are retained.
+`wall_overlap_check` then reports `status: "unverified"` and its error; the overall status is
+`needs_review`, including when the lettering checks found no collisions. A successful drawing
+render does not establish that this optional wall comparison completed.
 
 Saved plan templates can enable live room tags with `room_labels: "area"` or `"name_and_area"`
 through `view.configure` (also in Studio's view-template panel). Tags use the selected storey's
