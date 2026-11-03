@@ -15,6 +15,26 @@ With nothing selected, Properties describes the active view. Selecting an elemen
 editable parameters and existing drag handles; **Edit type** opens the referenced shared family.
 Type edits and instance overrides have different scopes, shown explicitly in the editor.
 
+## Export a model or drawing
+
+**Export** in the application bar offers **IFC4 BIM** and **GLB 3D model** from both the 3D
+and plan workspaces. Choose a phase and visibility filter, then a destination. Full-model export
+is the default. GLB can explicitly use the current single-building 3D storey cut; if that
+building or its storey schedule changes while the dialog is open, reopen Export before using
+the cut. IFC keeps complete storey geometry and ignores the viewport camera and cut.
+
+Geometry generation and writing run in the background against the document captured when export
+starts. Live edits, Undo and project replacement do not alter that snapshot. Activity retains
+its source filename, phase, filter and full-model or cut scope alongside the exact `export.ifc`
+or `export.gltf` command. Linked GLB reference files are read at export time. Canceling the
+destination dialog starts no export; hiding an active export leaves it running. Normal app
+closure waits for the active export to finish. Export errors remain visible for retry.
+
+For a saved drawing, **Export → Drawing · PDF, SVG, PNG, DXF…** opens its controls in
+Properties, including when the canvas was focused or the supporting panel was closed.
+Model export does not include sheet annotations. These controls reuse the existing exchange
+writers; they do not change IFC semantics or make file replacement atomic.
+
 ## Walls and exterior outlines
 
 Choose **Architecture → Wall**. In an empty project, click the exterior corners on the gridded

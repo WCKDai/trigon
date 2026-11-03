@@ -162,6 +162,7 @@ pub struct StudioApp {
     pub(crate) plan_level: usize,
     pub(crate) drawing: String,
     drafting: Drafting,
+    pub(crate) model_export: crate::model_export::ModelExport,
     pub(crate) phase: usize,
     pub(crate) filter: PhaseFilter,
     pub(crate) phase_colors: bool,
@@ -283,6 +284,7 @@ impl StudioApp {
             plan_level: 0,
             drawing: String::new(),
             drafting: Drafting::default(),
+            model_export: crate::model_export::ModelExport::default(),
             phase: 0,
             filter: PhaseFilter::Complete,
             phase_colors: false,
@@ -400,6 +402,7 @@ impl StudioApp {
                 self.selection = None;
                 self.authoring = Authoring::default();
                 self.model_tools.cancel();
+                self.model_export.project_replaced();
                 self.drafting.cancel_placement();
                 self.empty_pan = egui::Vec2::ZERO;
                 self.inspector = Inspector::Elements;
@@ -714,6 +717,26 @@ impl StudioApp {
         }
     }
 
+    fn show_model_export(&mut self, format: crate::model_export::Format) {
+        let view = self.view();
+        let level = if self.mode == Mode::ThreeD { self.level } else { None };
+        self.model_export.show(format, &self.session.doc, view, level, self.session.path.as_deref());
+    }
+
+    fn poll_model_export(&mut self) {
+        if let Some(done) = self.model_export.poll() {
+            let seq = self.feed.push(Who::Owner, done.request.command, done.request.params, done.result.clone(), done.ms);
+            self.feed.set_context(seq, done.request.scope.clone());
+            self.status = Some(match done.result {
+                Ok(result) => {
+                    let path = result.get("written").and_then(Value::as_str).unwrap_or("destination");
+                    (format!("Export complete: {path} · {}", done.request.scope), false)
+                }
+                Err(error) => (format!("Export failed: {error} · {}", done.request.scope), true),
+            });
+        }
+    }
+
     fn pick_open(&mut self) {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(p) = rfd::FileDialog::new().add_filter("Trigon model", &["trigon"]).pick_file() {
@@ -739,7 +762,8 @@ impl StudioApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused()
+        if self.model_export.open
+            || ctx.text_edit_focused()
             || (self.authoring.family_placement_active() && self.family_text_owned_on_input)
             || egui::Popup::is_any_open(ctx)
             || self.palette.open
@@ -868,15 +892,33 @@ impl StudioApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled_ui(self.mode == Mode::Drawing, |ui| icons::button(ui, Icon::Export, "Export", false))
-                    .inner
-                    .on_hover_text("Open the saved drawing's PDF, SVG, PNG and DXF export settings")
-                    .clicked()
-                {
-                    self.authoring.tab = Tab::Drawings;
-                    self.drafting.show_export();
-                }
+                let export = icons::button(ui, Icon::Export, "Export", false).on_hover_text("Export the BIM model, 3D geometry or a saved drawing");
+                egui::Popup::menu(&export).show(|ui| {
+                    ui.strong("Model exchange");
+                    for format in [crate::model_export::Format::Ifc, crate::model_export::Format::Glb] {
+                        if ui.add_enabled(!self.model_export.busy(), egui::Button::new(format.label())).clicked() {
+                            self.show_model_export(format);
+                            ui.close();
+                        }
+                    }
+                    if self.model_export.busy() && ui.button("Export progress…").clicked() {
+                        self.model_export.open = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    let saved = self.mode == Mode::Drawing && self.session.doc.views.iter().any(|view| view.id == self.drawing);
+                    if ui.add_enabled(saved, egui::Button::new("Drawing · PDF, SVG, PNG, DXF…")).clicked() {
+                        self.authoring.tab = Tab::Drawings;
+                        self.drafting.show_export();
+                        self.focus_canvas = false;
+                        self.dock_open = true;
+                        self.dock_properties = true;
+                        ui.close();
+                    }
+                    if !saved {
+                        ui.weak("Open a saved drawing to export its annotations and sheet settings.");
+                    }
+                });
                 if icons::button(ui, Icon::Save, "Save", false).on_hover_text(format!("Save project ({save_hint})")).clicked() {
                     if self.session.path.is_some() { self.save(None) } else { self.pick_save_as() }
                 }
@@ -1601,6 +1643,9 @@ impl StudioApp {
     }
 
     fn edit_block_reason(&self) -> Option<&'static str> {
+        if self.model_export.open {
+            return Some("Close the export dialog to resume editing.");
+        }
         if self.authoring.tab == Tab::Families {
             if self.authoring.family_placement_active() {
                 if self.building() || self.build_error.is_some() {
@@ -2442,7 +2487,7 @@ impl StudioApp {
     }
 
     fn annotation_canvas_editor(&mut self, ctx: &egui::Context, keyboard_owned: bool) {
-        if !self.drafting.placement_active() || self.mode != Mode::Drawing || self.palette.open || self.confirm_close {
+        if !self.drafting.placement_active() || self.mode != Mode::Drawing || self.palette.open || self.confirm_close || self.model_export.open {
             return;
         }
         let Some(rect) = self.viewport_rect else { return };
@@ -3019,6 +3064,15 @@ impl StudioApp {
     }
 
     fn confirm_close_dialog(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && self.model_export.busy() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.model_export.open = true;
+            self.status = Some(("An export is running. Wait for it to finish before closing Trigon Studio.".into(), false));
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.model_export.open = false;
+        }
         if ctx.input(|i| i.viewport().close_requested()) && self.session.dirty && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = true;
@@ -3171,11 +3225,21 @@ impl StudioApp {
             }
         }
         self.annotation_canvas_editor(&ctx, annotation_keyboard_owned);
-        if let Some(run) = self.palette.ui(&ctx) {
+        if !self.model_export.open
+            && let Some(run) = self.palette.ui(&ctx)
+        {
             let r = self.run(Who::Owner, run.command, run.params);
             self.palette.set_outcome(r.map(|v| crate::activity::pretty(&v)));
         }
         self.confirm_close_dialog(&ctx);
+        if !self.confirm_close
+            && let Some(result) = self.model_export.ui(&ctx, &self.session.doc)
+        {
+            self.status = Some(match result {
+                Ok(()) => ("Exporting a model snapshot…".into(), false),
+                Err(error) => (error, true),
+            });
+        }
     }
 }
 
@@ -3194,6 +3258,7 @@ impl eframe::App for StudioApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.window_hidden = ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().occluded == Some(true));
         self.poll_worker();
+        self.poll_model_export();
         let _ = frame;
         for _ in 0..REQUESTS_PER_FRAME {
             let Some(req) = self.server.as_ref().and_then(Server::try_recv) else { break };
@@ -3249,6 +3314,265 @@ mod tests {
     fn window(app: &StudioApp) -> usize {
         let row = app.schedules.data().unwrap().rows.iter().find(|r| r.kind == trigon_engine::ScheduleOpeningKind::Window).unwrap();
         schedules::resolve_row(&app.scene, row).unwrap()
+    }
+
+    #[test]
+    fn model_exports_are_findable_from_the_3d_and_plan_workspaces() {
+        for mode in [Mode::ThreeD, Mode::Plan] {
+            let mut app = app(false);
+            app.mode = mode;
+            let document = app.session.doc.clone();
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut time = 0.0;
+            let mut draw = |app: &mut StudioApp, events| {
+                time += 0.05;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 250.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.app_bar(ui),
+                );
+                output.textures_delta.clear();
+                output.shapes
+            };
+            let shapes = draw(&mut app, Vec::new());
+            let point = shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Export" => Some(text.pos + text.galley.size() * 0.5),
+                    _ => None,
+                })
+                .expect("Export must remain visible in the application bar");
+            for event in [
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(&mut app, vec![event]);
+            }
+            let shapes = draw(&mut app, Vec::new());
+            fn labels(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+                shapes
+                    .iter()
+                    .flat_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => vec![text.galley.text().to_string()],
+                        egui::Shape::Vec(shapes) => shapes
+                            .iter()
+                            .filter_map(|shape| match shape {
+                                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect()
+            }
+            let labels = labels(&shapes);
+            ctx.data_mut(|data| data.clear());
+            assert!(labels.iter().any(|label| label.contains("IFC")), "{mode:?}: model IFC export is inaccessible: {labels:?}");
+            assert!(labels.iter().any(|label| label.contains("GLB")), "{mode:?}: model GLB export is inaccessible: {labels:?}");
+            assert_eq!(app.session.doc, document, "opening Export must not edit the model");
+        }
+    }
+
+    #[test]
+    fn drawing_export_reveals_its_properties_controls_from_any_dock_state() {
+        for (dock, properties, focus) in [(false, false, false), (true, false, false), (true, true, false), (true, false, true)] {
+            let mut app = app(false);
+            app.run(Who::Owner, "view.define", json!({"id":"export-drawing","name":"Export drawing","kind":{"view":"plan","level":0}})).unwrap();
+            app.open_drawing("export-drawing".into());
+            app.authoring.tab = Tab::Project;
+            app.dock_open = dock;
+            app.dock_properties = properties;
+            app.focus_canvas = focus;
+            complete(&mut app);
+            let before = app.session.doc.clone();
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut time = 0.0;
+            let mut draw = |app: &mut StudioApp, events| {
+                time += 0.05;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.workspace_ui(ui),
+                );
+                output.textures_delta.clear();
+                output.shapes
+            };
+            let mut click = |app: &mut StudioApp, label: &str| {
+                let shapes = draw(app, Vec::new());
+                let point = shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos + text.galley.size() * 0.5),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("missing action {label}"));
+                for event in [
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                    egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+                ] {
+                    draw(app, vec![event]);
+                }
+            };
+            click(&mut app, "Export");
+            click(&mut app, "Drawing · PDF, SVG, PNG, DXF…");
+            let mut controls_visible = false;
+            // Existing header/scroll animations need to settle before checking
+            // the final visible controls; these are simulated frames, not sleeps.
+            for _ in 0..20 {
+                let shapes = draw(&mut app, Vec::new());
+                controls_visible = shapes.iter().any(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Export annotated view" => {
+                        shape.clip_rect.contains(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => false,
+                });
+            }
+            ctx.data_mut(|data| data.clear());
+            assert!(app.dock_open && app.dock_properties && !app.focus_canvas);
+            assert!(controls_visible, "export controls are inaccessible from dock={dock}, properties={properties}, focus={focus}");
+            assert_eq!(app.session.doc, before);
+        }
+    }
+
+    #[test]
+    fn export_modal_preserves_a_ready_annotation_and_its_keyboard_input() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"export-input","name":"Export input","kind":{"view":"plan","level":0}})).unwrap();
+        app.open_drawing("export-input".into());
+        complete(&mut app);
+        app.drafting.start_placement(&app.session.doc, "export-input", 0);
+        app.drafting.picked([1000.0, 1000.0]);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let document = app.session.doc.clone();
+        app.show_model_export(crate::model_export::Format::Ifc);
+        for (frame, key) in [None, Some(egui::Key::Enter), Some(egui::Key::Escape)].into_iter().enumerate() {
+            let events = key
+                .map(|key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() })
+                .into_iter()
+                .collect();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    time: Some(frame as f64 * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+            assert_eq!(app.session.doc, document);
+            assert!(app.drafting.placement_active(), "the export dialog must not finish or discard the annotation");
+        }
+        assert!(!app.model_export.open, "Escape should close only Export");
+        ctx.data_mut(|data| data.clear());
+    }
+
+    #[test]
+    fn export_completion_records_the_typed_command_without_a_rebuild_or_history_edit() {
+        let mut app = app(false);
+        let ctx = egui::Context::default();
+        let path = std::env::temp_dir().join(format!("trigon-studio-export-{}.glb", std::process::id()));
+        app.mode = Mode::ThreeD;
+        app.phase = 0;
+        app.show_model_export(crate::model_export::Format::Glb);
+        let document = app.session.doc.clone();
+        let dirty = app.session.dirty;
+        let generation = app.generation;
+        app.model_export.start(&app.session.doc, path.clone(), &ctx).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.model_export.busy() && Instant::now() < deadline {
+            app.poll_model_export();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!app.model_export.busy());
+        let entry = app.feed.latest().unwrap();
+        assert_eq!(entry.command, "export.gltf");
+        assert!(entry.result.is_ok(), "{:?}", entry.result);
+        assert_eq!(entry.params["phase"], "existing");
+        assert_eq!(app.session.doc, document);
+        assert_eq!(app.session.dirty, dirty);
+        assert_eq!(app.generation, generation, "a read-only model export must not rebuild the viewport");
+        assert!(app.view_state()["model_export"]["written"].is_string());
+        assert_eq!(app.view_state()["model_export"]["error"], Value::Null);
+        assert!(std::fs::read(&path).unwrap().starts_with(b"glTF"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn activity_keeps_old_project_export_scope_after_switching_and_opening_another_export() {
+        let mut app = app(false);
+        let ctx = egui::Context::default();
+        app.session.path = Some(PathBuf::from("original.trigon"));
+        app.show_model_export(crate::model_export::Format::Glb);
+        let path = std::env::temp_dir().join(format!("trigon-studio-export-context-{}.glb", std::process::id()));
+        app.model_export.start(&app.session.doc, path.clone(), &ctx).unwrap();
+        app.run(Who::Owner, "document.new", json!({})).unwrap();
+        let new_document = app.session.doc.clone();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.model_export.busy() && Instant::now() < deadline {
+            app.poll_model_export();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!app.model_export.busy());
+        let original_entry = app.feed.latest().unwrap();
+        let seq = original_entry.seq;
+        assert_eq!(original_entry.command, "export.gltf");
+        assert!(original_entry.result.is_ok());
+        assert!(original_entry.context.as_deref().unwrap().contains("original.trigon"));
+        assert!(original_entry.context.as_deref().unwrap().contains("full model"));
+        assert!(original_entry.params.get("context").is_none() && original_entry.params.get("scope").is_none());
+        app.show_model_export(crate::model_export::Format::Ifc);
+        assert_eq!(app.feed.latest().unwrap().seq, seq);
+        assert!(app.feed.latest().unwrap().context.as_deref().unwrap().contains("original.trigon"));
+        assert_eq!(app.session.doc, new_document);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn normal_close_waits_for_a_running_export_even_when_the_project_is_clean() {
+        let mut app = app(false);
+        app.session.dirty = false;
+        let ctx = egui::Context::default();
+        let path = std::env::temp_dir().join(format!("trigon-studio-export-close-{}.glb", std::process::id()));
+        app.show_model_export(crate::model_export::Format::Glb);
+        app.model_export.start(&app.session.doc, path.clone(), &ctx).unwrap();
+        let close_input = || {
+            let mut input = egui::RawInput::default();
+            input.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+            input
+        };
+        let mut output = ctx.run_ui(close_input(), |_| app.confirm_close_dialog(&ctx));
+        output.textures_delta.clear();
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
+        assert!(!app.confirm_close, "a clean document does not need a save prompt");
+        assert!(app.model_export.open && app.model_export.busy());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.model_export.busy() && Instant::now() < deadline {
+            app.poll_model_export();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(!app.model_export.busy());
+        let mut output = ctx.run_ui(close_input(), |_| app.confirm_close_dialog(&ctx));
+        output.textures_delta.clear();
+        let cancelled =
+            output.viewport_output[&egui::ViewportId::ROOT].commands.iter().any(|command| matches!(command, egui::ViewportCommand::CancelClose));
+        ctx.data_mut(|data| data.clear());
+        assert!(!cancelled, "close can proceed after the export finishes");
+        assert!(std::fs::read(&path).unwrap().starts_with(b"glTF"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

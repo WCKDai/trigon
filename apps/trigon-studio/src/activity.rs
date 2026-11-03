@@ -44,6 +44,8 @@ pub struct Entry {
     pub at: Instant,
     /// What the rebuild after it changed (model-changing commands only).
     pub changes: Option<Changes>,
+    /// UI provenance for a command run against a detached document snapshot.
+    pub context: Option<String>,
 }
 
 #[derive(Default)]
@@ -107,8 +109,24 @@ impl Feed {
         if self.entries.len() >= MAX_ENTRIES {
             self.entries.pop_front();
         }
-        self.entries.push_back(Entry { seq: self.next, who, command: command.into(), params, result, ms, at: Instant::now(), changes: None });
+        self.entries.push_back(Entry {
+            seq: self.next,
+            who,
+            command: command.into(),
+            params,
+            result,
+            ms,
+            at: Instant::now(),
+            changes: None,
+            context: None,
+        });
         self.next
+    }
+
+    pub fn set_context(&mut self, seq: u64, context: String) {
+        if let Some(entry) = self.entries.iter_mut().rev().find(|entry| entry.seq == seq) {
+            entry.context = Some(context);
+        }
     }
 
     pub fn set_changes(&mut self, seq: u64, changes: Changes) {
@@ -176,6 +194,9 @@ impl Feed {
                                     ui.weak(if e.ms < 10.0 { format!("{:.1} ms", e.ms) } else { format!("{:.0} ms", e.ms) });
                                     ui.weak(age(e.at.elapsed()));
                                 });
+                                if let Some(context) = &e.context {
+                                    ui.add(egui::Label::new(egui::RichText::new(context).small()).wrap());
+                                }
                                 let line = gist(&e.result);
                                 if e.result.is_err() {
                                     ui.colored_label(egui::Color32::from_rgb(200, 70, 60), line);
