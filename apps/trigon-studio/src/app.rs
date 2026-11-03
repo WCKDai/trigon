@@ -209,6 +209,7 @@ pub struct StudioApp {
     show_activity: bool,
     schedules: Schedules,
     properties: Properties,
+    stair_editor: crate::stair_editor::Editor,
     pending_selection: Option<String>,
     pending_family_targets: Option<Vec<String>>,
     family_text_owned_on_input: bool,
@@ -328,6 +329,7 @@ impl StudioApp {
             show_activity: false,
             schedules: Schedules::default(),
             properties: Properties::default(),
+            stair_editor: crate::stair_editor::Editor::default(),
             pending_selection: None,
             pending_family_targets: None,
             family_text_owned_on_input: false,
@@ -415,6 +417,7 @@ impl StudioApp {
                 self.view_ribbon = false;
                 self.schedules = Schedules::default();
                 self.properties = Properties::default();
+                self.stair_editor.clear();
                 self.drafting = Drafting::default();
                 self.drawing.clear();
                 if self.mode == Mode::Drawing {
@@ -1701,11 +1704,16 @@ impl StudioApp {
     }
 
     fn run_form(&mut self, run: crate::authoring::Run) {
+        let stair_change = matches!(run.command, "precision.preview" | "precision.apply") && run.params["action"]["command"] == "stair.refine_source";
+        let stair_target = stair_change.then(|| self.stair_editor.target_after(&run.params["action"]["params"])).flatten();
         let family_placement = matches!(run.command, "facade.place" | "facade.place_at");
         if self.edit_block_reason().is_some() {
             let error = "Wait for the active model view before applying this change.".to_owned();
             if family_placement {
                 self.authoring.acknowledge_family_placement(Some(error.clone()));
+            }
+            if stair_change {
+                self.stair_editor.failed(&error);
             }
             self.status = Some((error, true));
             return;
@@ -1739,6 +1747,10 @@ impl StudioApp {
                         self.authoring.targets = ids.join("\n");
                     }
                 }
+                if stair_change {
+                    self.pending_selection = stair_target;
+                    self.stair_editor.clear();
+                }
                 if let Some(annotation) = value.get("annotation").and_then(|a| serde_json::from_value(a.clone()).ok()) {
                     self.drafting.select(&annotation);
                 }
@@ -1747,6 +1759,9 @@ impl StudioApp {
             Err(error) => {
                 if family_placement {
                     self.authoring.acknowledge_family_placement(Some(error.clone()));
+                }
+                if stair_change {
+                    self.stair_editor.failed(&error);
                 }
                 self.status = Some((error, true));
             }
@@ -1772,6 +1787,10 @@ impl StudioApp {
                 self.run_form(run);
             }
             ui.add_space(8.0);
+        }
+        if self.precision_review.stair_params().is_some() {
+            ui.weak("These captured parameters and canvas outlines are the change that Apply will use. Any local stair draft is retained separately; cancel this preview to return to it.");
+            return;
         }
         let blocked =
             self.edit_block_reason().or_else(|| self.precision_review.is_pending().then_some("Apply or cancel the preview to revise the inputs."));
@@ -1842,9 +1861,20 @@ impl StudioApp {
             && let Some(element) = &selected
         {
             ui.add(egui::Label::new(egui::RichText::new(&element.id).monospace()).wrap());
-            let edit = self.properties.ui(ui, &element.id, blocked);
-            if let Some(edit) = edit {
-                self.apply_property_edit(edit);
+            if element.kind == "stair" {
+                self.stair_editor.sync(&self.session.doc, Some(&element.id));
+                if self.stair_editor.selected(&element.id) {
+                    if let Some(run) = self.stair_editor.ui(ui, &self.session.doc, blocked) {
+                        self.run_form(run);
+                    }
+                } else {
+                    ui.weak("This staircase needs a unique named source before it can be refined.");
+                }
+            } else {
+                let edit = self.properties.ui(ui, &element.id, blocked);
+                if let Some(edit) = edit {
+                    self.apply_property_edit(edit);
+                }
             }
             if ui.button("Edit type…").on_hover_text("Edit the shared family type used by this instance").clicked()
                 && self.authoring.choose_instance_type(&self.session.doc, element)
@@ -1940,6 +1970,8 @@ impl StudioApp {
     pub(crate) fn authoring_feedback(&self) -> Value {
         json!({"model_tool":self.model_tools.feedback(), "annotation":self.drafting.placement_feedback(),
             "family_placement":self.authoring.family_placement_feedback(&self.session.doc),
+            "stair_edit":self.stair_editor.feedback(&self.session.doc),
+            "stair_preview":self.precision_review.stair_params(),
             "canvas_focus":self.focus_canvas,"ribbon_expanded":self.ribbon_expanded,
             "dock":if !self.dock_open {"closed"} else if self.dock_properties {"properties"} else {"browser"},
             "empty_workplane":self.viewport_rect.filter(|_|self.session.doc.buildings.is_empty() && self.mode==Mode::Plan).map(|r|json!({"origin_window_points":[r.center().x+self.empty_pan.x,r.center().y+self.empty_pan.y],"mm_per_point":self.empty_mm_per_point,"units":"mm","axes":"x_right_y_up"}))})
@@ -2393,6 +2425,20 @@ impl StudioApp {
             self.properties.gizmo.cancel();
             return;
         }
+        if self.selection.and_then(|i| self.scene.elements.get(i)).is_some_and(|e| e.kind == "stair") {
+            self.stair_editor.sync(&self.session.doc, Some(&edit.id));
+            if self.stair_editor.handle_edit(&self.session.doc, &edit.id, &edit.properties) {
+                self.dock_open = true;
+                self.dock_properties = true;
+                self.focus_canvas = false;
+                let feedback = self.stair_editor.feedback(&self.session.doc);
+                self.status = Some(match feedback["error"].as_str() {
+                    Some(error) => (error.to_owned(), true),
+                    None => ("Stair draft updated · review its departure and arrival levels".into(), false),
+                });
+            }
+            return;
+        }
         let phase = self.session.doc.phases.get(self.phase).map(|p| p.id.clone());
         let params = json!({"id":edit.id,"phase":phase,"filter":filter_name(self.filter),"properties":edit.properties});
         match self.run(Who::Owner, "element.set", params) {
@@ -2437,8 +2483,12 @@ impl StudioApp {
             return Vec::new();
         }
         let Some(element) = self.selection.and_then(|index| self.scene.elements.get(index)) else { return Vec::new() };
-        self.properties
-            .handles(&element.id)
+        let handles = if element.kind == "stair" {
+            self.stair_editor.handles_in_view(&self.session.doc, self.stair_preview_view())
+        } else {
+            self.properties.handles(&element.id)
+        };
+        handles
             .into_iter()
             .filter_map(|handle| {
                 let mapping = if self.mode == Mode::ThreeD {
@@ -2472,7 +2522,46 @@ impl StudioApp {
         })
     }
 
+    fn stair_preview_view(&self) -> crate::stair_editor::PreviewView {
+        use crate::stair_editor::PreviewView;
+        match self.mode {
+            Mode::Plan => PreviewView::Plan(self.plan_level),
+            Mode::ThreeD => PreviewView::Spatial { clip_z: self.clip_z().map(|z| f64::from(z) * 1000.0 + self.scene.origin[2]) },
+            Mode::Drawing => self.session.doc.views.iter().find(|v| v.id == self.drawing).map_or(PreviewView::Hidden, |v| match v.kind {
+                DrawingViewKind::Plan { level } => PreviewView::Plan(level),
+                _ => PreviewView::Hidden,
+            }),
+        }
+    }
+
+    fn stair_preview_outlines(&self) -> Vec<Vec<[f64; 3]>> {
+        let view = self.stair_preview_view();
+        if let Some(params) = self.precision_review.stair_params() {
+            crate::stair_editor::captured_outlines(&self.session.doc, params, view)
+        } else if self.precision_review.is_pending() {
+            Vec::new()
+        } else {
+            self.stair_editor.outlines(&self.session.doc, view)
+        }
+    }
+
     fn model_handles_ui(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
+        let outlines = if self.edit_block_reason().is_none() { self.stair_preview_outlines() } else { Vec::new() };
+        let screen = |p: [f64; 3]| {
+            if self.mode == Mode::ThreeD {
+                properties::project(self.camera, rect, std::array::from_fn(|k| ((p[k] - self.scene.origin[k]) / 1000.0) as f32))
+            } else {
+                self.drawing_point(p).and_then(|p| self.plan.model_to_screen(rect, p))
+            }
+        };
+        let painter = ui.painter_at(rect);
+        for outline in outlines {
+            for (&a, &b) in outline.iter().zip(outline.iter().cycle().skip(1)).take(outline.len()) {
+                if let (Some(a), Some(b)) = (screen(a), screen(b)) {
+                    painter.line_segment([a, b], egui::Stroke::new(1.5, theme::ACCENT));
+                }
+            }
+        }
         let Some(id) = self.selection.and_then(|index| self.scene.elements.get(index)).map(|e| e.id.clone()) else {
             self.properties.gizmo.cancel();
             return false;
@@ -3146,6 +3235,8 @@ impl StudioApp {
         }
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         self.model_tools.sync_context(&self.session.doc, self.plan_level);
+        let picked_stair = self.selection.and_then(|i| self.scene.elements.get(i)).filter(|e| e.kind == "stair").map(|e| e.id.as_str());
+        self.stair_editor.sync(&self.session.doc, picked_stair);
         self.drafting.sync_context(&self.session.doc);
         self.sync_family_view();
         self.browser_rect = None;
@@ -5082,5 +5173,221 @@ mod tests {
         assert!(app.level.is_none(), "the previously active cut must not hide the focused row");
         assert_ne!(app.camera.target, [500.0; 3]);
         assert!(app.redraw && app.selection_dirty);
+    }
+
+    fn stair_app() -> StudioApp {
+        let mut session = Session::new(Box::new(Live::new(Credentials::default())));
+        session
+            .execute(
+                "building.add",
+                json!({"id":"wing","name":"Stair controls",
+            "footprint":[[0,0],[14000,0],[14000,12000],[0,12000]],"storeys":3,"storey_height_mm":3000}),
+            )
+            .unwrap();
+        session
+            .execute(
+                "interior.add_stairs",
+                json!({"building":"wing","stairs":[{
+            "id":"wing.stair-a","levels":[0,1],"outline":[[2000,2000],[5000,2000],[5000,4000],[2000,4000]],
+            "kind":"u_turn","rounded":false,"well":160,"landing":1000}]}),
+            )
+            .unwrap();
+        let mut app = StudioApp::with_context(egui::Context::default(), None, session);
+        app.request_rebuild(None);
+        complete(&mut app);
+        app.selection = app.scene.find_unique("wing.stair-a.L1");
+        assert!(app.selection.is_some());
+        app.stair_editor.sync(&app.session.doc, Some("wing.stair-a.L1"));
+        app
+    }
+
+    #[test]
+    fn stair_handle_stages_a_coherent_review_and_reselects_the_original_picked_storey() {
+        let mut app = stair_app();
+        app.focus_canvas = true;
+        app.dock_open = false;
+        app.dock_properties = false;
+        let before = app.session.doc.clone();
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":2200}) });
+        assert_eq!(app.session.doc, before, "drag release only stages source parameters");
+        assert_eq!(app.authoring_feedback()["stair_edit"]["dirty"], true);
+        assert!(!app.focus_canvas && app.dock_open && app.dock_properties, "the staged review must be findable from the handle");
+        let run = app.stair_editor.preview(&app.session.doc).unwrap();
+        let result = app.run(Who::Owner, run.command, run.params).unwrap();
+        assert!(app.precision_review.is_pending());
+        assert_eq!(app.session.doc, before);
+        app.run_form(crate::authoring::Run {
+            command: "precision.apply",
+            params: json!({
+            "preview_token":result["preview_token"],"action":result["action"]}),
+        });
+        complete(&mut app);
+        assert_eq!(app.session.doc.buildings[0].stairs[0].levels, vec![0]);
+        assert_eq!(app.session.doc.buildings[0].stairs[1].levels, vec![1]);
+        let selected = app.selection.and_then(|i| app.scene.elements.get(i)).unwrap();
+        assert_eq!(selected.id, "wing.stair-a.refined1.L1");
+        app.run(Who::Owner, "edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.doc, before);
+    }
+
+    #[test]
+    fn rejected_stair_clearance_preview_retains_draft_and_engine_error() {
+        let mut app = stair_app();
+        let before = app.session.doc.clone();
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":2200}) });
+        let valid = app.stair_editor.preview(&app.session.doc).unwrap();
+        app.run_form(valid);
+        assert!(app.precision_review.is_pending(), "a valid refinement must reach engine validation before the negative clearance case");
+        app.precision_review.clear();
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":10000}) });
+        let run = app.stair_editor.preview(&app.session.doc).unwrap();
+        app.run_form(run);
+        assert_eq!(app.session.doc, before);
+        assert!(!app.precision_review.is_pending());
+        let feedback = app.authoring_feedback();
+        assert_eq!(feedback["stair_edit"]["dirty"], true);
+        let error = feedback["stair_edit"]["error"].as_str().expect("clearance refusal remains visible");
+        assert!(
+            error.contains("wing.stair-a.refined1") && error.contains("outside wing.slab.L1") && error.contains("site-fixed"),
+            "wrong refusal: {error}"
+        );
+        assert!(app.status.as_ref().unwrap().1);
+    }
+
+    #[test]
+    fn hidden_stair_properties_cannot_reuse_a_storey_after_external_basement_insertion() {
+        let mut app = stair_app();
+        app.dock_open = false;
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":2200}) });
+        app.dock_open = false;
+        app.run(Who::Agent("test".into()), "building.add_basement", json!({"building":"wing","floor":-2500})).unwrap();
+        complete(&mut app);
+        let after = app.session.doc.clone();
+        assert!(app.stair_editor.handles(&app.session.doc).is_empty());
+        assert_eq!(app.authoring_feedback()["stair_edit"]["stale"], true);
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":2300}) });
+        assert_eq!(app.session.doc, after);
+        assert_eq!(app.authoring_feedback()["stair_edit"]["stale"], true);
+        assert!(app.stair_editor.preview(&app.session.doc).is_err());
+    }
+
+    #[test]
+    fn captured_ai_stair_preview_owns_panel_and_overlay_then_cancel_restores_local_draft() {
+        let mut app = stair_app();
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":2100}) });
+        let local = app.stair_editor.preview(&app.session.doc).unwrap();
+        let mut remote = local.params.clone();
+        let part = remote["action"]["params"]["partitions"].as_array_mut().unwrap().last_mut().unwrap();
+        let mut stair: trigon_model::Stair = serde_json::from_value(part.clone()).unwrap();
+        let f = trigon_model::stair::frame(&stair).unwrap();
+        stair.outline = vec![f.at(0.0, 0.0), f.at(f.length, 0.0), f.at(f.length, 2300.0), f.at(0.0, 2300.0)];
+        *part = json!(stair);
+        let before = app.session.doc.clone();
+        let response = app.run(Who::Agent("test".into()), "precision.preview", remote.clone()).unwrap();
+        assert_eq!(app.session.doc, before);
+        assert_eq!(app.stair_editor.preview(&app.session.doc).unwrap().params, local.params, "AI preview retains the separate human draft");
+        let captured = app.precision_review.stair_params().unwrap();
+        assert_eq!(*captured, response["action"]["params"]);
+        assert!(crate::stair_editor::captured_summary(captured).iter().any(|line| line.contains("width 2300 mm")));
+        app.mode = Mode::Plan;
+        app.plan_level = 1;
+        let width = |rings: Vec<Vec<[f64; 3]>>| {
+            assert_eq!(rings.len(), 1);
+            let lo = rings[0].iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+            let hi = rings[0].iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
+            hi - lo
+        };
+        assert_eq!(width(app.stair_preview_outlines()), 2300.0);
+        let ctx = egui::Context::default();
+        fn labels(shape: &egui::Shape) -> Vec<(String, egui::Rect)> {
+            match shape {
+                egui::Shape::Text(t) => vec![(t.galley.text().to_owned(), egui::Rect::from_min_size(t.pos, t.galley.size()))],
+                egui::Shape::Vec(v) => v.iter().flat_map(labels).collect(),
+                _ => Vec::new(),
+            }
+        }
+        let frame = |app: &mut StudioApp, events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(380.0, 3000.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| app.selection_panel(ui));
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes.iter().flat_map(|s| labels(&s.shape)).collect::<Vec<_>>()
+        };
+        let click = |app: &mut StudioApp, at: egui::Pos2| {
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+                    ],
+                );
+            }
+        };
+        let shown = frame(&mut app, vec![]);
+        assert!(shown.iter().any(|(s, _)| s.contains("width 2300 mm")));
+        assert!(!shown.iter().any(|(s, _)| s == "2100" || s.contains("width 2100 mm") || s == "FLIGHTS AND LANDING"));
+        click(&mut app, shown.iter().find(|(s, _)| s == "Cancel preview").unwrap().1.center());
+        assert!(!app.precision_review.is_pending());
+        assert_eq!(width(app.stair_preview_outlines()), 2100.0);
+        assert_eq!(app.stair_editor.preview(&app.session.doc).unwrap().params, local.params);
+        assert_eq!(app.session.doc, before);
+        app.run(Who::Agent("test".into()), "precision.preview", remote).unwrap();
+        let shown = frame(&mut app, vec![]);
+        click(&mut app, shown.iter().find(|(s, _)| s == "Apply change").unwrap().1.center());
+        complete(&mut app);
+        assert!(!app.precision_review.is_pending());
+        let changed = app.session.doc.buildings[0].stairs.iter().find(|s| s.id == "wing.stair-a.refined1").unwrap();
+        assert_eq!(trigon_model::stair::frame(changed).unwrap().width, 2300.0, "Apply must consume the displayed capture, not the 2100 mm draft");
+        assert_eq!(changed.levels, vec![1]);
+        let after = app.session.doc.clone();
+        app.run(Who::Owner, "edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.doc, before);
+        app.run(Who::Owner, "edit.redo", json!({})).unwrap();
+        assert_eq!(app.session.doc, after);
+    }
+
+    #[test]
+    fn stair_preview_follows_only_changed_departures_and_arrivals_in_active_view() {
+        let mut app = stair_app();
+        app.apply_property_edit(properties::Edit { id: "wing.stair-a.L1".into(), properties: json!({"width_mm":2200}) });
+        app.mode = Mode::Plan;
+        for (level, count) in [(0, 0), (1, 1), (2, 1), (3, 0)] {
+            app.plan_level = level;
+            assert_eq!(app.stair_preview_outlines().len(), count, "plan L{level}");
+            assert_eq!(
+                app.stair_editor.handles_in_view(&app.session.doc, app.stair_preview_view()).len(),
+                if level == 1 { 2 } else { 0 },
+                "only the edited departure receives handles"
+            );
+        }
+        app.session.doc.views.push(trigon_model::annotation::DrawingView {
+            id: "other-plan".into(),
+            name: "Ground".into(),
+            kind: DrawingViewKind::Plan { level: 0 },
+            template: None,
+        });
+        app.mode = Mode::Drawing;
+        app.drawing = "other-plan".into();
+        app.plan_level = 1;
+        assert!(app.stair_preview_outlines().is_empty(), "saved plan context takes precedence over retained plan_level");
+        app.session.doc.views.last_mut().unwrap().kind = DrawingViewKind::Plan { level: 2 };
+        assert_eq!(app.stair_preview_outlines().len(), 1);
+        app.session.doc.views.last_mut().unwrap().kind = DrawingViewKind::Facade { facade: "wing.f1".into() };
+        assert!(app.stair_preview_outlines().is_empty(), "shaft plan rings are not section/elevation geometry");
+        app.mode = Mode::ThreeD;
+        app.level = None;
+        assert_eq!(app.stair_preview_outlines().len(), 2);
+        app.level = Some(0);
+        assert!(app.stair_preview_outlines().is_empty());
+        app.level = Some(1);
+        assert_eq!(app.stair_preview_outlines().len(), 1);
     }
 }

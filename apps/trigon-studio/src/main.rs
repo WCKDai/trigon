@@ -24,6 +24,7 @@ mod render;
 mod scene;
 mod schedules;
 mod screen_lines;
+mod stair_editor;
 mod terrain_panel;
 mod theme;
 mod worker;

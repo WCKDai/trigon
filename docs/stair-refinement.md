@@ -2,8 +2,32 @@
 
 `stair.refine_source` edits an entire existing stair definition or partitions its
 departure storeys into explicitly named native `Stair` definitions. CLI, MCP and
-precision preview/apply use the same engine implementation. A Studio scope/handle
-adapter is separate work; this command does not implement that UI.
+precision preview/apply and Studio's staircase controls use the same engine
+implementation.
+
+## In Studio
+
+Select a named staircase in the canvas or Project Browser. Properties offers
+**This storey**, **All storeys of this staircase**, or **Selected storeys**.
+The scope refers to departure flights; their receiving floor openings are
+validated together. Width/run handles and the dimension, landing, well and
+turning-step controls stage a draft without changing the saved model.
+
+Review the draft, then use **Apply change** or **Cancel preview**. The review
+panel and canvas outlines show the exact captured action, including an AI
+preview received while a different human draft is open. Cancel returns to that
+local draft; Apply consumes the captured parameters. Invalid input retains the
+previous draft and its error. External source or storey changes require a reload.
+
+Plans show changed departure/arrival outlines only on their affected levels.
+3D outlines use physical floor elevations, including a legacy implicit attic.
+Plan outlines are hidden in sections and elevations. A handle edit opens
+Properties even from Focus mode. Undo restores the whole source partition and
+its references.
+
+These controls refine existing native stair kinds. They do not introduce
+independent intermediate landing elevations or establish surveyed stair
+continuity where the source evidence is incomplete.
 
 ## Request
 
@@ -109,7 +133,9 @@ departure and arrival floor. It uses native `stair::opening` and
 and the attic boundary. It never tests containment against the slab polygon
 after cutting stair holes: that would conceal wall intrusions or reject valid
 flush contact. Concave edges are checked between boundary crossings, not merely
-at the shaft corners.
+at the shaft corners. The floor boundary is also tested for intrusion into the
+shaft, including intervals between its intersections; a near-contact endpoint
+cannot excuse a deeper concave crossing.
 
 Boundary contact has a `1e-6 mm` geometric tolerance. The new command normalizes
 intersection contact by edge length so rotation/translation does not reject exact
@@ -181,6 +207,6 @@ command; native-file compatibility is distinct from command-replay support.
 
 `edit.undo` restores the complete prior document and geometry; `edit.redo`
 restores the result. A saved result reopens without migration. Roll back the
-implementation by reverting its single engine commit. A future Studio adapter
-should submit this same request and present the ID mapping, compulsory validation
-and bounded before/after feedback without inferring source scope from geometry.
+implementation by reverting the relevant engine and Studio commits. Studio
+submits this same request, retaining exact source values instead of inferring
+shared scope from geometric similarity.
