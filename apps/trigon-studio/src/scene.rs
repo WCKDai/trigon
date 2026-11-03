@@ -745,6 +745,12 @@ impl Scene {
 
     /// The nearest element hit by the ray `o + t·d` (scene metres), ignoring what lies above `clip`.
     pub fn pick(&self, o: [f32; 3], d: [f32; 3], clip: Option<f32>) -> Option<usize> {
+        self.pick_hit(o, d, clip).map(|(index, _)| index)
+    }
+
+    /// The same nearest mesh hit, with its position in site-local millimetres.
+    /// Placement consumes the actual triangle intersection, including the scene origin.
+    pub fn pick_hit(&self, o: [f32; 3], d: [f32; 3], clip: Option<f32>) -> Option<(usize, [f64; 3])> {
         let mut best: Option<(f32, u32)> = None;
         for (t, tri) in self.vertices.as_chunks::<{ VERTEX_FLOATS * 3 }>().0.iter().enumerate() {
             let p = |k: usize| [tri[k * VERTEX_FLOATS], tri[k * VERTEX_FLOATS + 1], tri[k * VERTEX_FLOATS + 2]];
@@ -759,7 +765,9 @@ impl Scene {
                 best = Some((hit, *e));
             }
         }
-        best.map(|(_, e)| e as usize)
+        best.map(|(distance, element)| {
+            (element as usize, std::array::from_fn(|axis| self.origin[axis] + f64::from(o[axis] + d[axis] * distance) * 1000.0))
+        })
     }
 
     /// Copies of the triangles of `elements`, recoloured and moved by `shift` (metres; another
@@ -1179,6 +1187,23 @@ mod tests {
         let (lo, hi) = s.elements[wall].bounds.unwrap();
         assert!((hi[0] - lo[0] - 9.0).abs() < 0.01 && hi[1] - lo[1] < 1.0, "{lo:?} {hi:?}");
         assert!(s.pick([0.0, -50.0, 1.5], [0.0, -1.0, 0.0], None).is_none(), "nothing behind the camera");
+    }
+
+    #[test]
+    fn placement_hit_uses_the_nearest_triangle_and_restores_the_site_origin() {
+        let built = build(&doc()).unwrap();
+        let mut scene = Scene::from_built(&built, false);
+        scene.origin = [12000.0, -34000.0, 800.0];
+        let origin = [0.0, -50.0, 1.5];
+        let direction = [0.0, 1.0, 0.0];
+        let (index, position) = scene.pick_hit(origin, direction, None).unwrap();
+        assert_eq!(Some(index), scene.pick(origin, direction, None));
+        assert_eq!(scene.elements[index].kind, "wall");
+        assert!((position[0] - 12000.0).abs() < 1e-6);
+        assert!((position[2] - 2300.0).abs() < 1e-6);
+        let (lo, hi) = scene.elements[index].bounds.unwrap();
+        let y = (position[1] - scene.origin[1]) / 1000.0;
+        assert!((y - f64::from(lo[1])).abs().min((y - f64::from(hi[1])).abs()) < 1e-4);
     }
 
     #[test]

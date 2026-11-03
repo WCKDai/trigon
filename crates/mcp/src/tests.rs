@@ -47,7 +47,7 @@ fn headless_sessions_serve_every_command_and_no_studio_tools() {
     let r = rpc(&mut s, 2, "tools/call", json!({"name": "document_info", "arguments": {}}));
     assert_eq!(r["result"]["isError"], false, "{r}");
     let before = s.doc.clone();
-    for name in ["studio_view", "studio_screenshot", "studio_click", "studio_drag", "studio_key"] {
+    for name in ["studio_start", "studio_view", "studio_screenshot", "studio_click", "studio_drag", "studio_key"] {
         let r = rpc(&mut s, 3, "tools/call", json!({"name": name, "arguments": {}}));
         assert_eq!(r["error"]["code"], -32602, "{r}");
         assert!(r["error"]["message"].as_str().unwrap().contains(&format!("unknown tool {name}")), "{r}");
@@ -89,6 +89,8 @@ fn studio() -> (u16, Arc<Mutex<Vec<Value>>>, Arc<trigon_control::Presence>) {
         while let Some(req) = server.recv_timeout(Duration::from_secs(60)) {
             log.lock().unwrap().push(json!({"method": req.method, "params": req.params}));
             let r = match req.method.as_str() {
+                "ui.start" if req.params["action"] == "refused" => Err("ui.start: action refused".into()),
+                "ui.start" => Ok(json!({"mode":"plan", "authoring":{"active":true}, "journal_len":s.doc.journal.len()})),
                 "ui.view" => Ok(json!({"mode": req.params.get("mode").cloned().unwrap_or(json!("3d")), "level": null})),
                 "ui.screenshot" => Ok(json!({"width": 2, "height": 1, "target": req.params["target"], "png_base64": "iVBORw0KGgo="})),
                 "ui.drag" if req.params.get("steps") == Some(&json!(0)) => Err("ui.drag: `steps` must be an integer from 1 to 60".into()),
@@ -321,4 +323,27 @@ fn drawing_preflight_schema_and_shaped_feedback_reach_mcp_clients() {
         assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
         assert_eq!(s.doc.buildings, before.buildings);
     }
+}
+
+#[test]
+fn studio_start_forwards_one_ui_request_without_changing_the_journal() {
+    let (port, seen, _) = studio();
+    let mut remote = Remote::new(&format!("127.0.0.1:{port}"), Some(TOKEN));
+    remote.try_connect().unwrap();
+    assert!(tool_names(&mut remote).contains(&"studio_start".to_owned()));
+    let args = json!({"action":"window","target":"b1.f3"});
+    let reply = rpc(&mut remote, 2, "tools/call", json!({"name":"studio_start","arguments":args}));
+    assert_eq!(reply["result"]["isError"], false);
+    let state: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(state["journal_len"], 0);
+    assert_eq!(*seen.lock().unwrap(), vec![json!({"method":"ui.start","params":args})]);
+    let reply = rpc(&mut remote, 3, "tools/call", json!({"name":"studio_start","arguments":{"action":"refused"}}));
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(seen.lock().unwrap().len(), 2, "a refusal must not retry or become command.run");
+    let tools = studio_tools();
+    let schema = &tools.as_array().unwrap().iter().find(|tool| tool["name"] == "studio_start").unwrap()["inputSchema"];
+    assert_eq!(schema["required"], json!(["action"]));
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["target"]["maxLength"], 256);
+    assert_eq!(schema["properties"]["action"]["enum"].as_array().unwrap().len(), 8);
 }

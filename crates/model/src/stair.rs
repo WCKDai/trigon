@@ -5,6 +5,7 @@ use crate::mesh::Mesh;
 use crate::{ModelError, Result};
 
 mod fitted;
+pub mod sequence;
 
 /// Riser height aimed for, mm (Danish practice: about 170–180 mm).
 const RISER: f64 = 175.0;
@@ -578,6 +579,16 @@ pub fn opening(st: &Stair) -> Result<Vec<[f64; 2]>> {
         ring.reverse();
     }
     Ok(ring)
+}
+
+/// Whether one complete shaft opening covers another, including concave fitted edges.
+/// Uses the same 0.000001 mm boundary tolerance as fitted stair validation, rather than
+/// polygon-overlay quantization or an area cutoff. This is a numerical tolerance, not
+/// a statement of measurement accuracy. Neither stair is changed.
+pub fn opening_covers(outer: &Stair, inner: &Stair) -> Result<bool> {
+    let outer = opening(outer)?;
+    let inner = opening(inner)?;
+    Ok(inner.iter().zip(inner.iter().cycle().skip(1)).all(|(&a, &b)| fitted::covers_segment(&outer, a, b)))
 }
 
 /// Quarter winders and a straight middle flight, built once for both the plan and solids.

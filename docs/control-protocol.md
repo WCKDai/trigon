@@ -92,6 +92,7 @@ The channel is untrusted input; nothing a client sends can crash Studio.
 | `command.run` | `command`: a command id (`facade.place`), `params`: its parameters | the command's result. Runs exactly as the owner's commands do: journaled, undoable, refused changes leave the model as it was. Listed in the feed under the client's name, and the rebuild after a change highlights what it changed |
 | `commands.list` | `schemas?`: bool | every command: `id`, `summary`, `changes_model`, and with `schemas` its `params_schema` |
 | `document.summary` | — | `document.info`, plus `path` and `unsaved` |
+| `ui.start` | `action`: `select`, `building`, `wall`, `window`, `door`, `component`, `roof` or `edit`; `target?`: a unique visible element id (1–256 characters) | Opens the same task and Properties controls as a Studio button. Returns the current view and authoring state. Starting does not change the document or undo history; invalid requests preserve the current task. A placement target must be a facade host or a hosted component; `door` also accepts an interior wall and opens its selected-storey form. |
 | `ui.view` | `mode?`: `3d`, `plan` or `drawing`; `drawing?`: saved drawing view id (implies drawing mode); `level?`: a level index (the plan's level; in 3D, show up to that level, cut 1.2 m above its floor), or `null` for the whole model in 3D; `phase?`: a phase id; `filter?`: `complete`, `demolition`, `new` or `all`; `appearance?`: `materials` (default actual finishes) or `phases` (3D phase colors); `fit?`: bool; `focus?`: an element id (a facade's wall such as `b1.f3`, a placement such as `b1.f3.L2.B0`), framed and seen from outside its facade | the view: `mode`, `drawing`, `drawings`, `drawing_mapping`, `level`, `plan_level`, `levels`, `phase`, `phases`, `filter`, `appearance`, `selection`, `camera`, `model_box_m`, `window_hidden`. The parameters are checked whole before anything changes |
 | `ui.click` | `x`, `y`: window points from the top left; `button?`: `left` (default), `right`, `middle`; `double?`; `shift?`, `command?`, `alt?`, `ctrl?` | `{queued, window_hidden}`. Real pointer input: the events a click makes (move, press, release) are fed to the window one per frame, so they act exactly as the owner's click (picking an element, pressing a button). Nothing arrives while the window is hidden |
 | `ui.key` | `key`: an egui key name (`K`, `Escape`, `Enter`, `Z`…); `command?`, `shift?`, `alt?`, `ctrl?` | `{queued, window_hidden}`. A real key press and release (`{"key": "K", "command": true}` opens the command palette) |
@@ -128,7 +129,7 @@ coordinates, it changes when the window or dock is resized; read it again before
 
 `trigon mcp` serves MCP (JSON-RPC 2.0) on stdio. Bridged to Studio, engine tools become
 `command.run` on this channel and the MCP client's name (from `initialize`) is sent with
-`control.hello`. Five Studio-only tools call UI methods directly: `studio_view` (`ui.view`),
+`control.hello`. Six Studio-only tools call UI methods directly: `studio_start` (`ui.start`), `studio_view` (`ui.view`),
 `studio_screenshot` (`ui.screenshot`, returned to the agent as an image), `studio_click`
 (`ui.click`), `studio_drag` (`ui.drag`) and `studio_key` (`ui.key`). The input tools preserve the
 parameters and validation above, including window-point coordinates, click buttons, modifiers
@@ -167,3 +168,15 @@ A screen-styling fallback uses the valid base tree with paper pens and is report
 `drawing_raster.last_style_warning`; it does not make the drawing invalid. Genuine drawing/model
 errors still block edits. `pending_rasters` and `prepared_stroke_zoom_bucket` distinguish CPU-ready
 snapshot data from the visible texture's `shown_stroke_zoom_bucket` and `uploads` counter.
+
+### Hand a task to a person
+
+```json
+{"id":4,"method":"ui.start","params":{"action":"window","target":"b1.f3"}}
+```
+
+The person can choose the type, storey and placement point in the revealed tool controls.
+`ui.view.focus` changes framing; `ui.start.target` establishes the selection or facade host.
+Use `action:"edit"` with a target to reveal its model properties. Finish/Apply uses the same
+journaled commands as agent edits. Starting a different tool is refused while a precision
+preview or export dialog needs attention. Unsaved shared-type edits keep their review flow.

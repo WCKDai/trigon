@@ -28,6 +28,11 @@ impl Review {
         self.value.is_some()
     }
 
+    pub fn stair_params(&self) -> Option<&Value> {
+        let value = self.value.as_ref()?;
+        (value["action"]["command"] == "stair.refine_source").then_some(&value["action"]["params"])
+    }
+
     fn apply(&self) -> Option<Run> {
         let value = self.value.as_ref()?;
         Some(Run { command: "precision.apply", params: json!({"action":value["action"],"preview_token":value["preview_token"]}) })
@@ -43,6 +48,7 @@ impl Review {
             ui.heading(match command {
                 "edit.align_walls" => "Align to reference",
                 "edit.copy_to_levels" => "Copy to levels",
+                "stair.refine_source" => "Refine staircase",
                 "entrance.set_unit" => "Update apartment record",
                 "entrance.bind_stair" => "Connect entrance to stair",
                 "annotation.define" => "Save reference guide",
@@ -67,6 +73,18 @@ impl Review {
                 if let Some(findings) = value["sanity_feedback"]["total_findings"].as_u64() {
                     ui.weak(format!("{findings} review candidates; a valid build does not establish measured accuracy."));
                 }
+            }
+            if let Some(params) = self.stair_params() {
+                ui.strong("Captured stair parameters");
+                for line in crate::stair_editor::captured_summary(params) {
+                    ui.add(egui::Label::new(line).wrap());
+                }
+                egui::CollapsingHeader::new("Exact positions and boundaries").show(ui, |ui| {
+                    for line in crate::stair_editor::captured_coordinates(params) {
+                        ui.add(egui::Label::new(line).wrap());
+                    }
+                });
+                ui.weak("Departure flights and their receiving floor openings are checked together. Apply uses this captured action, not a separate local draft.");
             }
             let result = &value["result"];
             if let Some(id) = result["id"].as_str() {

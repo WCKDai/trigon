@@ -1253,6 +1253,22 @@ pub(crate) fn connect_walls(s: &mut Session, mut p: ConnectWalls) -> Result<Valu
     }
     let mut ids = Vec::new();
     for (entry, item) in entries.iter().zip(changes) {
+        // Whole-source edits retain their position, so a precise junction preview names
+        // only the changed coordinates. A selected storey still uses the split path below.
+        if let Item::Wall(wall) = &item
+            && wall.levels == entry.original.levels()
+        {
+            let next = handle(&s.doc, entry)?;
+            let source = s.doc.buildings[entry.building]
+                .interior_walls
+                .iter_mut()
+                .find(|source| source.id == entry.original.id())
+                .ok_or_else(|| invalid("source element changed"))?;
+            *source = wall.clone();
+            remap_references(&mut s.doc, entry, &next, false);
+            ids.push(next);
+            continue;
+        }
         let shared = remove(&mut s.doc, entry)?;
         let next = put(&mut s.doc, entry, item, shared, false, false)?;
         remap_references(&mut s.doc, entry, &next, shared);

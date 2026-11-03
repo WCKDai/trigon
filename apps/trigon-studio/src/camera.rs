@@ -130,11 +130,12 @@ impl Orbit {
         if !r.is_finite() || !c.iter().all(|v| v.is_finite()) {
             return;
         }
-        let half = (self.fov_y / 2.0).min((self.fov_y / 2.0).tan().atan2(1.0 / aspect.clamp(0.2, 5.0)));
+        let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+        let half = (self.fov_y / 2.0).min(((self.fov_y / 2.0).tan() * aspect).atan());
         self.target = c;
         self.radius = r;
-        // The bounding sphere is generous for a building's flat box: frame a little tighter.
-        self.distance = (r / half.sin() * 0.9).clamp(MIN_DISTANCE, MAX_DISTANCE);
+        // Preserve containment in both axes, including portrait canvases, with a small margin.
+        self.distance = (r / half.sin() * 1.05).clamp(MIN_DISTANCE, MAX_DISTANCE);
     }
 
     /// Look at a box from outside along `facing` (x, y), slightly from above, with room around it.
@@ -231,5 +232,36 @@ mod tests {
         c.fit([f32::NAN; 3], [1.0; 3], 1.0);
         c.zoom_at(1e30, [0.0, 0.0, -1.0]);
         assert!(c.view_proj(1.0).iter().all(|v| v.is_finite()));
+    }
+}
+
+#[cfg(test)]
+mod release_framing_regression {
+    use super::*;
+    #[test]
+    fn fit_keeps_every_corner_visible_across_canvas_shapes() {
+        for (lo, hi) in [([-10.0, -10.0, 0.0], [10.0, 10.0, 20.0]), ([-5.0, -5.0, 0.0], [5.0, 5.0, 60.0]), ([-50.0, -1.0, 0.0], [50.0, 1.0, 1.0])] {
+            for aspect in [0.15, 0.3, 0.6, 1.0, 1.6, 3.0, 5.5] {
+                for (yaw, pitch) in [(-120.0_f32, 28.0_f32), (41.0, 65.0)] {
+                    let mut camera = Orbit { yaw: yaw.to_radians(), pitch: pitch.to_radians(), ..Default::default() };
+                    camera.fit(lo, hi, aspect);
+                    let matrix = camera.view_proj(aspect);
+                    for x in [lo[0], hi[0]] {
+                        for y in [lo[1], hi[1]] {
+                            for z in [lo[2], hi[2]] {
+                                let point = project(&matrix, [x, y, z]);
+                                assert!(
+                                    point.iter().all(|v| v.is_finite())
+                                        && point[0].abs() <= 1.0
+                                        && point[1].abs() <= 1.0
+                                        && (0.0..=1.0).contains(&point[2]),
+                                    "cropped at aspect {aspect}, yaw {yaw}, pitch {pitch}: {point:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

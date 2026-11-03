@@ -145,9 +145,10 @@ pub(crate) fn visible_stairs(b: &trigon_model::Building, level: usize) -> Vec<&t
             if !level.checked_sub(1).is_some_and(|previous| s.levels.contains(&previous)) {
                 return false;
             }
-            let n = s.outline.len().max(1) as f64;
-            let centre = s.outline.iter().fold([0.0; 2], |a, p| [a[0] + p[0] / n, a[1] + p[1] / n]);
-            !outgoing.iter().any(|next| trigon_model::stair::opening(next).is_ok_and(|ring| crate::drawings::inside(&ring, centre)))
+            // An arrival can extend beyond the next flight even when its centre is inside.
+            // Use the complete opening (including turns/fitted boundaries), as drawing and
+            // audit do. Keep it visible unless one departure covers the entire footprint.
+            !outgoing.iter().any(|next| trigon_model::stair::opening_covers(next, s).is_ok_and(|covered| covered))
         })
         .collect()
 }
@@ -2221,6 +2222,198 @@ mod tests {
                     assert_eq!(doc, original, "drawing must not change the model");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn arrival_coverage_requires_the_complete_opening() {
+        for (rotation, translation) in [(0.0_f64, [0.0, 0.0]), (37.25, [150000.0, -270000.0]), (-118.0, [-80000.0, 95000.0])] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let transform = |[x, y]: [f64; 2]| [translation[0] + x * cos - y * sin, translation[1] + x * sin + y * cos];
+            let stair = |id: &str, level: usize, [x, y, length, width]: [f64; 4], landing: f64| -> trigon_model::Stair {
+                serde_json::from_value(json!({"id":id,"levels":[level],"kind":"u_turn","rounded":false,"tread":250,
+                    "landing":landing,"well":150,"outline":[[x,y],[x+length,y],[x+length,y+width],[x,y+width]]}))
+                .unwrap()
+            };
+            let arrival = stair("arrival", 0, [2000.0, 2000.0, 2000.0, 2000.0], 1000.0);
+            let same = stair("outgoing", 1, [2000.0, 2000.0, 2000.0, 2000.0], 1000.0);
+            let mut rotated = same.clone();
+            let (rs, rc) = 45.0_f64.to_radians().sin_cos();
+            for p in &mut rotated.outline {
+                let [x, y] = [p[0] - 3000.0, p[1] - 3000.0];
+                *p = [3000.0 + x * rc - y * rs, 3000.0 + x * rs + y * rc];
+            }
+            // All arrival opening corners lie on/in this fitted outgoing opening, but an
+            // edge crosses its notch. A corner-only test would still suppress real material.
+            let mut notched = same.clone();
+            notched.boundary = Some(vec![
+                [2000.0, 2000.0],
+                [2800.0, 2000.0],
+                [2800.0, 2200.0],
+                [3200.0, 2200.0],
+                [3200.0, 2000.0],
+                [5000.0, 2000.0],
+                [5000.0, 4000.0],
+                [2000.0, 4000.0],
+            ]);
+            let mut cases = vec![
+                ("identical", arrival.clone(), same.clone(), false),
+                ("larger departure", arrival.clone(), stair("outgoing", 1, [1500.0, 1500.0, 3000.0, 3000.0], 1000.0), false),
+                ("800 mm strip", arrival.clone(), stair("outgoing", 1, [2800.0, 2000.0, 2000.0, 2000.0], 1000.0), true),
+                ("sub-square-mm strip", arrival.clone(), stair("outgoing", 1, [2000.00025, 2000.0, 2000.0, 2000.0], 1000.0), true),
+                ("shorter landing", arrival.clone(), stair("outgoing", 1, [2000.0, 2000.0, 2000.0, 2000.0], 500.0), true),
+                ("smaller departure", arrival.clone(), stair("outgoing", 1, [2500.0, 2500.0, 1500.0, 1000.0], 500.0), true),
+                ("across strip", arrival.clone(), stair("outgoing", 1, [2000.0, 2500.0, 2000.0, 2000.0], 1000.0), true),
+                ("edge contact", arrival.clone(), stair("outgoing", 1, [5000.0, 2000.0, 2000.0, 2000.0], 1000.0), true),
+                ("disjoint", arrival.clone(), stair("outgoing", 1, [5100.0, 2000.0, 2000.0, 2000.0], 1000.0), true),
+                ("relative rotation", arrival.clone(), rotated, true),
+                ("concave departure", arrival.clone(), notched.clone(), true),
+                ("fitted arrival covered", notched.clone(), same.clone(), false),
+            ];
+            // Preserve suppression for coincident default, rounded, straight and two-turn
+            // footprints, and keep a genuinely exposed strip for each shape.
+            for kind in ["straight", "u_turn", "double_quarter_turn"] {
+                let mut a = arrival.clone();
+                a.kind = serde_json::from_value(json!(kind)).unwrap();
+                a.rounded = true;
+                a.tread = None;
+                a.landing = None;
+                a.well = None;
+                let mut d = a.clone();
+                cases.push(("coincident defaults", a.clone(), d.clone(), false));
+                for p in &mut d.outline {
+                    p[0] += 800.0;
+                }
+                cases.push(("exposed defaults", a, d, true));
+            }
+            for (label, mut a, mut d, exposed) in cases {
+                a.id = "arrival".into();
+                a.levels = vec![0];
+                d.id = "outgoing".into();
+                d.levels = vec![1];
+                for st in [&mut a, &mut d] {
+                    for p in &mut st.outline {
+                        *p = transform(*p);
+                    }
+                    if let Some(boundary) = &mut st.boundary {
+                        for p in boundary {
+                            *p = transform(*p);
+                        }
+                    }
+                    assert!(trigon_model::stair::opening(st).is_ok(), "invalid public fixture: {label}");
+                }
+                let outline = [[0.0, 0.0], [12000.0, 0.0], [12000.0, 12000.0], [0.0, 12000.0]].map(transform);
+                let mut b = trigon_model::Building::new("synthetic", "Arrival coverage", &outline, 3, 3000.0).unwrap();
+                b.stairs = vec![a, d];
+                let before = b.clone();
+                for reverse in [false, true] {
+                    if reverse {
+                        b.stairs.reverse();
+                    }
+                    let shown = visible_stairs(&b, 1);
+                    assert_eq!(shown.iter().any(|s| s.id == "arrival"), exposed, "{label}, rotation={rotation}, reverse={reverse}");
+                    assert!(shown.iter().any(|s| s.id == "outgoing"));
+                    assert_eq!(shown.len(), 1 + usize::from(exposed));
+                    assert_eq!(visible_stairs(&b, 0).iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["arrival"]);
+                    assert_eq!(visible_stairs(&b, 2).iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["outgoing"]);
+                }
+                b.stairs.reverse();
+                assert_eq!(b, before, "visibility must not rewrite source geometry or IDs");
+            }
+        }
+    }
+
+    #[test]
+    fn arrival_coverage_keeps_drawing_picking_and_exact_undo_replay() {
+        for (rotation, translation) in [(0.0_f64, [0.0, 0.0]), (37.25, [150000.0, -270000.0])] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let transform = |[x, y]: [f64; 2]| [translation[0] + x * cos - y * sin, translation[1] + x * sin + y * cos];
+            let ring = |x: f64| [[x, 2000.0], [x + 2000.0, 2000.0], [x + 2000.0, 4000.0], [x, 4000.0]].map(transform);
+            let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+            let footprint = [[0.0, 0.0], [12000.0, 0.0], [12000.0, 12000.0], [0.0, 12000.0]].map(transform);
+            s.execute(
+                "building.add",
+                json!({"id":"synthetic","name":"Arrival coverage","footprint":footprint,
+                "storeys":3,"storey_height_mm":3000}),
+            )
+            .unwrap();
+            s.execute(
+                "interior.add_stairs",
+                json!({"building":"synthetic","clear_walls_inside":false,"stairs":[
+                    {"id":"arrival","levels":[0],"kind":"u_turn","outline":ring(2000.0),"rounded":false,"tread":250,"landing":1000,"well":150},
+                    {"id":"outgoing","levels":[1],"kind":"u_turn","outline":ring(2800.0),"rounded":false,"tread":250,"landing":1000,"well":150}
+                ]}),
+            )
+            .unwrap();
+            s.execute("view.define", json!({"id":"arrival-plan","name":"Arrival plan","kind":{"view":"plan","level":1}})).unwrap();
+            let before = s.doc.clone();
+            let history = (s.dirty, s.undo.clone(), s.redo.clone());
+            let arrival = &before.buildings[0].stairs[0];
+            let symbol = trigon_model::stair::symbol(arrival, 3000.0).unwrap();
+            let opening = trigon_model::stair::opening(arrival).unwrap();
+            for presentation in [false, true] {
+                let (prims, _, elements) = scene(&s.doc, 1, View::latest(&s.doc), presentation).unwrap();
+                let owned: Vec<_> = prims
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, prim)| {
+                        if !elements.get(&i).is_some_and(|e| e.id == "arrival.L0") {
+                            return None;
+                        }
+                        match prim {
+                            Prim::Line { a, b, .. } | Prim::StairLine { a, b, .. } => Some((*a, *b)),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                for edge in symbol.outline.iter().chain(&symbol.treads) {
+                    assert!(owned.contains(edge), "arrival detail is missing at rotation={rotation}, presentation={presentation}");
+                }
+                assert!(prims.iter().any(|p| matches!(p, Prim::PickRegion(r) if r.id == "arrival.L0" && r.rings == vec![opening.clone()])));
+            }
+            let sheet = drawing_sheet(&s.doc, 1, View::latest(&s.doc)).unwrap();
+            assert!(!mixed_plan_owned_paths(&sheet.scene, |id| id == "arrival.L0").is_empty());
+            let svg_before = sheet_svg_text(&s.doc, 1, View::latest(&s.doc)).unwrap();
+            for point in [[2000.0, 3000.0], [2200.0, 2350.0]] {
+                let hit = s.execute("view.pick", json!({"id":"arrival-plan","point":transform(point),"tolerance_mm":1})).unwrap();
+                assert_eq!(hit["hit"]["id"], "arrival.L0", "{hit}");
+                assert_eq!(hit["hit"]["kind"], "stair");
+            }
+            assert_eq!(s.doc, before);
+            assert_eq!((s.dirty, s.undo.clone(), s.redo.clone()), history);
+            // Edit only the synthetic outgoing source, then require exact document restoration.
+            s.execute("element.set", json!({"id":"outgoing.L1","properties":{"outline":ring(3100.0)}})).unwrap();
+            let changed = s.doc.clone();
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(s.doc, before);
+            assert_eq!(sheet_svg_text(&s.doc, 1, View::latest(&s.doc)).unwrap(), svg_before);
+            s.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(s.doc, changed);
+            let mut replay = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+            for entry in &s.doc.journal {
+                replay.execute(&entry.command, entry.params.clone()).unwrap();
+            }
+            assert_eq!(replay.doc, changed);
+            assert_eq!(sheet_svg_text(&replay.doc, 1, View::latest(&replay.doc)).unwrap(), sheet_svg_text(&s.doc, 1, View::latest(&s.doc)).unwrap());
+            // A fully covered receiving flight must still contribute no duplicate symbol.
+            s.execute("element.set", json!({"id":"outgoing.L1","properties":{"outline":ring(2000.0)}})).unwrap();
+            let covered = drawing_sheet(&s.doc, 1, View::latest(&s.doc)).unwrap();
+            assert!(mixed_plan_owned_paths(&covered.scene, |id| id == "arrival.L0").is_empty());
+            assert!(!covered.scene.element_regions.iter().any(|r| r.id == "arrival.L0"));
+            let mut outgoing_only = s.doc.clone();
+            outgoing_only.buildings[0].stairs.remove(0);
+            let reference = drawing_sheet(&outgoing_only, 1, View::latest(&outgoing_only)).unwrap();
+            assert_eq!(covered.scene.items, reference.scene.items);
+            // Removing the source also removes its real slab void. Compare stair picking
+            // regions here; source-dependent slab regions must retain their own geometry.
+            let stair_regions = |scene: &crate::sheet::Scene| {
+                scene.element_regions.iter().filter(|r| r.kind == crate::views::DrawingElementKind::Stair).cloned().collect::<Vec<_>>()
+            };
+            assert_eq!(stair_regions(&covered.scene), stair_regions(&reference.scene));
+            assert_eq!(
+                sheet_svg_text(&s.doc, 1, View::latest(&s.doc)).unwrap(),
+                sheet_svg_text(&outgoing_only, 1, View::latest(&outgoing_only)).unwrap()
+            );
         }
     }
 

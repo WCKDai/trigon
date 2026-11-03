@@ -5,8 +5,8 @@
 //!
 //! The commands run on a [`Backend`]: a session of the server's own ([`Session`], headless), or
 //! a running Trigon Studio reached over its control channel ([`Remote`]), where the owner watches
-//! every call land. Bridged to Studio, five more tools let the agent see and steer the owner's
-//! view (`studio_view`, `studio_screenshot`, `studio_click`, `studio_drag`, `studio_key`).
+//! every call land. Bridged to Studio, six more tools let the agent see and steer the owner's
+//! view (`studio_start`, `studio_view`, `studio_screenshot`, `studio_click`, `studio_drag`, `studio_key`).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::io::{BufRead, Write};
@@ -34,7 +34,9 @@ const STUDIO_INSTRUCTIONS: &str = " You are connected to Trigon Studio: the owne
 command land in the model and in the activity feed. studio_view shows them a level, a phase or the \
 plan and returns window-point coordinates and dimensional handles; studio_screenshot shows you \
 what they see. studio_click, studio_drag and studio_key queue the same pointer and keyboard input \
-as the owner's. Use fresh studio_view coordinates for picking and handle drags.";
+as the owner's. Use fresh studio_view coordinates for picking and handle drags. \
+studio_start opens the same human task as a Studio button without changing the document; \
+its optional target selects an element or facade host for the task.";
 
 /// Where tool calls run.
 pub trait Backend {
@@ -135,6 +137,14 @@ fn tool_name(id: &str) -> String {
 fn studio_tools() -> Value {
     json!([
         {
+            "name": "studio_start",
+            "description": "Open a human authoring task in Studio. action is select, building, wall, window, door, component, roof or edit. Optional target is a unique visible element id. Opens the same controls as a button without changing the document; returns view and authoring state.",
+            "inputSchema": {"type":"object", "properties": {
+                "action":{"type":"string", "enum":["select","building","wall","window","door","component","roof","edit"]},
+                "target":{"type":"string", "minLength":1, "maxLength":256}
+            }, "required":["action"], "additionalProperties":false}
+        },
+        {
             "name": "studio_view",
             "description": "Change what the owner sees in Trigon Studio and return the view: mode (3d, plan or drawing), drawing (a saved drawing view id), level (the plan's \
                             level; in 3D the top level shown, cut 1.2 m above its floor; null shows everything), phase (a phase id), \
@@ -223,6 +233,7 @@ fn text_content(v: &Value) -> Value {
 /// A Studio tool call's MCP result.
 fn call_studio_tool(backend: &mut dyn Backend, name: &str, args: Value) -> Value {
     let (method, args) = match name {
+        "studio_start" => ("ui.start", args),
         "studio_view" => ("ui.view", args),
         "studio_screenshot" => (
             "ui.screenshot",
@@ -282,7 +293,9 @@ pub fn handle(backend: &mut dyn Backend, msg: &Value) -> Option<Value> {
         "tools/call" => {
             let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or_default();
             let args = msg.pointer("/params/arguments").cloned().unwrap_or(Value::Null);
-            if backend.has_studio() && matches!(name, "studio_view" | "studio_screenshot" | "studio_click" | "studio_drag" | "studio_key") {
+            if backend.has_studio()
+                && matches!(name, "studio_start" | "studio_view" | "studio_screenshot" | "studio_click" | "studio_drag" | "studio_key")
+            {
                 return ok(call_studio_tool(backend, name, args));
             }
             let Some(spec) = commands().iter().find(|c| tool_name(c.id) == name) else {

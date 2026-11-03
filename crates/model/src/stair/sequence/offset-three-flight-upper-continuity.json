@@ -1,0 +1,625 @@
+{
+  "id": "offset-three-flight-upper-continuity",
+  "public_synthetic": true,
+  "building": {
+    "id": "public",
+    "footprint": [
+      [
+        0,
+        0
+      ],
+      [
+        20000,
+        0
+      ],
+      [
+        20000,
+        10000
+      ],
+      [
+        0,
+        10000
+      ]
+    ],
+    "wall_thickness_mm": 200,
+    "storeys": [
+      {
+        "name": "Basement",
+        "elevation": -2400,
+        "height": 2400,
+        "roof_level": false
+      },
+      {
+        "name": "Ground",
+        "elevation": 0,
+        "height": 3000,
+        "roof_level": false
+      },
+      {
+        "name": "Upper",
+        "elevation": 3000,
+        "height": 3000,
+        "roof_level": false
+      }
+    ],
+    "floor_thickness_mm": 220
+  },
+  "source": {
+    "kind": "explicit_sequence_v1",
+    "id": "public.route",
+    "name": "Public offset and intermediate elevations",
+    "landings": [
+      {
+        "id": "base",
+        "name": "base",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 0
+          },
+          "offset_mm": 300
+        },
+        "access_level": 0,
+        "outline": [
+          [
+            2000,
+            3000
+          ],
+          [
+            3000,
+            3000
+          ],
+          [
+            3000,
+            4000
+          ],
+          [
+            2000,
+            4000
+          ]
+        ],
+        "ports": [
+          {
+            "id": "out",
+            "edge": [
+              [
+                3000,
+                4000
+              ],
+              [
+                3000,
+                3000
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "slab",
+          "thickness_mm": 180
+        },
+        "guards": []
+      },
+      {
+        "id": "threshold",
+        "name": "threshold",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 1
+          },
+          "offset_mm": -120
+        },
+        "access_level": 1,
+        "outline": [
+          [
+            5500,
+            3000
+          ],
+          [
+            6500,
+            3000
+          ],
+          [
+            6500,
+            4000
+          ],
+          [
+            5500,
+            4000
+          ]
+        ],
+        "ports": [
+          {
+            "id": "in",
+            "edge": [
+              [
+                5500,
+                4000
+              ],
+              [
+                5500,
+                3000
+              ]
+            ]
+          },
+          {
+            "id": "out",
+            "edge": [
+              [
+                6500,
+                4000
+              ],
+              [
+                6500,
+                3000
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "slab",
+          "thickness_mm": 220
+        },
+        "guards": []
+      },
+      {
+        "id": "rear",
+        "name": "rear",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 1
+          },
+          "offset_mm": 600
+        },
+        "access_level": null,
+        "outline": [
+          [
+            7400,
+            3000
+          ],
+          [
+            8400,
+            3000
+          ],
+          [
+            8400,
+            4000
+          ],
+          [
+            7400,
+            4000
+          ]
+        ],
+        "ports": [
+          {
+            "id": "in",
+            "edge": [
+              [
+                7400,
+                4000
+              ],
+              [
+                7400,
+                3000
+              ]
+            ]
+          },
+          {
+            "id": "out",
+            "edge": [
+              [
+                8400,
+                4000
+              ],
+              [
+                8400,
+                3000
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "slab",
+          "thickness_mm": 220
+        },
+        "guards": []
+      },
+      {
+        "id": "front",
+        "name": "front",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 1
+          },
+          "offset_mm": 1800
+        },
+        "access_level": null,
+        "outline": [
+          [
+            9900,
+            3000
+          ],
+          [
+            10900,
+            3000
+          ],
+          [
+            10900,
+            4000
+          ],
+          [
+            9900,
+            4000
+          ]
+        ],
+        "ports": [
+          {
+            "id": "in",
+            "edge": [
+              [
+                9900,
+                4000
+              ],
+              [
+                9900,
+                3000
+              ]
+            ]
+          },
+          {
+            "id": "out",
+            "edge": [
+              [
+                10900,
+                4000
+              ],
+              [
+                10900,
+                3000
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "slab",
+          "thickness_mm": 220
+        },
+        "guards": []
+      },
+      {
+        "id": "upper",
+        "name": "upper",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 2
+          },
+          "offset_mm": 0
+        },
+        "access_level": 2,
+        "outline": [
+          [
+            12400,
+            3000
+          ],
+          [
+            13400,
+            3000
+          ],
+          [
+            13400,
+            4000
+          ],
+          [
+            12400,
+            4000
+          ]
+        ],
+        "ports": [
+          {
+            "id": "in",
+            "edge": [
+              [
+                12400,
+                4000
+              ],
+              [
+                12400,
+                3000
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "floor",
+          "floor": {
+            "kind": "storey",
+            "level": 2
+          }
+        },
+        "guards": []
+      }
+    ],
+    "flights": [
+      {
+        "id": "f0",
+        "name": "Basement ascent",
+        "from": {
+          "landing": "base",
+          "port": "out"
+        },
+        "to": {
+          "landing": "threshold",
+          "port": "in"
+        },
+        "soffit_mm": 150,
+        "profile": {
+          "kind": "straight",
+          "tread_ids": [
+            "t01",
+            "t02",
+            "t03",
+            "t04",
+            "t05",
+            "t06",
+            "t07",
+            "t08",
+            "t09",
+            "t10"
+          ]
+        },
+        "guards": {
+          "left": null,
+          "right": null
+        }
+      },
+      {
+        "id": "f1",
+        "name": "Short entrance flight",
+        "from": {
+          "landing": "threshold",
+          "port": "out"
+        },
+        "to": {
+          "landing": "rear",
+          "port": "in"
+        },
+        "soffit_mm": 150,
+        "profile": {
+          "kind": "straight",
+          "tread_ids": [
+            "t01",
+            "t02",
+            "t03"
+          ]
+        },
+        "guards": {
+          "left": null,
+          "right": null
+        }
+      },
+      {
+        "id": "f2",
+        "name": "Return to front landing",
+        "from": {
+          "landing": "rear",
+          "port": "out"
+        },
+        "to": {
+          "landing": "front",
+          "port": "in"
+        },
+        "soffit_mm": 150,
+        "profile": {
+          "kind": "straight",
+          "tread_ids": [
+            "t01",
+            "t02",
+            "t03",
+            "t04",
+            "t05"
+          ]
+        },
+        "guards": {
+          "left": null,
+          "right": null
+        }
+      },
+      {
+        "id": "f3",
+        "name": "Upper arrival",
+        "from": {
+          "landing": "front",
+          "port": "out"
+        },
+        "to": {
+          "landing": "upper",
+          "port": "in"
+        },
+        "soffit_mm": 150,
+        "profile": {
+          "kind": "straight",
+          "tread_ids": [
+            "t01",
+            "t02",
+            "t03",
+            "t04",
+            "t05"
+          ]
+        },
+        "guards": {
+          "left": null,
+          "right": null
+        }
+      }
+    ],
+    "openings": [
+      {
+        "id": "cut-ground",
+        "floor": {
+          "kind": "storey",
+          "level": 1
+        },
+        "outline": [
+          [
+            2000,
+            2500
+          ],
+          [
+            12400,
+            2500
+          ],
+          [
+            12400,
+            4500
+          ],
+          [
+            2000,
+            4500
+          ]
+        ]
+      },
+      {
+        "id": "cut-upper",
+        "floor": {
+          "kind": "storey",
+          "level": 2
+        },
+        "outline": [
+          [
+            2000,
+            2500
+          ],
+          [
+            12400,
+            2500
+          ],
+          [
+            12400,
+            4500
+          ],
+          [
+            2000,
+            4500
+          ]
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "landing_top_z_mm": {
+      "base": -2100,
+      "threshold": -120,
+      "rear": 600,
+      "front": 1800,
+      "upper": 3000
+    },
+    "riser_count_by_flight": [
+      11,
+      4,
+      6,
+      6
+    ],
+    "riser_height_mm_by_flight": [
+      180,
+      180,
+      200,
+      200
+    ],
+    "tread_count_by_flight": [
+      10,
+      3,
+      5,
+      5
+    ],
+    "flight_volume_mm3": [
+      825000000,
+      297000000,
+      525000000,
+      525000000
+    ],
+    "landing_volume_mm3": [
+      180000000,
+      220000000,
+      220000000,
+      220000000,
+      0
+    ],
+    "owned_material_volume_mm3": 3012000000,
+    "owned_material_volume_m3": 3.012,
+    "risers": 27,
+    "treads": 23,
+    "floor_owned_upper_landing_extra_volume_mm3": 0,
+    "opening_area_mm2_each": 20800000,
+    "floor_void_volume_mm3_each_at_220_thickness": 4576000000,
+    "expected_tread_top_z_mm": [
+      [
+        -1920,
+        -1740,
+        -1560,
+        -1380,
+        -1200,
+        -1020,
+        -840,
+        -660,
+        -480,
+        -300
+      ],
+      [
+        60,
+        240,
+        420
+      ],
+      [
+        800,
+        1000,
+        1200,
+        1400,
+        1600
+      ],
+      [
+        2000,
+        2200,
+        2400,
+        2600,
+        2800
+      ]
+    ],
+    "part_ids": [
+      "public.route.flight.f0",
+      "public.route.flight.f1",
+      "public.route.flight.f2",
+      "public.route.flight.f3",
+      "public.route.landing.base",
+      "public.route.landing.threshold",
+      "public.route.landing.rear",
+      "public.route.landing.front",
+      "public.route.landing.upper"
+    ],
+    "body_mesh_ids": [
+      "public.route.flight.f0",
+      "public.route.flight.f1",
+      "public.route.flight.f2",
+      "public.route.flight.f3",
+      "public.route.landing.base",
+      "public.route.landing.threshold",
+      "public.route.landing.rear",
+      "public.route.landing.front"
+    ],
+    "lowest_floor_has_no_hole": true,
+    "threshold_to_room_floor_offset_mm": -120,
+    "threshold_is_not_claimed_flush_room_access": true,
+    "guards": {
+      "body_count": 0,
+      "explicitly_requested_none": true,
+      "safety_compliance": "not assessed"
+    }
+  }
+}

@@ -6,6 +6,10 @@ use trigon_engine::{Session, commands};
 
 /// Every method the control channel answers, with a one-line description (docs/control-protocol.md).
 pub const METHODS: &[(&str, &str)] = &[
+    (
+        "ui.start",
+        "start a human task: action (select, building, wall, window, door, component, roof, edit), optional target (unique visible element id); opens Studio controls without changing the document",
+    ),
     ("control.hello", "name this client (`client`), shown in the app's activity feed; answered by the server"),
     ("control.pending", "the reply of this connection's request that timed out, once it has one"),
     ("command.run", "run any engine command: `command` (dotted id), `params` (object)"),

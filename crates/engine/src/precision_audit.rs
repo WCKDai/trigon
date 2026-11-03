@@ -439,6 +439,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn arrival_coverage_audit_keeps_exposed_symbols_and_wall_clashes() {
+        for (rotation, translation) in [(0.0_f64, [0.0, 0.0]), (37.25, [150000.0, -270000.0]), (-118.0, [-80000.0, 95000.0])] {
+            let (sin, cos) = rotation.to_radians().sin_cos();
+            let transform = |[x, y]: [f64; 2]| [translation[0] + x * cos - y * sin, translation[1] + x * sin + y * cos];
+            for (offset, expected_overlap, expected_wall) in [(0.0, None, false), (800.0, Some(4400000.0), true), (1100.0, Some(3800000.0), true)] {
+                for fallback_ids in [false, true] {
+                    let outline = [[0.0, 0.0], [12000.0, 0.0], [12000.0, 12000.0], [0.0, 12000.0]].map(transform);
+                    let mut b = trigon_model::Building::new("synthetic", "Arrival audit", &outline, 3, 3000.0).unwrap();
+                    let ring = |x: f64| [[x, 2000.0], [x + 2000.0, 2000.0], [x + 2000.0, 4000.0], [x, 4000.0]].map(transform);
+                    b.stairs = serde_json::from_value(json!([
+                        {"id":if fallback_ids { "" } else { "arrival" },"levels":[0],"kind":"u_turn","outline":ring(2000.0),"rounded":false,"tread":250,"landing":1000,"well":150},
+                        {"id":if fallback_ids { "" } else { "outgoing" },"levels":[1],"kind":"u_turn","outline":ring(2000.0+offset),"rounded":false,"tread":250,"landing":1000,"well":150}
+                    ])).unwrap();
+                    // This wall crosses only the exposed 800 mm strip when the departure is offset.
+                    b.interior_walls = serde_json::from_value(json!([
+                        {"id":"strip-wall","levels":[1],"a":transform([2400.0,2200.0]),"b":transform([2400.0,3800.0]),"thickness":100}
+                    ]))
+                    .unwrap();
+                    let mut s = Session::new(Box::new(trigon_data::Live::new(Default::default())));
+                    s.doc.buildings.push(b);
+                    let before = s.doc.clone();
+                    let report = s.execute("precision.audit", json!({"building":"synthetic","levels":[1]})).unwrap();
+                    assert_eq!(report["geometry_valid"], true, "{report}");
+                    let hits: Vec<_> = report["findings"].as_array().unwrap().iter().filter(|f| f["kind"] == "overlapping_stair_symbols").collect();
+                    assert_eq!(hits.len(), usize::from(expected_overlap.is_some()), "rotation={rotation}, offset={offset}: {report}");
+                    let arrival_id = if fallback_ids { "synthetic.stair0.L0" } else { "arrival.L0" };
+                    let outgoing_id = if fallback_ids { "synthetic.stair1.L1" } else { "outgoing.L1" };
+                    if let Some(area) = expected_overlap {
+                        let hit = hits[0];
+                        assert_eq!(hit["ids"], json!([arrival_id, outgoing_id]));
+                        assert_eq!(hit["departure_levels"], json!([0, 1]));
+                        assert_eq!(hit["level"], 1);
+                        assert_eq!(hit["review_required"], true);
+                        assert!((hit["opening_overlap_mm2"].as_f64().unwrap() - area).abs() < 0.01, "{hit}");
+                        for (axis, expected) in [offset * cos, offset * sin].into_iter().enumerate() {
+                            assert!((hit["centre_delta_mm"][axis].as_f64().unwrap() - expected).abs() < 1e-6);
+                        }
+                    }
+                    let wall_hits: Vec<_> = report["findings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|f| f["kind"] == "stair_wall_overlap" && f["id"] == arrival_id)
+                        .collect();
+                    assert_eq!(wall_hits.len(), usize::from(expected_wall), "{report}");
+                    if expected_wall {
+                        assert_eq!(wall_hits[0]["wall_id"], "strip-wall.L1");
+                        assert_eq!(wall_hits[0]["departure_level"], 0);
+                        assert!((wall_hits[0]["opening_overlap_mm2"].as_f64().unwrap() - 160000.0).abs() < 0.01);
+                    }
+                    assert!(
+                        !report["findings"].as_array().unwrap().iter().any(|f| f["kind"] == "overlapping_stair_sources"),
+                        "adjacent-storey symbols must not become same-storey source collisions"
+                    );
+                    assert_eq!(s.doc, before);
+                    assert!(!s.dirty);
+                    assert!(s.undo.is_empty() && s.redo.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stair_turns_intruding_into_wall_material_are_reported_without_changing_the_document() {
         for rotation in [0.0_f64, 37.25, -118.0] {
             for (start, expected_wall, expected_area) in

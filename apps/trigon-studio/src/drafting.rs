@@ -1,5 +1,5 @@
-//! Drawing authoring forms produce the same engine commands used by CLI/MCP. Picking fills
-//! typed millimetre fields; only the explicit Add/Update button changes the document.
+//! Drawing authoring produces the same engine commands used by CLI/MCP. Canvas gestures
+//! collect a local draft; Finish/Enter explicitly submits one undoable annotation command.
 
 use eframe::egui;
 use serde_json::json;
@@ -15,6 +15,16 @@ use crate::{authoring::Run, theme};
 pub enum Action {
     Open(String),
     Run(Run),
+}
+
+#[derive(Default)]
+struct Placement {
+    picked: usize,
+    pending: bool,
+    focus_text: bool,
+    frame: Option<(DrawingViewKind, Option<[[f64; 2]; 2]>)>,
+    stale: bool,
+    error: Option<String>,
 }
 
 pub struct Drafting {
@@ -53,6 +63,10 @@ pub struct Drafting {
     export_path: String,
     reveal_export: bool,
     guide_mode: bool,
+    placement: Option<Placement>,
+    repeat_placement: bool,
+    chain_placement: bool,
+    text_editor: Option<egui::Id>,
 }
 
 impl Default for Drafting {
@@ -93,6 +107,10 @@ impl Default for Drafting {
             export_path: "out/drawing.pdf".into(),
             reveal_export: false,
             guide_mode: false,
+            placement: None,
+            repeat_placement: true,
+            chain_placement: false,
+            text_editor: None,
         }
     }
 }
@@ -217,14 +235,54 @@ impl Drafting {
         if changed || doc.views.iter().any(|v| v.id == self.view_id) {
             self.view_id = unique_id("drawing", |id| doc.views.iter().any(|v| v.id == id));
         }
+        self.sync_context(doc);
+    }
+
+    fn frame(doc: &Document, id: &str) -> Option<(DrawingViewKind, Option<[[f64; 2]; 2]>)> {
+        let mut views = doc.views.iter().filter(|view| view.id == id);
+        let view = views.next()?;
+        if views.next().is_some() {
+            return None;
+        }
+        let mut kind = view.kind.clone();
+        if let DrawingViewKind::Section { depth_mm, .. } = &mut kind {
+            *depth_mm = 0.0;
+        }
+        let edge = if let DrawingViewKind::Facade { facade } = &kind {
+            let mut sources =
+                doc.buildings.iter().flat_map(|building| building.facades.iter().filter(|f| &f.id == facade).map(move |f| (building, f)));
+            let (building, facade) = sources.next()?;
+            if sources.next().is_some() {
+                return None;
+            }
+            let (a, b) = building.edge(facade.edge)?;
+            Some([a, b])
+        } else {
+            None
+        };
+        Some((kind, edge))
+    }
+
+    pub(crate) fn sync_context(&mut self, doc: &Document) {
+        let frame = Self::frame(doc, &self.current_view);
+        if let Some(placement) = &mut self.placement
+            && (placement.frame != frame || frame.is_none())
+        {
+            placement.stale = true;
+            placement.pending = false;
+            placement.error = Some("The drawing coordinate frame changed. Restart the annotation tool before placing this draft.".into());
+            self.picking = None;
+        }
     }
 
     pub fn new_note(&mut self, doc: &Document) {
+        self.text_editor = None;
         self.guide_mode = false;
         self.selected = None;
         self.note_id = unique_id("annotation", |id| doc.annotations.iter().any(|a| a.id == id));
         self.picking = None;
         self.region_points.clear();
+        self.placement = None;
     }
 
     /// Start a saved plan datum with exact site coordinates; the shared preview
@@ -254,6 +312,8 @@ impl Drafting {
     }
 
     pub fn select(&mut self, a: &Annotation) {
+        self.text_editor = None;
+        self.placement = None;
         self.guide_mode = a.id.starts_with("reference-guide-") && matches!(a.kind, AnnotationKind::Line { .. });
         self.selected = Some(a.id.clone());
         self.note_id = a.id.clone();
@@ -304,17 +364,294 @@ impl Drafting {
     }
 
     pub fn ribbon(&mut self, ui: &mut egui::Ui, doc: &Document, id: &str) {
-        if ui.selectable_label(self.picking.is_none(), "Select").clicked() {
-            self.picking = None;
+        if ui.selectable_label(self.placement.is_none() && self.picking.is_none(), "Select").clicked() {
+            self.cancel_placement();
         }
         let view = doc.views.iter().find(|v| v.id == id);
         for (i, label) in ["Text", "Dimension", "Leader", "Level", "Area fill", "Line"].into_iter().enumerate() {
             let enabled = view.is_some_and(|v| i != 3 || !matches!(v.kind, DrawingViewKind::Plan { .. }));
-            if ui.add_enabled(enabled, egui::Button::selectable(self.picking.is_some() && self.kind == i, label)).clicked() {
-                self.new_note(doc);
-                self.kind = i;
-                self.picking = Some(0);
+            if ui.add_enabled(enabled, egui::Button::selectable(self.placement.is_some() && self.kind == i, label)).clicked() {
+                self.start_placement(doc, id, i);
             }
+        }
+    }
+
+    /// Tool indices match the ribbon: text, aligned dimension, leader, level, fill, line.
+    /// Starting or cancelling a gesture never changes the document.
+    pub fn start_placement(&mut self, doc: &Document, id: &str, kind: usize) -> bool {
+        if kind > 5 || !doc.views.iter().any(|view| view.id == id && (kind != 3 || !matches!(view.kind, DrawingViewKind::Plan { .. }))) {
+            return false;
+        }
+        self.opened(doc, id);
+        self.new_note(doc);
+        self.kind = kind;
+        self.picking = Some(0);
+        self.placement = Some(Placement { frame: Self::frame(doc, id), ..Default::default() });
+        true
+    }
+
+    pub fn placement_active(&self) -> bool {
+        self.placement.is_some()
+    }
+
+    pub fn placement_status(&self) -> &'static str {
+        let Some(placement) = &self.placement else { return "Choose an annotation tool, then click the drawing." };
+        if placement.pending {
+            return "Placing annotation…";
+        }
+        match (self.kind, self.picking) {
+            (0, Some(_)) => "Click the text position, then type your note.",
+            (1, Some(0)) => "Aligned dimension · click the first witness point.",
+            (1, Some(1)) => "Click the second witness point.",
+            (1, Some(_)) => "Click to position the dimension line and its witness offset.",
+            (2, Some(0)) => "Click the arrow tip on the drawing.",
+            (2, Some(1)) => "Click the leader bend.",
+            (2, Some(_)) => "Click the text position, then type your note.",
+            (3, Some(_)) => "Click the level mark position.",
+            (4, Some(_)) if self.region_points.len() < 3 => "Area fill · click at least three corners.",
+            (4, Some(_)) => "Add corners, or press Enter / Finish to close the fill.",
+            (5, Some(0)) => "Manual line · click the start point.",
+            (5, Some(_)) => "Click the end point.",
+            (0 | 2 | 3, None) => "Edit the text, then press Enter or Finish.",
+            _ => "Press Enter or Finish to place. Esc cancels this draft.",
+        }
+    }
+
+    fn placement_geometry_complete(&self) -> bool {
+        self.placement.as_ref().is_some_and(|placement| {
+            placement.picked
+                >= match self.kind {
+                    1 | 2 | 4 => 3,
+                    5 => 2,
+                    _ => 1,
+                }
+        })
+    }
+
+    fn draft_annotation(&self) -> Annotation {
+        Annotation { id: self.note_id.clone(), view: self.current_view.clone(), size_mm: self.size, style: self.style, kind: self.annotation_kind() }
+    }
+
+    pub fn placement_ready(&self) -> bool {
+        self.placement.as_ref().is_some_and(|placement| !placement.pending && !placement.stale)
+            && self.placement_geometry_complete()
+            && self.draft_annotation().validate().is_ok()
+    }
+
+    /// Read-only feedback for the same gesture humans see on the canvas. Unpicked form
+    /// defaults are deliberately omitted; dimension picks include its offset-position click.
+    pub fn placement_feedback(&self) -> serde_json::Value {
+        let active = self.placement.is_some();
+        let pending = self.placement.as_ref().is_some_and(|placement| placement.pending);
+        let picked = if !active {
+            &[][..]
+        } else if self.kind == 4 {
+            self.region_points.as_slice()
+        } else {
+            &self.points[..self.placement.as_ref().map_or(0, |placement| placement.picked.min(3))]
+        };
+        let command_error = self.placement.as_ref().and_then(|placement| placement.error.clone());
+        let validation_error =
+            self.placement_geometry_complete().then(|| self.draft_annotation().validate().err().map(|error| error.to_string())).flatten();
+        let error = validation_error.or_else(|| command_error.clone());
+        json!({
+            "active":active,
+            "tool":active.then_some(["text","aligned_dimension","leader","level","area_fill","line"][self.kind.min(5)]),
+            "kind":active.then_some(["text","dimension","leader","level","region","line"][self.kind.min(5)]),
+            "annotation_id":active.then_some(self.note_id.as_str()),
+            "view":active.then_some(self.current_view.as_str()),
+            "selected":self.selected,
+            "picked_points":picked,
+            "next_step":self.placement_status(),
+            "ready":self.placement_ready(),
+            "pending":pending,
+            "stale":self.placement.as_ref().is_some_and(|placement| placement.stale),
+            "error":error,
+            "command_error":command_error,
+            "units":{"points":"drawing_plane_mm","witness_offset":"model_mm","text_size":"paper_mm","line_width":"paper_mm"},
+            "options":active.then(|| json!({
+                "text":self.text,"text_size_mm":self.size,"text_style":self.style,
+                "witness_offset_mm":self.offset,"repeat":self.repeat_placement,"chain":self.chain_placement,
+                "graphic_only":matches!(self.kind,4|5)
+            }))
+        })
+    }
+
+    pub fn cancel_placement(&mut self) {
+        if self.placement.take().is_some() {
+            self.region_points.clear();
+        }
+        self.picking = None;
+    }
+
+    /// Only an explicit Finish/Enter should call this. A command remains pending until the
+    /// caller reports success/failure, so repaint and repeated input cannot submit it twice.
+    pub fn finish_placement(&mut self, doc: &Document, id: &str) -> Option<Run> {
+        self.sync_context(doc);
+        if self.current_view != id
+            || !self.placement_ready()
+            || !doc.views.iter().any(|view| view.id == id && (self.kind != 3 || !matches!(view.kind, DrawingViewKind::Plan { .. })))
+        {
+            return None;
+        }
+        // Another command may have claimed the provisional id since this gesture began.
+        if doc.annotations.iter().any(|annotation| annotation.id == self.note_id) {
+            self.note_id = unique_id("annotation", |id| doc.annotations.iter().any(|annotation| annotation.id == id));
+            if doc.annotations.iter().any(|annotation| annotation.id == self.note_id) {
+                return None;
+            }
+        }
+        let annotation = self.draft_annotation();
+        if let Some(placement) = &mut self.placement {
+            placement.pending = true;
+            placement.error = None;
+        }
+        Some(Run {
+            command: "annotation.define",
+            params: json!({"id":annotation.id,"view":annotation.view,"size_mm":annotation.size_mm,"style":annotation.style,"kind":annotation.kind}),
+        })
+    }
+
+    /// Call for a successfully returned annotation instead of `select`. Repeat placement
+    /// starts only after success; errors preserve the original draft for correction/retry.
+    pub fn annotation_applied(&mut self, doc: &Document, annotation: &Annotation) {
+        let placing = self.placement.as_ref().is_some_and(|placement| placement.pending)
+            && annotation.id == self.note_id
+            && annotation.view == self.current_view;
+        if placing && self.repeat_placement {
+            let kind = self.kind;
+            let next_start = self.points[1];
+            if self.start_placement(doc, &annotation.view, kind) {
+                if self.chain_placement && matches!(kind, 1 | 5) {
+                    self.points[0] = next_start;
+                    self.picking = Some(1);
+                    if let Some(placement) = &mut self.placement {
+                        placement.picked = 1;
+                    }
+                }
+                return;
+            }
+        }
+        self.select(annotation);
+    }
+
+    pub fn placement_failed(&mut self, error: &str) {
+        if let Some(placement) = &mut self.placement {
+            placement.pending = false;
+            placement.error = Some(error.into());
+        }
+    }
+
+    /// A small native options editor intended for a bounded floating canvas panel.
+    /// Enter is handled after the text field has processed this frame's typing.
+    /// Capture this before other widgets process input: a foreign single-line editor
+    /// may surrender focus on Enter without consuming that event for later widgets.
+    pub(crate) fn keyboard_owned(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|memory| memory.focused()).is_none_or(|focused| Some(focused) == self.text_editor)
+    }
+
+    pub fn canvas_editor(&mut self, ui: &mut egui::Ui, doc: &Document, id: &str, keyboard_owned: bool) -> Option<Run> {
+        self.placement.as_ref()?;
+        ui.set_max_width(320.0);
+        ui.strong(["Text", "Aligned dimension", "Leader", "Level", "Area fill", "Manual line"][self.kind.min(5)]);
+        ui.label(self.placement_status());
+        let pending = self.placement.as_ref().is_some_and(|placement| placement.pending);
+        let mut finish = false;
+        let mut cancel = false;
+        ui.add_enabled_ui(!pending, |ui| {
+            if matches!(self.kind, 0 | 2 | 3) {
+                let text = ui.add(egui::TextEdit::singleline(&mut self.text).hint_text("Type a note").desired_width(280.0));
+                self.text_editor = Some(text.id);
+                if self.placement.as_ref().is_some_and(|placement| placement.focus_text) {
+                    text.request_focus();
+                    let mut state = egui::TextEdit::load_state(ui.ctx(), text.id).unwrap_or_default();
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::default(),
+                        egui::text::CCursor::new(self.text.chars().count()),
+                    )));
+                    state.store(ui.ctx(), text.id);
+                    if let Some(placement) = &mut self.placement {
+                        placement.focus_text = false;
+                    }
+                }
+            }
+            match self.kind {
+                1 => {
+                    ui.horizontal(|ui| {
+                        ui.label("Witness offset");
+                        number(ui, &mut self.offset);
+                    });
+                    ui.weak("Aligned to the two witnesses · offset in model mm");
+                }
+                3 => {
+                    ui.horizontal(|ui| {
+                        ui.label("Zero datum");
+                        number(ui, &mut self.datum);
+                    });
+                }
+                4 => {
+                    ui.horizontal(|ui| {
+                        ui.label("Fill");
+                        ui.color_edit_button_srgb(&mut self.region_fill);
+                        ui.checkbox(&mut self.region_border, "Border");
+                    });
+                    ui.weak("Graphic fill only. Define rooms and apartments with model tools.");
+                }
+                5 => {
+                    ui.horizontal(|ui| {
+                        ui.label("Pen");
+                        ui.color_edit_button_srgb(&mut self.stroke.colour);
+                        ui.add(egui::DragValue::new(&mut self.stroke.width_mm).range(0.05..=2.11).speed(0.01).suffix(" mm paper"));
+                    });
+                    ui.weak("Graphic line only. Room and apartment boundaries use model tools.");
+                }
+                _ => {}
+            }
+            if !matches!(self.kind, 4 | 5) {
+                ui.horizontal(|ui| {
+                    ui.label("Paper text");
+                    ui.add(egui::DragValue::new(&mut self.size).range(0.5..=12.0).speed(0.1).suffix(" mm"));
+                    egui::ComboBox::from_id_salt("canvas-annotation-font").selected_text(self.style.family.name()).show_ui(ui, |ui| {
+                        for family in [FontFamily::Sans, FontFamily::Serif, FontFamily::Mono] {
+                            ui.selectable_value(&mut self.style.family, family, family.name());
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.style.bold, "Bold");
+                    ui.checkbox(&mut self.style.italic, "Italic");
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.repeat_placement, "Keep placing");
+                if matches!(self.kind, 1 | 5) {
+                    ui.add_enabled(self.repeat_placement, egui::Checkbox::new(&mut self.chain_placement, "Chain"));
+                }
+            });
+            if self.placement_geometry_complete()
+                && let Err(error) = self.draft_annotation().validate()
+            {
+                ui.colored_label(theme::ACCENT, error.to_string());
+            }
+            ui.horizontal(|ui| {
+                finish = ui.add_enabled(self.placement_ready(), egui::Button::new("Finish · Enter")).clicked();
+                cancel = ui.button("Cancel · Esc").clicked();
+            });
+            if keyboard_owned {
+                finish |= ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                cancel |= ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            }
+        });
+        if let Some(error) = self.placement.as_ref().and_then(|placement| placement.error.as_deref()) {
+            ui.colored_label(theme::ACCENT, error);
+        }
+        if cancel {
+            self.cancel_placement();
+            None
+        } else if finish {
+            self.finish_placement(doc, id)
+        } else {
+            None
         }
     }
 
@@ -333,27 +670,129 @@ impl Drafting {
                 break;
             }
         }
-        let picked = if self.kind == 4 { self.region_points.as_slice() } else { &self.points[..self.picking.unwrap_or(0).min(3)] };
+        let picked = if self.kind == 4 {
+            self.region_points.as_slice()
+        } else {
+            let count = self.placement.as_ref().map_or(self.picking.unwrap_or(0), |placement| placement.picked);
+            &self.points[..count.min(if self.kind == 1 { 2 } else { 3 })]
+        };
         anchors.extend(picked.iter().copied().take(512 - anchors.len()));
         trigon_engine::AlignmentOptions { anchors, offset_mm: self.alignment_offset }
     }
 
     pub fn picked(&mut self, p: [f64; 2]) {
+        if p.iter().any(|value| !value.is_finite() || value.abs() > 1_000_000.0)
+            || self.placement.as_ref().is_some_and(|placement| placement.pending || placement.stale)
+        {
+            return;
+        }
         if self.kind == 4 && self.picking.is_some() {
+            if self.placement.is_some()
+                && self.region_points.len() >= 3
+                && self.region_points.first().is_some_and(|first| (first[0] - p[0]).hypot(first[1] - p[1]) <= 0.001)
+            {
+                self.picking = None;
+                return;
+            }
             if self.region_points.len() < 256 && self.region_points.last().is_none_or(|last| (last[0] - p[0]).hypot(last[1] - p[1]) > 0.001) {
                 self.region_points.push(p);
             }
             self.picking = (self.region_points.len() < 256).then_some(self.region_points.len());
+            if let Some(placement) = &mut self.placement {
+                placement.picked = self.region_points.len();
+            }
             return;
         }
         if let Some(i) = self.picking.filter(|i| *i < 3) {
+            let direct = self.placement.is_some();
+            if direct && i == 1 && matches!(self.kind, 1 | 2 | 5) {
+                let length = (p[0] - self.points[0][0]).hypot(p[1] - self.points[0][1]);
+                if !(0.001..=1_000_000.0).contains(&length) {
+                    return;
+                }
+            }
+            if direct && self.kind == 1 && i == 2 {
+                let Some(offset) = self.dimension_offset(p).filter(|offset| offset.abs() <= 100_000.0) else { return };
+                self.offset = offset;
+            }
             self.points[i] = p;
             self.picking = match (self.kind, i) {
                 (1, 0) | (2, 0) | (5, 0) => Some(1),
+                (1, 1) if direct => Some(2),
                 (2, 1) => Some(2),
                 _ => None,
             };
+            if let Some(placement) = &mut self.placement {
+                placement.picked = placement.picked.max(i + 1);
+                placement.focus_text = self.picking.is_none() && matches!(self.kind, 0 | 2 | 3);
+            }
         }
+    }
+
+    fn dimension_offset(&self, point: [f64; 2]) -> Option<f64> {
+        let [a, b] = [self.points[0], self.points[1]];
+        let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+        if !length.is_finite() || length < 0.001 {
+            return None;
+        }
+        let offset = ((b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])) / length;
+        offset.is_finite().then_some(offset)
+    }
+
+    /// The live rubber band contains only points actually picked, plus a valid cursor.
+    /// For a dimension's third click it follows the aligned dimension line, not the cursor's
+    /// arbitrary distance along that line. This is preview data only and emits no command.
+    pub fn preview_points(&self, cursor: Option<[f64; 2]>) -> Vec<[f64; 2]> {
+        let Some(placement) = &self.placement else { return self.points().to_vec() };
+        let cursor = cursor.filter(|point| point.iter().all(|value| value.is_finite() && value.abs() <= 1_000_000.0));
+        if self.kind == 1 && placement.picked >= 2 {
+            let [a, b] = [self.points[0], self.points[1]];
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if length < 0.001 {
+                return Vec::new();
+            }
+            let offset =
+                if self.picking == Some(2) { cursor.and_then(|point| self.dimension_offset(point)).unwrap_or(self.offset) } else { self.offset };
+            let shift = [-(b[1] - a[1]) / length * offset, (b[0] - a[0]) / length * offset];
+            return vec![[a[0] + shift[0], a[1] + shift[1]], [b[0] + shift[0], b[1] + shift[1]]];
+        }
+        let mut points = self.points().to_vec();
+        if self.picking.is_some()
+            && !placement.pending
+            && let Some(cursor) = cursor
+        {
+            points.push(cursor);
+        }
+        points
+    }
+
+    /// A dimension previews its actual offset line and both witnesses. The same
+    /// signed offset calculation is used by the final click and command.
+    pub fn preview_segments(&self, cursor: Option<[f64; 2]>) -> Vec<[[f64; 2]; 2]> {
+        let mut points = self.preview_points(cursor);
+        let source = self.points();
+        if self.kind == 1 && source.len() == 2 {
+            if self.placement.is_none() {
+                let [a, b] = [source[0], source[1]];
+                let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+                if length < 0.001 {
+                    return Vec::new();
+                }
+                let shift = [-(b[1] - a[1]) / length * self.offset, (b[0] - a[0]) / length * self.offset];
+                points = vec![[a[0] + shift[0], a[1] + shift[1]], [b[0] + shift[0], b[1] + shift[1]]];
+            }
+            if points.len() == 2 {
+                return vec![[source[0], points[0]], [points[0], points[1]], [points[1], source[1]]];
+            }
+        }
+        let mut segments: Vec<_> = points.windows(2).map(|pair| [pair[0], pair[1]]).collect();
+        if self.is_region()
+            && points.len() >= 3
+            && let (Some(first), Some(last)) = (points.first(), points.last())
+        {
+            segments.push([*last, *first]);
+        }
+        segments
     }
 
     pub fn hit<'a>(doc: &'a Document, view: &str, point: [f64; 2], tolerance: f64) -> Option<&'a Annotation> {
@@ -407,11 +846,12 @@ impl Drafting {
         if self.kind == 4 {
             return &self.region_points;
         }
-        &self.points[..match self.kind {
+        let count = match self.kind {
             1 | 5 => 2,
             2 => 3,
             _ => 1,
-        }]
+        };
+        &self.points[..self.placement.as_ref().map_or(count, |placement| placement.picked.min(count))]
     }
 
     pub fn is_region(&self) -> bool {
@@ -458,8 +898,12 @@ impl Drafting {
                     .add_enabled(i != 3 || !matches!(view.kind, DrawingViewKind::Plan { .. }), egui::Button::selectable(self.kind == i, name))
                     .clicked()
                 {
-                    self.kind = i;
-                    self.picking = None;
+                    if self.selected.is_some() {
+                        self.kind = i;
+                        self.picking = None;
+                    } else {
+                        self.start_placement(doc, id, i);
+                    }
                 }
             }
         });
@@ -559,6 +1003,10 @@ impl Drafting {
                     });
                 }
                 ui.weak("Pick at least three corners. Do not repeat the first corner; Trigon closes and validates the boundary.");
+                ui.weak("Graphic fill only. Room and apartment definitions belong to model tools.");
+                if let Some(placement) = &mut self.placement {
+                    placement.picked = self.region_points.len();
+                }
             }
         }
         if self.kind != 4 && self.kind != 5 {
@@ -585,16 +1033,22 @@ impl Drafting {
         ui.horizontal_wrapped(|ui| {
             let label = if self.guide_mode {
                 "Preview guide"
+            } else if self.placement_active() {
+                "Finish annotation · Enter"
             } else if self.selected.is_some() {
                 "Update annotation"
             } else {
                 "Add annotation"
             };
-            if theme::primary(ui, label).clicked() {
-                run = Some(Run {
-                    command: "annotation.define",
-                    params: json!({"id":self.note_id,"view":id,"size_mm":self.size,"style":self.style,"kind":self.annotation_kind()}),
-                });
+            if ui.add_enabled_ui(!self.placement_active() || self.placement_ready(), |ui| theme::primary(ui, label)).inner.clicked() {
+                run = if self.placement_active() {
+                    self.finish_placement(doc, id)
+                } else {
+                    Some(Run {
+                        command: "annotation.define",
+                        params: json!({"id":self.note_id,"view":id,"size_mm":self.size,"style":self.style,"kind":self.annotation_kind()}),
+                    })
+                };
             }
             if let Some(selected) = &self.selected
                 && ui.button("Delete annotation").clicked()
@@ -603,7 +1057,11 @@ impl Drafting {
             }
         });
         if self.picking.is_some() {
-            ui.colored_label(theme::ACCENT, "Click the drawing to fill this point. Esc cancels. Middle-drag pans; Alt bypasses snaps.");
+            ui.colored_label(
+                theme::ACCENT,
+                if self.placement_active() { self.placement_status() } else { "Click the drawing to fill this point. Esc cancels." },
+            );
+            ui.weak("Middle-drag pans · Alt bypasses snaps");
         }
         egui::CollapsingHeader::new("Snapping").default_open(true).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -819,6 +1277,398 @@ impl Drafting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn placement_document() -> Document {
+        let mut doc = Document::default();
+        doc.buildings.push(
+            serde_json::from_value(json!({
+                "id":"block","name":"Drawing fixture",
+                "footprint":[[0,0],[10000,0],[10000,8000],[0,8000]],
+                "wall_thickness":300,
+                "storeys":[{"name":"Ground floor","elevation":0,"height":3000}],
+                "facades":[],"evidence":[]
+            }))
+            .unwrap(),
+        );
+        doc.views.push(serde_json::from_value(json!({"id":"plan","name":"Ground floor","kind":{"view":"plan","level":0}})).unwrap());
+        doc
+    }
+
+    #[test]
+    fn same_id_section_frame_changes_refuse_a_retained_annotation_draft() {
+        let mut doc = placement_document();
+        doc.views[0].kind = DrawingViewKind::Section { from: [0.0, 0.0], to: [10000.0, 0.0], flip: false, depth_mm: 30000.0 };
+        let mut tool = Drafting::default();
+        tool.start_placement(&doc, "plan", 0);
+        tool.picked([2000.0, 2500.0]);
+        if let DrawingViewKind::Section { flip, .. } = &mut doc.views[0].kind {
+            *flip = true;
+        }
+        tool.opened(&doc, "plan");
+        assert!(tool.finish_placement(&doc, "plan").is_none(), "old coordinates must not enter the reversed frame");
+        assert!(tool.placement_feedback()["error"].as_str().is_some());
+        assert!(doc.annotations.is_empty());
+    }
+
+    #[test]
+    fn section_depth_and_paper_style_changes_keep_the_same_annotation_frame() {
+        let mut doc = placement_document();
+        doc.views[0].kind = DrawingViewKind::Section { from: [0.0, 0.0], to: [10000.0, 0.0], flip: false, depth_mm: 30000.0 };
+        let mut tool = Drafting::default();
+        tool.start_placement(&doc, "plan", 0);
+        tool.picked([2000.0, 2500.0]);
+        if let DrawingViewKind::Section { depth_mm, .. } = &mut doc.views[0].kind {
+            *depth_mm = 40000.0;
+        }
+        doc.views[0].template = Some(DrawingTemplate::default());
+        tool.opened(&doc, "plan");
+        assert!(tool.finish_placement(&doc, "plan").is_some());
+    }
+
+    #[test]
+    fn live_dimension_segments_match_the_signed_offset_in_the_committed_command() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        tool.start_placement(&doc, "plan", 1);
+        tool.picked([0.0, 0.0]);
+        tool.picked([4000.0, 0.0]);
+        for point in [[3000.0, -1000.0], [1200.0, 800.0]] {
+            let segments = tool.preview_segments(Some(point));
+            assert_eq!(segments[1], [[0.0, point[1]], [4000.0, point[1]]]);
+            assert_eq!(segments[0], [[0.0, 0.0], [0.0, point[1]]]);
+            assert_eq!(segments[2], [[4000.0, point[1]], [4000.0, 0.0]]);
+        }
+        tool.picked([3000.0, -1000.0]);
+        let preview = tool.preview_segments(None);
+        let run = tool.finish_placement(&doc, "plan").unwrap();
+        assert_eq!(run.params["kind"]["offset_mm"], -1000.0);
+        assert_eq!(preview[1], [[0.0, -1000.0], [4000.0, -1000.0]]);
+    }
+
+    #[test]
+    fn rejected_annotation_reports_a_command_failure_with_the_retained_draft() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        tool.start_placement(&doc, "plan", 0);
+        tool.picked([2000.0, 2500.0]);
+        tool.finish_placement(&doc, "plan").unwrap();
+        tool.placement_failed("public annotation command rejection");
+        assert!(tool.placement_feedback()["error"].as_str().is_some(), "engine rejection must survive in AI feedback");
+        assert_eq!(tool.placement_feedback()["command_error"], "public annotation command rejection");
+        assert_eq!(tool.points(), &[[2000.0, 2500.0]]);
+    }
+
+    #[test]
+    fn direct_aligned_dimension_requires_two_witnesses_offset_and_explicit_finish() {
+        let doc = placement_document();
+        let before = doc.clone();
+        let mut tool = Drafting::default();
+        assert!(tool.start_placement(&doc, "plan", 1));
+        assert!(tool.points().is_empty(), "untouched form defaults are not preview geometry");
+        assert!(tool.finish_placement(&doc, "plan").is_none());
+        tool.picked([0.0, 0.0]);
+        assert_eq!(tool.picking, Some(1));
+        assert_eq!(tool.preview_points(Some([3000.0, 4000.0])), vec![[0.0, 0.0], [3000.0, 4000.0]]);
+        tool.picked([3000.0, 4000.0]);
+        assert_eq!(tool.picking, Some(2));
+        assert!(!tool.placement_ready());
+        assert!(tool.finish_placement(&doc, "plan").is_none());
+        assert_eq!(tool.preview_points(Some([1400.0, 1450.0])), vec![[200.0, -150.0], [3200.0, 3850.0]]);
+        tool.picked([1400.0, 1450.0]);
+        assert!(tool.placement_ready());
+        assert_eq!(tool.points(), &[[0.0, 0.0], [3000.0, 4000.0]]);
+        assert_eq!(tool.annotation_kind(), AnnotationKind::Dimension { from: [0.0, 0.0], to: [3000.0, 4000.0], offset_mm: -250.0 });
+        let run = tool.finish_placement(&doc, "plan").unwrap();
+        assert_eq!(run.command, "annotation.define");
+        assert_eq!(run.params["kind"]["offset_mm"], -250.0);
+        assert!(tool.finish_placement(&doc, "plan").is_none(), "one gesture may submit only once while pending");
+        assert_eq!(doc, before, "picking, preview and producing a command do not mutate the document");
+    }
+
+    #[test]
+    fn direct_text_preserves_paper_style_and_failed_drafts_until_retry() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        assert!(tool.start_placement(&doc, "plan", 0));
+        tool.size = 3.5;
+        tool.style = TextStyle { family: FontFamily::Serif, bold: true, italic: true };
+        tool.text = "North entrance".into();
+        tool.picked([1234.56789, -456.12345]);
+        assert!(tool.placement_ready());
+        assert!(tool.placement.as_ref().unwrap().focus_text);
+        let first = tool.finish_placement(&doc, "plan").unwrap();
+        assert_eq!(first.params["size_mm"], 3.5);
+        assert_eq!(first.params["kind"]["at"], json!([1234.56789, -456.12345]));
+        assert_eq!(first.params["style"], json!({"family":"serif","bold":true,"italic":true}));
+        assert!(!tool.placement_ready());
+        tool.picked([0.0, 0.0]);
+        assert_eq!(tool.points(), &[[1234.56789, -456.12345]], "pending geometry cannot be overwritten");
+        tool.placement_failed("public annotation command rejection");
+        assert!(tool.placement_ready());
+        let retry = tool.finish_placement(&doc, "plan").unwrap();
+        assert_eq!(retry.params, first.params);
+    }
+
+    #[test]
+    fn cancel_discards_only_the_unfinished_gesture_at_every_step() {
+        let doc = placement_document();
+        let before = doc.clone();
+        for kind in [0, 1, 2, 4, 5] {
+            for count in 0..=3 {
+                let mut tool = Drafting::default();
+                assert!(tool.start_placement(&doc, "plan", kind));
+                for point in [[0.0, 0.0], [2000.0, 0.0], [2000.0, 1000.0]].into_iter().take(count) {
+                    tool.picked(point);
+                }
+                tool.cancel_placement();
+                assert!(!tool.placement_active());
+                assert!(tool.picking.is_none());
+                assert!(tool.finish_placement(&doc, "plan").is_none());
+            }
+        }
+        assert_eq!(doc, before);
+        let note = Annotation {
+            id: "saved-note".into(),
+            view: "plan".into(),
+            size_mm: 2.5,
+            style: TextStyle::default(),
+            kind: AnnotationKind::Text { at: [100.0, 200.0], text: "Saved".into(), rotation_deg: 0.0 },
+        };
+        let mut tool = Drafting::default();
+        tool.select(&note);
+        tool.picking = Some(0);
+        tool.cancel_placement();
+        assert_eq!(tool.selected.as_deref(), Some("saved-note"));
+        assert_eq!(tool.annotation_kind(), note.kind, "cancelling a selected annotation's pick preserves its edit values");
+    }
+
+    #[test]
+    fn direct_region_closes_without_repeating_a_corner_and_rejects_crossing_fills() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        assert!(tool.start_placement(&doc, "plan", 4));
+        for point in [[0.0, 0.0], [3000.0, 0.0], [3000.0, 2000.0]] {
+            tool.picked(point);
+        }
+        assert!(tool.placement_ready());
+        tool.picked([0.0, 0.0]);
+        assert!(tool.picking.is_none());
+        assert_eq!(tool.points().len(), 3);
+        assert!(tool.finish_placement(&doc, "plan").is_some());
+        tool.cancel_placement();
+        assert!(tool.start_placement(&doc, "plan", 4));
+        for point in [[0.0, 0.0], [3000.0, 2000.0], [0.0, 2000.0], [3000.0, 0.0]] {
+            tool.picked(point);
+        }
+        assert!(!tool.placement_ready());
+        assert!(tool.finish_placement(&doc, "plan").is_none());
+        assert_eq!(tool.points().len(), 4, "invalid geometry stays available for correction");
+    }
+
+    #[test]
+    fn repeat_and_chain_restart_only_after_success_with_a_new_annotation_id() {
+        let mut doc = placement_document();
+        let mut tool = Drafting { chain_placement: true, ..Default::default() };
+        assert!(tool.start_placement(&doc, "plan", 5));
+        tool.picked([1000.0, 2000.0]);
+        tool.picked([5000.0, 2000.0]);
+        let run = tool.finish_placement(&doc, "plan").unwrap();
+        let first: Annotation = serde_json::from_value(run.params).unwrap();
+        assert!(!tool.placement_ready());
+        doc.annotations.push(first.clone());
+        tool.annotation_applied(&doc, &first);
+        assert!(tool.placement_active());
+        assert_eq!(tool.picking, Some(1));
+        assert_eq!(tool.points(), &[[5000.0, 2000.0]]);
+        assert!(tool.selected.is_none());
+        assert_ne!(tool.note_id, first.id);
+        assert!(tool.finish_placement(&doc, "plan").is_none());
+        tool.picked([5000.0, 5000.0]);
+        let next = tool.finish_placement(&doc, "plan").unwrap();
+        assert_ne!(next.params["id"], first.id);
+        assert_eq!(next.params["kind"]["from"], json!([5000.0, 2000.0]));
+        assert_eq!(next.params["kind"]["to"], json!([5000.0, 5000.0]));
+        tool.repeat_placement = false;
+        let second: Annotation = serde_json::from_value(next.params).unwrap();
+        doc.annotations.push(second.clone());
+        tool.annotation_applied(&doc, &second);
+        assert!(!tool.placement_active());
+        assert_eq!(tool.selected.as_deref(), Some(second.id.as_str()));
+    }
+
+    #[test]
+    fn completed_direct_placement_is_one_engine_command_and_one_exact_undo() {
+        let mut session = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        session.doc = placement_document();
+        let before = session.doc.clone();
+        let mut tool = Drafting { repeat_placement: false, ..Default::default() };
+        assert!(tool.start_placement(&session.doc, "plan", 0));
+        tool.picked([2000.0, 1000.0]);
+        tool.text = "Entrance".into();
+        let run = tool.finish_placement(&session.doc, "plan").unwrap();
+        assert_eq!(session.doc, before);
+        let result = session.execute(run.command, run.params).unwrap();
+        let placed: Annotation = serde_json::from_value(result["annotation"].clone()).unwrap();
+        tool.annotation_applied(&session.doc, &placed);
+        assert_eq!(session.doc.annotations.len(), 1);
+        assert_eq!(session.doc.journal.len(), before.journal.len() + 1);
+        assert_eq!(session.doc.journal.last().unwrap().command, "annotation.define");
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc.annotations, vec![placed]);
+    }
+
+    #[test]
+    fn hostile_or_degenerate_picks_do_not_advance_or_emit_commands() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        assert!(!tool.start_placement(&doc, "missing", 0));
+        assert!(!tool.start_placement(&doc, "plan", 3), "vertical level marks are unavailable in plans");
+        assert!(!tool.start_placement(&doc, "plan", usize::MAX));
+        assert!(tool.start_placement(&doc, "plan", 1));
+        for point in [[f64::NAN, 0.0], [0.0, f64::INFINITY], [1_000_001.0, 0.0]] {
+            tool.picked(point);
+        }
+        assert!(tool.points().is_empty());
+        tool.picked([0.0, 0.0]);
+        tool.picked([0.0, 0.0]);
+        assert_eq!(tool.picking, Some(1));
+        tool.picked([1000.0, 0.0]);
+        tool.picked([0.0, 100_001.0]);
+        assert_eq!(tool.picking, Some(2));
+        assert!(tool.finish_placement(&doc, "plan").is_none());
+        tool.picked([0.0, -1000.0]);
+        assert!(tool.finish_placement(&doc, "other-view").is_none());
+        assert!(tool.finish_placement(&doc, "plan").is_some());
+    }
+
+    #[test]
+    fn a_provisional_id_claimed_during_placement_never_overwrites_the_existing_note() {
+        let mut doc = placement_document();
+        let mut tool = Drafting::default();
+        assert!(tool.start_placement(&doc, "plan", 0));
+        tool.picked([10.0, 20.0]);
+        let existing = tool.draft_annotation();
+        doc.annotations.push(existing.clone());
+        let run = tool.finish_placement(&doc, "plan").unwrap();
+        assert_ne!(run.params["id"], existing.id);
+        assert_eq!(doc.annotations, vec![existing]);
+    }
+
+    #[test]
+    fn placement_feedback_reports_actual_picks_step_units_validation_and_pending() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        assert_eq!(tool.placement_feedback()["active"], false);
+        assert_eq!(tool.placement_feedback()["picked_points"], json!([]));
+        tool.start_placement(&doc, "plan", 1);
+        let empty = tool.placement_feedback();
+        assert_eq!(empty["tool"], "aligned_dimension");
+        assert_eq!(empty["kind"], "dimension");
+        assert_eq!(empty["picked_points"], json!([]));
+        assert_eq!(empty["units"]["points"], "drawing_plane_mm");
+        assert_eq!(empty["units"]["text_size"], "paper_mm");
+        assert_eq!(empty["ready"], false);
+        tool.picked([0.0, 0.0]);
+        tool.picked([3000.0, 0.0]);
+        let witnesses = tool.placement_feedback();
+        assert_eq!(witnesses["picked_points"], json!([[0.0, 0.0], [3000.0, 0.0]]));
+        assert!(witnesses["next_step"].as_str().unwrap().contains("witness offset"));
+        tool.picked([1000.0, 400.0]);
+        assert_eq!(tool.placement_feedback()["picked_points"], json!([[0.0, 0.0], [3000.0, 0.0], [1000.0, 400.0]]));
+        assert_eq!(tool.placement_feedback()["ready"], true);
+        tool.finish_placement(&doc, "plan").unwrap();
+        assert_eq!(tool.placement_feedback()["pending"], true);
+        assert_eq!(tool.placement_feedback()["ready"], false);
+        tool.placement_failed("public annotation command rejection");
+        tool.offset = 100_001.0;
+        assert_eq!(tool.placement_feedback()["ready"], false);
+        assert!(tool.placement_feedback()["error"].as_str().unwrap().contains("offset_mm"));
+        tool.cancel_placement();
+        assert_eq!(tool.placement_feedback()["picked_points"], json!([]));
+    }
+
+    #[test]
+    fn native_canvas_text_editor_commits_current_typing_on_enter_and_never_on_repaint() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        tool.start_placement(&doc, "plan", 0);
+        tool.picked([1000.0, 2000.0]);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut run = None;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    if let Some(action) = tool.canvas_editor(ui, &doc, "plan", true) {
+                        run = Some(action);
+                    }
+                });
+            });
+            output.textures_delta.clear();
+            assert!(run.is_none(), "repainting a complete draft does not submit it");
+        }
+        let mut run = None;
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::Text("Lobby".into()),
+                egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+            ],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                if let Some(action) = tool.canvas_editor(ui, &doc, "plan", true) {
+                    run = Some(action);
+                }
+            });
+        });
+        output.textures_delta.clear();
+        let run = run.expect("Enter finishes the current native editor's draft");
+        assert_eq!(run.params["kind"]["text"], "Lobby");
+        assert_eq!(run.params["kind"]["at"], json!([1000.0, 2000.0]));
+        assert!(tool.finish_placement(&doc, "plan").is_none());
+    }
+
+    #[test]
+    fn foreign_editor_losing_focus_on_enter_does_not_finish_the_canvas_note() {
+        let doc = placement_document();
+        let mut tool = Drafting::default();
+        tool.start_placement(&doc, "plan", 0);
+        tool.picked([1000.0, 2000.0]);
+        let ctx = egui::Context::default();
+        let foreign = egui::Id::new("foreign-drawing-name");
+        let mut name = "Drawing name".to_string();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                tool.canvas_editor(ui, &doc, "plan", true);
+            });
+            output.textures_delta.clear();
+        }
+        ctx.memory_mut(|memory| memory.request_focus(foreign));
+        let mut run = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                let owned = tool.keyboard_owned(ui.ctx());
+                ui.add(egui::TextEdit::singleline(&mut name).id(foreign));
+                run = tool.canvas_editor(ui, &doc, "plan", owned);
+            },
+        );
+        output.textures_delta.clear();
+        ctx.data_mut(|data| data.clear());
+        assert!(run.is_none(), "Enter belonged to the foreign single-line editor before it surrendered focus");
+        assert_eq!(tool.placement_feedback()["pending"], false);
+    }
 
     #[test]
     fn reference_preset_uses_exact_plan_coordinates_and_a_red_dotted_pen() {

@@ -104,22 +104,16 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> egu
     }
 }
 
-/// Native button interaction with a compact vertical ribbon arrangement.
+/// Compact, borderless ribbon actions use the original assets at their native aspect ratio.
 pub fn ribbon_button(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> egui::Response {
-    let response = ui.add(egui::Button::new("").selected(selected).min_size(egui::vec2(72.0, 54.0)));
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
-    if let Some(texture) = icon.texture(ui) {
-        let rect = egui::Rect::from_center_size(response.rect.center_top() + egui::vec2(0.0, 18.0), egui::vec2(26.0, 26.0));
-        ui.painter().image(texture.id(), rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-    }
-    ui.painter().text(
-        response.rect.center_bottom() - egui::vec2(0.0, 5.0),
-        egui::Align2::CENTER_BOTTOM,
-        label,
-        egui::FontId::proportional(11.0),
-        if ui.is_enabled() { crate::theme::INK } else { crate::theme::MUTED },
-    );
-    response
+    let button = if let Some(texture) = icon.texture(ui) {
+        let size = texture.size_vec2();
+        let image = egui::Image::from_texture((texture.id(), egui::vec2(18.0, 18.0 * size.y / size.x)));
+        egui::Button::image_and_text(image, label)
+    } else {
+        egui::Button::new(label)
+    };
+    ui.add(button.frame(false).selected(selected).min_size(egui::vec2(100.0, 28.0)))
 }
 
 #[cfg(test)]

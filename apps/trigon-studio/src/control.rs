@@ -9,7 +9,33 @@ use serde_json::{Value, json};
 use trigon_control::{Request, methods};
 
 use crate::activity::Who;
-use crate::app::{Mode, SHOT_WAIT, Shot, ShotTarget, StudioApp, filter_name, parse_filter};
+use crate::app::{Mode, SHOT_WAIT, Shot, ShotTarget, StudioAction, StudioApp, filter_name, parse_filter};
+
+pub(crate) fn parse_start(p: &Value) -> Result<(StudioAction, Option<&str>), String> {
+    let object = p.as_object().ok_or("ui.start: params must be an object")?;
+    if object.keys().any(|key| !matches!(key.as_str(), "action" | "target")) {
+        return Err("ui.start: only action and optional target are accepted".into());
+    }
+    let action = match object.get("action").and_then(Value::as_str) {
+        Some("select") => StudioAction::Select,
+        Some("building") => StudioAction::Building,
+        Some("wall") => StudioAction::Wall,
+        Some("window") => StudioAction::Window,
+        Some("door") => StudioAction::Door,
+        Some("component") => StudioAction::Component,
+        Some("roof") => StudioAction::Roof,
+        Some("edit") => StudioAction::EditSelection,
+        _ => return Err("ui.start: action must be select, building, wall, window, door, component, roof or edit".into()),
+    };
+    let target = match object.get("target") {
+        None => None,
+        Some(Value::String(target)) if !target.trim().is_empty() && target.chars().count() <= 256 && !target.chars().any(char::is_control) => {
+            Some(target.as_str())
+        }
+        Some(_) => return Err("ui.start: target must be a nonempty element id of at most 256 characters".into()),
+    };
+    Ok((action, target))
+}
 
 /// A checked `ui.view` request; `None` keeps the current setting.
 #[derive(Debug, Default, PartialEq)]
@@ -206,6 +232,7 @@ impl StudioApp {
     pub(crate) fn handle_request(&mut self, req: Request, ctx: &egui::Context) {
         let (connection, method, params, responder) = req.into_parts();
         let reply = match method.as_str() {
+            "ui.start" => self.ui_start(&params),
             "command.run" => methods::command_run_params(&params).and_then(|(id, p)| {
                 let who = Who::Agent(self.agent_name(connection));
                 self.run(who, &id, p)
@@ -250,6 +277,12 @@ impl StudioApp {
         };
         responder.send(reply);
         ctx.request_repaint();
+    }
+
+    pub(crate) fn ui_start(&mut self, params: &Value) -> Result<Value, String> {
+        let (action, target) = parse_start(params)?;
+        self.start_action(action, target)?;
+        Ok(self.view_state())
     }
 
     /// `ui.view`: checked whole, then applied.
@@ -312,6 +345,8 @@ impl StudioApp {
             "level": self.level,
             "plan_level": self.plan_level,
             "drawing": if self.mode==Mode::Drawing {Some(&self.drawing)} else {None},
+            "authoring": self.authoring_feedback(),
+            "model_export": self.model_export.feedback(),
             "drawing_raster": self.plan.diagnostics(),
             "drawing_mapping": if self.mode!=Mode::ThreeD && !self.drawing_plan() {self.viewport_rect.filter(|r|self.plan.ready(*r,self.ppp)).and_then(|r|self.plan.screen_mapping(r))} else {None},
             "drawings": self.session.doc.views.iter().map(|v|(&v.id,&v.name)).collect::<Vec<_>>(),
@@ -460,6 +495,34 @@ impl StudioApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_requests_are_strict_and_bounded() {
+        for action in ["select", "building", "wall", "window", "door", "component", "roof", "edit"] {
+            assert!(parse_start(&json!({"action":action})).is_ok());
+        }
+        assert_eq!(parse_start(&json!({"action":"edit","target":"b1.f3"})).unwrap(), (StudioAction::EditSelection, Some("b1.f3")));
+        for params in [
+            json!(null),
+            json!([]),
+            json!("window"),
+            json!({}),
+            json!({"action":null}),
+            json!({"action":1}),
+            json!({"action":"unknown"}),
+            json!({"action":"Window"}),
+            json!({"action":"window","target":null}),
+            json!({"action":"window","target":1}),
+            json!({"action":"window","target":""}),
+            json!({"action":"window","target":" "}),
+            json!({"action":"window","target":"a\nb"}),
+            json!({"action":"window","target":"a".repeat(257)}),
+            json!({"action":"window","params":{}}),
+            json!({"action":"window","target":"b1.f3","force":true}),
+        ] {
+            assert!(parse_start(&params).is_err(), "{params}");
+        }
+    }
 
     #[test]
     fn appearance_control_is_explicit_checked_and_optional() {

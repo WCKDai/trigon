@@ -1,0 +1,285 @@
+{
+  "id": "rectangular-fan",
+  "public_synthetic": true,
+  "building": {
+    "id": "public",
+    "footprint": [
+      [
+        -2000,
+        -2000
+      ],
+      [
+        4000,
+        -2000
+      ],
+      [
+        4000,
+        4000
+      ],
+      [
+        -2000,
+        4000
+      ]
+    ],
+    "wall_thickness_mm": 200,
+    "storeys": [
+      {
+        "name": "Public lower datum",
+        "elevation": -1000,
+        "height": 5000,
+        "roof_level": false
+      }
+    ],
+    "floor_thickness_mm": 220
+  },
+  "embedding_note": "Independent platforms at Z=0 and 720 are above the -1000 floor, with no slab intersection. No room-floor or structural support certification.",
+  "source": {
+    "kind": "explicit_sequence_v1",
+    "id": "public.winder",
+    "name": "Rectangular quarter-turn cell oracle",
+    "landings": [
+      {
+        "id": "low",
+        "name": "Before quarter turn",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 0
+          },
+          "offset_mm": 1000
+        },
+        "access_level": 0,
+        "outline": [
+          [
+            0,
+            -1000
+          ],
+          [
+            1000,
+            -1000
+          ],
+          [
+            1000,
+            0
+          ],
+          [
+            0,
+            0
+          ]
+        ],
+        "ports": [
+          {
+            "id": "out",
+            "edge": [
+              [
+                0,
+                0
+              ],
+              [
+                1000,
+                0
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "slab",
+          "thickness_mm": 200
+        },
+        "guards": []
+      },
+      {
+        "id": "high",
+        "name": "After quarter turn",
+        "elevation": {
+          "floor": {
+            "kind": "storey",
+            "level": 0
+          },
+          "offset_mm": 1720
+        },
+        "access_level": null,
+        "outline": [
+          [
+            -1000,
+            0
+          ],
+          [
+            0,
+            0
+          ],
+          [
+            0,
+            1000
+          ],
+          [
+            -1000,
+            1000
+          ]
+        ],
+        "ports": [
+          {
+            "id": "in",
+            "edge": [
+              [
+                0,
+                0
+              ],
+              [
+                0,
+                1000
+              ]
+            ]
+          }
+        ],
+        "walk_via": [],
+        "surface": {
+          "kind": "slab",
+          "thickness_mm": 200
+        },
+        "guards": []
+      }
+    ],
+    "flights": [
+      {
+        "id": "turn",
+        "name": "Quarter ascent",
+        "from": {
+          "landing": "low",
+          "port": "out"
+        },
+        "to": {
+          "landing": "high",
+          "port": "in"
+        },
+        "soffit_mm": 150,
+        "profile": {
+          "kind": "tread_chain",
+          "treads": [
+            {
+              "id": "fan-a",
+              "outline": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1000,
+                  0
+                ],
+                [
+                  1000,
+                  500
+                ]
+              ],
+              "entry_edge": [
+                0,
+                1
+              ],
+              "exit_edge": [
+                0,
+                2
+              ]
+            },
+            {
+              "id": "fan-b",
+              "outline": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1000,
+                  500
+                ],
+                [
+                  1000,
+                  1000
+                ],
+                [
+                  500,
+                  1000
+                ]
+              ],
+              "entry_edge": [
+                0,
+                1
+              ],
+              "exit_edge": [
+                0,
+                3
+              ]
+            },
+            {
+              "id": "fan-c",
+              "outline": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  500,
+                  1000
+                ],
+                [
+                  0,
+                  1000
+                ]
+              ],
+              "entry_edge": [
+                0,
+                1
+              ],
+              "exit_edge": [
+                0,
+                2
+              ]
+            }
+          ]
+        },
+        "guards": {
+          "left": null,
+          "right": null
+        }
+      }
+    ],
+    "openings": []
+  },
+  "expected": {
+    "landing_top_z_mm": [
+      0,
+      720
+    ],
+    "riser_count": 4,
+    "riser_height_mm": 180,
+    "tread_count": 3,
+    "tread_top_z_mm": [
+      180,
+      360,
+      540
+    ],
+    "tread_area_mm2": [
+      250000,
+      500000,
+      250000
+    ],
+    "tread_volume_mm3": [
+      82500000,
+      165000000,
+      82500000
+    ],
+    "flight_volume_mm3": 330000000,
+    "landing_volume_mm3": 400000000,
+    "owned_material_volume_mm3": 730000000,
+    "ids": [
+      "public.winder.flight.turn",
+      "public.winder.flight.turn.tread.fan-a",
+      "public.winder.flight.turn.tread.fan-b",
+      "public.winder.flight.turn.tread.fan-c",
+      "public.winder.landing.low",
+      "public.winder.landing.high"
+    ],
+    "last_riser_onto_landing": true
+  }
+}

@@ -171,7 +171,7 @@ impl Properties {
                 ui.add_enabled_ui(editable, |ui| {
                     if let Some(choices) = property["choices"].as_array() {
                         let mut text = value.as_str().unwrap_or_default().to_string();
-                        egui::ComboBox::from_id_salt("value").selected_text(&text).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt("value").width(ui.available_width()).truncate().selected_text(&text).show_ui(ui, |ui| {
                             for choice in choices.iter().filter_map(Value::as_str) {
                                 ui.selectable_value(&mut text, choice.to_string(), choice);
                             }
@@ -400,7 +400,19 @@ impl Gizmo {
         }
         let painter = ui.painter_at(rect);
         let pointer = ui.input(|i| i.pointer.interact_pos());
-        let nearest = pointer.filter(|_| ui.rect_contains_pointer(rect)).and_then(|pointer| {
+        // Native integrations can deliver the press and its first movement in one frame.
+        // Capture at the original press, even if the pointer has already left the marker.
+        let press = ui.input(|i| {
+            i.events.iter().find_map(|event| match event {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some(*pos),
+                _ => None,
+            })
+        });
+        let over_view = press.map_or_else(
+            || ui.rect_contains_pointer(rect),
+            |at| rect.contains(at) && ui.clip_rect().contains(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()),
+        );
+        let nearest = press.or(pointer).filter(|_| over_view).and_then(|pointer| {
             handles
                 .iter()
                 .filter_map(|handle| handle.mapping.screen(0.0).filter(|at| rect.contains(*at)).map(|at| (handle, at.distance_sq(pointer))))
@@ -409,8 +421,7 @@ impl Gizmo {
                 .map(|(handle, _)| handle)
         });
         if !self.active()
-            && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary))
-            && let (Some(handle), Some(pointer)) = (nearest, pointer)
+            && let (Some(handle), Some(pointer)) = (nearest, press)
         {
             self.begin(id, generation, handle, pointer);
         }
@@ -418,7 +429,7 @@ impl Gizmo {
         let mut edit = None;
         // Keep updating and finish a captured drag even when its marker leaves the viewport.
         if self.active() {
-            if (ui.input(|i| i.pointer.is_decidedly_dragging()) || self.drag.as_ref().is_some_and(|drag| drag.started))
+            if (ui.input(|i| !i.pointer.could_any_button_be_click()) || self.drag.as_ref().is_some_and(|drag| drag.started))
                 && let Some(pointer) = pointer
             {
                 self.update(pointer);
@@ -578,6 +589,53 @@ mod tests {
         assert_eq!(edits.len(), 1, "the nearest height handle must commit");
         assert!(edits[0].properties.get("height_mm").is_some());
         assert!((edits[0].properties["height_mm"].as_f64().unwrap() - (1400.0 + 8.0 / 0.012)).abs() < 0.1);
+    }
+
+    #[test]
+    fn fast_handle_drags_keep_the_original_press_when_pointer_events_share_a_frame() {
+        for release_in_same_frame in [false, true] {
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+            let mut gizmo = Gizmo::default();
+            let mut edits = Vec::new();
+            let mut frame = 0;
+            let mut draw = |events| {
+                frame += 1;
+                let mut output =
+                    ctx.run_ui(egui::RawInput { screen_rect: Some(rect), time: Some(frame as f64 * 0.03), events, ..Default::default() }, |ui| {
+                        ui.allocate_exact_size(rect.size(), egui::Sense::click_and_drag());
+                        if let (_, Some(edit)) = gizmo.ui(ui, rect, "window", 1, &[handle()], true) {
+                            edits.push(edit);
+                        }
+                    });
+                output.textures_delta.clear();
+            };
+            let press = egui::Event::PointerButton {
+                pos: egui::pos2(100.0, 100.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            };
+            let release = egui::Event::PointerButton {
+                pos: egui::pos2(140.0, 100.0),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            };
+            draw(vec![]);
+            let mut fast_events =
+                vec![egui::Event::PointerMoved(egui::pos2(100.0, 100.0)), press, egui::Event::PointerMoved(egui::pos2(140.0, 100.0))];
+            if release_in_same_frame {
+                fast_events.push(release.clone());
+            }
+            draw(fast_events);
+            if !release_in_same_frame {
+                draw(vec![release]);
+            }
+            draw(vec![]);
+            assert_eq!(edits.len(), 1, "one fast drag must commit once; same-frame release={release_in_same_frame}");
+            assert!((edits[0].properties["width_mm"].as_f64().unwrap() - 1400.0).abs() < 0.001);
+        }
     }
 
     #[test]

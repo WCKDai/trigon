@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use eframe::egui;
 use serde_json::{Value, json};
-use trigon_model::{Building, ComponentType, Document};
+use trigon_model::component::{Deck, Finish, Muntins, Railing, Screens, Side, WindowShape};
+use trigon_model::{Building, ComponentKind, ComponentType, Document};
 
 use crate::{
     icons::{self, Icon},
@@ -39,9 +40,98 @@ enum WallReference {
     Facade,
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(crate) enum FamilyCategory {
+    #[default]
+    All,
+    Windows,
+    Doors,
+    Balconies,
+    Guards,
+}
+
+impl FamilyCategory {
+    const CHOICES: [(Self, &'static str); 5] = [
+        (Self::All, "All categories"),
+        (Self::Windows, "Windows"),
+        (Self::Doors, "Doors"),
+        (Self::Balconies, "Balconies"),
+        (Self::Guards, "Guards & railings"),
+    ];
+
+    pub(crate) fn matches(self, ty: &ComponentType) -> bool {
+        match self {
+            Self::All => true,
+            Self::Windows => matches!(ty.kind, ComponentKind::Window { .. } | ComponentKind::FixedWindow | ComponentKind::HistoricWindow { .. }),
+            Self::Doors => matches!(
+                ty.kind,
+                ComponentKind::EntranceDoor | ComponentKind::PanelDoor { .. } | ComponentKind::FrenchDoor { .. } | ComponentKind::DoorWindow { .. }
+            ),
+            Self::Balconies => matches!(
+                ty.kind,
+                ComponentKind::FrenchBalcony { .. }
+                    | ComponentKind::Balcony { .. }
+                    | ComponentKind::BalconySlab { .. }
+                    | ComponentKind::ShapedBalcony { .. }
+                    | ComponentKind::SteelBalcony { .. }
+                    | ComponentKind::Loggia { .. }
+            ),
+            Self::Guards => matches!(ty.kind, ComponentKind::GuardRail { .. }),
+        }
+    }
+}
+
 pub struct Run {
     pub command: &'static str,
     pub params: Value,
+}
+
+#[derive(Clone, PartialEq)]
+struct PlacementScope {
+    facade: String,
+    level: usize,
+    edge: usize,
+    edge_points: [[f64; 2]; 2],
+    thickness: f64,
+    storeys: Vec<trigon_model::Storey>,
+    bays: Vec<f64>,
+    phase: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum PlacementMode {
+    #[default]
+    Point,
+    Pattern,
+}
+
+#[derive(Clone)]
+struct PlacementPoint {
+    scope: PlacementScope,
+    u_mm: f64,
+    guide: String,
+}
+
+struct UnscopedPoint {
+    host: Element,
+    site: [f64; 2],
+    edge_points: [[f64; 2]; 2],
+    alt: bool,
+}
+
+/// A local dimension envelope, not a geometry build or a clash certificate.
+pub(crate) struct PlacementPreview {
+    pub facade: String,
+    pub level: usize,
+    pub u_mm: f64,
+    pub sizes: [f64; 3],
+    pub opening: bool,
+    pub depth_mm: f64,
+    pub face: [[f64; 3]; 4],
+    pub plan: [[f64; 3]; 4],
+    pub axis: [[f64; 3]; 2],
+    pub captured: bool,
+    pub guide: String,
 }
 
 pub struct Authoring {
@@ -70,10 +160,32 @@ pub struct Authoring {
     group_id: String,
     group_name: String,
     pub search: String,
+    family_category: FamilyCategory,
     draft: Option<ComponentType>,
-    kind: Value,
+    draft_source: Option<ComponentType>,
+    draft_is_new: bool,
+    pending_type: Option<String>,
+    show_placement: bool,
+    place_mode: PlacementMode,
+    place_point: Option<PlacementPoint>,
+    place_hover: Option<PlacementPoint>,
+    place_unscoped: Option<UnscopedPoint>,
+    place_snap_mm: f64,
+    place_snap_axes: bool,
+    place_plan_identity: Option<(String, usize)>,
+    place_plan_level: Option<usize>,
+    place_plan_invalidated: bool,
     facade: String,
     bay_count: usize,
+    place_level: Option<usize>,
+    place_bay: usize,
+    place_all_bays: bool,
+    place_replace: bool,
+    place_scope: Option<PlacementScope>,
+    place_scope_error: Option<String>,
+    place_command_error: Option<String>,
+    place_overrides: bool,
+    place_sizes: [f64; 3],
     library_import_path: String,
     library_export_path: String,
     library_replace: bool,
@@ -108,10 +220,32 @@ impl Default for Authoring {
             group_id: "selection".into(),
             group_name: "Selection group".into(),
             search: String::new(),
+            family_category: FamilyCategory::All,
             draft: None,
-            kind: Value::Null,
+            draft_source: None,
+            draft_is_new: false,
+            pending_type: None,
+            show_placement: false,
+            place_mode: PlacementMode::Point,
+            place_point: None,
+            place_hover: None,
+            place_unscoped: None,
+            place_snap_mm: 100.0,
+            place_snap_axes: true,
+            place_plan_identity: None,
+            place_plan_level: None,
+            place_plan_invalidated: false,
             facade: String::new(),
             bay_count: 5,
+            place_level: None,
+            place_bay: 0,
+            place_all_bays: false,
+            place_replace: false,
+            place_scope: None,
+            place_scope_error: None,
+            place_command_error: None,
+            place_overrides: false,
+            place_sizes: [1200.0, 1500.0, 850.0],
             library_import_path: String::new(),
             library_export_path: "out/components.trigonlib".into(),
             library_replace: false,
@@ -127,33 +261,763 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut f64) {
 }
 
 pub fn family_name(ty: &ComponentType) -> String {
-    serde_json::to_value(&ty.kind)
-        .ok()
-        .and_then(|v| v.get("family").and_then(Value::as_str).map(|s| s.replace('_', " ")))
-        .unwrap_or_else(|| "Component".into())
+    match ty.kind {
+        ComponentKind::Window { .. } => "Casement window",
+        ComponentKind::FixedWindow => "Fixed window",
+        ComponentKind::HistoricWindow { .. } => "Traditional window",
+        ComponentKind::PanelDoor { .. } => "Panel door",
+        ComponentKind::EntranceDoor => "Entrance door",
+        ComponentKind::FrenchDoor { .. } => "French door",
+        ComponentKind::FrenchBalcony { .. } => "French balcony",
+        ComponentKind::Balcony { .. } => "Cantilever balcony",
+        ComponentKind::DoorWindow { .. } => "Door & window unit",
+        ComponentKind::BalconySlab { .. } => "Balcony slab",
+        ComponentKind::ShapedBalcony { .. } => "Shaped balcony",
+        ComponentKind::Loggia { .. } => "Loggia",
+        ComponentKind::SteelBalcony { .. } => "Steel balcony",
+        ComponentKind::GuardRail { .. } => "Guard rail",
+    }
+    .into()
+}
+
+fn family_mm(ui: &mut egui::Ui, label: &str, value: &mut f64, min: f64, max: f64) {
+    ui.add(egui::Label::new(label).wrap());
+    ui.add(egui::DragValue::new(value).speed(1.0).range(min..=max.max(min)).max_decimals(2).suffix(" mm"));
+    ui.end_row();
+}
+
+fn family_count(ui: &mut egui::Ui, label: &str, value: &mut u32, min: u32, max: u32) {
+    ui.add(egui::Label::new(label).wrap());
+    ui.add(egui::DragValue::new(value).range(min..=max));
+    ui.end_row();
+}
+
+fn family_choice<T: Copy + PartialEq>(ui: &mut egui::Ui, id: &str, label: &str, value: &mut T, choices: &[(T, &str)]) {
+    ui.add(egui::Label::new(label).wrap());
+    let selected = choices.iter().find(|(choice, _)| choice == value).map_or("Choose", |(_, label)| *label);
+    egui::ComboBox::from_id_salt(id).width(100.0).truncate().selected_text(selected).show_ui(ui, |ui| {
+        for (choice, label) in choices {
+            ui.selectable_value(value, *choice, *label);
+        }
+    });
+    ui.end_row();
+}
+
+fn railing_fields(ui: &mut egui::Ui, railing: &mut Railing, finish: &mut Finish, handrail: &mut bool) {
+    family_choice(
+        ui,
+        "family-railing",
+        "Railing style",
+        railing,
+        &[
+            (Railing::Frederiksberg, "Frederiksberg"),
+            (Railing::Norrebro, "Nørrebro"),
+            (Railing::Vesterbro, "Vesterbro"),
+            (Railing::Osterbro, "Østerbro"),
+        ],
+    );
+    family_choice(
+        ui,
+        "family-finish",
+        "Steel finish",
+        finish,
+        &[(Finish::Galvanised, "Galvanised"), (Finish::White, "White"), (Finish::Anthracite, "Anthracite")],
+    );
+    ui.label("Timber handrail");
+    ui.checkbox(handrail, "Include");
+    ui.end_row();
+}
+
+fn family_parameters(ui: &mut egui::Ui, draft: &mut ComponentType) {
+    let (width, height) = (draft.width, draft.height);
+    egui::Grid::new("family-parameters").num_columns(2).max_col_width((ui.available_width() * 0.47).max(70.0)).spacing([6.0, 6.0]).show(ui, |ui| {
+        match &mut draft.kind {
+            ComponentKind::Window { lights, top_light } => {
+                family_count(ui, "Window sashes", lights, 1, 8);
+                family_mm(ui, "Top-light height", top_light, 0.0, height / 2.0);
+            }
+            ComponentKind::HistoricWindow { shape, lights, top_light, panes_across, panes_down, muntins, muntin_width_mm, operable } => {
+                let mut profile = match shape {
+                    WindowShape::Rectangular => 0,
+                    WindowShape::Segmental { .. } => 1,
+                    WindowShape::Round => 2,
+                };
+                let before = profile;
+                family_choice(ui, "window-profile", "Opening profile", &mut profile, &[(0, "Rectangular"), (1, "Arched top"), (2, "Round")]);
+                if before != profile {
+                    *shape = match profile {
+                        1 => WindowShape::Segmental { rise_mm: 150.0_f64.min(width / 2.0).min(height * 0.45) },
+                        2 => WindowShape::Round,
+                        _ => WindowShape::Rectangular,
+                    };
+                }
+                if let WindowShape::Segmental { rise_mm } = shape {
+                    family_mm(ui, "Arch rise", rise_mm, 20.0, (width / 2.0).min(height * 0.45));
+                }
+                family_count(ui, "Window sashes", lights, 1, 4);
+                family_mm(ui, "Top-light height", top_light, 0.0, height / 2.0);
+                family_count(ui, "Pane columns per sash", panes_across, 1, 6);
+                family_count(ui, "Pane rows per sash", panes_down, 1, 8);
+                family_choice(
+                    ui,
+                    "window-muntins",
+                    "Glazing bars",
+                    muntins,
+                    &[(Muntins::TrueDivided, "True divided panes"), (Muntins::Applied, "Applied bars")],
+                );
+                family_mm(ui, "Glazing bar width", muntin_width_mm, 8.0, 60.0);
+                ui.label("Opening sashes");
+                ui.checkbox(operable, "Operable");
+                ui.end_row();
+            }
+            ComponentKind::PanelDoor { leaves, panel_columns, panel_rows, glazed_rows } => {
+                family_count(ui, "Door leaves", leaves, 1, 2);
+                family_count(ui, "Panel columns", panel_columns, 1, 3);
+                family_count(ui, "Panel rows", panel_rows, 1, 6);
+                family_count(ui, "Glazed upper rows", glazed_rows, 0, *panel_rows);
+            }
+            ComponentKind::FrenchDoor { leaves } => family_count(ui, "Door leaves", leaves, 1, 4),
+            ComponentKind::FrenchBalcony { leaves, rail_height } => {
+                family_count(ui, "Door leaves", leaves, 1, 4);
+                family_mm(ui, "Guard height", rail_height, 600.0, 1500.0);
+            }
+            ComponentKind::Balcony { leaves, depth, slab_width, rail_height } => {
+                family_count(ui, "Door leaves", leaves, 1, 4);
+                family_mm(ui, "Balcony depth", depth, 300.0, 3000.0);
+                family_mm(ui, "Balcony slab width", slab_width, width, 12000.0);
+                family_mm(ui, "Guard height", rail_height, 900.0, 1500.0);
+            }
+            ComponentKind::DoorWindow { door_width, door_side, window_sill, lights } => {
+                family_mm(ui, "Door leaf width", door_width, 500.0, width - 300.0);
+                family_choice(ui, "door-side", "Door side from outside", door_side, &[(Side::Left, "Left"), (Side::Right, "Right")]);
+                family_mm(ui, "Window sill above opening", window_sill, 0.0, height - 400.0);
+                family_count(ui, "Window sashes", lights, 1, 4);
+            }
+            ComponentKind::BalconySlab { depth, thickness } => {
+                family_mm(ui, "Balcony depth", depth, 300.0, 3000.0);
+                family_mm(ui, "Slab thickness", thickness, 60.0, 400.0);
+            }
+            ComponentKind::ShapedBalcony { depth, thickness, plan } => {
+                family_mm(ui, "Balcony depth", depth, 400.0, 3000.0);
+                family_mm(ui, "Slab thickness", thickness, 80.0, 400.0);
+                match plan {
+                    trigon_model::balcony::Plan::Bowed { return_fraction } => {
+                        ui.label("Straight return / depth");
+                        let mut percent = *return_fraction * 100.0;
+                        if ui.add(egui::DragValue::new(&mut percent).range(10.0..=70.0).suffix(" %")).changed() {
+                            *return_fraction = percent / 100.0;
+                        }
+                        ui.end_row();
+                    }
+                    trigon_model::balcony::Plan::Chamfered { corner_mm } => {
+                        family_mm(ui, "Chamfered corner", corner_mm, 50.0, (width / 3.0).min(*depth * 0.8))
+                    }
+                    trigon_model::balcony::Plan::Polygon { points } => {
+                        for (index, point) in points.iter_mut().enumerate() {
+                            for (axis, label, min, max) in [(0, "width", -50.0, 50.0), (1, "depth", 0.0, 100.0)] {
+                                ui.add(egui::Label::new(format!("Point {} · {label}", index + 1)).wrap());
+                                let mut percent = point[axis] * 100.0;
+                                if ui.add(egui::DragValue::new(&mut percent).range(min..=max).suffix(" %")).changed() {
+                                    point[axis] = percent / 100.0;
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    }
+                }
+            }
+            ComponentKind::Loggia { depth, rail_height, door_width, door_side } => {
+                family_mm(ui, "Recess depth", depth, 300.0, 4000.0);
+                family_mm(ui, "Guard height", rail_height, 600.0, 1500.0);
+                family_mm(ui, "Door leaf width", door_width, 500.0, (width - 300.0).max(500.0));
+                family_choice(ui, "loggia-door-side", "Door side from outside", door_side, &[(Side::Left, "Left"), (Side::Right, "Right")]);
+            }
+            ComponentKind::SteelBalcony { depth, railing, finish, deck, handrail, screens, tie_rods } => {
+                family_mm(ui, "Balcony depth", depth, 300.0, 3000.0);
+                railing_fields(ui, railing, finish, handrail);
+                family_choice(
+                    ui,
+                    "balcony-deck",
+                    "Deck material",
+                    deck,
+                    &[
+                        (Deck::Cumaru, "Cumaru timber"),
+                        (Deck::FibreConcrete, "Fibre concrete"),
+                        (Deck::Composite, "Composite"),
+                        (Deck::Bamboo, "Bamboo"),
+                    ],
+                );
+                family_choice(
+                    ui,
+                    "balcony-screens",
+                    "Privacy screens",
+                    screens,
+                    &[(Screens::None, "None"), (Screens::Left, "Left"), (Screens::Right, "Right"), (Screens::Both, "Both sides")],
+                );
+                ui.label("Support");
+                ui.checkbox(tie_rods, "Tie rods");
+                ui.end_row();
+            }
+            ComponentKind::GuardRail { projection, railing, finish, handrail } => {
+                family_mm(ui, "Projection to guard centre", projection, if *handrail { 35.0 } else { 20.0 }, 3000.0);
+                railing_fields(ui, railing, finish, handrail);
+            }
+            ComponentKind::FixedWindow | ComponentKind::EntranceDoor => {
+                ui.weak("This family uses the dimensions above.");
+                ui.end_row();
+            }
+        }
+    });
+}
+
+fn family_facade_label(building: &Building, facade: &trigon_model::doc::Facade) -> String {
+    let kind = match facade.kind {
+        trigon_model::doc::FacadeKind::Unknown => "Facade",
+        trigon_model::doc::FacadeKind::Street => "Street facade",
+        trigon_model::doc::FacadeKind::Courtyard => "Courtyard facade",
+        trigon_model::doc::FacadeKind::Party => "Party wall",
+    };
+    format!("{} · {kind} {}", building.name, facade.edge.saturating_add(1))
 }
 
 impl Authoring {
     pub fn choose_type(&mut self, ty: &ComponentType) {
-        self.kind = serde_json::to_value(&ty.kind).unwrap_or(Value::Null);
         self.draft = Some(ty.clone());
+        self.draft_source = Some(ty.clone());
+        self.draft_is_new = false;
+        self.pending_type = None;
+        self.place_sizes = [ty.width, ty.height, ty.sill];
+        self.place_overrides = false;
+        self.place_replace = false;
+        self.place_command_error = None;
         self.tab = Tab::Families;
     }
 
+    fn type_dirty(&self) -> bool {
+        self.draft.is_some() && (self.draft_is_new || self.draft != self.draft_source)
+    }
+
+    fn request_type(&mut self, ty: &ComponentType) {
+        self.tab = Tab::Families;
+        if self.draft.as_ref().is_some_and(|draft| draft.id == ty.id) && !self.draft_is_new {
+            return;
+        }
+        if self.type_dirty() {
+            self.pending_type = Some(ty.id.clone());
+        } else {
+            self.choose_type(ty);
+        }
+    }
+
+    /// Choosing another type never silently discards an edited form.
+    pub(crate) fn choose_instance_type(&mut self, doc: &Document, current: &Element) -> bool {
+        let mut ids = current.props.iter().filter(|(key, _)| *key == "type");
+        let Some((_, id)) = ids.next() else { return false };
+        if ids.next().is_some() {
+            return false;
+        }
+        let mut types = doc.types.iter().filter(|ty| ty.id == *id);
+        let Some(ty) = types.next() else { return false };
+        if types.next().is_some() {
+            return false;
+        }
+        self.request_type(ty);
+        true
+    }
+
+    pub(crate) fn begin_family_placement(&mut self, doc: &Document, current: Option<&Element>) {
+        if let Some(current) = current {
+            self.choose_instance_type(doc, current);
+        }
+        if self.draft.is_none()
+            && let Some(ty) = doc.types.first()
+        {
+            self.choose_type(ty);
+        }
+        self.tab = Tab::Families;
+        self.show_placement = true;
+        self.place_mode = PlacementMode::Point;
+        self.place_replace = false;
+        self.place_command_error = None;
+        self.place_point = None;
+        self.place_hover = None;
+        self.place_unscoped = None;
+        if let Some(current) = current {
+            self.prepare_family_host(doc, current);
+        }
+    }
+
+    /// A human Window/Door action chooses a matching saved type, without discarding
+    /// edits to another shared type. The existing draft review remains authoritative.
+    pub(crate) fn begin_family_category(&mut self, doc: &Document, current: Option<&Element>, category: FamilyCategory) {
+        let selected_type = current
+            .and_then(|element| element.props.iter().find(|(key, _)| *key == "type"))
+            .and_then(|(_, id)| doc.types.iter().find(|ty| ty.id == *id && category.matches(ty)));
+        let ty = selected_type
+            .or_else(|| self.draft.as_ref().filter(|ty| category.matches(ty)).and_then(|draft| doc.types.iter().find(|ty| ty.id == draft.id)))
+            .or_else(|| doc.types.iter().find(|ty| category.matches(ty)));
+        if let Some(ty) = ty {
+            self.request_type(ty);
+        }
+        self.begin_family_placement(doc, None);
+        if let Some(current) = current {
+            self.prepare_family_host(doc, current);
+        }
+    }
+
+    pub(crate) fn family_host_id<'a>(doc: &Document, current: &'a Element) -> Option<&'a str> {
+        let id = if current.host && current.kind == "wall" {
+            current.id.as_str()
+        } else {
+            let mut properties = current.props.iter().filter(|(key, _)| *key == "facade");
+            let (_, id) = properties.next()?;
+            if properties.next().is_some() {
+                return None;
+            }
+            id.as_str()
+        };
+        let mut hosts = doc.buildings.iter().flat_map(|b| b.facades.iter().filter(move |f| f.id == id).map(move |f| (b, f)));
+        let (building, facade) = hosts.next()?;
+        if hosts.next().is_some() || facade.kind == trigon_model::doc::FacadeKind::Party {
+            return None;
+        }
+        let (a, b) = building.edge(facade.edge)?;
+        trigon_model::FacadeFrame::new(a, b)?;
+        Some(id)
+    }
+
+    fn prepare_family_host(&mut self, doc: &Document, current: &Element) {
+        if self.pick_family_host(doc, current, None) {
+            return;
+        }
+        self.facade = Self::family_host_id(doc, current).unwrap_or_default().to_owned();
+        self.place_level = current.level;
+        self.place_scope = None;
+        self.place_scope_error = None;
+        self.accept_placement_scope(doc);
+    }
+
+    pub(crate) fn family_placement_active(&self) -> bool {
+        self.tab == Tab::Families && self.show_placement
+    }
+
+    pub(crate) fn acknowledge_family_placement(&mut self, error: Option<String>) {
+        self.place_command_error = error;
+    }
+
+    pub(crate) fn family_placement_feedback(&self, doc: &Document) -> Value {
+        let stale = self.place_scope.is_some() && self.place_scope != self.current_placement_scope(doc);
+        json!({"active":self.family_placement_active(),"type_id":self.draft.as_ref().map(|draft|&draft.id),
+            "scope":{"facade":self.facade,"level":self.place_level,"bay":self.place_bay,
+                "all_bays":self.place_all_bays,"phase":doc.phases.get(doc.active_index()).map(|phase|&phase.id)},
+            "ready":self.family_placement_active() && self.place_type(doc).is_some(),"stale":stale,
+            "error":self.place_scope_error.as_deref().or(stale.then_some("The placement source changed; choose its host and storey again.")).or(self.place_command_error.as_deref()),
+            "command_error":self.place_command_error,
+            "replace_existing":self.place_replace,"instance_overrides":self.place_overrides,
+            "mode":if self.place_mode == PlacementMode::Point { "point" } else { "bay_pattern" },
+            "captured_u_mm":self.place_point.as_ref().map(|p|p.u_mm),
+            "hover_u_mm":self.place_hover.as_ref().map(|p|p.u_mm),
+            "preview":self.family_preview(doc).map(|p|json!({"facade":p.facade,"level":p.level,"u_mm":p.u_mm,
+                "width":p.sizes[0],"height":p.sizes[1],"sill":p.sizes[2],"depth_mm":p.depth_mm,"opening":p.opening,
+                "face":p.face,"plan":p.plan,"captured":p.captured,"guide":p.guide})),
+            "snap_increment_mm":self.place_snap_mm,"snap_axes":self.place_snap_axes,
+            "units":"mm"})
+    }
+
+    /// No snapping is applied to programmatic/numeric picks. Viewport gestures use
+    /// `pick_family_host_snapped` with the actual Alt modifier.
+    pub(crate) fn pick_family_host(&mut self, doc: &Document, current: &Element, point: Option<[f64; 2]>) -> bool {
+        self.pick_family_host_snapped(doc, current, point, true)
+    }
+
+    pub(crate) fn pick_family_host_snapped(&mut self, doc: &Document, current: &Element, point: Option<[f64; 2]>, alt: bool) -> bool {
+        self.sync_placement_scope(doc);
+        let Some(picked) = self.family_point(doc, current, point, alt) else {
+            // A real bare-wall click can identify the host before the user chooses its
+            // storey. Retain the source frame and hit, but never make it placeable yet.
+            if self.family_placement_active()
+                && self.place_mode == PlacementMode::Point
+                && current.host
+                && current.kind == "wall"
+                && current.level.is_none()
+                && self.place_level.is_none()
+                && self.place_plan_level.is_none()
+                && let Some(site) = point.filter(|p| p.iter().all(|v| v.is_finite()))
+            {
+                let mut matches = doc.buildings.iter().flat_map(|b| b.facades.iter().filter(|f| f.id == current.id).map(move |f| (b, f)));
+                if let Some((building, facade)) = matches.next()
+                    && matches.next().is_none()
+                    && facade.kind != trigon_model::doc::FacadeKind::Party
+                    && let Some((a, b)) = building.edge(facade.edge)
+                    && let Some(frame) = trigon_model::FacadeFrame::new(a, b)
+                {
+                    let u = (site[0] - a[0]) * frame.t[0] + (site[1] - a[1]) * frame.t[1];
+                    if frame.length.is_finite() && u.is_finite() && (0.0..=frame.length).contains(&u) {
+                        self.facade = facade.id.clone();
+                        self.place_point = None;
+                        self.place_replace = false;
+                        self.place_unscoped = Some(UnscopedPoint { host: current.clone(), site, edge_points: [a, b], alt });
+                    }
+                }
+            }
+            return false;
+        };
+        self.facade = picked.scope.facade.clone();
+        self.place_level = Some(picked.scope.level);
+        self.place_bay = picked.scope.bays.iter().position(|u| (*u - picked.u_mm).abs() <= 1e-6).unwrap_or(picked.scope.bays.len());
+        self.place_all_bays = false;
+        self.accept_placement_scope(doc);
+        self.place_point = Some(picked);
+        self.place_hover = None;
+        self.place_unscoped = None;
+        true
+    }
+
+    fn choose_family_storey(&mut self, doc: &Document, level: usize) {
+        let pending = self.place_unscoped.take();
+        self.place_level = Some(level);
+        self.place_point = None;
+        self.place_hover = None;
+        self.accept_placement_scope(doc);
+        if let Some(pending) = pending
+            && self.place_scope.as_ref().is_some_and(|scope| scope.edge_points == pending.edge_points && scope.facade == pending.host.id)
+        {
+            self.pick_family_host_snapped(doc, &pending.host, Some(pending.site), pending.alt);
+        }
+    }
+
+    pub(crate) fn hover_family_host(&mut self, doc: &Document, hit: Option<(&Element, [f64; 2])>, alt: bool) {
+        self.sync_placement_scope(doc);
+        self.place_hover = hit.and_then(|(host, point)| self.family_point(doc, host, Some(point), alt));
+    }
+
+    /// A saved plan can supply an initial explicit level. Once invalidated, observing the
+    /// same saved ID/level again is not a new choice (nor is the application's global index).
+    pub(crate) fn sync_family_plan(&mut self, doc: &Document, view_id: Option<&str>) {
+        self.sync_placement_scope(doc);
+        let identity = view_id.and_then(|id| {
+            let mut views = doc.views.iter().filter(|view| view.id == id);
+            let view = views.next()?;
+            if views.next().is_some() || doc.buildings.len() != 1 {
+                return None;
+            }
+            let trigon_model::annotation::DrawingViewKind::Plan { level, .. } = view.kind else { return None };
+            doc.buildings.first()?.storeys.get(level)?;
+            Some((id.to_owned(), level))
+        });
+        if self.place_plan_invalidated {
+            // Record even an automatically remapped saved level as the stale observed view.
+            // A later view change or explicit Storey choice is the renewed user intent.
+            self.place_plan_identity = identity;
+            self.place_plan_level = None;
+            self.place_plan_invalidated = false;
+        } else if identity != self.place_plan_identity {
+            self.place_plan_level = identity.as_ref().map(|(_, level)| *level);
+            self.place_plan_identity = identity;
+        }
+    }
+
+    fn family_point(&self, doc: &Document, current: &Element, point: Option<[f64; 2]>, alt: bool) -> Option<PlacementPoint> {
+        if !self.family_placement_active() {
+            return None;
+        }
+        let facade_id = if current.host && current.kind == "wall" {
+            current.id.as_str()
+        } else if matches!(current.kind, "window" | "door" | "balcony" | "railing") {
+            let mut props = current.props.iter().filter(|(key, _)| *key == "facade");
+            let (_, id) = props.next()?;
+            if props.next().is_some() {
+                return None;
+            }
+            id.as_str()
+        } else {
+            return None;
+        };
+        let mut matches = doc
+            .buildings
+            .iter()
+            .flat_map(|building| building.facades.iter().filter(|facade| facade.id == facade_id).map(move |facade| (building, facade)));
+        let (building, facade) = matches.next()?;
+        if matches.next().is_some() || facade.kind == trigon_model::doc::FacadeKind::Party {
+            return None;
+        }
+        let retained_level = (self.facade.is_empty() || self.facade == facade.id).then_some(self.place_level).flatten();
+        let level = current.level.or(retained_level).or(self.place_plan_level)?;
+        let scope = Self::scope_for(doc, building, facade, level)?;
+        let frame = trigon_model::FacadeFrame::new(scope.edge_points[0], scope.edge_points[1])?;
+        let mut u = if let Some(point) = point {
+            if point.iter().any(|v| !v.is_finite()) {
+                return None;
+            }
+            (point[0] - frame.origin[0]) * frame.t[0] + (point[1] - frame.origin[1]) * frame.t[1]
+        } else {
+            let occurrence = current.id.strip_prefix(&format!("{}.L{level}.B", facade.id))?;
+            let index = occurrence.split('.').next()?.parse::<usize>().ok()?;
+            let bay = *facade.bays.get(index)?;
+            let mut placements = facade.placements.iter().filter(|p| {
+                p.level == level && p.bay == index && doc.lifetime(p).is_ok_and(|(c, d)| c <= doc.active_index() && doc.active_index() < d)
+            });
+            let u = if self.place_mode == PlacementMode::Pattern { bay } else { placements.next().map_or(bay, |p| p.u.unwrap_or(bay)) };
+            if self.place_mode == PlacementMode::Point && placements.any(|p| p.u.unwrap_or(bay) != u) {
+                return None;
+            }
+            u
+        };
+        if !u.is_finite() || !(0.0..=frame.length).contains(&u) {
+            return None;
+        }
+        let mut guide = "Exact coordinate".to_owned();
+        if self.place_mode == PlacementMode::Pattern {
+            let (index, distance) = facade.bays.iter().enumerate().map(|(i, centre)| (i, (u - centre).abs())).min_by(|a, b| a.1.total_cmp(&b.1))?;
+            if facade.bays.iter().enumerate().any(|(i, centre)| i != index && ((u - centre).abs() - distance).abs() <= 1e-6) {
+                return None;
+            }
+            u = facade.bays[index];
+            guide = format!("Bay {}", index + 1);
+        } else if !alt {
+            let mut axes = Vec::new();
+            if self.place_snap_axes {
+                axes.extend(facade.bays.iter().enumerate().map(|(i, u)| (*u, format!("Bay {} axis", i + 1))));
+                axes.extend(facade.placements.iter().filter_map(|p| {
+                    let (c, d) = doc.lifetime(p).ok()?;
+                    (c <= doc.active_index() && doc.active_index() < d)
+                        .then(|| p.u.or_else(|| facade.bays.get(p.bay).copied()).map(|u| (u, format!("Instance axis · L{}", p.level))))
+                        .flatten()
+                }));
+            }
+            let axis = axes
+                .into_iter()
+                .filter(|(axis, _)| axis.is_finite() && (u - axis).abs() <= 100.0)
+                .min_by(|a, b| (u - a.0).abs().total_cmp(&(u - b.0).abs()));
+            if let Some((axis, label)) = axis {
+                u = axis;
+                guide = label;
+            } else if self.place_snap_mm.is_finite() && self.place_snap_mm > 0.0 {
+                u = (u / self.place_snap_mm).round() * self.place_snap_mm;
+                guide = format!("{} mm increment", self.place_snap_mm);
+            }
+        } else {
+            guide = "Exact · Alt bypass".into();
+        }
+        if !u.is_finite() || !(0.0..=frame.length).contains(&u) {
+            return None;
+        }
+        Some(PlacementPoint { scope, u_mm: u, guide })
+    }
+
+    pub(crate) fn cancel_family_placement(&mut self) {
+        self.show_placement = false;
+        self.place_point = None;
+        self.place_hover = None;
+        self.place_unscoped = None;
+        self.place_replace = false;
+    }
+
+    fn instance_type(&self, doc: &Document) -> Option<ComponentType> {
+        if self.type_dirty() || self.type_error(doc).is_some() {
+            return None;
+        }
+        let mut ty = self.draft.clone()?;
+        if self.place_overrides {
+            [ty.width, ty.height, ty.sill] = self.place_sizes;
+        }
+        ty.validate().ok()?;
+        Some(ty)
+    }
+
+    pub(crate) fn family_preview(&self, doc: &Document) -> Option<PlacementPreview> {
+        if !self.family_placement_active() || self.place_mode != PlacementMode::Point {
+            return None;
+        }
+        // A captured click always wins over hover, including while editing in Properties.
+        let point = self.place_point.as_ref().or(self.place_hover.as_ref())?;
+        let mut matches = doc.buildings.iter().flat_map(|b| b.facades.iter().filter(|f| f.id == point.scope.facade).map(move |f| (b, f)));
+        let (building, facade) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        if Self::scope_for(doc, building, facade, point.scope.level).as_ref() != Some(&point.scope) {
+            return None;
+        }
+        let ty = self.instance_type(doc)?;
+        let frame = trigon_model::FacadeFrame::new(point.scope.edge_points[0], point.scope.edge_points[1])?;
+        let u = point.u_mm;
+        if !u.is_finite() || !(0.0..=frame.length).contains(&u) {
+            return None;
+        }
+        let z = building.storeys.get(point.scope.level)?.elevation + ty.sill;
+        let (left, right) = (u - ty.width / 2.0, u + ty.width / 2.0);
+        let opening = ty.kind.is_opening();
+        let depth = if opening { point.scope.thickness } else { -ty.kind.depth()? };
+        let face_depth = if opening { 0.0 } else { depth };
+        Some(PlacementPreview {
+            facade: facade.id.clone(),
+            level: point.scope.level,
+            u_mm: u,
+            sizes: [ty.width, ty.height, ty.sill],
+            opening,
+            depth_mm: depth.abs(),
+            face: [
+                frame.point(left, face_depth, z),
+                frame.point(right, face_depth, z),
+                frame.point(right, face_depth, z + ty.height),
+                frame.point(left, face_depth, z + ty.height),
+            ],
+            plan: [frame.point(left, 0.0, z), frame.point(right, 0.0, z), frame.point(right, depth, z), frame.point(left, depth, z)],
+            axis: [frame.point(u, face_depth, building.storeys.get(point.scope.level)?.elevation), frame.point(u, face_depth, z + ty.height)],
+            captured: self.place_point.is_some(),
+            guide: point.guide.clone(),
+        })
+    }
+
+    pub(crate) fn duplicate_selected_type(&mut self, doc: &Document) -> bool {
+        if self.type_dirty() {
+            return false;
+        }
+        let Some(source) = &self.draft else { return false };
+        if !doc.types.iter().any(|ty| ty == source) {
+            return false;
+        }
+        let mut id_base = source.id.clone();
+        while id_base.len() > 108 {
+            id_base.pop();
+        }
+        let mut name_base = source.name.clone();
+        while name_base.len() > 236 {
+            name_base.pop();
+        }
+        for n in 1..=10_000 {
+            let id = format!("{id_base}.copy{n}");
+            let name = format!("{name_base} copy {n}");
+            if !doc.types.iter().any(|ty| ty.id == id || ty.name == name) {
+                let mut copy = source.clone();
+                copy.id = id;
+                copy.name = name;
+                self.draft = Some(copy);
+                self.draft_is_new = true;
+                self.pending_type = None;
+                self.place_replace = false;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cancel_type_changes(&mut self, doc: &Document) {
+        let id = self.pending_type.take().or_else(|| self.draft_source.as_ref().map(|ty| ty.id.clone()));
+        if let Some(ty) = id.and_then(|id| doc.types.iter().find(|ty| ty.id == id)) {
+            self.choose_type(ty);
+        } else {
+            self.draft = None;
+            self.draft_source = None;
+            self.draft_is_new = false;
+        }
+    }
+
+    /// The document is authoritative: a successful command acknowledges its draft on the next
+    /// frame. A failed command leaves the draft available for correction or cancellation.
+    fn sync_type_draft(&mut self, doc: &Document) {
+        if let Some(draft) = &self.draft
+            && doc.types.iter().filter(|ty| ty.id == draft.id).count() == 1
+            && doc.types.iter().any(|ty| ty == draft)
+        {
+            self.draft_source = Some(draft.clone());
+            self.draft_is_new = false;
+        }
+        if !self.type_dirty()
+            && let Some(id) = self.pending_type.take()
+            && let Some(ty) = doc.types.iter().find(|ty| ty.id == id)
+        {
+            self.choose_type(ty);
+        }
+    }
+
+    fn type_error(&self, doc: &Document) -> Option<String> {
+        let draft = self.draft.as_ref()?;
+        for (label, value, max) in [("Type name", draft.name.as_str(), 256), ("Type ID", draft.id.as_str(), 128)] {
+            if value.trim().is_empty() || value.len() > max || value.chars().any(char::is_control) {
+                return Some(format!("{label} needs 1–{max} characters without line breaks."));
+            }
+        }
+        if self.draft_is_new {
+            if doc.types.iter().any(|ty| ty.id == draft.id) {
+                return Some("This type ID is already in use. Choose a distinct ID for the copy.".into());
+            }
+            if doc.types.iter().any(|ty| ty.name == draft.name) {
+                return Some("Choose a distinct name for the new type.".into());
+            }
+        } else {
+            let Some(source) = &self.draft_source else { return Some("Choose a saved type first.".into()) };
+            let mut matches = doc.types.iter().filter(|ty| ty.id == source.id);
+            if matches.next() != Some(source) || matches.next().is_some() || draft.id != source.id {
+                return Some("The saved type changed. Cancel to reload it before editing.".into());
+            }
+        }
+        draft.validate().err().map(|error| error.to_string())
+    }
+
+    fn define_type(&self, doc: &Document) -> Option<Run> {
+        if !self.type_dirty() || self.type_error(doc).is_some() {
+            return None;
+        }
+        Some(Run { command: "types.define", params: serde_json::to_value(self.draft.as_ref()?).ok()? })
+    }
+
+    fn type_use_count(doc: &Document, id: &str) -> usize {
+        doc.buildings
+            .iter()
+            .map(|building| {
+                building.facades.iter().flat_map(|facade| &facade.placements).filter(|placement| placement.type_id == id).count()
+                    + building.roof.dormers().iter().filter(|dormer| dormer.window_type == id).count()
+                    + building.roof.rooflights().iter().filter(|rooflight| rooflight.window_type == id).count()
+            })
+            .sum()
+    }
+
     pub fn library(&mut self, ui: &mut egui::Ui, doc: &Document) -> Option<Run> {
+        self.sync_type_draft(doc);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         let mut run = None;
+        egui::ComboBox::from_id_salt("family-category")
+            .width(ui.available_width())
+            .truncate()
+            .selected_text(
+                FamilyCategory::CHOICES.iter().find(|(category, _)| *category == self.family_category).map_or("All categories", |(_, label)| *label),
+            )
+            .show_ui(ui, |ui| {
+                for (category, label) in FamilyCategory::CHOICES {
+                    ui.selectable_value(&mut self.family_category, category, label);
+                }
+            });
         ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Find a family or type").desired_width(f32::INFINITY));
         let search = self.search.to_lowercase();
         theme::eyebrow(ui, "COMPONENT TYPES");
-        for ty in &doc.types {
-            if !format!("{} {} {}", ty.id, ty.name, family_name(ty)).to_lowercase().contains(&search) {
-                continue;
+        let mut shown = 0;
+        egui::ScrollArea::vertical().id_salt("family-type-list").max_height(330.0).show(ui, |ui| {
+            for ty in &doc.types {
+                if !self.family_category.matches(ty) || !format!("{} {} {}", ty.id, ty.name, family_name(ty)).to_lowercase().contains(&search) {
+                    continue;
+                }
+                shown += 1;
+                let selected = self.draft.as_ref().is_some_and(|d| d.id == ty.id);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 40.0],
+                        egui::Button::new(format!("{}\n{} · {:.0} × {:.0} mm", ty.name, family_name(ty), ty.width, ty.height))
+                            .selected(selected)
+                            .wrap(),
+                    )
+                    .on_hover_text(format!("{}\n{} linked instances across all phases", ty.id, Self::type_use_count(doc, &ty.id)))
+                    .clicked()
+                {
+                    self.request_type(ty);
+                }
             }
-            let selected = self.draft.as_ref().is_some_and(|d| d.id == ty.id);
-            if ui.selectable_label(selected, &ty.name).on_hover_text(format!("{} · {:.0} × {:.0} mm", family_name(ty), ty.width, ty.height)).clicked()
-            {
-                self.choose_type(ty);
-            }
+        });
+        if shown == 0 {
+            ui.weak("No matching types. Clear the search or choose another category.");
+        } else {
+            ui.weak(format!("{shown} of {} project types", doc.types.len()));
         }
         ui.add_space(8.0);
         ui.weak("Select a shared type to edit all referencing instances, or duplicate it as a new type.");
@@ -201,7 +1065,7 @@ impl Authoring {
             }
             ui.checkbox(&mut self.library_selected_only, "Selected type only");
             if self.library_selected_only {
-                ui.weak(self.draft.as_ref().map_or("Choose a type to export", |t| t.id.as_str()));
+                ui.weak(self.draft_source.as_ref().map_or("Choose a saved type to export", |t| t.name.as_str()));
             } else {
                 ui.weak(format!("All {} shared project types", doc.types.len()));
             }
@@ -234,7 +1098,7 @@ impl Authoring {
     fn export_library(&self) -> Option<Run> {
         let mut params = json!({"path":Self::library_path(&self.library_export_path)?});
         if self.library_selected_only {
-            params["ids"] = json!([self.draft.as_ref()?.id]);
+            params["ids"] = json!([self.draft_source.as_ref()?.id]);
         }
         Some(Run { command: "types.export", params })
     }
@@ -569,18 +1433,37 @@ impl Authoring {
         ui.add(egui::Label::new("One-time alignment within 15°. Lengths and door distances along each wall stay fixed. Use exact storey occurrences for guides or facade material.").wrap());
     }
 
-    pub fn ribbon(&mut self, ui: &mut egui::Ui) {
-        for (tool, icon, label) in [
-            (Tool::Move, Icon::Move, "Move"),
-            (Tool::Copy, Icon::Copy, "Copy"),
-            (Tool::Align, Icon::Align, "Align"),
-            (Tool::Levels, Icon::Levels, "To levels"),
-        ] {
-            if icons::ribbon_button(ui, icon, label, self.tool == tool).clicked() {
-                self.tool = tool;
+    pub fn ribbon(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut chosen = false;
+        egui::Grid::new("modify-ribbon").num_columns(3).spacing(egui::vec2(4.0, 2.0)).show(ui, |ui| {
+            for (i, (tool, icon, label)) in [
+                (Tool::Move, Icon::Move, "Move"),
+                (Tool::Copy, Icon::Copy, "Copy"),
+                (Tool::Align, Icon::Align, "Align"),
+                (Tool::Levels, Icon::Levels, "To levels"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if icons::ribbon_button(ui, icon, label, self.tool == tool).clicked() {
+                    self.tool = tool;
+                    chosen = true;
+                }
+                if i == 2 {
+                    ui.end_row();
+                }
             }
-        }
-        ui.selectable_value(&mut self.tool, Tool::Delete, "Delete");
+            if ui.add(egui::Button::new("Delete").frame(false).selected(self.tool == Tool::Delete).min_size(egui::vec2(100.0, 28.0))).clicked() {
+                self.tool = Tool::Delete;
+                chosen = true;
+            }
+        });
+        chosen
+    }
+
+    pub(crate) fn reset_selection_tool(&mut self) {
+        self.targets.clear();
+        self.tool = Tool::Move;
     }
 
     pub(crate) fn command_controls_first(&self) -> bool {
@@ -814,129 +1697,449 @@ impl Authoring {
         run
     }
 
-    fn family_editor(&mut self, ui: &mut egui::Ui, doc: &Document, level: usize) -> Option<Run> {
-        let Some(draft) = &mut self.draft else {
-            theme::eyebrow(ui, "FAMILIES");
-            ui.label("Choose a component type from the library.");
+    fn placement_facade<'a>(&self, doc: &'a Document) -> Option<(&'a Building, &'a trigon_model::doc::Facade)> {
+        let mut matches = doc
+            .buildings
+            .iter()
+            .flat_map(|building| building.facades.iter().filter(|facade| facade.id == self.facade).map(move |facade| (building, facade)));
+        let result = matches.next()?;
+        matches.next().is_none().then_some(result)
+    }
+
+    fn placement_counts(&self, doc: &Document) -> Option<(usize, usize)> {
+        if self.type_dirty()
+            || self.type_error(doc).is_some()
+            || self.place_scope_error.is_some()
+            || self.place_scope.is_none()
+            || self.place_scope != self.current_placement_scope(doc)
+        {
             return None;
+        }
+        let draft = self.draft.as_ref()?;
+        let (building, facade) = self.placement_facade(doc)?;
+        let level = self.place_level?;
+        building.storeys.get(level)?;
+        let bay = if self.place_mode == PlacementMode::Point {
+            let point = self.place_point.as_ref()?;
+            if Some(&point.scope) != self.place_scope.as_ref() || !point.u_mm.is_finite() {
+                return None;
+            }
+            let frame = trigon_model::FacadeFrame::new(point.scope.edge_points[0], point.scope.edge_points[1])?;
+            if !(0.0..=frame.length).contains(&point.u_mm) {
+                return None;
+            }
+            let mut matches = facade.bays.iter().enumerate().filter(|(_, u)| (**u - point.u_mm).abs() <= 1e-6);
+            let bay = matches.next().map(|(i, _)| i).unwrap_or(facade.bays.len());
+            if matches.next().is_some() {
+                return None;
+            }
+            bay
+        } else {
+            if facade.bays.is_empty() || (!self.place_all_bays && self.place_bay >= facade.bays.len()) {
+                return None;
+            }
+            self.place_bay
         };
-        let mut run = None;
-        theme::eyebrow(ui, &family_name(draft).to_uppercase());
-        ui.heading(&draft.name);
-        egui::Frame::new().fill(theme::CHROME).inner_margin(8.0).corner_radius(3).show(ui, |ui| {
-            theme::eyebrow(ui, "SHARED TYPE · PROJECT-WIDE");
-            ui.label("Sizes, materials and colors apply to every instance using this type. Explicit instance overrides stay local.");
-        });
-        if ui.button("Duplicate as new type").clicked() {
-            let base = draft.id.clone();
-            for n in 1..=10_000 {
-                let id = format!("{base}.copy{n}");
-                if !doc.types.iter().any(|t| t.id == id) {
-                    draft.id = id;
-                    draft.name = format!("{} copy", draft.name);
-                    break;
-                }
+        let all = self.place_mode == PlacementMode::Pattern && self.place_all_bays;
+        let mut occupied = BTreeSet::new();
+        for placement in &facade.placements {
+            if placement.level != level || (!all && placement.bay != bay) {
+                continue;
+            }
+            let (created, demolished) = doc.lifetime(placement).ok()?;
+            let ty = doc.component(&placement.type_id).ok()?;
+            if created <= doc.active_index() && doc.active_index() < demolished && ty.kind.is_opening() == draft.kind.is_opening() {
+                occupied.insert(placement.bay);
             }
         }
-        ui.label("Type name");
-        ui.text_edit_singleline(&mut draft.name);
-        ui.label("Type id");
-        ui.text_edit_singleline(&mut draft.id);
-        egui::Grid::new("family-sizes").show(ui, |ui| {
-            field(ui, "Width", &mut draft.width);
-            field(ui, "Height", &mut draft.height);
-            field(ui, "Sill", &mut draft.sill);
-        });
-        egui::CollapsingHeader::new("Family parameters").default_open(true).show(ui, |ui| {
-            if let Some(fields) = self.kind.as_object_mut() {
-                egui::Grid::new("family-parameters").show(ui, |ui| {
-                    for (key, value) in fields {
-                        if key == "family" {
-                            continue;
-                        }
-                        let label = key.replace('_', " ");
-                        match value {
-                            Value::Number(n) if n.is_u64() => {
-                                let mut v = n.as_u64().unwrap_or(0);
-                                ui.label(label);
-                                if ui.add(egui::DragValue::new(&mut v).range(0..=100_000)).changed() {
-                                    *value = json!(v);
-                                }
-                                ui.end_row();
+        Some((if all { facade.bays.len() } else { 1 }, occupied.len()))
+    }
+
+    pub(crate) fn place_type(&self, doc: &Document) -> Option<Run> {
+        let (_, occupied) = self.placement_counts(doc)?;
+        if occupied > 0 && !self.place_replace {
+            return None;
+        }
+        let instance = self.instance_type(doc)?;
+        let (_, facade) = self.placement_facade(doc)?;
+        let (command, mut params) = if self.place_mode == PlacementMode::Point {
+            (
+                "facade.place_at",
+                json!({"facade":self.facade,"type":instance.id,"level":self.place_level?,
+                "u_mm":self.place_point.as_ref()?.u_mm,"replace":self.place_replace}),
+            )
+        } else {
+            let bays = if self.place_all_bays { (0..facade.bays.len()).collect::<Vec<_>>() } else { vec![self.place_bay] };
+            ("facade.place", json!({"facade":self.facade,"type":instance.id,"levels":[self.place_level?],"bays":bays}))
+        };
+        if self.place_overrides {
+            params["width"] = json!(instance.width);
+            params["height"] = json!(instance.height);
+            params["sill"] = json!(instance.sill);
+        }
+        Some(Run { command, params })
+    }
+
+    fn scope_for(doc: &Document, building: &Building, facade: &trigon_model::doc::Facade, level: usize) -> Option<PlacementScope> {
+        building.storeys.get(level)?;
+        let (a, b) = building.edge(facade.edge)?;
+        if a.iter().chain(&b).any(|v| !v.is_finite()) {
+            return None;
+        }
+        let frame = trigon_model::FacadeFrame::new(a, b)?;
+        if !frame.length.is_finite() || facade.bays.iter().any(|u| !u.is_finite() || !(0.0..=frame.length).contains(u)) {
+            return None;
+        }
+        Some(PlacementScope {
+            facade: facade.id.clone(),
+            level,
+            edge: facade.edge,
+            edge_points: [a, b],
+            thickness: building.edge_thickness(facade.edge, level),
+            storeys: building.storeys.clone(),
+            bays: facade.bays.clone(),
+            phase: doc.phases.get(doc.active_index()).map(|p| p.id.clone()),
+        })
+    }
+
+    fn current_placement_scope(&self, doc: &Document) -> Option<PlacementScope> {
+        let (building, facade) = self.placement_facade(doc)?;
+        Self::scope_for(doc, building, facade, self.place_level?)
+    }
+
+    pub(crate) fn family_placement_succeeded(&mut self, doc: &Document, result: &Value) {
+        self.place_command_error = None;
+        self.place_replace = false;
+        // Only acknowledge this form's own exact point. An appended bay must not look like
+        // an external grid edit on the next frame; unrelated source changes still invalidate.
+        if result["facade"].as_str() == Some(self.facade.as_str())
+            && result["level"].as_u64().and_then(|n| usize::try_from(n).ok()) == self.place_level
+            && result["u_mm"].as_f64() == self.place_point.as_ref().map(|p| p.u_mm)
+            && let Some(scope) = self.current_placement_scope(doc)
+            && let Some(point) = &mut self.place_point
+        {
+            let mut expected = point.scope.clone();
+            expected.bays = scope.bays.clone();
+            if expected == scope {
+                point.scope = scope.clone();
+                self.place_scope = Some(scope);
+                self.place_scope_error = None;
+                self.place_hover = None;
+            }
+        }
+    }
+
+    fn accept_placement_scope(&mut self, doc: &Document) {
+        self.place_scope = self.current_placement_scope(doc);
+        self.place_scope_error = None;
+        self.place_command_error = None;
+        self.place_replace = false;
+    }
+
+    pub(crate) fn sync_placement_scope(&mut self, doc: &Document) {
+        if self
+            .place_unscoped
+            .as_ref()
+            .is_some_and(|point| self.placement_facade(doc).and_then(|(b, f)| b.edge(f.edge)).map(|(a, b)| [a, b]) != Some(point.edge_points))
+        {
+            self.place_unscoped = None;
+            self.place_scope_error = Some("The clicked host frame changed. Pick a fresh point.".into());
+        }
+        if self.place_scope.is_some() && self.place_scope != self.current_placement_scope(doc) {
+            self.place_scope = None;
+            self.place_level = None;
+            self.place_plan_level = None;
+            self.place_plan_invalidated = true;
+            self.place_point = None;
+            self.place_hover = None;
+            self.place_unscoped = None;
+            self.place_replace = false;
+            self.place_scope_error =
+                Some("The host frame, storeys, bay grid or phase changed. Choose a current storey or saved plan, then pick a fresh point.".into());
+        }
+    }
+
+    fn family_placement(&mut self, ui: &mut egui::Ui, doc: &Document, _level: usize) -> Option<Run> {
+        self.sync_placement_scope(doc);
+        let mut run = None;
+        let response = egui::CollapsingHeader::new("Place component").id_salt("family-placement").open(Some(self.show_placement)).show(ui, |ui| {
+            let facades = doc.buildings.iter().flat_map(|building| building.facades.iter().map(move |facade| (building, facade))).collect::<Vec<_>>();
+            if facades.is_empty() {
+                ui.weak("Create a building and facade before placing a component.");
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                let before = self.place_mode;
+                ui.selectable_value(&mut self.place_mode, PlacementMode::Point, "Point");
+                ui.selectable_value(&mut self.place_mode, PlacementMode::Pattern, "Bay pattern");
+                if self.place_mode != before {
+                    self.place_point = None;
+                    self.place_hover = None;
+                    self.place_unscoped = None;
+                    self.place_replace = false;
+                    self.place_command_error = None;
+                }
+                if ui.small_button("Exit placement").clicked() {
+                    self.cancel_family_placement();
+                }
+            });
+            ui.weak("Choose a storey or open a saved plan. Click a facade, review the preview, then Place. Escape exits.");
+            ui.label("Host facade");
+            let mut host_chosen = false;
+            let facade_name =
+                self.placement_facade(doc).map_or_else(|| "Choose facade".into(), |(building, facade)| family_facade_label(building, facade));
+            egui::ComboBox::from_id_salt("place-facade").width(ui.available_width()).truncate().selected_text(facade_name).show_ui(ui, |ui| {
+                for (building, facade) in &facades {
+                    host_chosen |= ui
+                        .selectable_value(&mut self.facade, facade.id.clone(), family_facade_label(building, facade))
+                        .on_hover_text(&facade.id)
+                        .clicked();
+                }
+            });
+            if host_chosen {
+                self.place_level = None;
+                self.place_point = None;
+                self.place_hover = None;
+                self.place_unscoped = None;
+                self.place_bay = 0;
+                self.accept_placement_scope(doc);
+            }
+            let Some((building, facade)) = self.placement_facade(doc) else {
+                ui.colored_label(
+                    theme::ACCENT,
+                    if self.facade.is_empty() {
+                        "Choose a host facade before placing a component.".into()
+                    } else {
+                        format!("Host {} is missing or ambiguous. Choose a uniquely named facade.", self.facade)
+                    },
+                );
+                return;
+            };
+            if let Some(error) = &self.place_scope_error {
+                ui.colored_label(theme::ACCENT, error);
+            }
+            if let Some(error) = &self.place_command_error {
+                ui.colored_label(theme::ACCENT, error);
+            }
+            ui.label("Storey");
+            let mut storey_chosen = false;
+            let storey_name = self
+                .place_level
+                .and_then(|index| building.storeys.get(index).map(|storey| format!("{} · L{index}", storey.name)))
+                .unwrap_or_else(|| "Choose storey".into());
+            egui::ComboBox::from_id_salt("place-level").width(ui.available_width()).truncate().selected_text(storey_name).show_ui(ui, |ui| {
+                for (index, storey) in building.storeys.iter().enumerate() {
+                    storey_chosen |= ui.selectable_value(&mut self.place_level, Some(index), format!("{} · L{index}", storey.name)).clicked();
+                }
+            });
+            if storey_chosen && let Some(level) = self.place_level {
+                self.choose_family_storey(doc, level);
+            }
+            if self.place_mode == PlacementMode::Point {
+                if let Some(point) = &mut self.place_point {
+                    ui.label("Along facade from source start");
+                    if ui.add(egui::DragValue::new(&mut point.u_mm).speed(1.0).max_decimals(12).suffix(" mm")).changed() {
+                        point.guide = "Exact numeric coordinate".into();
+                        self.place_replace = false;
+                    }
+                    ui.weak("Captured point · moving the pointer cannot change it. Click the facade again to choose another point.");
+                } else {
+                    ui.colored_label(
+                        theme::ACCENT,
+                        if self.place_unscoped.is_some() {
+                            "Facade point captured · choose its storey to review the preview."
+                        } else {
+                            "Click a point on the facade to capture the placement."
+                        },
+                    );
+                }
+                egui::CollapsingHeader::new("Snap / align · hold Alt to bypass").show(ui, |ui| {
+                    ui.checkbox(&mut self.place_snap_axes, "Bay and instance axes (100 mm radius)");
+                    ui.label("Along-wall increment (0 = off)");
+                    ui.add(egui::DragValue::new(&mut self.place_snap_mm).speed(1.0).range(0.0..=10000.0).max_decimals(6).suffix(" mm"));
+                    ui.weak("Numeric edits are exact and never snapped. This is a drawing aid; the engine validates placement on Place.");
+                });
+            } else {
+                if self.place_bay >= facade.bays.len() {
+                    self.place_bay = 0;
+                    self.place_replace = false;
+                }
+                ui.label("Placement scope");
+                let before = self.place_all_bays;
+                ui.checkbox(&mut self.place_all_bays, "All bays on this storey");
+                if self.place_all_bays != before {
+                    self.place_replace = false;
+                }
+                if !self.place_all_bays && !facade.bays.is_empty() {
+                    let before = self.place_bay;
+                    egui::ComboBox::from_id_salt("place-bay")
+                        .width(ui.available_width())
+                        .truncate()
+                        .selected_text(format!("Bay {} of {}", self.place_bay + 1, facade.bays.len()))
+                        .show_ui(ui, |ui| {
+                            for (index, position) in facade.bays.iter().enumerate() {
+                                ui.selectable_value(&mut self.place_bay, index, format!("Bay {} · {:.0} mm along facade", index + 1, position));
                             }
-                            Value::Number(n) => {
-                                let mut v = n.as_f64().unwrap_or(0.0);
-                                ui.label(label);
-                                if ui.add(egui::DragValue::new(&mut v).speed(1.0).range(0.0..=100_000.0)).changed() {
-                                    *value = json!(v);
-                                }
-                                ui.end_row();
-                            }
-                            Value::Bool(b) => {
-                                ui.checkbox(b, label);
-                                ui.end_row();
-                            }
-                            Value::String(text) => {
-                                ui.label(label);
-                                let options: &[&str] = match key.as_str() {
-                                    "door_side" => &["left", "right"],
-                                    "railing" => &["frederiksberg", "norrebro", "vesterbro", "osterbro"],
-                                    "finish" => &["galvanised", "white", "anthracite"],
-                                    "deck" => &["cumaru", "fibre_concrete", "composite", "bamboo"],
-                                    "screens" => &["none", "left", "right", "both"],
-                                    _ => &[],
-                                };
-                                if options.is_empty() {
-                                    ui.add(egui::TextEdit::singleline(text).desired_width(130.0));
-                                } else {
-                                    egui::ComboBox::from_id_salt(key).width(130.0).selected_text(text.as_str()).show_ui(ui, |ui| {
-                                        for option in options {
-                                            ui.selectable_value(text, option.to_string(), *option);
-                                        }
-                                    });
-                                }
-                                ui.end_row();
-                            }
-                            _ => {}
-                        }
+                        });
+                    if self.place_bay != before {
+                        self.place_replace = false;
+                    }
+                }
+            }
+            ui.checkbox(&mut self.place_overrides, "Override new instance sizes");
+            if self.place_overrides {
+                ui.weak("These sizes apply to the chosen slots. The shared type stays unchanged.");
+                egui::Grid::new("place-sizes").max_col_width(ui.available_width() * 0.47).show(ui, |ui| {
+                    for (label, value) in ["Instance width", "Instance height", "Instance sill"].into_iter().zip(&mut self.place_sizes) {
+                        ui.label(label);
+                        ui.add(egui::DragValue::new(value).speed(1.0).max_decimals(12).suffix(" mm"));
+                        ui.end_row();
+                    }
+                });
+            } else {
+                ui.weak("New instances inherit the saved type dimensions.");
+            }
+            if self.type_dirty() {
+                ui.colored_label(theme::ACCENT, "Apply or cancel the type draft before placement.");
+            } else if let Some((count, occupied)) = self.placement_counts(doc) {
+                ui.weak(format!("{count} {} · active phase", if count == 1 { "instance" } else { "instances" }));
+                if occupied > 0 {
+                    ui.colored_label(theme::ACCENT, format!("{occupied} occupied {}", if occupied == 1 { "slot" } else { "slots" }));
+                    ui.checkbox(&mut self.place_replace, "Replace existing in these slots");
+                    ui.weak("Replacement affects the displayed slots only. Earlier-phase instances are demolished in the active phase.");
+                }
+            }
+            let placement = self.place_type(doc);
+            if ui.add_enabled(placement.is_some(), egui::Button::new("Place component").wrap()).clicked() {
+                run = placement;
+                self.place_replace = false;
+            }
+            if self.place_mode == PlacementMode::Pattern {
+                egui::CollapsingHeader::new("Facade bay grid").id_salt("family-bay-grid").show(ui, |ui| {
+                    ui.weak("Changing the shared facade grid affects every storey. Reducing the count removes placements beyond its end.");
+                    ui.horizontal(|ui| {
+                        ui.label("Bay count");
+                        ui.add(egui::DragValue::new(&mut self.bay_count).range(1..=200));
+                    });
+                    if ui.button("Update facade grid").clicked() {
+                        run = Some(Run { command: "facade.set_bays", params: json!({"facade":self.facade,"count":self.bay_count}) });
+                        self.place_replace = false;
                     }
                 });
             }
         });
-        let exists = doc.types.iter().any(|t| t.id == draft.id);
+        if response.header_response.clicked() {
+            self.show_placement = !self.show_placement;
+        }
+        run
+    }
+
+    fn family_editor(&mut self, ui: &mut egui::Ui, doc: &Document, level: usize) -> Option<Run> {
+        self.sync_type_draft(doc);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.label("Component type");
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt("placement-component-type")
+            .width(ui.available_width())
+            .truncate()
+            .selected_text(self.draft.as_ref().map_or("Choose a type", |ty| ty.name.as_str()))
+            .show_ui(ui, |ui| {
+                for ty in &doc.types {
+                    if ui.selectable_label(self.draft.as_ref().is_some_and(|draft| draft.id == ty.id), &ty.name).clicked() {
+                        chosen = Some(ty);
+                    }
+                }
+            });
+        if let Some(ty) = chosen {
+            self.request_type(ty);
+        }
+        let Some(draft) = &self.draft else {
+            theme::eyebrow(ui, "FAMILIES & TYPES");
+            ui.label("Choose a type from the component browser, or edit the type of a picked component.");
+            return None;
+        };
+        theme::eyebrow(ui, &family_name(draft).to_uppercase());
+        ui.add(egui::Label::new(egui::RichText::new(&draft.name).heading()).wrap());
+        ui.weak(format!("{:.0} × {:.0} mm · sill {:.0} mm", draft.width, draft.height, draft.sill));
+        if self.show_placement && !self.type_dirty() {
+            let run = self.family_placement(ui, doc, level);
+            if ui.button("Edit shared type…").clicked() {
+                self.cancel_family_placement();
+            }
+            return run;
+        }
+        let count = if self.draft_is_new { 0 } else { Self::type_use_count(doc, &draft.id) };
+        egui::Frame::new().fill(theme::CHROME).inner_margin(8.0).corner_radius(3).show(ui, |ui| {
+            theme::eyebrow(ui, if self.draft_is_new { "NEW TYPE · UNSAVED COPY" } else { "SHARED TYPE · PROJECT-WIDE" });
+            ui.label(if self.draft_is_new {
+                "Apply creates a separate type. Existing instances keep their original type.".to_string()
+            } else {
+                format!(
+                    "{count} linked {} across all phases. Apply updates every reference. Explicit instance overrides stay local.",
+                    if count == 1 { "instance" } else { "instances" }
+                )
+            });
+        });
+        if let Some(id) = &self.pending_type {
+            let name = doc.types.iter().find(|ty| ty.id == *id).map_or(id.as_str(), |ty| ty.name.as_str());
+            ui.colored_label(theme::ACCENT, format!("Apply or cancel this draft to switch to {name}."));
+        }
+        let dirty = self.type_dirty();
         if ui
-            .add_sized(
-                [ui.available_width(), 30.0],
-                egui::Button::new(if exists { "Update shared type and its instances" } else { "Create component type" }),
-            )
+            .add_enabled(!dirty, egui::Button::new("Duplicate type…"))
+            .on_hover_text("Creates an unsaved copy with a distinct name and ID. Apply the copy before placing it.")
             .clicked()
         {
-            let mut params = serde_json::to_value(&*draft).unwrap_or(Value::Null);
-            params["kind"] = self.kind.clone();
-            run = Some(Run { command: "types.define", params });
+            self.duplicate_selected_type(doc);
         }
+        let Some(draft) = &mut self.draft else { return None };
+        ui.label("Type name");
+        ui.add(egui::TextEdit::singleline(&mut draft.name).char_limit(256).desired_width(f32::INFINITY));
+        egui::Grid::new("family-sizes").max_col_width(ui.available_width() * 0.47).spacing([6.0, 6.0]).show(ui, |ui| {
+            family_mm(ui, "Width", &mut draft.width, 300.0, 6000.0);
+            let guard = matches!(
+                draft.kind,
+                ComponentKind::BalconySlab { .. }
+                    | ComponentKind::ShapedBalcony { .. }
+                    | ComponentKind::SteelBalcony { .. }
+                    | ComponentKind::GuardRail { .. }
+            );
+            family_mm(ui, if guard { "Guard height" } else { "Height" }, &mut draft.height, 300.0, 4000.0);
+            family_mm(ui, "Sill above floor", &mut draft.sill, 0.0, 3000.0);
+        });
+        egui::CollapsingHeader::new("Family parameters").default_open(true).show(ui, |ui| family_parameters(ui, draft));
+        egui::CollapsingHeader::new("Type identity").id_salt("family-identity").show(ui, |ui| {
+            ui.weak("The stable ID links model instances to this definition.");
+            if self.draft_is_new {
+                ui.label("New type ID");
+                ui.add(egui::TextEdit::singleline(&mut draft.id).char_limit(128).desired_width(f32::INFINITY));
+            } else {
+                ui.add(egui::Label::new(&draft.id).wrap());
+            }
+        });
+        let error = self.type_error(doc);
+        if let Some(error) = &error {
+            ui.colored_label(theme::ACCENT, error);
+        }
+        let apply = self.define_type(doc);
+        let dirty = self.type_dirty();
+        let mut run = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(apply.is_some(), egui::Button::new(if self.draft_is_new { "Apply new type" } else { "Apply type" })).clicked() {
+                run = apply;
+            }
+            if ui.add_enabled(dirty || self.pending_type.is_some() || error.is_some(), egui::Button::new("Cancel")).clicked() {
+                self.cancel_type_changes(doc);
+            }
+            if dirty {
+                ui.weak("Unsaved draft");
+            } else {
+                ui.weak("Saved type");
+            }
+        });
         ui.separator();
-        theme::eyebrow(ui, "PLACE ON A FACADE");
-        let facades = doc.buildings.iter().flat_map(|b| &b.facades).collect::<Vec<_>>();
-        if !facades.iter().any(|f| f.id == self.facade) {
-            self.facade = facades.first().map_or(String::new(), |f| f.id.clone());
-        }
-        egui::ComboBox::from_id_salt("place-facade").selected_text(&self.facade).show_ui(ui, |ui| {
-            for f in &facades {
-                ui.selectable_value(&mut self.facade, f.id.clone(), format!("{} · {:?}", f.id, f.kind));
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Bay axes");
-            ui.add(egui::DragValue::new(&mut self.bay_count).range(1..=200));
-            if ui.add_enabled(!self.facade.is_empty(), egui::Button::new("Set grid")).clicked() {
-                run = Some(Run { command: "facade.set_bays", params: json!({"facade":self.facade,"count":self.bay_count}) });
-            }
-        });
-        ui.weak(format!("Places on the current plan storey ({level})."));
-        let has_bays = facades.iter().any(|f| f.id == self.facade && !f.bays.is_empty());
-        if ui.add_enabled(exists && has_bays, egui::Button::new("Place type on this storey")).clicked() {
-            run = Some(Run { command: "facade.place", params: json!({"facade":self.facade,"type":draft.id,"levels":[level]}) });
+        if let Some(placement) = self.family_placement(ui, doc, level) {
+            run = Some(placement);
         }
         run
     }
@@ -945,6 +2148,758 @@ impl Authoring {
 #[cfg(test)]
 mod library_tests {
     use super::*;
+
+    fn family_document() -> Document {
+        let mut doc = Document::default();
+        let mut building =
+            Building::new("family-test", "Family UI fixture", &[[0.0, 0.0], [12000.0, 0.0], [12000.0, 8000.0], [0.0, 8000.0]], 3, 3000.0).unwrap();
+        building.facades[0].bays = vec![2500.0, 6000.0, 9500.0];
+        doc.buildings.push(building);
+        doc
+    }
+
+    fn family_session(doc: Document) -> trigon_engine::Session {
+        let mut session = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        session.doc = doc;
+        session
+    }
+
+    #[test]
+    fn inline_type_picker_changes_the_reviewed_instance_without_losing_dirty_type_edits() {
+        let doc = family_document();
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|ty| ty.id == "window.fixed").unwrap());
+        form.begin_family_placement(&doc, None);
+        let mut host = family_host_element();
+        host.level = Some(0);
+        assert!(form.pick_family_host(&doc, &host, Some([3200.0, 0.0])));
+        form.place_overrides = true;
+        form.place_replace = true;
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut draw = |form: &mut Authoring, events| {
+            time += 0.1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 1000.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(form.family_editor(ui, &doc, 0).is_none());
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let mut click = |form: &mut Authoring, label: &str| {
+            let shapes = draw(form, vec![]);
+            let at = shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        shape.clip_rect.contains_rect(rect).then_some(rect.center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing visible picker control {label}"));
+            for event in [
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(form, vec![event]);
+            }
+        };
+        click(&mut form, "Fixed window");
+        click(&mut form, "Entrance door");
+        assert_eq!(form.draft.as_ref().unwrap().id, "door.entrance");
+        assert_eq!(form.place_point.as_ref().unwrap().u_mm, 3200.0);
+        assert!(!form.place_overrides && !form.place_replace);
+        assert_eq!(form.place_type(&doc).unwrap().params["type"], "door.entrance");
+        assert_eq!(form.family_preview(&doc).unwrap().sizes, [1200.0, 2300.0, 0.0]);
+        form.draft.as_mut().unwrap().width = 1300.0;
+        click(&mut form, "Entrance door");
+        click(&mut form, "Fixed window");
+        assert_eq!(form.draft.as_ref().unwrap().id, "door.entrance");
+        assert_eq!(form.draft.as_ref().unwrap().width, 1300.0);
+        assert_eq!(form.pending_type.as_deref(), Some("window.fixed"));
+        assert!(form.place_type(&doc).is_none(), "a dirty shared type cannot be placed silently");
+        assert_eq!(doc, before);
+        ctx.data_mut(|data| data.clear());
+    }
+
+    #[test]
+    fn point_placement_on_an_empty_bay_host_uses_the_human_pick_and_place_routes() {
+        let mut doc = family_document();
+        doc.buildings[0].facades[0].bays.clear();
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|ty| ty.id == "window.fixed").unwrap());
+        form.begin_family_placement(&doc, None);
+        let mut host = family_host_element();
+        host.level = Some(1);
+        assert!(form.pick_family_host(&doc, &host, Some([3200.0, 0.0])), "a new wall needs no facade.set_bays step");
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.command, "facade.place_at");
+        assert_eq!(run.params["u_mm"], 3200.0);
+        assert_eq!(run.params["level"], 1);
+        assert_eq!(doc, before, "picking and preview preparation are read-only");
+        let mut session = family_session(doc);
+        session.execute(run.command, run.params).unwrap();
+        let placed = session.doc.clone();
+        assert_eq!(placed.buildings[0].facades[0].bays, vec![3200.0]);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, placed);
+    }
+
+    #[test]
+    fn point_preview_matches_rotated_source_frame_storey_and_actual_model_dimensions() {
+        let mut doc = family_document();
+        let angle = 0.73_f64;
+        for point in &mut doc.buildings[0].footprint {
+            let [x, y] = *point;
+            *point = [15000.0 + x * angle.cos() - y * angle.sin(), -27000.0 + x * angle.sin() + y * angle.cos()];
+        }
+        doc.buildings[0].facades[0].bays.clear();
+        doc.buildings[0].facades[0].wall_schedule = vec![400.0, 420.0, 445.125];
+        let before = doc.clone();
+        let (a, b) = doc.buildings[0].edge(0).unwrap();
+        let frame = trigon_model::FacadeFrame::new(a, b).unwrap();
+        let hit = frame.point(3200.125, -753.25, 8200.0);
+        let projected = (hit[0] - a[0]) * frame.t[0] + (hit[1] - a[1]) * frame.t[1];
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        form.begin_family_placement(&doc, None);
+        form.place_level = Some(2);
+        assert!(form.pick_family_host_snapped(&doc, &family_host_element(), Some([hit[0], hit[1]]), true));
+        form.place_overrides = true;
+        form.place_sizes = [1234.5, 1450.25, 800.125];
+        let preview = form.family_preview(&doc).unwrap();
+        assert_eq!(preview.u_mm, projected, "never round the actual hit projection");
+        assert_eq!(preview.sizes, [1234.5, 1450.25, 800.125]);
+        assert_eq!(preview.face[0], frame.point(projected - 617.25, 0.0, 6800.125));
+        assert_eq!(preview.face[2], frame.point(projected + 617.25, 0.0, 8250.375));
+        assert_eq!(preview.plan[2], frame.point(projected + 617.25, 445.125, 6800.125));
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.params["u_mm"], projected);
+        assert_eq!(run.params["replace"], false);
+        assert_eq!(doc, before, "local dimension preview and commands are read-only until Place");
+        let mut session = family_session(doc);
+        session.execute(run.command, run.params).unwrap();
+        let building = &session.doc.buildings[0];
+        let resolved = trigon_model::build::resolve_facade(&session.doc, building, &building.facades[0]).unwrap();
+        assert_eq!(resolved[0].rect.u0, projected - preview.sizes[0] / 2.0);
+        assert_eq!(resolved[0].rect.u1, projected + preview.sizes[0] / 2.0);
+        assert_eq!(resolved[0].rect.v0, preview.face[0][2]);
+        assert_eq!(resolved[0].rect.v1, preview.face[2][2]);
+        let built = trigon_model::build::build(&session.doc).unwrap();
+        let wall = built[0].walls.iter().find(|wall| wall.id == "family-test.f1").unwrap();
+        assert_eq!(wall.openings[0].rect, resolved[0].rect);
+        let placed = session.doc.clone();
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, placed);
+    }
+
+    #[test]
+    fn point_snapping_is_optional_and_hover_cannot_move_a_captured_numeric_target() {
+        let mut session = family_session(family_document());
+        session.execute("facade.place_at", json!({"facade":"family-test.f1","level":1,"type":"window.fixed","u_mm":7100.375})).unwrap();
+        // A moved occurrence is a useful alignment axis independently of its bay centre.
+        session.doc.buildings[0].facades[0].placements[0].u = Some(7300.625);
+        let doc = &session.doc;
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        form.begin_family_placement(doc, None);
+        let mut host = family_host_element();
+        host.level = Some(0);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([3234.875, 0.0]), false));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 3200.0);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([6051.125, 0.0]), false));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 6000.0);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([7350.0, 0.0]), false));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 7300.625);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([6051.125, 0.0]), true));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 6051.125, "Alt bypasses both axes and increments");
+        form.place_point.as_mut().unwrap().u_mm = 3456.123456789;
+        form.place_overrides = true;
+        form.place_sizes = [1234.56789, 1450.23456, 800.12345];
+        let reviewed = form.place_type(doc).unwrap().params;
+        form.hover_family_host(doc, Some((&host, [9501.25, 0.0])), false);
+        assert_eq!(form.family_placement_feedback(doc)["hover_u_mm"], 9500.0);
+        assert_eq!(form.family_preview(doc).unwrap().u_mm, 3456.123456789);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 2000.0))), ..Default::default() },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        assert!(form.family_editor(ui, doc, 99).is_none());
+                        assert!(ui.min_rect().right() <= 280.0);
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            form.hover_family_host(doc, None, false);
+            assert_eq!(form.place_type(doc).unwrap().params, reviewed, "Properties repaints and pointer exit preserve exact reviewed inputs");
+        }
+        form.cancel_family_placement();
+        assert!(form.family_preview(doc).is_none());
+        assert!(form.place_point.is_none());
+    }
+
+    #[test]
+    fn point_scope_needs_explicit_storeys_and_a_renewed_saved_plan_after_basement_changes() {
+        let mut session = family_session(family_document());
+        session.doc.views.push(serde_json::from_value(json!({"id":"ground-plan","name":"Ground","kind":{"view":"plan","level":0}})).unwrap());
+        let mut form = Authoring::default();
+        form.begin_family_placement(&session.doc, None);
+        let host = family_host_element();
+        assert!(!form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        assert_eq!(form.place_type(&session.doc).unwrap().params["level"], 0);
+        session.execute("building.add_basement", json!({"building":"family-test","floor":-2500})).unwrap();
+        // The engine remaps the saved plan, but a background refresh is not renewed user intent.
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(!form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(!form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        assert!(form.family_preview(&session.doc).is_none());
+        form.sync_family_plan(&session.doc, None);
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        assert_eq!(form.place_type(&session.doc).unwrap().params["level"], 1);
+        form.place_level = Some(99);
+        assert!(form.place_type(&session.doc).is_none());
+    }
+
+    #[test]
+    fn point_bare_wall_pick_retains_a_source_hit_until_an_explicit_storey_choice() {
+        let mut doc = family_document();
+        let scene = crate::scene::Scene::from_built(&trigon_model::build::build(&doc).unwrap(), false);
+        let host = scene.elements.iter().find(|e| e.id == "family-test.f1").unwrap();
+        assert_eq!(host.level, None);
+        let mut form = Authoring::default();
+        form.begin_family_placement(&doc, None);
+        assert!(!form.pick_family_host_snapped(&doc, host, Some([3200.125, 0.0]), true));
+        assert_eq!(form.facade, "family-test.f1");
+        assert!(form.place_type(&doc).is_none());
+        form.choose_family_storey(&doc, 2);
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.params["level"], 2);
+        assert_eq!(run.params["u_mm"], 3200.125);
+        form.cancel_family_placement();
+        form.begin_family_placement(&doc, None);
+        form.place_level = None;
+        assert!(!form.pick_family_host(&doc, host, Some([5000.25, 0.0])));
+        doc.buildings[0].footprint[1][0] += 500.0;
+        form.choose_family_storey(&doc, 1);
+        assert!(form.place_type(&doc).is_none(), "never reinterpret an unscoped hit in a changed host frame");
+    }
+
+    #[test]
+    fn point_capture_is_invalidated_by_host_translation_rotation_and_grid_edits() {
+        for change in 0..3 {
+            let mut doc = family_document();
+            let mut form = Authoring::default();
+            form.begin_family_placement(&doc, None);
+            form.place_level = Some(1);
+            assert!(form.pick_family_host(&doc, &family_host_element(), Some([3200.0, 0.0])));
+            if change == 0 {
+                for p in &mut doc.buildings[0].footprint {
+                    p[0] += 500.0;
+                }
+            } else if change == 1 {
+                for p in &mut doc.buildings[0].footprint {
+                    *p = [-p[1], p[0]];
+                }
+            } else {
+                doc.buildings[0].facades[0].bays.push(4000.0);
+            }
+            assert!(form.family_preview(&doc).is_none());
+            assert!(form.place_type(&doc).is_none());
+            assert!(!form.pick_family_host(&doc, &family_host_element(), Some([3300.0, 0.0])), "a bare wall cannot renew stale scope");
+            assert!(form.place_point.is_none());
+            assert!(form.place_level.is_none());
+        }
+    }
+
+    #[test]
+    fn point_replacement_requires_consent_and_own_append_allows_repeat_with_exact_history() {
+        let mut session = family_session(family_document());
+        session.doc.buildings[0].facades[0].bays = vec![9500.0, 2500.0];
+        let before = session.doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(session.doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        form.begin_family_placement(&session.doc, None);
+        let mut host = family_host_element();
+        host.level = Some(1);
+        assert!(form.pick_family_host(&session.doc, &host, Some([6000.125, 0.0])));
+        let run = form.place_type(&session.doc).unwrap();
+        let result = session.execute(run.command, run.params.clone()).unwrap();
+        assert_eq!(session.doc.buildings[0].facades[0].bays, vec![9500.0, 2500.0, 6000.125]);
+        form.family_placement_succeeded(&session.doc, &result);
+        form.sync_placement_scope(&session.doc);
+        assert_eq!(form.place_level, Some(1), "the form acknowledges its own bay append");
+        assert!(form.place_type(&session.doc).is_none(), "no implicit replacement");
+        let first = session.doc.clone();
+        assert!(session.execute(run.command, run.params).is_err(), "the command also refuses without consent");
+        assert_eq!(session.doc, first);
+        form.place_replace = true;
+        let replacement = form.place_type(&session.doc).unwrap();
+        assert_eq!(replacement.params["replace"], true);
+        session.execute(replacement.command, replacement.params).unwrap();
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, first);
+        assert!(form.pick_family_host(&session.doc, &host, Some([3200.25, 0.0])));
+        assert!(!form.place_replace, "a new point clears replacement consent");
+        let run = form.place_type(&session.doc).unwrap();
+        let result = session.execute(run.command, run.params).unwrap();
+        form.family_placement_succeeded(&session.doc, &result);
+        let two = session.doc.clone();
+        assert_eq!(two.buildings[0].facades[0].bays, vec![9500.0, 2500.0, 6000.125, 3200.25]);
+        assert_eq!(two.buildings[0].facades[0].placements[0], first.buildings[0].facades[0].placements[0]);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, first);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, first);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, two);
+        form.place_replace = true;
+        form.choose_type(&session.doc.types[0]);
+        assert!(!form.place_replace);
+        form.place_replace = true;
+        host.level = Some(2);
+        assert!(form.pick_family_host(&session.doc, &host, Some([6000.125, 0.0])));
+        assert!(!form.place_replace);
+        form.place_replace = true;
+        host.id = "family-test.f2".into();
+        assert!(form.pick_family_host(&session.doc, &host, Some([12000.0, 3200.0])));
+        assert!(!form.place_replace);
+    }
+
+    #[test]
+    fn duplicate_type_has_a_distinct_stable_identity_and_never_changes_the_original() {
+        let mut doc = family_document();
+        let source = doc.types[0].clone();
+        let mut first = source.clone();
+        first.id = format!("{}.copy1", source.id);
+        first.name = format!("{} copy 1", source.name);
+        doc.types.push(first);
+        let mut occupied_name = source.clone();
+        occupied_name.id = "another-type".into();
+        occupied_name.name = format!("{} copy 2", source.name);
+        doc.types.push(occupied_name);
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(&source);
+        assert!(form.duplicate_selected_type(&doc));
+        let copy = form.draft.as_ref().unwrap().clone();
+        assert_eq!(copy.id, format!("{}.copy3", source.id));
+        assert_eq!(copy.name, format!("{} copy 3", source.name));
+        assert_eq!(doc, before, "starting a copy never writes the model");
+        assert!(!form.duplicate_selected_type(&doc), "another click cannot discard an unsaved copy");
+        let run = form.define_type(&doc).unwrap();
+        assert_eq!(run.command, "types.define");
+        assert_eq!(serde_json::from_value::<ComponentType>(run.params.clone()).unwrap(), copy);
+        let mut session = family_session(doc);
+        session.execute(run.command, run.params).unwrap();
+        assert_eq!(session.doc.component(&source.id).unwrap(), &source);
+        assert_eq!(session.doc.component(&copy.id).unwrap(), &copy);
+        form.sync_type_draft(&session.doc);
+        assert!(!form.type_dirty(), "successful Apply acknowledges only the saved definition");
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc.types, before.types);
+    }
+
+    #[test]
+    fn duplicate_keeps_unicode_identity_within_limits_and_rejects_late_collisions() {
+        let mut doc = Document::default();
+        doc.types[0].id = "æ".repeat(60);
+        doc.types[0].name = "窓".repeat(85);
+        let source = doc.types[0].clone();
+        let mut form = Authoring::default();
+        form.choose_type(&source);
+        assert!(form.duplicate_selected_type(&doc));
+        let copy = form.draft.as_ref().unwrap().clone();
+        assert!(copy.id.len() <= 128 && copy.name.len() <= 256);
+        assert!(form.define_type(&doc).is_some());
+        let mut collision = copy.clone();
+        collision.width += 50.0;
+        doc.types.push(collision);
+        assert!(form.define_type(&doc).is_none(), "a late ID collision must not turn a new copy into a shared replacement");
+        form.cancel_type_changes(&doc);
+        assert_eq!(form.draft, Some(source));
+        assert!(!form.type_dirty());
+    }
+
+    #[test]
+    fn family_drafts_require_apply_and_cancel_protects_selection_changes() {
+        let doc = Document::default();
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(&doc.types[0]);
+        assert!(form.define_type(&doc).is_none(), "an unchanged form cannot create a redundant history entry");
+        form.draft.as_mut().unwrap().width = 900.0;
+        form.request_type(&doc.types[1]);
+        assert_eq!(form.draft.as_ref().unwrap().id, doc.types[0].id, "switching types must not discard the edited draft");
+        assert_eq!(form.pending_type.as_deref(), Some(doc.types[1].id.as_str()));
+        let run = form.define_type(&doc).unwrap();
+        assert_eq!(run.params["width"], 900.0);
+        assert_eq!(doc, before, "even preparing Apply is a read-only operation");
+        form.cancel_type_changes(&doc);
+        assert_eq!(form.draft.as_ref(), Some(&doc.types[1]));
+        assert!(form.pending_type.is_none());
+        form.draft.as_mut().unwrap().width = f64::NAN;
+        assert!(form.define_type(&doc).is_none(), "hostile nonfinite dimensions cannot produce a command");
+        form.cancel_type_changes(&doc);
+        assert_eq!(form.draft.as_ref(), Some(&doc.types[1]));
+    }
+
+    #[test]
+    fn stale_type_drafts_do_not_overwrite_updates_from_another_command() {
+        let mut doc = Document::default();
+        let mut form = Authoring::default();
+        form.choose_type(&doc.types[0]);
+        form.draft.as_mut().unwrap().width = 900.0;
+        doc.types[0].name = "Updated elsewhere".into();
+        form.sync_type_draft(&doc);
+        assert!(form.define_type(&doc).is_none());
+        assert!(form.type_error(&doc).unwrap().contains("saved type changed"));
+        form.cancel_type_changes(&doc);
+        assert_eq!(form.draft.as_ref(), Some(&doc.types[0]));
+    }
+
+    #[test]
+    fn rejected_shared_type_apply_keeps_the_document_and_the_editable_draft() {
+        let doc = family_document();
+        let mut session = family_session(doc);
+        session.execute("facade.place", json!({"facade":"family-test.f1","type":"window.casement.1","levels":[0],"bays":[0,1]})).unwrap();
+        let before = session.doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(&session.doc.types[0]);
+        form.draft.as_mut().unwrap().width = 6000.0;
+        let run = form.define_type(&session.doc).unwrap();
+        assert!(session.execute(run.command, run.params).is_err(), "overlapping or out-of-host windows must be rejected by the shared engine");
+        assert_eq!(session.doc, before);
+        form.sync_type_draft(&session.doc);
+        assert_eq!(form.draft.as_ref().unwrap().width, 6000.0);
+        assert!(form.type_dirty(), "a rejected engine command must not acknowledge or erase the draft");
+        form.cancel_type_changes(&session.doc);
+        assert_eq!(form.draft.as_ref(), Some(&before.types[0]));
+    }
+
+    #[test]
+    fn placement_defaults_to_one_explicit_slot_and_keeps_instance_overrides_local() {
+        let doc = family_document();
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
+        let mut host = family_host_element();
+        host.level = Some(1);
+        assert!(form.pick_family_host(&doc, &host, Some([2500.0, 0.0])));
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.command, "facade.place");
+        assert_eq!(run.params["levels"], json!([1]));
+        assert_eq!(run.params["bays"], json!([0]));
+        assert!(run.params.get("width").is_none(), "inherited sizes must stay linked to the saved type");
+        form.place_overrides = true;
+        form.place_sizes = [950.0, 1600.0, 700.0];
+        let run = form.place_type(&doc).unwrap();
+        let mut session = family_session(doc);
+        session.execute(run.command, run.params).unwrap();
+        assert_eq!(session.doc.types, before.types);
+        let placement = &session.doc.buildings[0].facades[0].placements[0];
+        assert_eq!((placement.width, placement.height, placement.sill), (Some(950.0), Some(1600.0), Some(700.0)));
+        assert_eq!(placement.level, 1);
+        assert_eq!(placement.bay, 0);
+        assert!(form.place_type(&session.doc).is_none(), "replacing an occupied slot requires a fresh opt-in");
+        form.place_replace = true;
+        assert!(form.place_type(&session.doc).is_some());
+        form.place_all_bays = true;
+        assert_eq!(form.place_type(&session.doc).unwrap().params["bays"], json!([0, 1, 2]));
+        form.place_sizes[1] = f64::INFINITY;
+        assert!(form.place_type(&session.doc).is_none());
+        form.place_sizes[1] = 1500.0;
+        form.place_level = Some(99);
+        assert!(form.place_type(&session.doc).is_none(), "an out-of-building storey must never become an unscoped command");
+    }
+
+    #[test]
+    fn family_type_filters_and_reference_count_follow_real_component_families() {
+        let mut doc = family_document();
+        let window = doc.types[0].clone();
+        assert!(FamilyCategory::Windows.matches(&window));
+        assert!(!FamilyCategory::Doors.matches(&window));
+        let balcony = doc.types.iter().find(|ty| matches!(ty.kind, ComponentKind::FrenchBalcony { .. })).unwrap();
+        assert!(FamilyCategory::Balconies.matches(balcony));
+        assert!(!FamilyCategory::Doors.matches(balcony));
+        let placement = serde_json::from_value(json!({"type":window.id,"level":0,"bay":0})).unwrap();
+        doc.buildings[0].facades[0].placements.push(placement);
+        let dormer = json!({"id":"d1","facade":"family-test.f1","u_mm":6000,"window_type":window.id,"width_mm":700,"height_mm":1000});
+        doc.buildings[0].roof = serde_json::from_value(json!({"kind":"mansard","dormers":[dormer]})).unwrap();
+        assert_eq!(
+            Authoring::type_use_count(&doc, &window.id),
+            2,
+            "dormer references belong to the shared scope even though their dimensions are local"
+        );
+    }
+    #[test]
+    fn picked_instance_routes_to_its_saved_type_without_discarding_another_draft() {
+        let doc = family_document();
+        let element = Element {
+            id: "family-test.f1.L1.B1".into(),
+            kind: "window",
+            level: Some(1),
+            props: vec![("type", doc.types[1].id.clone()), ("facade", "family-test.f1".into())],
+            ranges: Vec::new(),
+            fingerprint: 0,
+            host: false,
+            bounds: None,
+            facing: None,
+        };
+        let mut form = Authoring::default();
+        form.begin_family_placement(&doc, Some(&element));
+        assert!(form.show_placement);
+        assert_eq!(form.draft.as_ref(), Some(&doc.types[1]));
+        assert_eq!(form.facade, "family-test.f1");
+        assert_eq!(form.place_level, Some(1));
+        form.choose_type(&doc.types[0]);
+        form.draft.as_mut().unwrap().height = 1700.0;
+        assert!(form.choose_instance_type(&doc, &element));
+        assert_eq!(form.draft.as_ref().unwrap().height, 1700.0);
+        assert_eq!(form.pending_type.as_deref(), Some(doc.types[1].id.as_str()));
+        form.cancel_type_changes(&doc);
+        assert_eq!(form.draft.as_ref(), Some(&doc.types[1]));
+        let mut ambiguous = doc.clone();
+        ambiguous.types.push(doc.types[1].clone());
+        assert!(!form.choose_instance_type(&ambiguous, &element));
+    }
+
+    fn family_host_element() -> Element {
+        Element {
+            id: "family-test.f1".into(),
+            kind: "wall",
+            level: None,
+            // Exterior wall `facade` metadata describes its classification, not its ID.
+            props: vec![("facade", "street".into())],
+            ranges: Vec::new(),
+            fingerprint: 0,
+            host: true,
+            bounds: None,
+            facing: None,
+        }
+    }
+
+    #[test]
+    fn vanished_component_host_never_substitutes_the_first_remaining_facade() {
+        let mut doc = family_document();
+        let mut other = Building::new("other", "Other", &[[20000.0, 0.0], [32000.0, 0.0], [32000.0, 8000.0], [20000.0, 8000.0]], 3, 3000.0).unwrap();
+        other.facades[0].bays = vec![2500.0];
+        doc.buildings.push(other);
+        let mut host = family_host_element();
+        host.id = "other.f1".into();
+        host.level = Some(0);
+        let mut form = Authoring::default();
+        form.begin_family_placement(&doc, None);
+        assert!(form.pick_family_host(&doc, &host, Some([22500.0, 0.0])));
+        doc.buildings.pop();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            form.family_placement(ui, &doc, 0);
+        });
+        output.textures_delta.clear();
+        ctx.data_mut(|data| data.clear());
+        assert_eq!(form.facade, "other.f1", "keep the missing identity visible; do not choose another host");
+        assert!(form.place_type(&doc).is_none());
+    }
+
+    #[test]
+    fn basement_insertion_invalidates_a_reviewed_component_storey_scope() {
+        let mut session = family_session(family_document());
+        let mut form = Authoring::default();
+        form.begin_family_placement(&session.doc, None);
+        let mut host = family_host_element();
+        host.level = Some(0);
+        assert!(form.pick_family_host(&session.doc, &host, Some([2500.0, 0.0])));
+        assert!(form.place_type(&session.doc).is_some());
+        session.execute("building.add_basement", json!({"building":"family-test","floor":-2500})).unwrap();
+        assert!(form.place_type(&session.doc).is_none(), "L0 changed identity; require renewed scope selection");
+        assert_eq!(form.family_placement_feedback(&session.doc)["stale"], true);
+        assert_eq!(form.family_placement_feedback(&session.doc)["ready"], false);
+        form.sync_placement_scope(&session.doc);
+        assert!(form.place_level.is_none());
+        host.level = Some(1);
+        assert!(form.pick_family_host(&session.doc, &host, Some([2500.0, 0.0])));
+        let before = session.doc.clone();
+        let run = form.place_type(&session.doc).unwrap();
+        assert_eq!(run.params["level"], json!(1));
+        assert!(!form.place_replace);
+        session.execute(run.command, run.params).unwrap();
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+    }
+
+    #[test]
+    fn hidden_properties_bare_wall_pick_cannot_renew_a_stale_storey_index() {
+        let mut session = family_session(family_document());
+        let mut form = Authoring::default();
+        form.begin_family_placement(&session.doc, None);
+        let scene = crate::scene::Scene::from_built(&trigon_model::build::build(&session.doc).unwrap(), false);
+        let host = scene.elements.iter().find(|element| element.id == "family-test.f1").unwrap();
+        assert_eq!(host.level, None, "real facade walls span storeys");
+        form.place_level = Some(0); // Explicit original ground-floor choice.
+        assert!(form.pick_family_host(&session.doc, host, Some([2500.0, 0.0])));
+        session.execute("building.add_basement", json!({"building":"family-test","floor":-2500})).unwrap();
+        let rebuilt = crate::scene::Scene::from_built(&trigon_model::build::build(&session.doc).unwrap(), false);
+        let host = rebuilt.elements.iter().find(|element| element.id == "family-test.f1").unwrap();
+        // No Properties render or manual scope synchronization occurs before this pick.
+        assert!(!form.pick_family_host(&session.doc, host, Some([2500.0, 0.0])), "a bare-wall hit contains no renewed storey choice");
+        assert!(form.place_type(&session.doc).is_none());
+    }
+
+    #[test]
+    fn family_host_pick_projects_site_local_mm_onto_translated_rotated_source_bays() {
+        let mut doc = family_document();
+        let angle = 0.73_f64;
+        for point in &mut doc.buildings[0].footprint {
+            let [x, y] = *point;
+            *point = [15000.0 + x * angle.cos() - y * angle.sin(), -27000.0 + x * angle.sin() + y * angle.cos()];
+        }
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(&doc.types[0]);
+        form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
+        form.place_level = Some(2);
+        form.place_all_bays = true;
+        form.place_replace = true;
+        let (a, b) = doc.buildings[0].edge(0).unwrap();
+        let frame = trigon_model::build::FacadeFrame::new(a, b).unwrap();
+        let point = frame.point(6100.0, -500.0, 0.0);
+        assert!(form.pick_family_host(&doc, &family_host_element(), Some([point[0], point[1]])));
+        assert_eq!(form.facade, "family-test.f1");
+        assert_eq!(form.place_level, Some(2), "a facade wall pick retains the explicitly selected storey");
+        assert_eq!(form.place_bay, 1, "the click snaps to the source bay at 6000 mm despite translation, rotation and outward offset");
+        assert!(!form.place_all_bays && !form.place_replace);
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.params["levels"], json!([2]));
+        assert_eq!(run.params["bays"], json!([1]));
+        assert!(run.params.get("u").is_none(), "a bay-snapped pick must not invent a free host position");
+        assert_eq!(doc, before, "picking fills the form without executing placement or altering source coordinates");
+    }
+
+    #[test]
+    fn family_host_pick_uses_known_component_occurrences_when_a_3d_point_is_unavailable() {
+        let doc = family_document();
+        let mut picked = family_host_element();
+        picked.host = false;
+        picked.kind = "balcony";
+        picked.id = "family-test.f1.L1.B2.balcony".into();
+        picked.level = Some(1);
+        picked.props = vec![("facade", "family-test.f1".into()), ("type", doc.types[6].id.clone())];
+        let mut form = Authoring::default();
+        form.choose_type(&doc.types[0]);
+        form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
+        assert!(form.pick_family_host(&doc, &picked, None));
+        assert_eq!(form.place_level, Some(1));
+        assert_eq!(form.place_bay, 2);
+        assert_eq!(form.draft.as_ref(), Some(&doc.types[0]), "host picking never changes the type being placed");
+        assert_eq!(form.place_type(&doc).unwrap().params["bays"], json!([2]));
+        picked.id = "family-test.f1.L1.B99.balcony".into();
+        assert!(!form.pick_family_host(&doc, &picked, None));
+        picked.id = "not-an-identifiable-occurrence".into();
+        assert!(!form.pick_family_host(&doc, &picked, None), "a missing point cannot become a guessed bay");
+    }
+
+    #[test]
+    fn ambiguous_or_hostile_family_picks_leave_every_placement_choice_unchanged() {
+        let doc = family_document();
+        let wall = family_host_element();
+        let mut form = Authoring::default();
+        form.choose_type(&doc.types[0]);
+        form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
+        form.facade = "family-test.f2".into();
+        form.place_level = Some(1);
+        form.place_bay = 2;
+        form.place_all_bays = true;
+        form.place_replace = true;
+        let choices =
+            |form: &Authoring| (form.facade.clone(), form.place_level, form.place_bay, form.place_all_bays, form.place_replace, form.draft.clone());
+        let before = choices(&form);
+        for point in [None, Some([f64::NAN, 0.0]), Some([0.0, f64::INFINITY]), Some([4250.0, 0.0])] {
+            assert!(!form.pick_family_host(&doc, &wall, point), "missing, hostile and equally near bay picks must be inert");
+            assert_eq!(choices(&form), before);
+        }
+        let mut duplicate = doc.clone();
+        duplicate.buildings.push(doc.buildings[0].clone());
+        assert!(!form.pick_family_host(&duplicate, &wall, Some([6000.0, 0.0])));
+        let mut no_bays = doc.clone();
+        no_bays.buildings[0].facades[0].bays.clear();
+        assert!(!form.pick_family_host(&no_bays, &wall, Some([6000.0, 0.0])));
+        let mut missing = wall.clone();
+        missing.id = "missing-facade".into();
+        assert!(!form.pick_family_host(&doc, &missing, Some([6000.0, 0.0])));
+        let mut interior = wall.clone();
+        interior.kind = "interior wall";
+        assert!(!form.pick_family_host(&doc, &interior, Some([6000.0, 0.0])));
+        assert_eq!(choices(&form), before);
+        form.place_level = None;
+        assert!(!form.pick_family_host(&doc, &wall, Some([6000.0, 0.0])), "a wall cannot infer a missing storey from an XY point");
+        form.place_level = Some(99);
+        assert!(!form.pick_family_host(&doc, &wall, Some([6000.0, 0.0])));
+        form.place_level = Some(1);
+        form.tab = Tab::Project;
+        assert!(!form.family_placement_active());
+        assert!(!form.pick_family_host(&doc, &wall, Some([6000.0, 0.0])));
+        assert_eq!(choices(&form), before);
+    }
+
+    #[test]
+    fn typed_family_forms_fit_a_280_pixel_dock_and_render_without_changing_saved_values() {
+        let mut doc = family_document();
+        doc.types.extend(trigon_model::component::copenhagen_types());
+        doc.types.extend(trigon_model::balcony::copenhagen_types());
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for ty in &doc.types {
+            let mut form = Authoring::default();
+            let mut named = ty.clone();
+            named.name = "Long project type name for a narrow component properties dock".into();
+            let mut displayed = doc.clone();
+            displayed.types = vec![named.clone()];
+            form.choose_type(&named);
+            form.begin_family_placement(&displayed, None);
+            form.show_placement = false; // Exercise every shared type control, not the compact placement editor.
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 3000.0))), ..Default::default() },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        assert!(form.family_editor(ui, &displayed, 0).is_none());
+                        assert!(ui.min_rect().right() <= 280.0, "{} controls overflow the dock: {:?}", family_name(ty), ui.min_rect());
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(form.draft.as_ref(), Some(&named), "rendering a typed form cannot silently clamp or rewrite saved parameters");
+        }
+    }
+
     #[test]
     fn wall_alignment_form_keeps_the_captured_reference_and_only_requests_a_preflight() {
         let doc = Document::default();
