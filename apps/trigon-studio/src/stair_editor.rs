@@ -202,26 +202,6 @@ impl Draft {
             .collect()
     }
 
-    fn next_id(&self, doc: &Document) -> Result<String, String> {
-        for suffix in 1..=1000 {
-            let id = format!("{}.refined{suffix}", self.expected.id);
-            if id.len() > 128 {
-                return Err("This source ID is too long to allocate a separate stair definition.".into());
-            }
-            let used = doc.buildings.iter().any(|b| {
-                b.id == id
-                    || b.stairs.iter().any(|s| s.id == id)
-                    || b.interior_walls.iter().any(|w| w.id == id)
-                    || b.rooms.iter().any(|r| r.id == id)
-                    || b.facades.iter().any(|f| f.id == id)
-            });
-            if !used {
-                return Ok(id);
-            }
-        }
-        Err("No free stair definition ID was found. Choose an existing definition to edit.".into())
-    }
-
     fn request(&self, doc: &Document) -> Result<Run, String> {
         if self.stale || !self.current(doc) {
             return Err("The staircase or its storeys changed. Reload it before reviewing this draft.".into());
@@ -239,7 +219,7 @@ impl Draft {
         let partitions = if kept.is_empty() {
             vec![changed]
         } else {
-            changed.id = self.next_id(doc)?;
+            changed.id = trigon_engine::suggest_stair_split_id(doc, &changed).map_err(|e| e.to_string())?;
             let mut original = self.expected.clone();
             original.levels = kept;
             vec![original, changed]
@@ -786,6 +766,34 @@ mod tests {
         d.scope = Scope::Selected;
         d.levels.clear();
         assert!(d.request(&s.doc).is_err());
+    }
+
+    #[test]
+    fn split_name_skips_an_occupied_occurrence_alias_and_previews_with_exact_undo() {
+        let mut s = session();
+        s.execute(
+            "interior.add_stairs",
+            json!({"building":"wing","stairs":[{
+            "id":"wing.stair-a.refined1.L1","levels":[0],
+            "outline":[[8000,2000],[11000,2000],[11000,4000],[8000,4000]],
+            "kind":"straight","rounded":false}]}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let mut editor = Editor::default();
+        editor.sync(&s.doc, Some("wing.stair-a.L1"));
+        assert!(editor.handle_edit(&s.doc, "wing.stair-a.L1", &json!({"width_mm":2200})));
+        let run = editor.preview(&s.doc).unwrap();
+        assert_eq!(run.params["action"]["params"]["partitions"][1]["id"], "wing.stair-a.refined2");
+        let preview = s.execute(run.command, run.params).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("precision.apply", json!({"action":preview["action"],"preview_token":preview["preview_token"]})).unwrap();
+        let after = s.doc.clone();
+        assert_eq!(after.buildings[0].stairs.last().unwrap().id, "wing.stair-a.refined2");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after);
     }
 
     #[test]

@@ -40,6 +40,89 @@ fn glb(doc: &Document) -> Vec<u8> {
     trigon_io::glb::write(&trigon_model::build(doc).unwrap(), &[])
 }
 
+#[test]
+fn stair_split_name_reserves_normalized_aliases_and_stored_references_without_mutation() {
+    for case in 0..8 {
+        let mut s = fixture();
+        match case {
+            0 => s.doc.buildings[0].stairs[0].id = "core.refined1.L01".into(),
+            1 => {
+                s.doc.buildings[0].interior_walls = serde_json::from_value(json!([
+                    {"id":"core.refined1","levels":[3],"a":[8000,7000],"b":[10000,7000],"thickness":120}
+                ]))
+                .unwrap();
+            }
+            2 => {
+                s.doc.buildings[0].rooms = serde_json::from_value(json!([
+                    {"id":"core.refined1.L1","levels":[3],"name":"Public",
+                    "polygon":[[8000,7000],[10000,7000],[10000,9000],[8000,9000]]}
+                ]))
+                .unwrap();
+            }
+            3 | 4 => {
+                s.doc.groups.push(
+                    serde_json::from_value(json!({"id":"reserved","name":"Stored selection",
+                    "targets":[if case == 3 {"stair:core.refined1"} else {"core.refined1.L01"}]}))
+                    .unwrap(),
+                );
+            }
+            5 | 6 => {
+                s.doc.buildings[0].entrances = serde_json::from_value(json!([
+                    {"street":"Synthetic","number":"1","point":[0,0],
+                    "stair":if case == 5 {Some("core.refined1")} else {None},
+                    "stair_by_level":if case == 6 {json!({"1":"core.refined1"})} else {json!({})},"units":[]}
+                ]))
+                .unwrap();
+            }
+            _ => s.doc.buildings[0].facades[0].id = "core.refined1.L1".into(),
+        }
+        let before = s.doc.clone();
+        let mut changed = before.buildings[0].stairs[1].clone();
+        changed.levels = vec![1, 2];
+        changed.landing = Some(900.125);
+        changed.id = crate::suggest_stair_split_id(&s.doc, &changed).unwrap();
+        assert_eq!(changed.id, "core.refined2", "case {case}");
+        assert_eq!(s.doc, before);
+        let mut retained = before.buildings[0].stairs[1].clone();
+        retained.levels = vec![0];
+        s.execute(
+            "stair.refine_source",
+            json!({"building":"b","expected_source":before.buildings[0].stairs[1],
+            "partitions":[retained,changed]}),
+        )
+        .unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
+fn stair_split_name_is_bounded_and_does_not_reserve_unselected_departures() {
+    let mut s = fixture();
+    s.doc.buildings[0].stairs[0].id = "core.refined1.L0".into();
+    let mut partition = s.doc.buildings[0].stairs[1].clone();
+    partition.levels = vec![1, 2];
+    assert_eq!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap(), "core.refined1");
+    partition.levels = vec![0];
+    assert_eq!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap(), "core.refined2");
+    for block in 0..4 {
+        let targets: Vec<_> = (1 + block * 250..=250 + block * 250).map(|n| format!("core.refined{n}")).collect();
+        s.doc.groups.push(serde_json::from_value(json!({"id":format!("g{block}"),"name":"Reserved","targets":targets})).unwrap());
+    }
+    let before = s.doc.clone();
+    assert!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap_err().to_string().contains("1000 suffixes"));
+    partition.levels = vec![usize::MAX];
+    assert!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap_err().to_string().contains("does not exist"));
+    partition.levels = vec![1, 1];
+    assert!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap_err().to_string().contains("duplicate departure"));
+    partition.levels.clear();
+    assert!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap_err().to_string().contains("1..60 departure"));
+    partition.levels = vec![1];
+    partition.id = "a".repeat(128);
+    assert!(crate::suggest_stair_split_id(&s.doc, &partition).unwrap_err().to_string().contains("too long"));
+    assert_eq!(s.doc, before);
+}
+
 fn refuses(s: &mut Session, command: &str, params: Value, message: &str) {
     let state = (s.doc.clone(), s.undo.clone(), s.redo.clone(), s.path.clone(), s.dirty);
     let error = s.execute(command, params).unwrap_err();

@@ -161,6 +161,48 @@ fn placement_aliases(doc: &Document, stair: &Stair) -> Result<()> {
     Ok(())
 }
 
+/// Suggest a bounded split name using the same source/occurrence namespace as
+/// `stair.refine_source`. `partition` carries the original ID and the selected
+/// departure levels. This reads the current document; it does not reserve the
+/// result or approve geometry. Preview/apply must still validate the exact edit.
+pub fn suggest_stair_split_id(doc: &Document, partition: &Stair) -> Result<String> {
+    identifier(&partition.id)?;
+    levels(partition, MAX_LEVELS)?;
+    let mut occupied: BTreeSet<_> = namespace(doc)?.into_keys().collect();
+    if doc.groups.len() > 200 || doc.buildings.iter().fold(0usize, |n, b| n.saturating_add(b.entrances.len())) > MAX_CONSUMERS {
+        return Err(invalid("stair refinement is bounded to 200 groups and 5000 entrances"));
+    }
+    for entrance in doc.buildings.iter().flat_map(|b| &b.entrances) {
+        if entrance.stair_by_level.len() > MAX_LEVELS {
+            return Err(invalid("stair refinement maps at most 60 stored departure overrides"));
+        }
+        occupied.extend(entrance.stair.iter().chain(entrance.stair_by_level.values()).map(|id| key(id)));
+    }
+    for group in &doc.groups {
+        if group.targets.len() > 256 || group.targets.iter().any(|t| t.len() > 512) {
+            return Err(invalid(format!("group {}: at most 256 targets of at most 512 bytes", group.id)));
+        }
+        occupied.extend(group.targets.iter().map(|id| key(id)));
+    }
+    let built = trigon_model::build(doc)?;
+    for record in crate::element_properties_from_built(doc, &built, trigon_model::build::View::latest(doc))? {
+        if let Some(id) = record["id"].as_str() {
+            occupied.insert(key(id));
+        }
+    }
+    let mut candidate = partition.clone();
+    for suffix in 1..=1000 {
+        candidate.id = format!("{}.refined{suffix}", partition.id);
+        if candidate.id.len() > 128 {
+            return Err(invalid("this source ID is too long to allocate a separate stair definition"));
+        }
+        if aliases(&candidate).all(|id| !occupied.contains(&key(&id))) && placement_aliases(doc, &candidate).is_ok() {
+            return Ok(candidate.id);
+        }
+    }
+    Err(invalid("no free stair definition ID was found within 1000 suffixes"))
+}
+
 /// Compute references against the untouched document, then apply this mapped copy once.
 fn consumers(
     doc: &Document,

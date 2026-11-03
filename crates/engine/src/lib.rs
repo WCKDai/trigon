@@ -58,6 +58,7 @@ pub use schedules::{
     OpeningQuantityBasis, OpeningSchedule, OpeningScheduleRow, OpeningScheduleTotals, ScheduleOpeningKind, opening_schedule,
     opening_schedule_from_built,
 };
+pub use stair_refinement::suggest_stair_split_id;
 pub use views::{
     DrawingDisplay, DrawingElementHit, DrawingElementKind, DrawingElementRegion, DrawingElementSegment, DrawingPreview, DrawingSnap,
     DrawingTransform, SnapKind, SnapOptions, drawing_view, drawing_view_display, plan_drawing, plan_drawing_display, snap_drawing,

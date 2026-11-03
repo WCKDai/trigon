@@ -19,6 +19,13 @@ preview received while a different human draft is open. Cancel returns to that
 local draft; Apply consumes the captured parameters. Invalid input retains the
 previous draft and its error. External source or storey changes require a reload.
 
+Splitting automatically skips occupied source names, departure aliases and stored
+references. The read-only engine helper `suggest_stair_split_id` suggests a name
+against the current document, including displayed element IDs; it does not reserve
+it. Preview and Apply still validate the complete action against current state.
+The helper checks at most 1000 suffixes and retains Studio's 128-byte generated-ID
+limit. Existing typed commands, native serialization and defaults are unchanged.
+
 Plans show changed departure/arrival outlines only on their affected levels.
 3D outlines use physical floor elevations, including a legacy implicit attic.
 Plan outlines are hidden in sections and elevations. A handle edit opens
