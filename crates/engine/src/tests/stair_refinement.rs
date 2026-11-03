@@ -379,6 +379,60 @@ fn stair_refinement_shaft_fit_checks_departure_arrival_attic_and_exact_contact()
 }
 
 #[test]
+fn stair_refinement_near_contact_cannot_hide_a_concave_floor_intrusion() {
+    for yaw in [0_f64, 31., -118.] {
+        let (sin, cos) = yaw.to_radians().sin_cos();
+        let transform = |[x, y]: [f64; 2]| [x * cos - y * sin, x * sin + y * cos];
+        // A 100 mm notch sits between almost-collinear floor edges. Contact at
+        // one crossing endpoint must not excuse the entire crossing region.
+        let footprint = [
+            [-1100., -100.00000009999985],
+            [1041.4213562665989, -100.0000001],
+            [1100.000000424264, -41.42135588375615],
+            [1158.5786440818788, -99.99999889700568],
+            [9499.99999994, -99.9999995],
+            [10500., -100.0000001],
+            [11100., -100.0000001],
+            [11100., 5100.],
+            [-1100., 5100.],
+        ]
+        .map(transform);
+        let mut s = Session::new(Box::new(Canned));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Concave shaft contact",
+            "footprint":footprint,"preserve_vertices":true,"storeys":2,
+            "storey_height_mm":3000,"wall_thickness_mm":100}),
+        )
+        .unwrap();
+        let outline = [[2000., 1000.], [4500., 1000.], [4500., 2000.], [2000., 2000.]].map(transform);
+        s.execute(
+            "interior.add_stairs",
+            json!({"building":"b","stairs":[{
+            "id":"core","levels":[0],"outline":outline,"kind":"straight"}]}),
+        )
+        .unwrap();
+        let original = s.doc.buildings[0].stairs[0].clone();
+        let mut valid = original.clone();
+        valid.tread = Some(275.);
+        s.execute("stair.refine_source", json!({"building":"b","expected_source":original,"partitions":[valid]})).unwrap();
+        let after_valid = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(!s.redo.is_empty());
+        let baseline = glb(&s.doc);
+        let mut candidate = original.clone();
+        candidate.outline = [[0., 0.], [10000., 0.], [10000., 3000.], [0., 3000.]].into_iter().map(transform).collect();
+        let params = json!({"building":"b","expected_source":original,"partitions":[candidate]});
+        refuses(&mut s, "stair.refine_source", params.clone(), "site-fixed");
+        assert_eq!(glb(&s.doc), baseline);
+        refuses(&mut s, "precision.preview", json!({"action":{"command":"stair.refine_source","params":params}}), "site-fixed");
+        assert_eq!(glb(&s.doc), baseline);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after_valid);
+    }
+}
+
+#[test]
 fn stair_refinement_fitted_boundaries_and_null_turn_controls_use_native_geometry() {
     let mut s = fixture();
     let source = s.doc.buildings[0].stairs[1].clone();

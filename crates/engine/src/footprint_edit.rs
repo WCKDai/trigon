@@ -188,6 +188,44 @@ fn fixed_shape_contact(boundary: &[[f64; 2]], host: &str, id: &str, points: &[[f
     let cross = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
     let count = if closed { points.len() } else { points.len().saturating_sub(1) };
     let mut probes = 0;
+    if metric_contact && closed {
+        // A near-contact endpoint cannot excuse the rest of a crossing. Check
+        // the reverse boundary too: a usable-floor vertex or edge strictly
+        // inside the shaft means some shaft material is outside that floor.
+        // Split at actual intersections so a long edge's midpoint cannot hide
+        // a short concave intrusion. The old footprint predicate is unchanged.
+        for (edge, (&a, &b)) in boundary.iter().zip(boundary.iter().cycle().skip(1)).take(boundary.len()).enumerate() {
+            let direction = [b[0] - a[0], b[1] - a[1]];
+            let mut stations = vec![0., 1.];
+            for (&c, &d) in points.iter().zip(points.iter().cycle().skip(1)).take(points.len()) {
+                let other = [d[0] - c[0], d[1] - c[1]];
+                let offset = [c[0] - a[0], c[1] - a[1]];
+                let denominator = cross([0., 0.], direction, other);
+                if denominator != 0. {
+                    let t = cross([0., 0.], offset, other) / denominator;
+                    let u = cross([0., 0.], offset, direction) / denominator;
+                    if (0. ..=1.).contains(&t) && (0. ..=1.).contains(&u) {
+                        stations.push(t);
+                    }
+                }
+            }
+            stations.sort_by(f64::total_cmp);
+            stations.dedup();
+            for t in stations.iter().copied().chain(stations.windows(2).map(|pair| (pair[0] + pair[1]) / 2.)) {
+                probes += 1;
+                if probes > 4096 {
+                    return Err(invalid(format!("{id} containment against {host} exceeds 4096 edge intervals")));
+                }
+                let point = [a[0] + t * direction[0], a[1] + t * direction[1]];
+                let (inside, clearance) = contains(points, point);
+                if inside && clearance > 1e-6 {
+                    return Err(invalid(format!(
+                        "{host} source edge {edge} at {point:?} lies {clearance:.9} mm inside {id}; site-fixed shaft geometry cannot be clipped implicitly"
+                    )));
+                }
+            }
+        }
+    }
     for (&a, &b1) in points.iter().zip(points.iter().cycle().skip(1)).take(count) {
         let direction = [b1[0] - a[0], b1[1] - a[1]];
         let mut stations = vec![0., 1.];
