@@ -13,6 +13,7 @@ mod drafting;
 mod drawing_raster;
 mod entrances;
 mod icons;
+mod model_tools;
 mod outline_panel;
 mod palette;
 mod plan_view;

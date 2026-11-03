@@ -12,6 +12,7 @@ use trigon_control::auth::{LaunchFiles, Listen};
 use trigon_control::{Presence, Responder, Server};
 use trigon_data::{Credentials, Live};
 use trigon_engine::{Session, commands};
+use trigon_model::annotation::DrawingViewKind;
 use trigon_model::build::{PhaseFilter, View};
 
 use crate::activity::{Action, Changes, Feed, Who};
@@ -191,6 +192,16 @@ pub struct StudioApp {
     open_views: Vec<OpenView>,
     active_view: Option<ViewTarget>,
     view_ribbon: bool,
+    ribbon_expanded: bool,
+    focus_canvas: bool,
+    dock_open: bool,
+    dock_properties: bool,
+    dock_rect: Option<egui::Rect>,
+    last_property_id: Option<String>,
+    show_command_strip: bool,
+    model_tools: crate::model_tools::ModelTools,
+    empty_pan: egui::Vec2,
+    empty_mm_per_point: f64,
     browser_query: String,
     pub(crate) browser_rect: Option<egui::Rect>,
     command_query: String,
@@ -297,6 +308,16 @@ impl StudioApp {
             open_views: Vec::new(),
             active_view: None,
             view_ribbon: false,
+            ribbon_expanded: false,
+            focus_canvas: false,
+            dock_open: false,
+            dock_properties: false,
+            dock_rect: None,
+            last_property_id: None,
+            show_command_strip: false,
+            model_tools: crate::model_tools::ModelTools::default(),
+            empty_pan: egui::Vec2::ZERO,
+            empty_mm_per_point: 20.0,
             browser_query: String::new(),
             browser_rect: None,
             command_query: String::new(),
@@ -374,6 +395,9 @@ impl StudioApp {
                 self.fit_pending = true;
                 self.selection = None;
                 self.authoring = Authoring::default();
+                self.model_tools.cancel();
+                self.drafting.cancel_placement();
+                self.empty_pan = egui::Vec2::ZERO;
                 self.inspector = Inspector::Elements;
                 self.entrances.clear();
                 self.terrain_panel = crate::terrain_panel::TerrainPanel::default();
@@ -704,15 +728,19 @@ impl StudioApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() {
+        if ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) || self.palette.open || self.confirm_close {
             return;
         }
         let (undo, redo, palette, save, open, fit) = ctx.input_mut(|i| {
             let cmd = egui::Modifiers::COMMAND;
             let shift_cmd = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+            // egui matches command-Z with extra Shift too. Consume the more
+            // specific Redo binding before trying the plain Undo binding.
+            let redo = i.consume_key(shift_cmd, egui::Key::Z) || i.consume_key(cmd, egui::Key::Y);
+            let undo = !redo && i.consume_key(cmd, egui::Key::Z);
             (
-                i.consume_key(cmd, egui::Key::Z),
-                i.consume_key(shift_cmd, egui::Key::Z) || i.consume_key(cmd, egui::Key::Y),
+                undo,
+                redo,
                 i.consume_key(cmd, egui::Key::K),
                 i.consume_key(cmd, egui::Key::S),
                 i.consume_key(cmd, egui::Key::O),
@@ -735,6 +763,21 @@ impl StudioApp {
         }
         if fit {
             self.fit();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.focus_canvas = !self.focus_canvas;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if self.model_tools.active() {
+                self.model_tools.escape();
+            }
+            self.drafting.cancel_placement();
+        }
+        if self.model_tools.active()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            && let Some(run) = self.model_tools.finish(&self.session.doc)
+        {
+            self.run_model_tool(run);
         }
     }
 
@@ -759,6 +802,11 @@ impl StudioApp {
 
     fn app_bar(&mut self, ui: &mut egui::Ui) {
         let wide = ui.available_width() > 1100.0;
+        let mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
+        let search_hint = if mac { "⌘ K" } else { "Ctrl+K" };
+        let undo_hint = if mac { "⌘Z" } else { "Ctrl+Z" };
+        let redo_hint = if mac { "⇧⌘Z" } else { "Ctrl+Shift+Z" };
+        let save_hint = if mac { "⌘S" } else { "Ctrl+S" };
         ui.horizontal(|ui| {
             theme::wordmark(ui);
             ui.separator();
@@ -794,10 +842,11 @@ impl StudioApp {
             });
             if wide {
                 ui.separator();
-                if icons::button(ui, Icon::Undo, "", false).on_hover_text("Undo the last model or annotation change (⌘Z)").clicked() {
+                if icons::button(ui, Icon::Undo, "", false).on_hover_text(format!("Undo the last model or annotation change ({undo_hint})")).clicked()
+                {
                     self.undo_redo(Action::Undo);
                 }
-                if icons::button(ui, Icon::Redo, "", false).on_hover_text("Redo (⇧⌘Z)").clicked() {
+                if icons::button(ui, Icon::Redo, "", false).on_hover_text(format!("Redo ({redo_hint})")).clicked() {
                     self.undo_redo(Action::Redo);
                 }
             }
@@ -811,11 +860,12 @@ impl StudioApp {
                     self.authoring.tab = Tab::Drawings;
                     self.drafting.show_export();
                 }
-                if icons::button(ui, Icon::Save, "Save", false).on_hover_text("Save project (⌘S)").clicked() {
+                if icons::button(ui, Icon::Save, "Save", false).on_hover_text(format!("Save project ({save_hint})")).clicked() {
                     if self.session.path.is_some() { self.save(None) } else { self.pick_save_as() }
                 }
                 ui.separator();
-                if icons::button(ui, Icon::Search, "⌘ K", false).on_hover_text("Search and run any command (⌘K)").clicked() {
+                if icons::button(ui, Icon::Search, search_hint, false).on_hover_text(format!("Search and run any command ({search_hint})")).clicked()
+                {
                     self.palette.show();
                 }
             });
@@ -823,21 +873,169 @@ impl StudioApp {
     }
 
     fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
             for (tab, label) in
                 [(Tab::Project, "Architecture"), (Tab::Families, "Components"), (Tab::Drawings, "Annotate"), (Tab::Schedules, "Schedules")]
             {
                 if theme::workspace_tab(ui, label, self.authoring.tab == tab && !self.view_ribbon).clicked() {
+                    self.model_tools.cancel();
                     self.inspect_elements();
                     self.authoring.tab = tab;
                     self.view_ribbon = false;
-                    self.drafting.picking = None;
+                    self.drafting.cancel_placement();
+                    if tab == Tab::Families {
+                        self.dock_open = true;
+                        self.dock_properties = false;
+                    }
                 }
             }
             if theme::workspace_tab(ui, "View", self.view_ribbon).clicked() {
                 self.view_ribbon = true;
             }
+            ui.separator();
+            if ui
+                .selectable_label(self.dock_open && !self.dock_properties, "Browser")
+                .on_hover_text("Project Browser · views, elements and families")
+                .clicked()
+            {
+                self.dock_open = !(self.dock_open && !self.dock_properties);
+                self.dock_properties = false;
+            }
+            if ui
+                .selectable_label(self.dock_open && self.dock_properties, "Properties")
+                .on_hover_text("Properties of the selected element, view or active tool")
+                .clicked()
+            {
+                self.dock_open = !(self.dock_open && self.dock_properties);
+                self.dock_properties = true;
+            }
+            if ui.selectable_label(self.ribbon_expanded, "Ribbon").on_hover_text("Expand or minimise the full ribbon").clicked() {
+                self.ribbon_expanded = !self.ribbon_expanded;
+            }
+            if ui.selectable_label(self.focus_canvas, "Focus").on_hover_text("Focus canvas · F11").clicked() {
+                self.focus_canvas = !self.focus_canvas;
+            }
         });
+    }
+
+    fn compact_ribbon(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if self.view_ribbon {
+                if ui.button("Fit view").clicked() {
+                    self.fit();
+                }
+                ui.toggle_value(&mut self.show_activity, "Activity");
+                ui.toggle_value(&mut self.show_command_strip, "Command bar");
+                ui.toggle_value(&mut self.focus_canvas, "Focus canvas");
+                return;
+            }
+            match self.authoring.tab {
+                Tab::Project => {
+                    if icons::button(ui, Icon::Select, "Select", !self.model_tools.active()).clicked() {
+                        self.model_tools.cancel();
+                        self.inspect_elements();
+                    }
+                    if icons::button(ui, Icon::Wall, "Wall", self.model_tools.active() && self.model_tools.feedback()["tool"] == "wall").clicked() {
+                        self.begin_model_tool(false);
+                    }
+                    if icons::button(ui, Icon::Roof, "Roof", self.model_tools.active() && self.model_tools.feedback()["tool"] == "roof").clicked() {
+                        self.begin_model_tool(true);
+                    }
+                    if icons::button(ui, Icon::Component, "Component", false).clicked() {
+                        self.model_tools.cancel();
+                        let selected = self.selection.and_then(|i| self.scene.elements.get(i));
+                        self.authoring.begin_family_placement(&self.session.doc, selected);
+                        self.dock_open = true;
+                        self.dock_properties = true;
+                    }
+                    let modify = ui.menu_button("Modify", |ui| {
+                        self.authoring.ribbon(ui);
+                    });
+                    if modify.response.clicked() {
+                        self.model_tools.cancel();
+                        self.dock_open = true;
+                        self.dock_properties = true;
+                    }
+                    ui.menu_button("Set out", |ui| {
+                        if self.coordination_ribbon(ui) {
+                            self.dock_open = true;
+                            self.dock_properties = true;
+                            ui.close();
+                        }
+                    });
+                    if self.model_tools.active() {
+                        ui.separator();
+                        ui.label(self.model_tools.title());
+                        if ui.button("Finish").clicked()
+                            && let Some(run) = self.model_tools.finish(&self.session.doc)
+                        {
+                            self.run_model_tool(run);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.model_tools.cancel();
+                        }
+                    }
+                }
+                Tab::Families => {
+                    if ui.button("Browse types").clicked() {
+                        self.dock_open = true;
+                        self.dock_properties = false;
+                    }
+                    if ui.button("Edit type").clicked() {
+                        if let Some(selected) = self.selection.and_then(|i| self.scene.elements.get(i)) {
+                            self.authoring.choose_instance_type(&self.session.doc, selected);
+                        }
+                        self.dock_open = true;
+                        self.dock_properties = true;
+                    }
+                    if ui.button("Duplicate type").clicked() {
+                        self.authoring.duplicate_selected_type(&self.session.doc);
+                        self.dock_open = true;
+                        self.dock_properties = true;
+                    }
+                    if ui.button("Place component").clicked() {
+                        let selected = self.selection.and_then(|i| self.scene.elements.get(i));
+                        self.authoring.begin_family_placement(&self.session.doc, selected);
+                        self.dock_open = true;
+                        self.dock_properties = true;
+                    }
+                }
+                Tab::Drawings => {
+                    if self.mode != Mode::Drawing {
+                        ui.label("Choose a saved drawing, or annotate the active floor plan.");
+                        if ui.add_enabled(self.reference_level().is_some(), egui::Button::new("Annotate this plan")).clicked() {
+                            self.ensure_annotation_view();
+                        }
+                    } else {
+                        self.drafting.ribbon(ui, &self.session.doc, &self.drawing);
+                    }
+                }
+                Tab::Schedules => {
+                    ui.label("Select a row to inspect an instance, or open its shared type.");
+                }
+            }
+        });
+    }
+
+    fn ensure_annotation_view(&mut self) {
+        let Some(level) = self.reference_level() else { return };
+        if let Some(view) =
+            self.session.doc.views.iter().find(|v| matches!(v.kind,trigon_model::annotation::DrawingViewKind::Plan {level:l} if l==level))
+        {
+            self.open_drawing(view.id.clone());
+            return;
+        }
+        let id = (0..256).map(|i| format!("plan-L{level}-{i}")).find(|id| !self.session.doc.views.iter().any(|v| v.id == *id));
+        let Some(id) = id else {
+            self.status = Some(("No free plan view ID.".into(), true));
+            return;
+        };
+        let name = format!("Floor plan · {}", self.levels().get(level).map_or("Floor", String::as_str));
+        match self.run(Who::Owner, "view.define", json!({"id":id,"name":name,"kind":{"view":"plan","level":level}})) {
+            Ok(_) => self.open_drawing(id),
+            Err(error) => self.status = Some((error, true)),
+        }
     }
 
     fn ribbon(&mut self, ui: &mut egui::Ui) {
@@ -879,7 +1077,12 @@ impl StudioApp {
                     match self.authoring.tab {
                         Tab::Project => {
                             ui.vertical(|ui| {
-                                ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| self.authoring.ribbon(ui));
+                                if ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| self.authoring.ribbon(ui)).inner {
+                                    self.inspect_elements();
+                                    self.drafting.cancel_placement();
+                                    self.dock_open = true;
+                                    self.dock_properties = true;
+                                }
                                 theme::eyebrow(ui, "MODIFY");
                             });
                             ui.separator();
@@ -950,7 +1153,7 @@ impl StudioApp {
                                 ui.horizontal_wrapped(|ui| {
                                     if icons::button(ui, Icon::Select, "Edit elements", false).clicked() {
                                         self.authoring.tab = Tab::Project;
-                                        self.drafting.picking = None;
+                                        self.drafting.cancel_placement();
                                     }
                                     ui.add_enabled_ui(!self.precision_review.is_pending(), |ui| {
                                         self.drafting.ribbon(ui, &self.session.doc, if self.mode == Mode::Drawing { &self.drawing } else { "" })
@@ -1021,8 +1224,12 @@ impl StudioApp {
             .enumerate()
             {
                 if icons::ribbon_button(ui, icon, label, false).on_hover_text("Open shared project types and placement controls").clicked() {
+                    self.inspect_elements();
+                    self.drafting.cancel_placement();
                     self.authoring.tab = Tab::Families;
                     self.authoring.search = query.into();
+                    self.dock_open = true;
+                    self.dock_properties = false;
                     chosen = true;
                 }
                 if i % 2 == 1 {
@@ -1042,7 +1249,13 @@ impl StudioApp {
                     .enumerate()
             {
                 if icons::ribbon_button(ui, icon, label, false).on_hover_text("Find modelling commands and their parameters").clicked() {
-                    self.palette.show_query(query);
+                    if query == "interior" {
+                        self.begin_model_tool(false);
+                    } else if query == "roof" {
+                        self.begin_model_tool(true);
+                    } else {
+                        self.palette.show_query(query);
+                    }
                     chosen = true;
                 }
                 if i % 2 == 1 {
@@ -1140,7 +1353,7 @@ impl StudioApp {
                 return;
             }
         }
-        self.drafting.picking = None;
+        self.drafting.cancel_placement();
         self.view_changed(false);
     }
 
@@ -1149,7 +1362,7 @@ impl StudioApp {
         let levels = self.levels();
         self.open_views.retain(|tab| match &tab.target {
             ViewTarget::ThreeD(level) => level.is_none_or(|level| level < levels.len()),
-            ViewTarget::Plan(level) => *level < levels.len(),
+            ViewTarget::Plan(level) => *level < levels.len() || (self.session.doc.buildings.is_empty() && *level == 0),
             ViewTarget::Drawing(id) => self.session.doc.views.iter().any(|view| &view.id == id),
         });
         if !self.open_views.iter().any(|tab| Some(&tab.target) == self.active_view.as_ref()) {
@@ -1268,7 +1481,7 @@ impl StudioApp {
             let after = (self.mode, self.level, self.plan_level, self.phase, self.filter, self.drawing.clone(), self.phase_colors);
             if before != after {
                 if before.5 != after.5 {
-                    self.drafting.picking = None;
+                    self.drafting.cancel_placement();
                 }
                 self.view_changed(before.3 != after.3 || before.4 != after.4 || before.6 != after.6);
             }
@@ -1277,6 +1490,9 @@ impl StudioApp {
 
     /// The view settings changed: rebuild what the new view needs.
     pub(crate) fn view_changed(&mut self, phase_changed: bool) {
+        if self.mode != Mode::Plan {
+            self.model_tools.cancel();
+        }
         if self.mode == Mode::Drawing
             && let Some(trigon_model::annotation::DrawingViewKind::Plan { level }) =
                 self.session.doc.views.iter().find(|view| view.id == self.drawing).map(|view| &view.kind)
@@ -1408,12 +1624,20 @@ impl StudioApp {
     }
 
     fn run_form(&mut self, run: crate::authoring::Run) {
+        let family_placement = run.command == "facade.place";
         if self.edit_block_reason().is_some() {
-            self.status = Some(("Wait for the active model view before applying this change.".into(), true));
+            let error = "Wait for the active model view before applying this change.".to_owned();
+            if family_placement {
+                self.authoring.acknowledge_family_placement(Some(error.clone()));
+            }
+            self.status = Some((error, true));
             return;
         }
         match self.run(Who::Owner, run.command, run.params) {
             Ok(value) => {
+                if family_placement {
+                    self.authoring.acknowledge_family_placement(None);
+                }
                 if run.command == "precision.preview" {
                     self.status = Some(("Preview ready · review and apply in Properties".into(), false));
                     return;
@@ -1430,11 +1654,28 @@ impl StudioApp {
                 }
                 self.status = Some((format!("{} completed", run.command), false));
             }
-            Err(error) => self.status = Some((error, true)),
+            Err(error) => {
+                if family_placement {
+                    self.authoring.acknowledge_family_placement(Some(error.clone()));
+                }
+                self.status = Some((error, true));
+            }
         }
     }
 
     fn selection_panel(&mut self, ui: &mut egui::Ui) {
+        if self.model_tools.active() {
+            let first_footprint = self.session.doc.buildings.is_empty() && self.model_tools.feedback()["wall_mode"] == "exterior_footprint";
+            let blocked = self.creation_block_reason(first_footprint);
+            if let Some(reason) = blocked {
+                ui.label(egui::RichText::new(reason).color(theme::ACCENT));
+            }
+            let run = ui.add_enabled_ui(blocked.is_none(), |ui| self.model_tools.properties(ui, &self.session.doc, self.plan_level)).inner;
+            if let Some(run) = run {
+                self.run_model_tool(run);
+            }
+            return;
+        }
         let blocked = self.edit_block_reason();
         if self.precision_review.is_pending() {
             if let Some(run) = self.precision_review.ui(ui, blocked) {
@@ -1494,6 +1735,15 @@ impl StudioApp {
             ui.label(egui::RichText::new(reason).color(theme::ACCENT));
         }
         let controls_first = self.authoring.command_controls_first();
+        if self.authoring.tab == Tab::Project
+            && selected.is_none()
+            && self.pending_selection.is_none()
+            && self.authoring.targets.trim().is_empty()
+            && !controls_first
+        {
+            self.idle_view_properties(ui);
+            return;
+        }
         if controls_first {
             self.authoring_controls(ui, selected.as_ref());
             ui.separator();
@@ -1505,6 +1755,12 @@ impl StudioApp {
             let edit = self.properties.ui(ui, &element.id, blocked);
             if let Some(edit) = edit {
                 self.apply_property_edit(edit);
+            }
+            if ui.button("Edit type…").on_hover_text("Edit the shared family type used by this instance").clicked()
+                && self.authoring.choose_instance_type(&self.session.doc, element)
+            {
+                self.dock_open = true;
+                self.dock_properties = true;
             }
             ui.horizontal(|ui| {
                 if ui.button("Show in 3D").clicked()
@@ -1560,7 +1816,101 @@ impl StudioApp {
         });
     }
 
+    fn idle_view_properties(&mut self, ui: &mut egui::Ui) {
+        theme::eyebrow(ui, "View properties");
+        let levels = self.levels();
+        let name = match self.mode {
+            Mode::ThreeD => "3D / Coordination".to_string(),
+            Mode::Plan => format!("Floor plan · {}", levels.get(self.plan_level).map_or("New outline", String::as_str)),
+            Mode::Drawing => self.session.doc.views.iter().find(|v| v.id == self.drawing).map_or("Drawing".to_string(), |v| v.name.clone()),
+        };
+        ui.strong(name);
+        ui.add_space(8.0);
+        ui.label("Select an element in the canvas or Project Browser to edit its properties.");
+        ui.separator();
+        if let Some(phase) = self.session.doc.phases.get(self.phase) {
+            ui.label(format!("Phase · {}", phase.name));
+        }
+        ui.label(format!("Visibility · {}", filter_name(self.filter)));
+        if self.mode == Mode::ThreeD {
+            ui.label(if self.phase_colors { "Display · Phase colors" } else { "Display · Materials" });
+        }
+        if self.mode == Mode::Drawing && ui.button("Drawing settings…").clicked() {
+            self.show_drawing_properties();
+        }
+        if ui.button("Fit view").clicked() {
+            self.fit();
+        }
+    }
+
+    pub(crate) fn authoring_feedback(&self) -> Value {
+        json!({"model_tool":self.model_tools.feedback(), "annotation":self.drafting.placement_feedback(),
+            "family_placement":self.authoring.family_placement_feedback(&self.session.doc),
+            "canvas_focus":self.focus_canvas,"ribbon_expanded":self.ribbon_expanded,
+            "dock":if !self.dock_open {"closed"} else if self.dock_properties {"properties"} else {"browser"},
+            "empty_workplane":self.viewport_rect.filter(|_|self.session.doc.buildings.is_empty() && self.mode==Mode::Plan).map(|r|json!({"origin_window_points":[r.center().x+self.empty_pan.x,r.center().y+self.empty_pan.y],"mm_per_point":self.empty_mm_per_point,"units":"mm","axes":"x_right_y_up"}))})
+    }
+
+    fn begin_model_tool(&mut self, roof: bool) {
+        self.drafting.cancel_placement();
+        self.inspect_elements();
+        self.mode = Mode::Plan;
+        self.view_changed(false);
+        if roof {
+            self.model_tools.start_roof(&self.session.doc, self.plan_level);
+        } else {
+            self.model_tools.start_wall(&self.session.doc, self.plan_level);
+        }
+        self.dock_open = true;
+        self.dock_properties = true;
+        self.ribbon_expanded = false;
+    }
+
+    fn creation_block_reason(&self, first_footprint: bool) -> Option<&'static str> {
+        if first_footprint {
+            if self.building() {
+                Some("Wait for the current model build before creating a footprint.")
+            } else if self.build_error.is_some() {
+                Some("Resolve the model build error before creating a footprint.")
+            } else if self.precision_review.is_pending() {
+                Some("Apply or cancel the current precision preview first.")
+            } else {
+                None
+            }
+        } else {
+            self.edit_block_reason()
+        }
+    }
+
+    fn run_model_tool(&mut self, run: crate::authoring::Run) {
+        // An explicit first footprint uses the empty construction plane; there is
+        // no existing floor drawing to be ready yet. Model builds and transactions
+        // remain guarded, and Session still validates the complete new building.
+        let first_footprint = self.session.doc.buildings.is_empty() && run.command == "building.add";
+        let reason = self.creation_block_reason(first_footprint);
+        let blocked = reason.map(str::to_string).or_else(|| {
+            (self.phase != self.session.doc.active_index() || self.filter != PhaseFilter::Complete)
+                .then(|| "Use the active phase's complete view to create elements.".to_string())
+        });
+        if let Some(reason) = blocked {
+            self.model_tools.acknowledge(false, Some(reason.clone()));
+            self.status = Some((reason, true));
+            return;
+        }
+        match self.run(Who::Owner, run.command, run.params) {
+            Ok(_) => {
+                self.model_tools.acknowledge(true, None);
+                self.status = Some((format!("{} completed", run.command), false));
+            }
+            Err(error) => {
+                self.model_tools.acknowledge(false, Some(error.clone()));
+                self.status = Some((error, true));
+            }
+        }
+    }
+
     pub(crate) fn inspect_elements(&mut self) {
+        self.model_tools.cancel();
         self.inspector = Inspector::Elements;
         self.entrances.clear();
         self.precision_review.clear();
@@ -1575,7 +1925,7 @@ impl StudioApp {
         self.authoring.tab = Tab::Project;
         self.view_ribbon = false;
         self.inspector = inspector;
-        self.drafting.picking = None;
+        self.drafting.cancel_placement();
         self.selection = None;
         self.pending_selection = None;
         self.authoring.targets.clear();
@@ -1683,6 +2033,9 @@ impl StudioApp {
         if self.authoring.tab == Tab::Families {
             if let Some(run) = self.authoring.library(ui, &self.session.doc) {
                 let _ = self.run(Who::Owner, run.command, run.params);
+            }
+            if ui.button("Type properties…").clicked() {
+                self.dock_properties = true;
             }
             return;
         }
@@ -1926,11 +2279,14 @@ impl StudioApp {
                     self.open_drawing(id.into());
                 }
                 if let Some(a) = value.get("annotation").and_then(|a| serde_json::from_value(a.clone()).ok()) {
-                    self.drafting.select(&a);
+                    self.drafting.annotation_applied(&self.session.doc, &a);
                 }
                 self.status = Some((format!("{} completed", run.command), false));
             }
-            Err(error) => self.status = Some((error, true)),
+            Err(error) => {
+                self.drafting.placement_failed(&error);
+                self.status = Some((error, true));
+            }
         }
     }
 
@@ -1955,7 +2311,6 @@ impl StudioApp {
     }
 
     fn drawing_point(&self, point: [f64; 3]) -> Option<[f64; 2]> {
-        use trigon_model::annotation::DrawingViewKind;
         if self.mode == Mode::Plan {
             return Some([point[0], point[1]]);
         }
@@ -2037,19 +2392,219 @@ impl StudioApp {
         busy
     }
 
+    fn annotation_canvas_editor(&mut self, ctx: &egui::Context, keyboard_owned: bool) {
+        if !self.drafting.placement_active() || self.mode != Mode::Drawing || self.palette.open || self.confirm_close {
+            return;
+        }
+        let Some(rect) = self.viewport_rect else { return };
+        let mut run = None;
+        egui::Area::new(egui::Id::new("annotation-canvas-editor"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.left_top() + egui::vec2(12.0, 12.0))
+            .constrain_to(rect)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width((rect.width() - 32.0).clamp(220.0, 360.0));
+                    run = self.drafting.canvas_editor(ui, &self.session.doc, &self.drawing, keyboard_owned);
+                });
+            });
+        if let Some(run) = run {
+            self.run_drafting(run);
+        }
+    }
+
+    fn empty_model_canvas(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        self.viewport_rect = Some(rect);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, theme::PAPER);
+        if response.dragged_by(egui::PointerButton::Middle) {
+            self.empty_pan += response.drag_delta();
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                self.empty_mm_per_point = (self.empty_mm_per_point * (-f64::from(scroll) * 0.002).exp()).clamp(0.1, 2000.0);
+            }
+        }
+        let origin = rect.center() + self.empty_pan;
+        let mut step = 1000.0 / self.empty_mm_per_point as f32;
+        while step < 30.0 {
+            step *= 10.0;
+        }
+        while step > 300.0 {
+            step /= 10.0;
+        }
+        let stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(220));
+        let mut x = rect.left() + (origin.x - rect.left()).rem_euclid(step);
+        for _ in 0..100 {
+            if x > rect.right() {
+                break;
+            }
+            painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
+            x += step;
+        }
+        let mut y = rect.top() + (origin.y - rect.top()).rem_euclid(step);
+        for _ in 0..100 {
+            if y > rect.bottom() {
+                break;
+            }
+            painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
+            y += step;
+        }
+        painter.line_segment([origin - egui::vec2(12.0, 0.0), origin + egui::vec2(12.0, 0.0)], egui::Stroke::new(1.0, theme::ACCENT));
+        painter.line_segment([origin - egui::vec2(0.0, 12.0), origin + egui::vec2(0.0, 12.0)], egui::Stroke::new(1.0, theme::ACCENT));
+        if self.model_tools.active() {
+            self.model_canvas_gesture(ui, &response, rect, true);
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Choose Wall to draw a building outline",
+                egui::FontId::proportional(16.0),
+                theme::DRAWING_INK,
+            );
+        }
+    }
+
+    fn model_canvas_gesture(&mut self, ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, empty: bool) {
+        let painter = ui.painter_at(rect);
+        let bypass = ui.input(|input| input.modifiers.alt);
+        let raw_point = response.hover_pos().and_then(|at| {
+            if empty {
+                let origin = rect.center() + self.empty_pan;
+                let raw = [f64::from(at.x - origin.x) * self.empty_mm_per_point, -f64::from(at.y - origin.y) * self.empty_mm_per_point];
+                let grid = (!bypass).then(|| self.model_tools.snap_options().grid_mm).flatten();
+                Some(grid.filter(|g| g.is_finite() && *g > 0.0).map_or(raw, |g| [(raw[0] / g).round() * g, (raw[1] / g).round() * g]))
+            } else {
+                self.plan.aligned_cursor(rect, at, (!bypass).then(|| self.model_tools.snap_options()), None).map(|(point, _)| point)
+            }
+        });
+        let point = raw_point.map(|p| self.model_tools.constrained(p));
+        let screen = |p: [f64; 2]| -> Option<egui::Pos2> {
+            if empty {
+                Some(rect.center() + self.empty_pan + egui::vec2((p[0] / self.empty_mm_per_point) as f32, (-p[1] / self.empty_mm_per_point) as f32))
+            } else {
+                self.plan.model_to_screen(rect, p)
+            }
+        };
+        for [a, b] in self.model_tools.preview(point) {
+            if let (Some(a), Some(b)) = (screen(a), screen(b)) {
+                painter.line_segment([a, b], egui::Stroke::new(1.5, theme::ACCENT));
+            }
+        }
+        if let Some(point) = point {
+            response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
+            if let Some(at) = screen(point) {
+                painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, theme::ACCENT));
+                let length = self.model_tools.anchor().map(|a| (point[0] - a[0]).hypot(point[1] - a[1]));
+                let label = length.map_or_else(|| format!("{:.0}, {:.0} mm", point[0], point[1]), |l| format!("{l:.1} mm"));
+                painter.text(at + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(12.0), theme::DRAWING_INK);
+            }
+            if response.clicked()
+                && let Some(raw_point) = raw_point
+                && let Some(run) = self.model_tools.point(&self.session.doc, raw_point)
+            {
+                self.run_model_tool(run);
+            }
+        }
+        if response.secondary_clicked() {
+            self.model_tools.end_chain();
+        }
+        let message = self.model_tools.error().unwrap_or_else(|| self.model_tools.status());
+        painter.text(
+            rect.left_bottom() + egui::vec2(12.0, -14.0),
+            egui::Align2::LEFT_BOTTOM,
+            message,
+            egui::FontId::proportional(12.0),
+            theme::DRAWING_INK,
+        );
+    }
+
+    fn family_site_point(&self, host: &crate::scene::Element, point: [f64; 2]) -> Option<[f64; 2]> {
+        if point.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        if self.mode == Mode::Plan {
+            return Some(point);
+        }
+        let view = self.session.doc.views.iter().find(|view| view.id == self.drawing)?;
+        match &view.kind {
+            DrawingViewKind::Plan { .. } => Some(point),
+            DrawingViewKind::Facade { facade } => {
+                let host_facade = if host.host && host.kind == "wall" {
+                    Some(host.id.as_str())
+                } else {
+                    host.props.iter().find(|(key, _)| *key == "facade").map(|(_, value)| value.as_str())
+                }?;
+                if host_facade != facade {
+                    return None;
+                }
+                let mut matches = self
+                    .session
+                    .doc
+                    .buildings
+                    .iter()
+                    .flat_map(|building| building.facades.iter().filter(|f| &f.id == facade).map(move |f| (building, f)));
+                let (building, source) = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
+                let (a, b) = building.edge(source.edge)?;
+                let frame = trigon_model::FacadeFrame::new(a, b)?;
+                Some([a[0] + frame.t[0] * point[0], a[1] + frame.t[1] * point[0]])
+            }
+            // A section projects surfaces at different depths onto one plane. That
+            // projection cannot identify the picked facade's source point uniquely.
+            DrawingViewKind::Section { .. } => None,
+        }
+    }
+
     fn viewport_drawing(&mut self, ui: &mut egui::Ui) {
+        if self.session.doc.buildings.is_empty() {
+            self.empty_model_canvas(ui);
+            return;
+        }
         if self.plan_wanted == 0 {
             self.request_plan();
         }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.drafting.picking = None;
-        }
-        let picking = self.mode == Mode::Drawing && self.authoring.tab == Tab::Drawings && self.drafting.picking.is_some();
+        let picking =
+            self.model_tools.picking() || (self.mode == Mode::Drawing && self.authoring.tab == Tab::Drawings && self.drafting.picking.is_some());
         let handle_capture = self.viewport_rect.is_some_and(|rect| self.handle_hover(ui, rect));
         let response = self.plan.ui(ui, picking || handle_capture);
         let rect = response.rect;
         self.viewport_rect = Some(rect);
         if self.drawing_plan() || self.plan.error.is_some() || !self.plan.ready(rect, self.ppp) {
+            return;
+        }
+        if self.model_tools.active() {
+            self.model_canvas_gesture(ui, &response, rect, false);
+            return;
+        }
+        if self.authoring.family_placement_active() {
+            response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
+            if response.clicked()
+                && let Some(at) = response.interact_pointer_pos()
+            {
+                let host = self
+                    .plan
+                    .pick_element(rect, at)
+                    .and_then(|hit| self.scene.find_unique(&hit.id))
+                    .and_then(|i| self.scene.elements.get(i))
+                    .cloned();
+                let point = host.as_ref().and_then(|host| self.plan.screen_to_model(rect, at).and_then(|point| self.family_site_point(host, point)));
+                if let Some(host) = host
+                    && let Some(point) = point
+                    && self.authoring.pick_family_host(&self.session.doc, &host, Some(point))
+                {
+                    self.dock_open = true;
+                    self.dock_properties = true;
+                    self.status = Some(("Host picked · review dimensions, then Place type".into(), false));
+                } else {
+                    self.status = Some(("Pick an unambiguous bay in a floor plan or an elevation of that facade.".into(), true));
+                }
+            }
             return;
         }
         let handles_busy = self.model_handles_ui(ui, rect);
@@ -2090,69 +2645,67 @@ impl StudioApp {
         }
         if self.mode == Mode::Drawing && self.authoring.tab == Tab::Drawings {
             let painter = ui.painter_at(rect);
+            let snap = (!ui.input(|i| i.modifiers.alt)).then(|| self.drafting.options());
+            let settings = self.drafting.alignment_options(&self.session.doc, &self.drawing);
+            let alignment = (picking && self.drafting.alignment).then_some(&settings);
+            let cursor = response.hover_pos().and_then(|at| self.plan.aligned_cursor(rect, at, snap, alignment));
             if picking || self.drafting.selected.is_some() {
-                for p in self.drafting.points() {
+                let point = cursor.as_ref().map(|(point, _)| *point);
+                let preview = self.drafting.preview_points(point);
+                for p in &preview {
                     if let Some(at) = self.plan.model_to_screen(rect, *p) {
                         painter.circle_stroke(at, 4.0, egui::Stroke::new(1.5, theme::ACCENT));
                     }
                 }
-                if self.drafting.is_region() {
-                    let points: Vec<_> = self.drafting.points().iter().filter_map(|point| self.plan.model_to_screen(rect, *point)).collect();
-                    for pair in points.windows(2) {
-                        painter.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, theme::ACCENT));
-                    }
-                    if !picking && let (Some(first), Some(last)) = (points.first(), points.last()) {
-                        painter.line_segment([*last, *first], egui::Stroke::new(1.5, theme::ACCENT));
+                for [a, b] in self.drafting.preview_segments(point) {
+                    if let (Some(a), Some(b)) = (self.plan.model_to_screen(rect, a), self.plan.model_to_screen(rect, b)) {
+                        painter.line_segment([a, b], egui::Stroke::new(1.5, theme::ACCENT));
                     }
                 }
             }
-            if let Some(p) = response.hover_pos() {
-                let snap = (!ui.input(|i| i.modifiers.alt)).then(|| self.drafting.options());
-                let settings = self.drafting.alignment_options(&self.session.doc, &self.drawing);
-                let alignment = (picking && self.drafting.alignment).then_some(&settings);
-                if let Some((point, aligned)) = self.plan.aligned_cursor(rect, p, snap, alignment) {
-                    let snapped = aligned.as_ref().map(|a| a.snap);
-                    if picking && let Some(aligned) = &aligned {
-                        for guide in &aligned.guides {
-                            if let (Some(a), Some(b)) = (self.plan.model_to_screen(rect, guide[0]), self.plan.model_to_screen(rect, guide[1])) {
-                                painter.line_segment([a, b], egui::Stroke::new(0.8, theme::ACCENT.gamma_multiply(0.6)));
-                            }
+            if let Some((point, aligned)) = cursor {
+                let snapped = aligned.as_ref().map(|a| a.snap);
+                if picking && let Some(aligned) = &aligned {
+                    for guide in &aligned.guides {
+                        if let (Some(a), Some(b)) = (self.plan.model_to_screen(rect, guide[0]), self.plan.model_to_screen(rect, guide[1])) {
+                            painter.line_segment([a, b], egui::Stroke::new(0.8, theme::ACCENT.gamma_multiply(0.6)));
                         }
                     }
-                    if picking {
-                        response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
-                        if let Some(at) = self.plan.model_to_screen(rect, point) {
-                            painter.rect_stroke(
-                                egui::Rect::from_center_size(at, egui::vec2(10.0, 10.0)),
-                                0.0,
-                                egui::Stroke::new(1.5, theme::ACCENT),
-                                egui::StrokeKind::Middle,
-                            );
-                            if let Some(s) = snapped {
-                                painter.text(
-                                    at + egui::vec2(10.0, -12.0),
-                                    egui::Align2::LEFT_BOTTOM,
-                                    s.kind.name(),
-                                    egui::FontId::proportional(12.0),
-                                    theme::ACCENT,
-                                );
-                            }
-                        }
-                        if let Some(i) = self.drafting.picking.filter(|i| *i > 0)
-                            && let Some(from) = self.drafting.points().get(i - 1).and_then(|q| self.plan.model_to_screen(rect, *q))
-                            && let Some(to) = self.plan.model_to_screen(rect, point)
-                        {
-                            painter.line_segment([from, to], egui::Stroke::new(1.0, theme::ACCENT));
-                        }
-                        if response.clicked() {
-                            self.drafting.picked(point);
-                        }
-                    }
-                    let text =
-                        format!("x {:.3}  ·  y {:.3} mm{}", point[0], point[1], snapped.map_or(String::new(), |s| format!("  ·  {}", s.kind.name())));
-                    let at = rect.left_bottom() + egui::vec2(12.0, -12.0);
-                    painter.text(at, egui::Align2::LEFT_BOTTOM, text, egui::FontId::monospace(12.0), theme::DRAWING_INK);
                 }
+                if picking {
+                    response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
+                    if let Some(at) = self.plan.model_to_screen(rect, point) {
+                        painter.rect_stroke(
+                            egui::Rect::from_center_size(at, egui::vec2(10.0, 10.0)),
+                            0.0,
+                            egui::Stroke::new(1.5, theme::ACCENT),
+                            egui::StrokeKind::Middle,
+                        );
+                        if let Some(s) = snapped {
+                            painter.text(
+                                at + egui::vec2(10.0, -12.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                s.kind.name(),
+                                egui::FontId::proportional(12.0),
+                                theme::ACCENT,
+                            );
+                        }
+                    }
+                    if response.clicked() {
+                        self.drafting.picked(point);
+                        let state = self.drafting.placement_feedback();
+                        if self.drafting.placement_ready()
+                            && matches!(state["kind"].as_str(), Some("dimension" | "line"))
+                            && let Some(run) = self.drafting.finish_placement(&self.session.doc, &self.drawing)
+                        {
+                            self.run_drafting(run);
+                        }
+                    }
+                }
+                let text =
+                    format!("x {:.3}  ·  y {:.3} mm{}", point[0], point[1], snapped.map_or(String::new(), |s| format!("  ·  {}", s.kind.name())));
+                let at = rect.left_bottom() + egui::vec2(12.0, -12.0);
+                painter.text(at, egui::Align2::LEFT_BOTTOM, text, egui::FontId::monospace(12.0), theme::DRAWING_INK);
             }
         }
     }
@@ -2198,7 +2751,22 @@ impl StudioApp {
             let (o, dir) = self.camera.ray(ndc, aspect);
             self.inspect_elements();
             self.pending_selection = None;
-            self.selection = self.scene.pick(o, dir, self.clip_z());
+            let placing = self.authoring.family_placement_active();
+            let hit = placing.then(|| self.scene.pick_hit(o, dir, self.clip_z())).flatten();
+            self.selection = if placing { hit.map(|(index, _)| index) } else { self.scene.pick(o, dir, self.clip_z()) };
+            if placing {
+                if let Some((index, point)) = hit
+                    && let Some(selected) = self.scene.elements.get(index)
+                    && self.authoring.pick_family_host(&self.session.doc, selected, Some([point[0], point[1]]))
+                {
+                    self.dock_open = true;
+                    self.dock_properties = true;
+                    self.status = Some(("Host picked · review dimensions, then Place type".into(), false));
+                } else {
+                    self.status =
+                        Some(("No unique facade bay at that hit. Pick a facade wall or opening, or choose a host in Properties.".into(), true));
+                }
+            }
             self.selection_dirty = true;
             self.redraw = true;
         }
@@ -2316,50 +2884,78 @@ impl StudioApp {
 impl StudioApp {
     fn workspace_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let annotation_keyboard_owned = self.drafting.keyboard_owned(&ctx) && !egui::Popup::is_any_open(&ctx);
         self.ppp = ctx.pixels_per_point();
         self.collect_window_shots(&ctx);
         self.shortcuts(&ctx);
         self.update_title(&ctx);
+        let selected_id = self.selection.and_then(|i| self.scene.elements.get(i)).map(|e| e.id.clone());
+        if selected_id != self.last_property_id {
+            if selected_id.is_some() {
+                self.dock_open = true;
+                self.dock_properties = true;
+            }
+            self.last_property_id = selected_id;
+        }
         egui::Panel::top("studio-title")
-            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(16, 8)))
+            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(12, 4)))
             .show(ui, |ui| self.app_bar(ui));
         egui::Panel::top("workspace-tabs")
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 0)))
             .show(ui, |ui| self.workspace_tabs(ui));
-        egui::Panel::top("ribbon")
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
-            .show(ui, |ui| self.ribbon(ui));
-        egui::Panel::top("command-strip")
-            .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(12, 3)))
-            .show(ui, |ui| self.command_strip(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        let window_width = ctx.content_rect().width();
-        let activity_floating = self.show_activity && window_width < 1200.0;
-        let dock_max_width = (window_width * 0.30).clamp(250.0, 380.0);
-        egui::Panel::left("project-dock")
-            .resizable(true)
-            .default_size(300.0)
-            .size_range(250.0..=dock_max_width)
-            .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(12))
-            .show(ui, |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.spacing_mut().text_edit_width = ui.available_width();
-                let properties_min = (ui.available_height() * 0.44).clamp(112.0, 260.0);
-                let properties_max = (ui.available_height() - 130.0).max(properties_min);
-                egui::Panel::top("properties-pane").resizable(true).default_size(322.0).size_range(properties_min..=properties_max).show(ui, |ui| {
-                    egui::ScrollArea::vertical().id_salt("properties-scroll").auto_shrink([false, false]).show(ui, |ui| self.selection_panel(ui));
-                });
-                ui.add_space(8.0);
-                let browser =
-                    egui::ScrollArea::vertical().id_salt("project-scroll").auto_shrink([false, false]).show(ui, |ui| self.project_browser(ui));
-                self.browser_rect = Some(browser.inner_rect);
-            });
-        if self.show_activity && !activity_floating {
-            egui::Panel::right("activity").resizable(true).default_size(280.0).size_range(220.0..=(window_width * 0.22).min(320.0)).show(ui, |ui| {
-                if let Some(action) = self.feed.ui(ui, true, true) {
-                    self.undo_redo(action);
+        if !self.focus_canvas {
+            egui::Panel::top("ribbon").frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| {
+                if self.ribbon_expanded {
+                    self.ribbon(ui);
+                } else {
+                    self.compact_ribbon(ui);
                 }
             });
+            if self.show_command_strip {
+                egui::Panel::top("command-strip")
+                    .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(10, 2)))
+                    .show(ui, |ui| self.command_strip(ui));
+            }
+        }
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        self.model_tools.sync_context(&self.session.doc, self.plan_level);
+        self.drafting.sync_context(&self.session.doc);
+        self.authoring.sync_placement_scope(&self.session.doc);
+        self.browser_rect = None;
+        self.dock_rect = None;
+        if self.dock_open && !self.focus_canvas {
+            let width = (ctx.content_rect().width() * 0.22).clamp(240.0, 320.0);
+            let dock = egui::Panel::left("project-dock")
+                .resizable(true)
+                .default_size(260.0)
+                .size_range(240.0..=width)
+                .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(10))
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.spacing_mut().text_edit_width = ui.available_width();
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.dock_properties, false, "Browser");
+                        ui.selectable_value(&mut self.dock_properties, true, "Properties");
+                        if ui.small_button("×").on_hover_text("Close panel").clicked() {
+                            self.dock_open = false;
+                        }
+                    });
+                    ui.separator();
+                    let body = egui::ScrollArea::vertical()
+                        .id_salt(if self.dock_properties { "properties-scroll" } else { "project-scroll" })
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.dock_properties {
+                                self.selection_panel(ui);
+                            } else {
+                                self.project_browser(ui);
+                            }
+                        });
+                    if !self.dock_properties {
+                        self.browser_rect = Some(body.inner_rect);
+                    }
+                });
+            self.dock_rect = Some(dock.response.rect);
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.authoring.tab == Tab::Schedules {
@@ -2371,18 +2967,23 @@ impl StudioApp {
             }
             egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(10, 3)).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                self.view_tabs(ui);
-            });
-            egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 3)).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                self.view_controls(ui);
+                let tabs_width = (ui.available_width() - 210.0).max(100.0);
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(tabs_width, 28.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.view_tabs(ui)
+                    });
+                    ui.menu_button("View settings", |ui| self.view_controls(ui));
+                    if ui.button("Fit").clicked() {
+                        self.fit();
+                    }
+                });
             });
             match self.mode {
                 Mode::ThreeD => self.viewport_3d(ui),
                 Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
             }
         });
-        if activity_floating {
+        if self.show_activity && !self.focus_canvas {
             let mut open = self.show_activity;
             let mut action = None;
             egui::Window::new("Activity")
@@ -2396,6 +2997,7 @@ impl StudioApp {
                 self.undo_redo(action);
             }
         }
+        self.annotation_canvas_editor(&ctx, annotation_keyboard_owned);
         if let Some(run) = self.palette.ui(&ctx) {
             let r = self.run(Who::Owner, run.command, run.params);
             self.palette.set_outcome(r.map(|v| crate::activity::pretty(&v)));
@@ -2472,6 +3074,275 @@ mod tests {
     fn window(app: &StudioApp) -> usize {
         let row = app.schedules.data().unwrap().rows.iter().find(|r| r.kind == trigon_engine::ScheduleOpeningKind::Window).unwrap();
         schedules::resolve_row(&app.scene, row).unwrap()
+    }
+
+    #[test]
+    fn repeated_escape_releases_model_tools_and_roof_cancels_immediately() {
+        let mut app = app(false);
+        app.begin_model_tool(false);
+        app.model_tools.point(&app.session.doc, [1000.0, 1000.0]);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+                |_| app.shortcuts(&ctx),
+            );
+            output.textures_delta.clear();
+        }
+        let wall_exited = !app.model_tools.active();
+        app.begin_model_tool(true);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            },
+            |_| app.shortcuts(&ctx),
+        );
+        output.textures_delta.clear();
+        let roof_exited = !app.model_tools.active();
+        ctx.data_mut(|data| data.clear());
+        assert!(wall_exited && roof_exited, "Escape must return control to selection: wall={wall_exited}, roof={roof_exited}");
+    }
+
+    #[test]
+    fn shift_command_redo_is_not_consumed_as_plain_undo() {
+        for mac in [true, false] {
+            let mut app = app(false);
+            app.run(Who::Owner, "view.define", json!({"id":"redo-key","name":"Redo key","kind":{"view":"plan","level":0}})).unwrap();
+            let expected = app.session.doc.clone();
+            app.undo_redo(Action::Undo);
+            let ctx = egui::Context::default();
+            ctx.set_os(if mac { egui::os::OperatingSystem::Mac } else { egui::os::OperatingSystem::Windows });
+            let modifiers = egui::Modifiers { command: true, mac_cmd: mac, ctrl: !mac, shift: true, ..Default::default() };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers }],
+                    ..Default::default()
+                },
+                |_| app.shortcuts(&ctx),
+            );
+            output.textures_delta.clear();
+            ctx.data_mut(|data| data.clear());
+            assert_eq!(app.session.doc, expected, "Shift+command+Z must Redo on mac={mac}, status={:?}", app.status);
+        }
+    }
+
+    #[test]
+    fn palette_enter_cannot_submit_a_ready_canvas_annotation() {
+        let mut app = app(false);
+        app.session.execute("view.define", json!({"id":"annotation-input","name":"Input ownership","kind":{"view":"plan","level":0}})).unwrap();
+        app.open_drawing("annotation-input".into());
+        app.drafting.start_placement(&app.session.doc, "annotation-input", 0);
+        app.drafting.picked([1000.0, 1000.0]);
+        app.palette.show();
+        let before = app.session.doc.clone();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for pressed in [false, true] {
+            let events = if pressed {
+                vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]
+            } else {
+                vec![]
+            };
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+        }
+        ctx.data_mut(|data| data.clear());
+        assert_eq!(app.session.doc, before, "Enter in Commands must not place the retained canvas note");
+        assert!(app.drafting.placement_active());
+        assert_eq!(app.drafting.placement_feedback()["pending"], false);
+    }
+
+    #[test]
+    fn modal_escape_does_not_discard_an_unfinished_canvas_annotation() {
+        for close_dialog in [false, true] {
+            let mut app = app(false);
+            app.session.execute("view.define", json!({"id":"escape-input","name":"Escape ownership","kind":{"view":"plan","level":0}})).unwrap();
+            app.open_drawing("escape-input".into());
+            app.drafting.start_placement(&app.session.doc, "escape-input", 4);
+            app.drafting.picked([1000.0, 1000.0]);
+            app.drafting.picked([3000.0, 1000.0]);
+            if close_dialog {
+                app.confirm_close = true;
+            } else {
+                app.palette.show();
+            }
+            let before = app.drafting.placement_feedback();
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+            ctx.data_mut(|data| data.clear());
+            assert_eq!(app.drafting.placement_feedback()["picked_points"], before["picked_points"], "the modal owned Escape");
+            assert!(app.drafting.placement_active());
+        }
+    }
+
+    #[test]
+    fn popup_keyboard_input_cannot_finish_or_cancel_a_canvas_draft() {
+        for key in [egui::Key::Escape, egui::Key::Enter] {
+            let mut app = app(false);
+            app.session.execute("view.define", json!({"id":"popup-input","name":"Popup ownership","kind":{"view":"plan","level":0}})).unwrap();
+            app.open_drawing("popup-input".into());
+            app.drafting.start_placement(&app.session.doc, "popup-input", 4);
+            for point in [[1000.0, 1000.0], [3000.0, 1000.0], [3000.0, 3000.0]] {
+                app.drafting.picked(point);
+            }
+            let before = app.drafting.placement_feedback();
+            let document = app.session.doc.clone();
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            egui::Popup::open_id(&ctx, egui::Id::new("family-or-font-selector"));
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    events: vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }],
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+            ctx.data_mut(|data| data.clear());
+            assert_eq!(app.drafting.placement_feedback()["picked_points"], before["picked_points"], "the popup owns {key:?}");
+            assert!(app.drafting.placement_active(), "the popup owns {key:?}");
+            assert_eq!(app.session.doc, document, "popup input cannot commit the canvas draft");
+        }
+    }
+
+    #[test]
+    fn elevation_host_picks_convert_u_to_the_correct_translated_facade_bay() {
+        let mut app = app(false);
+        let building = &mut app.session.doc.buildings[0];
+        building.footprint = vec![[10000.0, 20000.0], [18000.0, 20000.0], [18000.0, 28000.0], [10000.0, 28000.0]];
+        let facade = building.facades.iter_mut().find(|facade| facade.edge == 1).unwrap();
+        facade.bays = vec![2000.0, 4000.0, 6000.0];
+        let facade_id = facade.id.clone();
+        let mut host = app.scene.elements.iter().find(|element| element.kind == "wall").unwrap().clone();
+        host.id = facade_id.clone();
+        host.level = Some(0);
+        app.session
+            .doc
+            .views
+            .push(serde_json::from_value(json!({"id":"elevation-pick","name":"Elevation","kind":{"view":"facade","facade":facade_id}})).unwrap());
+        app.mode = Mode::Drawing;
+        app.drawing = "elevation-pick".into();
+        app.authoring.begin_family_placement(&app.session.doc, None);
+        let point = app.family_site_point(&host, [6000.0, 2500.0]).unwrap();
+        assert_eq!(point, [18000.0, 26000.0]);
+        assert!(app.authoring.pick_family_host(&app.session.doc, &host, Some(point)));
+        let document = app.session.doc.clone();
+        app.session.doc.views[0].kind = DrawingViewKind::Section { from: [10000.0, 20000.0], to: [18000.0, 20000.0], flip: false, depth_mm: 30000.0 };
+        assert!(app.family_site_point(&host, [6000.0, 2500.0]).is_none(), "ambiguous projected section depths must be refused");
+        app.session.doc = document;
+    }
+
+    #[test]
+    fn rejected_family_command_keeps_the_engine_error_in_authoring_feedback() {
+        let mut app = app(false);
+        app.authoring.begin_family_placement(&app.session.doc, None);
+        let facade = app.session.doc.buildings[0].facades.iter().find(|facade| !facade.bays.is_empty()).unwrap().id.clone();
+        let ty = app.session.doc.types.iter().find(|ty| ty.kind.is_opening()).unwrap().id.clone();
+        let before = app.session.doc.clone();
+        app.run_form(crate::authoring::Run {
+            command: "facade.place",
+            params: json!({"facade":facade,"type":ty,"levels":[0],"bays":[0],"width":800,"height":4000,"sill":500}),
+        });
+        let (error, failed) = app.status.as_ref().unwrap();
+        assert!(*failed, "the opening cannot fit this storey");
+        assert_eq!(app.session.doc, before, "rejected family placement is atomic");
+        assert_eq!(app.authoring_feedback()["family_placement"]["command_error"], error.as_str());
+        app.run_form(crate::authoring::Run {
+            command: "facade.place",
+            params: json!({"facade":facade,"type":ty,"levels":[0],"bays":[0],"width":800,"height":800,"sill":500}),
+        });
+        assert!(!app.status.as_ref().unwrap().1, "the corrected opening must be accepted");
+        assert!(app.authoring_feedback()["family_placement"]["command_error"].is_null(), "success clears the retained rejection");
+        app.session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.doc, before, "retry remains undoable through the shared command");
+    }
+
+    #[test]
+    fn expanded_modify_and_component_actions_release_the_wall_sketch() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let document = app.session.doc.clone();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut draw = |app: &mut StudioApp, events| {
+            time += 0.05;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 200.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.ribbon(ui);
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        for label in ["Move", "Copy", "All types"] {
+            app.begin_model_tool(false);
+            app.model_tools.point(&app.session.doc, [1000.0, 1000.0]);
+            let shapes = draw(&mut app, vec![]);
+            let pos = shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos + text.galley.size() * 0.5),
+                    _ => None,
+                })
+                .unwrap();
+            for event in [
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(&mut app, vec![event]);
+            }
+            assert!(!app.model_tools.active(), "{label} must take control from the sketch");
+            app.authoring.tab = Tab::Project;
+        }
+        ctx.data_mut(|data| data.clear());
+        assert_eq!(app.session.doc, document);
     }
 
     /// Exercise the actual control screenshot queue using a synthetic loopback request.
@@ -2753,9 +3624,11 @@ mod tests {
     }
 
     #[test]
-    fn properties_recover_from_a_collapsed_split_and_window_resize() {
+    fn properties_dock_recovers_from_legacy_splits_and_window_resize() {
         let mut app = app(false);
         app.authoring.tab = Tab::Project;
+        app.dock_open = true;
+        app.dock_properties = true;
         let document = app.session.doc.clone();
         let ctx = egui::Context::default();
         ctx.set_os(egui::os::OperatingSystem::Mac);
@@ -2777,14 +3650,16 @@ mod tests {
                     );
                     output.textures_delta.clear();
                 }
-                let properties = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("properties-pane")).unwrap().outer_rect;
+                let properties = app.dock_rect.unwrap();
                 let minimum = if size.y >= 800.0 { 240.0 } else { 100.0 };
                 if properties.height() < minimum {
                     failures.push(format!("Properties collapsed at {size:?}: {properties:?}"));
                 }
-                let browser = app.browser_rect.unwrap();
-                if browser.height() < 100.0 || properties.bottom() > browser.top() {
-                    failures.push(format!("dock regions overlap or collapse: {properties:?}, {browser:?}"));
+                if properties.bottom() > size.y || properties.right() > size.x * 0.5 {
+                    failures.push(format!("properties dock leaves its bounds: {properties:?}"));
+                }
+                if app.browser_rect.is_some() {
+                    failures.push("closed Browser reported a visible hit region".to_string());
                 }
             }
         }
@@ -2894,6 +3769,7 @@ mod tests {
     fn compact_ribbon_menus_open_the_same_editors_without_editing_the_model() {
         let mut app = app(false);
         app.authoring.tab = Tab::Project;
+        app.ribbon_expanded = true;
         let document = app.session.doc.clone();
         let ctx = egui::Context::default();
         ctx.set_os(egui::os::OperatingSystem::Mac);
@@ -2944,7 +3820,64 @@ mod tests {
     }
 
     #[test]
-    fn stacked_workspace_keeps_a_usable_canvas_at_minimum_and_reference_sizes() {
+    fn idle_properties_follow_the_view_and_selection_restores_element_editing() {
+        let mut app = app(false);
+        app.authoring.tab = Tab::Project;
+        let document = app.session.doc.clone();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let draw = |app: &mut StudioApp| {
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 800.0))), ..Default::default() },
+                |ui| app.selection_panel(ui),
+            );
+            let texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| if let egui::Shape::Text(text) = &shape.shape { Some(text.galley.text().to_string()) } else { None })
+                .collect::<Vec<_>>();
+            output.textures_delta.clear();
+            texts
+        };
+        let idle = draw(&mut app);
+        app.mode = Mode::Plan;
+        let plan = draw(&mut app);
+        app.selection = Some(window(&app));
+        let element = draw(&mut app);
+        app.selection = None;
+        app.authoring.choose_wall_alignment();
+        let alignment = draw(&mut app);
+        ctx.data_mut(|data| data.clear());
+        assert!(idle.iter().any(|t| t == "View properties"), "idle Properties must describe the view");
+        assert!(!idle.iter().any(|t| t == "X offset"), "disabled Move fields should not dominate an empty selection");
+        assert!(plan.iter().any(|t| t.starts_with("Floor plan")), "switching views must update the context");
+        assert!(element.iter().any(|t| t == "MODEL PARAMETERS"), "selected elements retain direct editable properties");
+        assert!(!alignment.iter().any(|t| t == "View properties"), "an explicitly chosen precision tool retains its form");
+        assert_eq!(app.session.doc, document);
+    }
+
+    #[test]
+    fn command_search_hint_matches_the_desktop_platform() {
+        let mut app = app(false);
+        let mut found = Vec::new();
+        for (os, expected) in [(egui::os::OperatingSystem::Mac, "⌘ K"), (egui::os::OperatingSystem::Windows, "Ctrl+K")] {
+            let ctx = egui::Context::default();
+            ctx.set_os(os);
+            theme::apply(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 80.0))), ..Default::default() },
+                |ui| app.app_bar(ui),
+            );
+            let matches = output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == expected));
+            output.textures_delta.clear();
+            ctx.data_mut(|data| data.clear());
+            found.push((os, matches));
+        }
+        assert!(found.iter().all(|(_, found)| *found), "wrong platform shortcut hints: {found:?}");
+    }
+
+    #[test]
+    fn canvas_dominates_and_optional_panels_stay_inside_the_window() {
         for os in [egui::os::OperatingSystem::Mac, egui::os::OperatingSystem::Windows, egui::os::OperatingSystem::Nix] {
             let mut app = app(false);
             app.authoring.tab = Tab::Project;
@@ -2952,21 +3885,94 @@ mod tests {
             let ctx = egui::Context::default();
             ctx.set_os(os);
             theme::apply(&ctx);
-            for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1600.0, 1076.0), egui::vec2(820.0, 520.0)] {
-                let mut output = ctx
-                    .run_ui(egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() }, |ui| {
-                        app.workspace_ui(ui)
-                    });
-                output.textures_delta.clear();
-                let canvas = app.viewport_rect.unwrap();
-                assert!(app.browser_rect.unwrap().height() >= 100.0, "project browser must remain usable at {size:?}: {:?}", app.browser_rect);
-                assert!(app.browser_rect.unwrap().bottom() <= size.y, "browser must remain inside the resized window");
-                assert!(canvas.width() >= 450.0 && canvas.height() >= 100.0, "unusable canvas at {size:?}: {canvas:?}");
-                assert!(canvas.right() <= size.x + 1.0 && canvas.bottom() <= size.y + 1.0, "canvas leaves {os:?} window {size:?}: {canvas:?}");
-                assert_eq!(app.session.doc, document);
+            let mut failures = Vec::new();
+            for size in [egui::vec2(1440.0, 900.0), egui::vec2(820.0, 520.0), egui::vec2(1600.0, 1076.0)] {
+                for (dock, properties, focus) in [(false, false, false), (true, false, false), (true, true, false), (true, true, true)] {
+                    app.dock_open = dock;
+                    app.dock_properties = properties;
+                    app.focus_canvas = focus;
+                    let mut output = ctx.run_ui(
+                        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() },
+                        |ui| app.workspace_ui(ui),
+                    );
+                    output.textures_delta.clear();
+                    let canvas = app.viewport_rect.unwrap();
+                    if canvas.width() < 450.0 || canvas.height() < 100.0 || canvas.right() > size.x + 1.0 || canvas.bottom() > size.y + 1.0 {
+                        failures.push(format!("unusable {os:?} canvas at {size:?}: {canvas:?}"));
+                    }
+                    if !dock || focus {
+                        let area = canvas.area() / (size.x * size.y);
+                        let minimum = if size.y >= 800.0 { 0.73 } else { 0.60 };
+                        if area < minimum {
+                            failures.push(format!("chrome dominates at {size:?}: canvas area {area:.3}"));
+                        }
+                        if app.dock_rect.is_some() || app.browser_rect.is_some() {
+                            failures.push("hidden panel retained a hit rectangle".into());
+                        }
+                    }
+                    if dock && !properties && !focus && app.browser_rect.is_none_or(|r| r.height() < 150.0 || r.bottom() > size.y) {
+                        failures.push("visible Browser is unusable".into());
+                    }
+                }
             }
             ctx.data_mut(|data| data.clear());
+            assert!(failures.is_empty(), "{}", failures.join("\n"));
+            assert_eq!(app.session.doc, document);
         }
+    }
+
+    #[test]
+    fn human_canvas_outline_creates_a_real_building_and_undo_restores_the_document() {
+        let session = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        let ctx = egui::Context::default();
+        ctx.set_os(egui::os::OperatingSystem::Mac);
+        theme::apply(&ctx);
+        let mut app = StudioApp::with_context(ctx.clone(), None, session);
+        complete(&mut app);
+        let before = app.session.doc.clone();
+        app.begin_model_tool(false);
+        complete(&mut app);
+        let mut time = 0.0;
+        let mut draw = |app: &mut StudioApp, events| {
+            time += 0.05;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+        };
+        draw(&mut app, Vec::new());
+        for point in [[-4000.0, -3000.0], [4000.0, -3000.0], [4000.0, 3000.0], [-4000.0, 3000.0]] {
+            let rect = app.viewport_rect.unwrap();
+            let pos =
+                rect.center() + app.empty_pan + egui::vec2((point[0] / app.empty_mm_per_point) as f32, (-point[1] / app.empty_mm_per_point) as f32);
+            for event in [
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(&mut app, vec![event]);
+            }
+        }
+        let sketch_feedback = app.authoring_feedback();
+        let uncommitted = app.session.doc == before;
+        draw(
+            &mut app,
+            vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }],
+        );
+        ctx.data_mut(|data| data.clear());
+        assert!(uncommitted, "partial sketch/repaint edited the document");
+        assert_eq!(sketch_feedback["model_tool"]["draft_points"].as_array().unwrap().len(), 4);
+        assert_eq!(app.session.doc.buildings.len(), 1, "human clicks + Enter must reach building.add: {:?}", app.status);
+        assert_eq!(app.session.doc.journal.last().unwrap().command, "building.add");
+        assert_eq!(app.session.doc.buildings[0].footprint.len(), 4);
+        app.run(Who::Owner, "edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.doc, before);
     }
 
     #[test]
