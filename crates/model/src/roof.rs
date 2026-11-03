@@ -583,6 +583,132 @@ pub fn max_depth(outline: &[[f64; 2]]) -> Result<f64> {
     Ok(sk.vertices.iter().map(|v| v[2]).fold(0.0, f64::max))
 }
 
+/// Absolute tolerance for a requested outer-cover maximum, in site millimetres (f64).
+pub const HEIGHT_TOLERANCE_MM: f64 = 1e-6;
+
+/// Derive a single pitch from the whole outer cover's maximum, including normal build-up.
+/// Uses at most two skeletons, then two endpoint measurements and 64 bounded bisections of
+/// their heightfields. Gable/verge topology is fixed in XY; half-hip intersections are clipped
+/// afresh at each pitch. No walls, openings, gutters or closed shells are built here.
+///
+/// Trial heightfields need not be viable roofs (e.g. a cap can consume a low-pitch gable).
+/// The caller MUST build/validate the final roof, including cap margins, Two Cut–Plumb bearing
+/// and hosted openings, and check its actual cover against HEIGHT_TOLERANCE_MM. Two Cut–Plumb
+/// changes only the underside, so it does not enter this top-surface measurement.
+pub fn pitch_for_cover_height(
+    outline: &[[f64; 2]],
+    eaves: f64,
+    target: f64,
+    gable_edges: &[usize],
+    buildup: &Buildup,
+    caps: &[(usize, f64)],
+) -> Result<f64> {
+    crate::checked("roof eaves", eaves, -1e8, 1e8)?;
+    if !(3..=2000).contains(&outline.len()) || outline.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e8) {
+        return Err(ModelError::Invalid("roof height needs 3 to 2000 finite site-local outline points within 100 km".into()));
+    }
+    crate::checked("ridge", target, eaves + 500., eaves + 30_000.)?;
+    crate::checked("roof overhang", buildup.overhang, 0., 2000.)?;
+    crate::checked("roof verge", buildup.verge, 0., 1500.)?;
+    crate::checked("roof thickness", buildup.thickness, 0., 1000.)?;
+    if caps.len() > 2 {
+        return Err(ModelError::Invalid("half-hipped roof requires one or two explicit source gable caps".into()));
+    }
+    let reference_pitch = 45_f64;
+    let reference_rise = reference_pitch.to_radians().tan();
+    let base = pitched(outline, 0., reference_pitch, gable_edges)?;
+    let under = if buildup.overhang == 0. && buildup.verge == 0. {
+        base.cover.clone()
+    } else {
+        let out = crate::build::inner_ring_by(outline, |e| if gable_edges.contains(&e) { -buildup.verge } else { -buildup.overhang });
+        pitched(&out, -buildup.overhang * reference_rise, reference_pitch, gable_edges)?.cover
+    };
+    let cap_sources = caps
+        .iter()
+        .map(|&(edge, drop)| {
+            let frame = outline
+                .get(edge)
+                .zip(outline.get(edge.saturating_add(1)).or_else(|| outline.first()))
+                .filter(|_| gable_edges.contains(&edge))
+                .and_then(|(&a, &b)| crate::build::FacadeFrame::new(a, b))
+                .ok_or_else(|| ModelError::Invalid(format!("half-hip edge {edge} is not an existing source gable")))?;
+            let tip = base
+                .gables
+                .positions
+                .iter()
+                .filter(|p| ((p[0] - frame.origin[0]) * frame.n[0] + (p[1] - frame.origin[1]) * frame.n[1]).abs() < 1e-6)
+                .map(|p| p[2])
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !tip.is_finite() {
+                return Err(ModelError::Invalid(format!("half-hip edge {edge} has no gable tip")));
+            }
+            Ok((frame, tip, drop))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let height = |pitch: f64| -> Result<f64> {
+        let scale = pitch.to_radians().tan() / reference_rise;
+        let mut cover = under.clone();
+        for p in &mut cover.positions {
+            p[2] *= scale;
+        }
+        for &(frame, tip, drop) in &cap_sources {
+            // Measure relative to this gable tip. Trial planes need no world-height or
+            // retained-gable assumptions; the unchanged final shell enforces those guards.
+            for p in &mut cover.positions {
+                p[2] -= tip * scale;
+            }
+            cover = halfhip::lower(&cover, halfhip::CapPlane::new(frame, 0., drop, pitch)?)?;
+            for p in &mut cover.positions {
+                p[2] += tip * scale;
+            }
+        }
+        let top = cover.positions.iter().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max);
+        let height = eaves + top + buildup.thickness / pitch.to_radians().cos();
+        if !height.is_finite() {
+            return Err(ModelError::Invalid("roof height measurement must be finite and nonempty".into()));
+        }
+        Ok(height)
+    };
+    let (mut low, mut high) = (5., 75.);
+    let (minimum, maximum) = (height(low)?, height(high)?);
+    let roundoff = |height: f64| 8. * f64::EPSILON * (target.abs() + height.abs()).max(1.);
+    if target < minimum - roundoff(minimum) || target > maximum + roundoff(maximum) {
+        return Err(ModelError::Invalid(format!(
+            "requested outer roof-cover height {target:.6} mm is outside {minimum:.6}..{maximum:.6} mm at 5..75 degrees; revise height or roof dimensions"
+        )));
+    }
+    // Preserve inclusive pitch endpoints; do not round a valid 5°/75° roof outside its range.
+    if (target - minimum).abs() <= roundoff(minimum) {
+        return Ok(low);
+    }
+    if (target - maximum).abs() <= roundoff(maximum) {
+        return Ok(high);
+    }
+    let mut best = (low, f64::INFINITY);
+    for _ in 0..64 {
+        let pitch = (low + high) / 2.;
+        let actual = height(pitch)?;
+        let error = (actual - target).abs();
+        if error < best.1 {
+            best = (pitch, error);
+        }
+        // Solve near f64 roundoff, not merely the cover tolerance: a tiny undershoot must
+        // not consume an inclusive 100 mm half-hip margin in the unchanged final guard.
+        if error <= 8. * f64::EPSILON * target.abs().max(1.) {
+            return Ok(pitch);
+        }
+        if actual < target {
+            low = pitch;
+        } else {
+            high = pitch;
+        }
+    }
+    if best.1 <= HEIGHT_TOLERANCE_MM / 100. {
+        return Ok(best.0);
+    }
+    Err(ModelError::Invalid("requested outer roof-cover height did not converge within 64 pitch bisections".into()))
+}
+
 fn skeleton(outline: &[[f64; 2]]) -> Result<Skeleton> {
     Skeleton::build(&[outline.to_vec()]).map_err(|e| ModelError::Invalid(format!("the outline has no roof skeleton: {e:?}")))
 }
@@ -856,6 +982,28 @@ mod tests {
     use super::*;
 
     const WING: [[f64; 2]; 4] = [[0.0, 0.0], [30000.0, 0.0], [30000.0, 12000.0], [0.0, 12000.0]];
+
+    #[test]
+    fn requested_cover_height_refuses_hostile_numeric_inputs() {
+        let buildup = Buildup { overhang: 400., verge: 135., thickness: 200., gutters: false };
+        for eaves in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -f64::MAX] {
+            assert!(
+                pitch_for_cover_height(&WING, eaves, eaves, &[1, 3], &buildup, &[]).is_err(),
+                "unbounded eaves must not hide the requested rise through rounding"
+            );
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, -1.] {
+            assert!(pitch_for_cover_height(&WING, 3000., value, &[1, 3], &buildup, &[]).is_err());
+            assert!(pitch_for_cover_height(&WING, 3000., 9000., &[1, 3], &Buildup { thickness: value, ..buildup }, &[]).is_err());
+            assert!(pitch_for_cover_height(&WING, 3000., 9000., &[1, 3], &buildup, &[(3, value)]).is_err());
+        }
+        assert!(pitch_for_cover_height(&[], 3000., 9000., &[], &buildup, &[]).is_err());
+        assert!(pitch_for_cover_height(&WING, 3000., 9000., &[usize::MAX], &buildup, &[]).is_err());
+        assert!(pitch_for_cover_height(&WING, 3000., 9000., &[1, 3], &buildup, &[(usize::MAX, 300.)]).is_err());
+        let mut hostile = WING;
+        hostile[0][0] = f64::NAN;
+        assert!(pitch_for_cover_height(&hostile, 3000., 9000., &[1, 3], &buildup, &[]).is_err());
+    }
 
     #[test]
     fn half_hip_retains_the_original_sloping_ridge_on_a_tapered_wing() {

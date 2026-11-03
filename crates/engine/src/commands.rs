@@ -676,7 +676,8 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: "building.set_roof",
         summary: "Set the roof: flat, or pitched from the eaves (the top of the walls) at `pitch_deg`, or at the pitch that puts \
-                  the ridge at `ridge` (mm above the terrain, e.g. read from a section). `gables` lists the facades that end in a \
+                  the whole outer roof-cover maximum at `ridge` (mm above the terrain, including build-up). This is not a \
+                  named principal ridge or a persistent shared-height constraint. `gables` lists the facades that end in a \
                   gable (wing ends, walls against neighbours). A pitched roof can carry on past the walls (`overhang_mm` at the \
                   eaves, `verge_mm` at the gables), have a build-up (`thickness_mm`, with fascia, soffit and verge boards) and \
                   `gutters`. Kind half_hipped adds explicit half_hips source-gable caps on a convex four-edge wing. \
@@ -2258,7 +2259,8 @@ pub(crate) struct SetRoof {
     rooflights: Option<Vec<trigon_model::roof::Rooflight>>,
     /// Optional lower/upper slate or tagpap construction, with typed family dimensions.
     covering: Option<trigon_model::roof::Covering>,
-    /// Ridge height, mm above the terrain; the pitch is worked out from it when `pitch_deg` is omitted.
+    /// Whole outer roof-cover maximum, mm above terrain including build-up (f64 tolerance 0.000001 mm).
+    /// Derives pitch when `pitch_deg` is omitted; not a named principal ridge or a persistent shared-height constraint.
     ridge: Option<f64>,
     /// Facades that end in a gable.
     gables: Option<Vec<String>>,
@@ -2687,7 +2689,38 @@ fn set_bays(s: &mut Session, p: SetBays) -> Result<Value> {
     Ok(json!({"facade": p.facade, "bays": centres.iter().map(|c| c.round()).collect::<Vec<_>>()}))
 }
 
-/// The phase view a command asks for: `phase` (default: the active phase) and `filter`.
+/// Resolve the same straightened source edges used by the building's roof-shell path.
+fn requested_roof_pitch(
+    b: &trigon_model::Building,
+    gables: &[String],
+    straighten: f64,
+    buildup: trigon_model::roof::Buildup,
+    half_hips: &[trigon_model::roof::HalfHip],
+    ridge: f64,
+) -> Result<f64> {
+    let kept = trigon_model::roof::eave_outline(&b.footprint, straighten);
+    let outline: Vec<_> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
+    let edges = gables
+        .iter()
+        .map(|g| {
+            let f = b.facade(g)?;
+            kept.iter()
+                .position(|&i| i == f.edge)
+                .filter(|&p| kept.get((p + 1) % kept.len()) == Some(&((f.edge + 1) % b.footprint.len())))
+                .ok_or_else(|| ModelError::Invalid(format!("gable {g} was straightened away; lower straighten_mm")))
+        })
+        .collect::<trigon_model::Result<Vec<_>>>()?;
+    let caps = half_hips
+        .iter()
+        .map(|cap| {
+            let edge = gables.iter().position(|g| g == &cap.facade).and_then(|i| edges.get(i)).copied();
+            edge.map(|edge| (edge, cap.drop_mm))
+                .ok_or_else(|| ModelError::Invalid(format!("half-hip {} is not an existing source gable", cap.facade)))
+        })
+        .collect::<trigon_model::Result<Vec<_>>>()?;
+    Ok(trigon_model::roof::pitch_for_cover_height(&outline, b.height(), ridge, &edges, &buildup, &caps)?)
+}
+
 pub(crate) fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
     if p.half_hips.is_some() && p.kind != "half_hipped" {
         return Err(ModelError::Invalid("half_hips requires kind half_hipped".into()).into());
@@ -2711,14 +2744,19 @@ pub(crate) fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
             }
             let pitch = match (p.pitch_deg, p.ridge) {
                 (Some(d), None) => d,
-                (None, Some(ridge)) => {
-                    let eaves = b.height();
-                    let kept = trigon_model::roof::eave_outline(&b.footprint, p.straighten_mm.unwrap_or(1200.0));
-                    let outline: Vec<[f64; 2]> = kept.iter().filter_map(|&i| b.footprint.get(i).copied()).collect();
-                    let depth = trigon_model::roof::max_depth(&outline)?;
-                    let rise = trigon_model::checked("ridge", ridge, eaves + 500.0, eaves + 30_000.0)? - eaves;
-                    (rise / depth).atan().to_degrees()
-                }
+                (None, Some(ridge)) => requested_roof_pitch(
+                    b,
+                    &gables,
+                    p.straighten_mm.unwrap_or(1200.0),
+                    trigon_model::roof::Buildup {
+                        overhang: p.overhang_mm.unwrap_or(0.0),
+                        verge: p.verge_mm.unwrap_or(0.0),
+                        thickness: p.thickness_mm.unwrap_or(0.0),
+                        gutters: p.gutters.unwrap_or(false),
+                    },
+                    p.half_hips.as_deref().unwrap_or_default(),
+                    ridge,
+                )?,
                 _ => {
                     return Err(EngineError::Params { command: "building.set_roof".into(), message: "give pitch_deg or ridge (one of them)".into() });
                 }
@@ -2773,6 +2811,15 @@ pub(crate) fn set_roof(s: &mut Session, p: SetRoof) -> Result<Value> {
     let id = b.id.clone();
     let built = trigon_model::build(&s.doc)?;
     let r = built.iter().find(|x| x.building_id == id).and_then(|x| x.roof.as_ref());
+    if let Some(target) = p.ridge.filter(|_| p.pitch_deg.is_none() && matches!(p.kind.as_str(), "pitched" | "half_hipped")) {
+        let actual = r.into_iter().flat_map(|roof| roof.cover.positions.iter().map(|p| p[2])).fold(f64::NEG_INFINITY, f64::max);
+        if !actual.is_finite() || (actual - target).abs() > trigon_model::roof::HEIGHT_TOLERANCE_MM {
+            return Err(ModelError::Invalid(format!(
+                "requested outer roof-cover height {target:.6} mm could not be built within 0.000001 mm (actual {actual:.9} mm); revise roof dimensions or openings"
+            ))
+            .into());
+        }
+    }
     Ok(json!({
         "roof": s.doc.building(Some(&id))?.roof,
         "eaves_mm": r.map(|r| r.eaves.round()),
