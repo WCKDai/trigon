@@ -2181,9 +2181,15 @@ fn moving_one_stair_storey_keeps_entrance_labels_units_other_floors_and_exact_un
         if selected == 2 {
             assert_eq!(render(&s, 3).matches(marker).count(), 1, "the receiving floor must resolve the moved previous departure");
         }
-        for (level, plan) in plans.iter().enumerate().take(3) {
-            if level != selected {
-                assert_eq!(&render(&s, level), plan, "unselected floor {level}");
+        for (level, plan) in plans.iter().enumerate() {
+            let updated = render(&s, level);
+            assert_eq!(updated.matches(marker).count(), 1, "entrance units on floor {level}");
+            if level == selected || level == selected + 1 {
+                // The receiving floor shares the moved departure's geometry. A partly
+                // exposed arrival must appear even beside an unchanged outgoing flight.
+                assert_ne!(&updated, plan, "coordinated stair floor {level}");
+            } else {
+                assert_eq!(&updated, plan, "unaffected floor {level}");
             }
         }
         let changed = s.doc.clone();

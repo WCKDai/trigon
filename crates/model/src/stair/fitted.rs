@@ -59,7 +59,7 @@ pub(super) fn segments(ring: &[[f64; 2]], a: [f64; 2], b: [f64; 2]) -> Vec<([f64
     parameters(a, b, ring).windows(2).filter(|w| contains(ring, at((w[0] + w[1]) / 2.))).map(|w| (at(w[0]), at(w[1]))).collect()
 }
 
-fn covers_segment(ring: &[[f64; 2]], a: [f64; 2], b: [f64; 2]) -> bool {
+pub(super) fn covers_segment(ring: &[[f64; 2]], a: [f64; 2], b: [f64; 2]) -> bool {
     contains(ring, a)
         && contains(ring, b)
         && segments(ring, a, b).iter().map(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1])).sum::<f64>() + EPS >= (a[0] - b[0]).hypot(a[1] - b[1])
