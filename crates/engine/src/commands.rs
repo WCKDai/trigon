@@ -1338,6 +1338,14 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| add_interior_walls(s, parse("interior.add_walls", v)?),
     },
     CommandSpec {
+        id: "interior.place_door",
+        summary: "Add one interior door to an exact displayed wall occurrence (id, at_mm, width_mm, height_mm). Centre is measured from the source wall start in mm. Changes only the selected storey, preserves existing doors, rejects overlaps and openings that cannot fit the joined wall or ceiling. Atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::elements::PlaceDoor>,
+        run: |s, v| crate::elements::place_door(s, parse("interior.place_door", v)?),
+    },
+    CommandSpec {
         id: "interior.doors_from_gaps",
         summary: "Turn door-sized gaps in interior walls into doors (traced plans show doors as gaps): two collinear pieces \
                   of one wall either side of a `min_mm`–`max_mm` gap (default 600–1300) become one wall with a door, and a \

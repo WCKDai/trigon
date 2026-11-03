@@ -29,6 +29,18 @@ pub(crate) struct Set {
     pub properties: BTreeMap<String, Value>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlaceDoor {
+    pub id: String,
+    pub at_mm: f64,
+    pub width_mm: f64,
+    #[serde(default = "trigon_model::doc::door_height")]
+    pub height_mm: f64,
+    pub phase: Option<String>,
+    pub filter: Option<String>,
+}
+
 #[derive(Clone)]
 enum Source {
     Site(usize),
@@ -792,6 +804,52 @@ pub(crate) fn get(session: &Session, params: Get) -> Result<Value> {
         return Err(invalid(format!("{}: expected one displayed element, found {}", params.id, matches.len())));
     }
     Ok(matches.pop().ok_or_else(|| invalid("missing element"))?.data)
+}
+
+/// Add to one displayed wall occurrence through the same source-splitting path
+/// as model properties. Validate a complete candidate before touching the session.
+pub(crate) fn place_door(session: &mut Session, params: PlaceDoor) -> Result<Value> {
+    identifier(&params.id)?;
+    checked("door centre", params.at_mm, 0.0, 1e9)?;
+    checked("door width", params.width_mm, 300.0, 4000.0)?;
+    checked("door height", params.height_mm, 1000.0, 4000.0)?;
+    let view = crate::commands::view_of(&session.doc, params.phase.as_deref(), params.filter.as_deref())?;
+    let built = build_view(&session.doc, view)?;
+    let mut found = records(&session.doc, &built, view)?.into_iter().filter(|r| r.data["id"] == params.id);
+    let selected = found.next().ok_or_else(|| invalid("Choose a displayed interior wall occurrence."))?;
+    if found.next().is_some() || selected.data["editable"] != true {
+        return Err(invalid("Choose one editable interior wall in the current phase."));
+    }
+    let Source::Interior(bi, wi, level) = selected.source else {
+        return Err(invalid("Doors can be added to an interior wall occurrence, not a facade, group or existing door."));
+    };
+    let building = session.doc.buildings.get(bi).ok_or_else(|| invalid("missing building"))?;
+    let storey = building.storeys.get(level).ok_or_else(|| invalid("missing storey"))?;
+    let source = building.interior_walls.get(wi).ok_or_else(|| invalid("missing wall"))?;
+    if params.height_mm + 50.0 > storey.height - building.ceiling_thickness(level) {
+        return Err(invalid("The door needs at least 50 mm of wall below the ceiling above its opening."));
+    }
+    let door_index = source.doors.len();
+    let storeys = building.storeys.len();
+    let mut candidate = session.doc.clone();
+    let root = ensure_definition_id(&mut candidate, bi, wi, "iw")?;
+    let wall = crate::edit::update_parameters(&mut candidate, &format!("{root}.L{level}"), |item| {
+        let crate::edit::Item::Wall(wall) = item else {
+            return Err(invalid("wrong wall source"));
+        };
+        wall.doors.push(trigon_model::doc::WallDoor { at: params.at_mm, width: params.width_mm, height: params.height_mm });
+        wall.validate(storeys)?;
+        Ok(())
+    })?;
+    let target = format!("{wall}.D{door_index}");
+    let built = build_view(&candidate, view)?;
+    let mut doors = built.iter().flat_map(|b| &b.interior).flat_map(|w| &w.doors).filter(|door| door.fill.id == target);
+    let door = doors.next().ok_or_else(|| invalid("The door cannot fit between the joined wall ends. Move it farther from the junction."))?;
+    if doors.next().is_some() || (door.fill.width - params.width_mm).abs() > 1e-6 {
+        return Err(invalid("The joined wall ends would reduce this opening. Move it farther from the junction."));
+    }
+    session.doc = candidate;
+    Ok(json!({"changed":1,"wall":wall,"targets":[target]}))
 }
 
 pub(crate) fn set(session: &mut Session, params: Set) -> Result<Value> {
@@ -1973,6 +2031,97 @@ mod tests {
         // The canonical room identity also works with the pre-existing transform commands.
         s.execute("edit.move", json!({"targets":[space],"delta":[100,0,0]})).unwrap();
         assert_eq!(property(&descriptor(&mut s, "room.space.L0"), "area_m2"), 28.0);
+    }
+
+    #[test]
+    fn manual_interior_door_is_storey_scoped_and_exactly_undoable() {
+        let mut s = session();
+        let before = s.doc.clone();
+        let original = trigon_model::build(&s.doc).unwrap();
+        let reply = s.execute("interior.place_door", json!({"id":"partition.L1","at_mm":9000.0,"width_mm":900.0,"height_mm":2100.0})).unwrap();
+        let target = reply["targets"][0].as_str().unwrap();
+        assert!(target.ends_with(".L1.D1"));
+        let built = trigon_model::build(&s.doc).unwrap();
+        assert_eq!(built[0].interior.iter().find(|w| w.id == "partition.L0"), original[0].interior.iter().find(|w| w.id == "partition.L0"));
+        let wall = built[0].interior.iter().find(|w| w.id == reply["wall"].as_str().unwrap()).unwrap();
+        assert_eq!(wall.doors.len(), 2);
+        assert_eq!(wall.doors[1].fill.width, 900.0);
+        assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+        assert_eq!(property(&descriptor(&mut s, target), "at_mm"), 9000.0);
+        let after = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after);
+        let encoded = serde_json::to_vec(&s.doc).unwrap();
+        assert_eq!(serde_json::from_slice::<Document>(&encoded).unwrap(), after);
+    }
+
+    #[test]
+    fn manual_interior_door_rejects_invalid_hosts_overlaps_and_hostile_dimensions_atomically() {
+        let mut s = session();
+        let before = s.doc.clone();
+        for change in [
+            json!({"at_mm":4000}),
+            json!({"at_mm":100}),
+            json!({"at_mm":16000}),
+            json!({"at_mm":f64::MAX}),
+            json!({"at_mm":-1}),
+            json!({"width_mm":0}),
+            json!({"width_mm":f64::MAX}),
+            json!({"height_mm":3000}),
+            json!({"height_mm":f64::MAX}),
+            json!({"height_mm":null}),
+            json!({"id":"partition"}),
+            json!({"id":"partition.L0.D0"}),
+            json!({"id":"b.f1"}),
+            json!({"id":"missing.L0"}),
+            json!({"id":"x".repeat(513)}),
+            json!({"id":"bad\nname"}),
+            json!({"extra":true}),
+        ] {
+            let mut params = json!({"id":"partition.L1","at_mm":9000,"width_mm":900,"height_mm":2100});
+            for (key, value) in change.as_object().unwrap() {
+                params[key] = value.clone();
+            }
+            assert!(s.execute("interior.place_door", params.clone()).is_err(), "{params}");
+            assert_eq!(s.doc, before, "{params}");
+        }
+        let duplicated_wall = s.doc.buildings[0].interior_walls[0].clone();
+        s.doc.buildings[0].interior_walls.push(duplicated_wall);
+        let duplicate = s.doc.clone();
+        assert!(s.execute("interior.place_door", json!({"id":"partition.L1","at_mm":9000,"width_mm":900})).is_err());
+        assert_eq!(s.doc, duplicate);
+    }
+
+    #[test]
+    fn manual_interior_door_keeps_anonymous_siblings_and_group_membership() {
+        for anonymous in [false, true] {
+            let mut s = session();
+            let root = if anonymous {
+                s.doc.buildings[0].interior_walls[0].id.clear();
+                "b.iw0"
+            } else {
+                "partition"
+            };
+            let mut sibling = s.doc.buildings[0].interior_walls[0].clone();
+            sibling.id.clear();
+            sibling.a[1] = 3000.0;
+            sibling.b[1] = 3000.0;
+            s.doc.buildings[0].interior_walls.push(sibling);
+            if !anonymous {
+                s.execute("group.define", json!({"id":"walls","name":"Selected wall","targets":["partition.L1"]})).unwrap();
+            }
+            let before = trigon_model::build(&s.doc).unwrap();
+            let reply = s.execute("interior.place_door", json!({"id":format!("{root}.L1"),"at_mm":9000,"width_mm":900})).unwrap();
+            let after = trigon_model::build(&s.doc).unwrap();
+            for id in [format!("{root}.L0"), "b.iw1.L0".into(), "b.iw1.L1".into()] {
+                assert_eq!(before[0].interior.iter().find(|w| w.id == id), after[0].interior.iter().find(|w| w.id == id));
+            }
+            if !anonymous {
+                assert_eq!(s.doc.groups[0].targets, vec![reply["wall"].as_str().unwrap().to_owned()]);
+            }
+        }
     }
 
     #[test]

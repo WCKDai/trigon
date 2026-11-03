@@ -271,6 +271,42 @@ impl ModelTools {
         }
     }
 
+    pub fn start_footprint(&mut self, doc: &Document, level: usize) {
+        self.start_wall(doc, level);
+        self.wall_mode = WallMode::Footprint;
+    }
+
+    /// The task row stays outside the scrolling settings and uses the same draft
+    /// and commit path as the detailed panel and Enter shortcut.
+    pub fn task_actions(&mut self, ui: &mut egui::Ui, doc: &Document) -> Option<Run> {
+        let mut run = None;
+        ui.horizontal_wrapped(|ui| {
+            let (label, ready) = match (self.tool, self.wall_mode) {
+                (Some(Tool::Wall), WallMode::Footprint) => ("Finish footprint", self.points.len() >= 3),
+                (Some(Tool::Roof), _) => ("Create / Update roof", !self.outline.is_empty()),
+                _ => ("Finish walls", true),
+            };
+            if ui.add_enabled(ready && self.pending.is_none(), egui::Button::new(label)).clicked() {
+                if self.tool == Some(Tool::Wall) && self.wall_mode == WallMode::Interior {
+                    self.cancel();
+                } else {
+                    run = self.finish(doc);
+                }
+            }
+            if ui.button("Cancel tool").clicked() {
+                self.cancel();
+            }
+            if self.anchor().is_some() {
+                ui.separator();
+                ui.checkbox(&mut self.exact, "Exact length");
+                if self.exact {
+                    ui.add(egui::DragValue::new(&mut self.length).range(100.0..=200_000.0).suffix(" mm"));
+                }
+            }
+        });
+        run
+    }
+
     /// Keep the active scope current even when Properties is collapsed. A workplane or source
     /// boundary change discards only transient sketch state; it never writes to the document.
     pub(crate) fn sync_context(&mut self, doc: &Document, level: usize) {
@@ -752,8 +788,10 @@ impl ModelTools {
         if self.wall_mode == WallMode::Footprint {
             ui.label("Building name");
             ui.add(egui::TextEdit::singleline(&mut self.new_name).char_limit(200).desired_width(f32::INFINITY));
-            ui.label("Building ID");
-            ui.add(egui::TextEdit::singleline(&mut self.new_id).char_limit(64).desired_width(f32::INFINITY));
+            egui::CollapsingHeader::new("Building identity").show(ui, |ui| {
+                ui.label("Building ID");
+                ui.add(egui::TextEdit::singleline(&mut self.new_id).char_limit(64).desired_width(f32::INFINITY));
+            });
             ui.horizontal(|ui| {
                 ui.label("Storeys");
                 ui.add(egui::DragValue::new(&mut self.new_storeys).range(1..=60));

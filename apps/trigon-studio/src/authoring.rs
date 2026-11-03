@@ -41,7 +41,7 @@ enum WallReference {
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
-enum FamilyCategory {
+pub(crate) enum FamilyCategory {
     #[default]
     All,
     Windows,
@@ -59,7 +59,7 @@ impl FamilyCategory {
         (Self::Guards, "Guards & railings"),
     ];
 
-    fn matches(self, ty: &ComponentType) -> bool {
+    pub(crate) fn matches(self, ty: &ComponentType) -> bool {
         match self {
             Self::All => true,
             Self::Windows => matches!(ty.kind, ComponentKind::Window { .. } | ComponentKind::FixedWindow | ComponentKind::HistoricWindow { .. }),
@@ -542,14 +542,59 @@ impl Authoring {
         self.place_point = None;
         self.place_hover = None;
         self.place_unscoped = None;
-        if let Some(current) = current
-            && !self.pick_family_host(doc, current, None)
-        {
-            self.facade.clear();
-            self.place_level = None;
-            self.place_scope = None;
-            self.place_scope_error = Some("Choose a facade and storey, then click its placement point.".into());
+        if let Some(current) = current {
+            self.prepare_family_host(doc, current);
         }
+    }
+
+    /// A human Window/Door action chooses a matching saved type, without discarding
+    /// edits to another shared type. The existing draft review remains authoritative.
+    pub(crate) fn begin_family_category(&mut self, doc: &Document, current: Option<&Element>, category: FamilyCategory) {
+        let selected_type = current
+            .and_then(|element| element.props.iter().find(|(key, _)| *key == "type"))
+            .and_then(|(_, id)| doc.types.iter().find(|ty| ty.id == *id && category.matches(ty)));
+        let ty = selected_type
+            .or_else(|| self.draft.as_ref().filter(|ty| category.matches(ty)).and_then(|draft| doc.types.iter().find(|ty| ty.id == draft.id)))
+            .or_else(|| doc.types.iter().find(|ty| category.matches(ty)));
+        if let Some(ty) = ty {
+            self.request_type(ty);
+        }
+        self.begin_family_placement(doc, None);
+        if let Some(current) = current {
+            self.prepare_family_host(doc, current);
+        }
+    }
+
+    pub(crate) fn family_host_id<'a>(doc: &Document, current: &'a Element) -> Option<&'a str> {
+        let id = if current.host && current.kind == "wall" {
+            current.id.as_str()
+        } else {
+            let mut properties = current.props.iter().filter(|(key, _)| *key == "facade");
+            let (_, id) = properties.next()?;
+            if properties.next().is_some() {
+                return None;
+            }
+            id.as_str()
+        };
+        let mut hosts = doc.buildings.iter().flat_map(|b| b.facades.iter().filter(move |f| f.id == id).map(move |f| (b, f)));
+        let (building, facade) = hosts.next()?;
+        if hosts.next().is_some() || facade.kind == trigon_model::doc::FacadeKind::Party {
+            return None;
+        }
+        let (a, b) = building.edge(facade.edge)?;
+        trigon_model::FacadeFrame::new(a, b)?;
+        Some(id)
+    }
+
+    fn prepare_family_host(&mut self, doc: &Document, current: &Element) {
+        if self.pick_family_host(doc, current, None) {
+            return;
+        }
+        self.facade = Self::family_host_id(doc, current).unwrap_or_default().to_owned();
+        self.place_level = current.level;
+        self.place_scope = None;
+        self.place_scope_error = None;
+        self.accept_placement_scope(doc);
     }
 
     pub(crate) fn family_placement_active(&self) -> bool {
@@ -1416,6 +1461,11 @@ impl Authoring {
         chosen
     }
 
+    pub(crate) fn reset_selection_tool(&mut self) {
+        self.targets.clear();
+        self.tool = Tool::Move;
+    }
+
     pub(crate) fn command_controls_first(&self) -> bool {
         self.tab != Tab::Families && self.tool != Tool::Move
     }
@@ -1987,6 +2037,22 @@ impl Authoring {
     fn family_editor(&mut self, ui: &mut egui::Ui, doc: &Document, level: usize) -> Option<Run> {
         self.sync_type_draft(doc);
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.label("Component type");
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt("placement-component-type")
+            .width(ui.available_width())
+            .truncate()
+            .selected_text(self.draft.as_ref().map_or("Choose a type", |ty| ty.name.as_str()))
+            .show_ui(ui, |ui| {
+                for ty in &doc.types {
+                    if ui.selectable_label(self.draft.as_ref().is_some_and(|draft| draft.id == ty.id), &ty.name).clicked() {
+                        chosen = Some(ty);
+                    }
+                }
+            });
+        if let Some(ty) = chosen {
+            self.request_type(ty);
+        }
         let Some(draft) = &self.draft else {
             theme::eyebrow(ui, "FAMILIES & TYPES");
             ui.label("Choose a type from the component browser, or edit the type of a picked component.");
@@ -2096,6 +2162,75 @@ mod library_tests {
         let mut session = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
         session.doc = doc;
         session
+    }
+
+    #[test]
+    fn inline_type_picker_changes_the_reviewed_instance_without_losing_dirty_type_edits() {
+        let doc = family_document();
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|ty| ty.id == "window.fixed").unwrap());
+        form.begin_family_placement(&doc, None);
+        let mut host = family_host_element();
+        host.level = Some(0);
+        assert!(form.pick_family_host(&doc, &host, Some([3200.0, 0.0])));
+        form.place_overrides = true;
+        form.place_replace = true;
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut draw = |form: &mut Authoring, events| {
+            time += 0.1;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 1000.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(form.family_editor(ui, &doc, 0).is_none());
+                },
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let mut click = |form: &mut Authoring, label: &str| {
+            let shapes = draw(form, vec![]);
+            let at = shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        shape.clip_rect.contains_rect(rect).then_some(rect.center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing visible picker control {label}"));
+            for event in [
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(form, vec![event]);
+            }
+        };
+        click(&mut form, "Fixed window");
+        click(&mut form, "Entrance door");
+        assert_eq!(form.draft.as_ref().unwrap().id, "door.entrance");
+        assert_eq!(form.place_point.as_ref().unwrap().u_mm, 3200.0);
+        assert!(!form.place_overrides && !form.place_replace);
+        assert_eq!(form.place_type(&doc).unwrap().params["type"], "door.entrance");
+        assert_eq!(form.family_preview(&doc).unwrap().sizes, [1200.0, 2300.0, 0.0]);
+        form.draft.as_mut().unwrap().width = 1300.0;
+        click(&mut form, "Entrance door");
+        click(&mut form, "Fixed window");
+        assert_eq!(form.draft.as_ref().unwrap().id, "door.entrance");
+        assert_eq!(form.draft.as_ref().unwrap().width, 1300.0);
+        assert_eq!(form.pending_type.as_deref(), Some("window.fixed"));
+        assert!(form.place_type(&doc).is_none(), "a dirty shared type cannot be placed silently");
+        assert_eq!(doc, before);
+        ctx.data_mut(|data| data.clear());
     }
 
     #[test]

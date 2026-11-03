@@ -36,6 +36,20 @@ limitations; checksums and dependency notices accompany the downloads.
 Start Studio with a blank document, model locally, and save to a `.trigon` project. The packages
 include the `trigon` command-line application for scripting and MCP.
 
+## Start modelling in Studio
+
+1. Click **Draw building**, enter the storeys and wall thickness, and click the outline's corners.
+2. Click **Finish footprint**. The walls and floors become one undoable change.
+3. Use **Wall** for partitions, **Window** or **Door** for openings, and **Roof** for the roof.
+   Choose a component type directly in the placement panel, then review its host, storey and size.
+4. Select a model element to edit its dimensions. For an interior door, select its wall and click
+   **Door**; enter the opening's centre, width and height in Properties.
+5. Use **Undo**, **Redo**, **History** and **Save** in the visible workspace controls.
+
+Agents can use `studio_start` to open these same tools for a person to continue. Model changes
+from either participant use the shared command history. See the [visual authoring guide](docs/studio-authoring.md)
+for supported workflows and current limits.
+
 ## What you can do
 
 - **Model buildings:** edit footprints, levels, layered walls, slabs, stairs, roofs, dormers,

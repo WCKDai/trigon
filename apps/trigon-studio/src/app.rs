@@ -16,7 +16,7 @@ use trigon_model::annotation::DrawingViewKind;
 use trigon_model::build::{PhaseFilter, View};
 
 use crate::activity::{Action, Changes, Feed, Who};
-use crate::authoring::{Authoring, Tab};
+use crate::authoring::{Authoring, FamilyCategory, Tab};
 use crate::camera::Orbit;
 use crate::drafting::{Action as DrawingAction, Drafting};
 use crate::icons::{self, Icon};
@@ -50,6 +50,20 @@ pub enum Mode {
     ThreeD,
     Plan,
     Drawing,
+}
+
+/// Starting a task is shared by buttons and agent handoffs. Only completing the
+/// task executes an engine command and changes the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StudioAction {
+    Select,
+    Building,
+    Wall,
+    Window,
+    Door,
+    Component,
+    Roof,
+    EditSelection,
 }
 
 impl Mode {
@@ -210,6 +224,7 @@ pub struct StudioApp {
     schedules: Schedules,
     properties: Properties,
     stair_editor: crate::stair_editor::Editor,
+    interior_door: crate::interior_door::Editor,
     pending_selection: Option<String>,
     pending_family_targets: Option<Vec<String>>,
     family_text_owned_on_input: bool,
@@ -330,6 +345,7 @@ impl StudioApp {
             schedules: Schedules::default(),
             properties: Properties::default(),
             stair_editor: crate::stair_editor::Editor::default(),
+            interior_door: crate::interior_door::Editor::default(),
             pending_selection: None,
             pending_family_targets: None,
             family_text_owned_on_input: false,
@@ -418,6 +434,7 @@ impl StudioApp {
                 self.schedules = Schedules::default();
                 self.properties = Properties::default();
                 self.stair_editor.clear();
+                self.interior_door = crate::interior_door::Editor::default();
                 self.drafting = Drafting::default();
                 self.drawing.clear();
                 if self.mode == Mode::Drawing {
@@ -845,7 +862,6 @@ impl StudioApp {
     }
 
     fn app_bar(&mut self, ui: &mut egui::Ui) {
-        let wide = ui.available_width() > 1100.0;
         let mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
         let search_hint = if mac { "⌘ K" } else { "Ctrl+K" };
         let undo_hint = if mac { "⌘Z" } else { "Ctrl+Z" };
@@ -884,13 +900,15 @@ impl StudioApp {
                     ui.close();
                 }
             });
-            if wide {
+            {
                 ui.separator();
-                if icons::button(ui, Icon::Undo, "", false).on_hover_text(format!("Undo the last model or annotation change ({undo_hint})")).clicked()
+                if icons::button(ui, Icon::Undo, "Undo", false)
+                    .on_hover_text(format!("Undo the last model or annotation change ({undo_hint})"))
+                    .clicked()
                 {
                     self.undo_redo(Action::Undo);
                 }
-                if icons::button(ui, Icon::Redo, "", false).on_hover_text(format!("Redo ({redo_hint})")).clicked() {
+                if icons::button(ui, Icon::Redo, "Redo", false).on_hover_text(format!("Redo ({redo_hint})")).clicked() {
                     self.undo_redo(Action::Redo);
                 }
             }
@@ -975,9 +993,7 @@ impl StudioApp {
             if ui.selectable_label(self.ribbon_expanded, "Ribbon").on_hover_text("Expand or minimise the full ribbon").clicked() {
                 self.ribbon_expanded = !self.ribbon_expanded;
             }
-            if ui.selectable_label(self.focus_canvas, "Focus").on_hover_text("Focus canvas · F11").clicked() {
-                self.focus_canvas = !self.focus_canvas;
-            }
+            ui.toggle_value(&mut self.show_activity, "History").on_hover_text("Review your changes and agent changes in the same history");
         });
     }
 
@@ -994,22 +1010,16 @@ impl StudioApp {
             }
             match self.authoring.tab {
                 Tab::Project => {
-                    if icons::button(ui, Icon::Select, "Select", !self.model_tools.active()).clicked() {
-                        self.model_tools.cancel();
-                        self.inspect_elements();
-                    }
-                    if icons::button(ui, Icon::Wall, "Wall", self.model_tools.active() && self.model_tools.feedback()["tool"] == "wall").clicked() {
-                        self.begin_model_tool(false);
-                    }
-                    if icons::button(ui, Icon::Roof, "Roof", self.model_tools.active() && self.model_tools.feedback()["tool"] == "roof").clicked() {
-                        self.begin_model_tool(true);
-                    }
-                    if icons::button(ui, Icon::Component, "Component", false).clicked() {
-                        self.model_tools.cancel();
-                        let selected = self.selection.and_then(|i| self.scene.elements.get(i));
-                        self.authoring.begin_family_placement(&self.session.doc, selected);
-                        self.dock_open = true;
-                        self.dock_properties = true;
+                    for (icon, label, action) in [
+                        (Icon::Select, "Select", StudioAction::Select),
+                        (Icon::Wall, "Wall", StudioAction::Wall),
+                        (Icon::Window, "Window", StudioAction::Window),
+                        (Icon::Door, "Door", StudioAction::Door),
+                        (Icon::Roof, "Roof", StudioAction::Roof),
+                    ] {
+                        if icons::button(ui, icon, label, action == StudioAction::Select && !self.model_tools.active()).clicked() {
+                            self.start_from_button(action);
+                        }
                     }
                     let modify = ui.menu_button("Modify", |ui| {
                         self.authoring.ribbon(ui);
@@ -1026,18 +1036,6 @@ impl StudioApp {
                             ui.close();
                         }
                     });
-                    if self.model_tools.active() {
-                        ui.separator();
-                        ui.label(self.model_tools.title());
-                        if ui.button("Finish").clicked()
-                            && let Some(run) = self.model_tools.finish(&self.session.doc)
-                        {
-                            self.run_model_tool(run);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.model_tools.cancel();
-                        }
-                    }
                 }
                 Tab::Families => {
                     if ui.button("Browse types").clicked() {
@@ -1057,10 +1055,7 @@ impl StudioApp {
                         self.dock_properties = true;
                     }
                     if ui.button("Place component").clicked() {
-                        let selected = self.selection.and_then(|i| self.scene.elements.get(i));
-                        self.authoring.begin_family_placement(&self.session.doc, selected);
-                        self.dock_open = true;
-                        self.dock_properties = true;
+                        self.start_from_button(StudioAction::Component);
                     }
                 }
                 Tab::Drawings => {
@@ -1286,12 +1281,16 @@ impl StudioApp {
             .enumerate()
             {
                 if icons::ribbon_button(ui, icon, label, false).on_hover_text("Open shared project types and placement controls").clicked() {
-                    self.inspect_elements();
-                    self.drafting.cancel_placement();
-                    self.authoring.tab = Tab::Families;
+                    if query == "window" || query == "door" {
+                        self.start_from_button(if query == "window" { StudioAction::Window } else { StudioAction::Door });
+                    } else {
+                        self.inspect_elements();
+                        self.drafting.cancel_placement();
+                        self.authoring.tab = Tab::Families;
+                        self.dock_open = true;
+                        self.dock_properties = false;
+                    }
                     self.authoring.search = query.into();
-                    self.dock_open = true;
-                    self.dock_properties = false;
                     chosen = true;
                 }
                 if i % 2 == 1 {
@@ -1312,9 +1311,9 @@ impl StudioApp {
             {
                 if icons::ribbon_button(ui, icon, label, false).on_hover_text("Find modelling commands and their parameters").clicked() {
                     if query == "interior" {
-                        self.begin_model_tool(false);
+                        self.start_from_button(StudioAction::Wall);
                     } else if query == "roof" {
-                        self.begin_model_tool(true);
+                        self.start_from_button(StudioAction::Roof);
                     } else {
                         self.palette.show_query(query);
                     }
@@ -1861,6 +1860,15 @@ impl StudioApp {
             && let Some(element) = &selected
         {
             ui.add(egui::Label::new(egui::RichText::new(&element.id).monospace()).wrap());
+            if element.kind == "interior wall"
+                && let Some(descriptor) = self.properties.descriptor(&element.id).cloned()
+                && let Some(mut run) = self.interior_door.ui(ui, &descriptor, self.scene_generation, blocked)
+            {
+                run.params["phase"] = json!(self.session.doc.phases.get(self.phase).map(|phase| &phase.id));
+                run.params["filter"] = json!(filter_name(self.filter));
+                self.run_form(run);
+                self.interior_door.outcome(self.status.as_ref().filter(|(_, error)| *error).map(|(message, _)| message.clone()));
+            }
             if element.kind == "stair" {
                 self.stair_editor.sync(&self.session.doc, Some(&element.id));
                 if self.stair_editor.selected(&element.id) {
@@ -1941,6 +1949,29 @@ impl StudioApp {
     }
 
     fn idle_view_properties(&mut self, ui: &mut egui::Ui) {
+        theme::eyebrow(ui, "Create & continue");
+        ui.horizontal_wrapped(|ui| {
+            for (label, action) in [
+                ("Add building", StudioAction::Building),
+                ("Draw walls", StudioAction::Wall),
+                ("Place window", StudioAction::Window),
+                ("Place door", StudioAction::Door),
+                ("Add roof", StudioAction::Roof),
+            ] {
+                if ui.button(label).clicked() {
+                    self.start_from_button(action);
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Show 3D").clicked() {
+                self.activate_view(ViewTarget::ThreeD(None));
+            }
+            if ui.button("Floor plan").clicked() {
+                self.activate_view(ViewTarget::Plan(self.plan_level));
+            }
+        });
+        ui.separator();
         theme::eyebrow(ui, "View properties");
         let levels = self.levels();
         let name = match self.mode {
@@ -1990,6 +2021,162 @@ impl StudioApp {
         self.dock_open = true;
         self.dock_properties = true;
         self.ribbon_expanded = false;
+    }
+
+    fn start_from_button(&mut self, action: StudioAction) {
+        if let Err(error) = self.start_action(action, None) {
+            self.status = Some((error, true));
+        }
+    }
+
+    pub(crate) fn start_action(&mut self, action: StudioAction, target: Option<&str>) -> Result<(), String> {
+        // Validate the entire handoff before changing selection, view or drafts.
+        if self.precision_review.is_pending() {
+            return Err("Apply or cancel the current preview before starting another tool.".into());
+        }
+        if self.model_export.open {
+            return Err("Close the export dialog before starting another tool.".into());
+        }
+        if target.is_some()
+            && !matches!(
+                action,
+                StudioAction::Select | StudioAction::EditSelection | StudioAction::Window | StudioAction::Door | StudioAction::Component
+            )
+        {
+            return Err("A target is supported for Select, Edit or component placement.".into());
+        }
+        let selection = match target {
+            Some(id) => Some(self.scene.find_unique(id).ok_or("Choose a unique element in the current view.")?),
+            None => self.selection,
+        };
+        if (target.is_some() || action == StudioAction::EditSelection) && (self.building() || self.build_error.is_some()) {
+            return Err("Wait for a valid current model before selecting a task target.".into());
+        }
+        if action == StudioAction::EditSelection && selection.is_none() {
+            return Err("Select an element in the canvas to edit it.".into());
+        }
+        let interior_door = action == StudioAction::Door
+            && selection.and_then(|index| self.scene.elements.get(index)).is_some_and(|element| element.kind == "interior wall");
+        if !interior_door
+            && target.is_some()
+            && matches!(action, StudioAction::Window | StudioAction::Door | StudioAction::Component)
+            && selection
+                .and_then(|index| self.scene.elements.get(index))
+                .and_then(|current| Authoring::family_host_id(&self.session.doc, current))
+                .is_none()
+        {
+            return Err("Choose a facade wall or a component hosted on a facade.".into());
+        }
+        let category = match action {
+            StudioAction::Window => Some(FamilyCategory::Windows),
+            StudioAction::Door if !interior_door => Some(FamilyCategory::Doors),
+            _ => None,
+        };
+        if category.is_some_and(|category| !self.session.doc.types.iter().any(|ty| category.matches(ty))) {
+            return Err("This project has no matching component type. Add one in Components first.".into());
+        }
+        if !matches!(action, StudioAction::Select | StudioAction::EditSelection | StudioAction::Building | StudioAction::Wall)
+            && self.session.doc.buildings.is_empty()
+        {
+            return Err("Draw a building first, then add walls, windows, doors and a roof.".into());
+        }
+        if !matches!(action, StudioAction::Select | StudioAction::EditSelection) {
+            if self.building() || self.build_error.is_some() {
+                return Err("Wait for a valid current model before starting a creation tool.".into());
+            }
+            if self.phase != self.session.doc.active_index() || self.filter != PhaseFilter::Complete {
+                return Err("Open the active phase's complete view before creating elements.".into());
+            }
+        }
+        self.inspect_elements();
+        self.drafting.cancel_placement();
+        self.authoring.cancel_family_placement();
+        self.selection = selection;
+        self.pending_selection = None;
+        self.pending_family_targets = None;
+        self.selection_dirty = true;
+        self.redraw = true;
+        self.authoring.reset_selection_tool();
+        self.interior_door.cancel();
+        self.focus_canvas = false;
+        self.view_ribbon = false;
+        self.authoring.tab = Tab::Project;
+        self.dock_open = true;
+        self.dock_properties = true;
+        if interior_door {
+            self.interior_door.start();
+            return Ok(());
+        }
+        match action {
+            StudioAction::Building | StudioAction::Wall | StudioAction::Roof => {
+                self.begin_model_tool(action == StudioAction::Roof);
+                if action == StudioAction::Building {
+                    self.model_tools.start_footprint(&self.session.doc, self.plan_level);
+                }
+            }
+            StudioAction::Window | StudioAction::Door | StudioAction::Component => {
+                let current = self.selection.and_then(|index| self.scene.elements.get(index));
+                if let Some(category) = category {
+                    self.authoring.begin_family_category(&self.session.doc, current, category);
+                } else {
+                    self.authoring.begin_family_placement(&self.session.doc, current);
+                }
+                self.sync_family_view();
+            }
+            StudioAction::Select | StudioAction::EditSelection => {}
+        }
+        Ok(())
+    }
+
+    fn start_surface(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        self.viewport_rect = Some(rect);
+        ui.painter().rect_filled(rect, 0.0, theme::PAPER);
+        ui.vertical_centered(|ui| {
+            ui.add_space((rect.height() * 0.15).min(70.0));
+            ui.heading("Start your building");
+            ui.add_space(8.0);
+            ui.label("Draw an outline to create exterior walls and floors.");
+            ui.label("Then add interior walls, windows, doors and a roof.");
+            ui.add_space(18.0);
+            if theme::primary(ui, "Draw building").clicked() {
+                self.start_from_button(StudioAction::Building);
+            }
+            ui.add_space(8.0);
+            if ui.button("Open project…").clicked() {
+                self.pick_open();
+            }
+            if ui.button("New from template…").clicked() {
+                self.pick_template(false);
+            }
+            ui.add_space(18.0);
+            ui.weak("Work directly, with an AI agent, or both. Every model change can be undone.");
+        });
+    }
+
+    fn active_task_bar(&mut self, ui: &mut egui::Ui) {
+        if self.model_tools.active() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(self.model_tools.title());
+                ui.label(self.model_tools.status());
+            });
+            if let Some(run) = self.model_tools.task_actions(ui, &self.session.doc) {
+                self.run_model_tool(run);
+            }
+        } else if self.authoring.family_placement_active() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Place component");
+                ui.label("Choose a type, click a facade, review its size and place it.");
+                if ui.button("Cancel placement").clicked() {
+                    self.authoring.cancel_family_placement();
+                }
+            });
+        }
+        if ui.small_button("Tool settings").clicked() {
+            self.focus_canvas = false;
+            self.dock_open = true;
+            self.dock_properties = true;
+        }
     }
 
     fn creation_block_reason(&self, first_footprint: bool) -> Option<&'static str> {
@@ -3233,6 +3420,11 @@ impl StudioApp {
                     .show(ui, |ui| self.command_strip(ui));
             }
         }
+        if self.model_tools.active() || self.authoring.family_placement_active() {
+            egui::Panel::top("active-task")
+                .frame(egui::Frame::new().fill(theme::CHROME).inner_margin(egui::Margin::symmetric(12, 4)))
+                .show(ui, |ui| self.active_task_bar(ui));
+        }
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         self.model_tools.sync_context(&self.session.doc, self.plan_level);
         let picked_stair = self.selection.and_then(|i| self.scene.elements.get(i)).filter(|e| e.kind == "stair").map(|e| e.id.as_str());
@@ -3296,6 +3488,15 @@ impl StudioApp {
                     }
                 });
             });
+            if self.session.doc.buildings.is_empty()
+                && self.mode != Mode::Drawing
+                && !self.drafting.placement_active()
+                && !self.model_tools.active()
+                && !self.authoring.family_placement_active()
+            {
+                self.start_surface(ui);
+                return;
+            }
             match self.mode {
                 Mode::ThreeD => self.viewport_3d(ui),
                 Mode::Plan | Mode::Drawing => self.viewport_drawing(ui),
@@ -4785,6 +4986,148 @@ mod tests {
             assert!(failures.is_empty(), "{}", failures.join("\n"));
             assert_eq!(app.session.doc, document);
         }
+    }
+
+    #[test]
+    fn studio_handoff_preserves_refused_drafts_and_reveals_selected_model_properties() {
+        let mut app = app(false);
+        let document = app.session.doc.clone();
+        let target = app.scene.elements[window(&app)].id.clone();
+        app.ui_start(&json!({"action":"building"})).unwrap();
+        assert!(app.model_tools.point(&app.session.doc, [1000.0, 1000.0]).is_none());
+        let feedback = app.authoring_feedback();
+        let mode = app.mode;
+        let selection = app.selection;
+        for request in [
+            json!({"action":"mystery"}),
+            json!({"action":"edit","target":"missing"}),
+            json!({"action":"wall","target":target}),
+            json!({"action":"window","extra":true}),
+        ] {
+            assert!(app.ui_start(&request).is_err());
+            assert_eq!(app.authoring_feedback(), feedback);
+            assert_eq!(app.mode, mode);
+            assert_eq!(app.selection, selection);
+            assert_eq!(app.session.doc, document);
+        }
+        app.authoring.targets = "old-target".into();
+        app.authoring.choose_wall_alignment();
+        app.pending_selection = Some("old-target".into());
+        app.pending_family_targets = Some(vec!["old-target".into()]);
+        app.redraw = false;
+        let view = app.ui_start(&json!({"action":"edit","target":target})).unwrap();
+        assert!(app.authoring.targets.is_empty());
+        assert!(!app.authoring.command_controls_first());
+        assert!(app.pending_selection.is_none() && app.pending_family_targets.is_none());
+        assert!(app.redraw);
+        assert_eq!(view["selection"], target);
+        assert_eq!(view["authoring"]["dock"], "properties");
+        assert!(!app.model_tools.active());
+        assert!(app.authoring.tab == Tab::Project);
+        app.ui_start(&json!({"action":"window","target":target})).unwrap();
+        assert!(app.authoring.family_placement_active());
+        assert!(!app.authoring.family_placement_feedback(&app.session.doc)["scope"]["facade"].as_str().unwrap().is_empty());
+        assert_eq!(app.session.doc, document);
+    }
+
+    #[test]
+    fn human_start_to_building_has_visible_creation_and_recovery_at_laptop_size() {
+        let session = Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = StudioApp::with_context(ctx.clone(), None, session);
+        complete(&mut app);
+        let before = app.session.doc.clone();
+        let mut time = 0.0;
+        let mut draw = |app: &mut StudioApp, events| {
+            time += 0.05;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1024.0, 768.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let click = |app: &mut StudioApp, draw: &mut dyn FnMut(&mut StudioApp, Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape>, label: &str| {
+            let shapes = draw(app, Vec::new());
+            let point = shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        shape.clip_rect.contains_rect(bounds).then_some(bounds.center())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing visible action {label}"));
+            for event in [
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos: point, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(app, vec![event]);
+            }
+        };
+        click(&mut app, &mut draw, "Draw building");
+        assert_eq!(app.mode, Mode::Plan);
+        assert!(app.dock_open && app.dock_properties);
+        complete(&mut app);
+        draw(&mut app, Vec::new());
+        for point in [[-2000.0, -2000.0], [2000.0, -2000.0], [2000.0, 2000.0], [-2000.0, 2000.0]] {
+            let rect = app.viewport_rect.unwrap();
+            let pos =
+                rect.center() + app.empty_pan + egui::vec2((point[0] / app.empty_mm_per_point) as f32, (-point[1] / app.empty_mm_per_point) as f32);
+            for event in [
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+            ] {
+                draw(&mut app, vec![event]);
+            }
+        }
+        assert_eq!(app.session.doc, before, "sketch clicks are transient");
+        click(&mut app, &mut draw, "Finish footprint");
+        complete(&mut app);
+        assert_eq!(app.session.doc.buildings.len(), 1, "{:?}", app.status);
+        let built = app.session.doc.clone();
+        click(&mut app, &mut draw, "Undo");
+        complete(&mut app);
+        assert_eq!(app.session.doc, before);
+        click(&mut app, &mut draw, "Redo");
+        complete(&mut app);
+        assert_eq!(app.session.doc, built);
+        click(&mut app, &mut draw, "Draw walls");
+        assert!(app.model_tools.active());
+        click(&mut app, &mut draw, "Finish walls");
+        assert!(!app.model_tools.active(), "Finish walls must release the canvas for selection");
+        click(&mut app, &mut draw, "Window");
+        assert!(app.authoring.family_placement_active());
+        let window = app.authoring.family_placement_feedback(&app.session.doc)["type_id"].as_str().unwrap().to_owned();
+        assert!(matches!(
+            app.session.doc.types.iter().find(|ty| ty.id == window).unwrap().kind,
+            trigon_model::ComponentKind::Window { .. }
+                | trigon_model::ComponentKind::FixedWindow
+                | trigon_model::ComponentKind::HistoricWindow { .. }
+        ));
+        click(&mut app, &mut draw, "Architecture");
+        click(&mut app, &mut draw, "Door");
+        assert!(app.authoring.family_placement_active());
+        let door = app.authoring.family_placement_feedback(&app.session.doc)["type_id"].as_str().unwrap().to_owned();
+        assert_ne!(window, door);
+        assert!(matches!(
+            app.session.doc.types.iter().find(|ty| ty.id == door).unwrap().kind,
+            trigon_model::ComponentKind::EntranceDoor
+                | trigon_model::ComponentKind::PanelDoor { .. }
+                | trigon_model::ComponentKind::FrenchDoor { .. }
+                | trigon_model::ComponentKind::DoorWindow { .. }
+        ));
+        assert_eq!(app.session.doc, built, "starting tools must not mutate the shared model");
+        ctx.data_mut(|data| data.clear());
     }
 
     #[test]

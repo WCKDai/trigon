@@ -8,10 +8,10 @@ No modelling command is submitted by moving the pointer, changing a draft field 
 
 The ribbon starts minimised. **Ribbon** expands the grouped tools. **Browser** and
 **Properties** open one resizable, full-height supporting panel. The panel can be closed without
-leaving the active sketch. **Focus** or **F11** hides supporting panels and the ribbon while
+leaving the active sketch. **View → Focus canvas** or **F11** hides supporting panels and the ribbon while
 retaining view navigation. **View settings** holds level, phase, visibility and display controls.
 
-With nothing selected, Properties describes the active view. Selecting an element exposes its
+With nothing selected, Properties offers the next creation actions and describes the active view. Selecting an element exposes its
 editable parameters and existing drag handles; **Edit type** opens the referenced shared family.
 Type edits and instance overrides have different scopes, shown explicitly in the editor.
 
@@ -37,20 +37,35 @@ writers; they do not change IFC semantics or make file replacement atomic.
 
 ## Walls and exterior outlines
 
-Choose **Architecture → Wall**. In an empty project, click the exterior corners on the gridded
-construction plane, then close the outline or use **Finish/Enter**. The result is a real building
+A fresh project offers **Draw building** directly on the canvas. **Architecture → Wall** also
+starts an outline when no building exists. Click the exterior corners on the gridded
+construction plane, then close the outline or use **Finish footprint / Enter**. The result is a real building
 with the explicitly displayed wall thickness and storeys. The sketch is transient until it is
 finished. Middle-drag pans the empty plane and scrolling changes its scale.
 
 In an existing building, choose the building and storey, then click wall start and end points.
 The second click creates a wall. Chain mode continues from the accepted endpoint. Ortho axes,
 exact length, snapping and thickness are available in Properties; the canvas displays temporary
-length feedback. Right-click or Escape ends the current chain; repeat Escape exits an empty tool.
+length feedback. The pinned task row keeps exact length and completion controls visible while
+Properties scrolls. **Finish walls** exits drawing; Enter ends the current chain. Right-click or Escape ends the current chain; repeat Escape exits an empty tool.
 
 The current interior-wall model uses centre lines and full-storey height. Arbitrary wall heights,
 base/top offsets and permanent alignment locks are not implemented by this tool. Exterior
 outlines use the engine's exterior-face footprint convention. All coordinates remain site-local
 millimetres, including translated or rotated buildings.
+
+## Interior doors
+
+Select an interior wall, then choose **Door** in Architecture or **Add interior door…** in its
+Properties. Enter the opening centre measured from the displayed source wall start, width and
+height, then click **Add door**. The new door is selected for normal dimension editing.
+
+The `interior.place_door` command changes only the selected storey, preserves existing doors and
+shared walls on other floors, and supports Undo/Redo. It rejects overlapping openings, out-of-wall
+spans, openings shortened by wall joins, and doors without 50 mm of wall below the ceiling above
+them. These checks establish host fit, not a general clash analysis of the building. A model or
+storey change invalidates an open form until **Review current wall**. Opening another project
+clears the form.
 
 ## Roofs
 
@@ -95,7 +110,10 @@ Apply/Cancel is explicit. Shared edits affect referencing uses; the editor repor
 counts rather than claiming a freshly built instance count. Stale shared drafts and conflicting
 copy IDs are rejected.
 
-**Place component** starts in **Point** mode. Choose a saved family/type, open an explicit
+**Window** and **Door** start placement with a matching saved type. The **Component type**
+picker in Properties changes types without leaving placement; unsaved shared-type edits must
+still be applied or cancelled. Selecting an interior wall before **Door** opens its interior-door
+form instead. **Place component** starts generic placement in **Point** mode. Choose a saved family/type, open an explicit
 saved plan or choose the host's storey in Properties, then click a real facade in plan,
 elevation or 3D. A bare-wall click can capture the host and point before a storey is selected;
 it remains unplaceable until that explicit choice. New walls need no bay-grid setup.
@@ -162,6 +180,18 @@ Open dropdowns own Enter and Escape before canvas tools. Handles retain the orig
 press when the native integration batches a press and movement into one frame; one completed
 drag still produces one undoable parameter edit.
 
-Compatibility: these controls reuse existing model commands and file fields. No native file
+Compatibility: the new interior-door command and these controls use existing file fields. No native file
 format migration or new modelling dependency is introduced by this UI change. Native appearance,
 platform builds and full gates must be checked on the integrated revision before release.
+
+## Shared human and agent tasks
+
+**Undo** and **Redo** remain visible at laptop widths. **History** opens the shared owner/agent
+activity feed. An agent can call `studio_start` / `ui.start` with a creation action or `edit` and
+an exact visible target. This opens the same task settings as the corresponding button without
+adding geometry. A handoff clears old Modify targets and exposes the current selection; invalid
+requests leave the previous task unchanged. See [the control protocol](control-protocol.md).
+
+Manual authoring is still being expanded: the expanded **Stairs** and **Slabs** actions currently
+open command search. Interior doors use a selected-wall numeric form, not canvas placement.
+The current toolset is a preview, not a complete replacement for every desktop BIM workflow.
