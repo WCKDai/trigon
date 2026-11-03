@@ -608,6 +608,8 @@ impl Editor {
                 }
                 if candidate.kind != StairKind::UTurn {
                     candidate.turn_chamfer = None;
+                    candidate.well = None;
+                    candidate.landing = None;
                 }
             }
             let frame = trigon_model::stair::frame(&previous).ok();
@@ -945,6 +947,59 @@ mod tests {
             assert_eq!(editor.draft.as_ref().unwrap().error.as_deref(), Some(error.as_str()));
         }
         assert!(editor.preview(&s.doc).is_err(), "the refused width cannot create a hidden well-only preview");
+    }
+
+    #[test]
+    fn real_kind_switch_clears_hidden_constraints_allows_width_entry_and_resets_exactly() {
+        let mut s = session();
+        let source = &mut s.doc.buildings[0].stairs[0];
+        *source = resize(source, 3000.0, 4000.0).unwrap();
+        source.well = Some(900.0);
+        source.landing = Some(1000.0);
+        let before = s.doc.clone();
+        let mut editor = Editor::default();
+        editor.sync(&s.doc, Some("wing.stair-a.L1"));
+        let ctx = egui::Context::default();
+        let shown = frame_ui(&mut editor, &s.doc, &ctx, vec![]);
+        let at = shown.iter().find(|(t, _)| t == "U-turn").unwrap().1.center();
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, true));
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, false));
+        let shown = frame_ui(&mut editor, &s.doc, &ctx, vec![]);
+        let at = shown.iter().find(|(t, _)| t == "Straight").expect("open real stair-kind menu").1.center();
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, true));
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, false));
+        assert_eq!(editor.draft.as_ref().unwrap().value.kind, StairKind::Straight);
+        let shown = frame_ui(&mut editor, &s.doc, &ctx, vec![]);
+        assert!(!shown.iter().any(|(t, _)| t == "Stair well" || t == "Half landing"));
+        let at = shown.iter().find(|(t, _)| t == "3000").unwrap().1.center();
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, true));
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, false));
+        frame_ui(&mut editor, &s.doc, &ctx, vec![]);
+        frame_ui(&mut editor, &s.doc, &ctx, vec![egui::Event::Text("2000".into())]);
+        frame_ui(
+            &mut editor,
+            &s.doc,
+            &ctx,
+            vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+        );
+        let d = editor.draft.as_ref().unwrap();
+        assert!(d.error.is_none(), "hidden U-turn constraints must not block Straight width: {:?}", d.error);
+        assert_eq!(trigon_model::stair::frame(&d.value).unwrap().width, 2000.0);
+        assert_eq!(d.value.well, None);
+        assert_eq!(d.value.landing, None);
+        let run = editor.preview(&s.doc).unwrap();
+        let captured: Stair = serde_json::from_value(run.params["action"]["params"]["partitions"][1].clone()).unwrap();
+        assert_eq!(captured.well, None);
+        assert_eq!(captured.landing, None);
+        s.execute(run.command, run.params).unwrap();
+        assert_eq!(s.doc, before, "review never commits the draft");
+        let shown = frame_ui(&mut editor, &s.doc, &ctx, vec![]);
+        let at = shown.iter().find(|(t, _)| t == "Reset draft").unwrap().1.center();
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, true));
+        frame_ui(&mut editor, &s.doc, &ctx, pointer(at, false));
+        assert_eq!(editor.draft.as_ref().unwrap().value, before.buildings[0].stairs[0]);
+        assert!(editor.preview(&s.doc).is_err());
+        assert_eq!(s.doc, before);
     }
 
     #[test]

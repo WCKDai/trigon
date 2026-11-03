@@ -26,6 +26,11 @@ it. Preview and Apply still validate the complete action against current state.
 The helper checks at most 1000 suffixes and retains Studio's 128-byte generated-ID
 limit. Existing typed commands, native serialization and defaults are unchanged.
 
+An explicit switch away from U-turn clears its inactive well and half-landing
+parameters in the draft. The captured review contains those cleared values;
+Reset draft restores the complete original source. Simply opening a staircase or
+repainting the form does not change existing parameters.
+
 Plans show changed departure/arrival outlines only on their affected levels.
 3D outlines use physical floor elevations, including a legacy implicit attic.
 Plan outlines are hidden in sections and elevations. A handle edit opens
