@@ -101,7 +101,7 @@ pub(crate) fn add(s: &mut Session, p: Add) -> Result<Value> {
     Ok(result)
 }
 
-fn intersects(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+pub(crate) fn intersects(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     let on = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| {
         cross(a, b, p).abs() < 1e-6

@@ -21,6 +21,8 @@ pub(crate) enum Action {
     DefineAnnotation(trigon_model::annotation::Annotation),
     #[serde(rename = "building.add")]
     AddBuilding(crate::local_building::Add),
+    #[serde(rename = "building.set_footprint")]
+    SetFootprint(crate::footprint_edit::SetFootprint),
     #[serde(rename = "building.set_roof")]
     SetRoof(Box<crate::commands::SetRoof>),
     #[serde(rename = "facade.place")]
@@ -90,6 +92,7 @@ fn run(s: &mut Session, action: Action) -> Result<Value> {
         Action::ConfigureView(p) => crate::view_config::configure(s, p),
         Action::DefineAnnotation(p) => crate::views::define_annotation(s, p),
         Action::AddBuilding(p) => crate::local_building::add(s, p),
+        Action::SetFootprint(p) => crate::footprint_edit::set(s, p),
         Action::SetRoof(p) => crate::commands::set_roof(s, *p),
         Action::Place(p) => crate::commands::place(s, p),
         Action::PlaceAt(p) => crate::commands::place_at(s, p),

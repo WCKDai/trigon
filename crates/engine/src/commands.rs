@@ -556,6 +556,14 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| load_address(s, parse("site.load_address", v)?),
     },
     CommandSpec {
+        id: "building.set_footprint",
+        summary: "Move indexed existing footprint corners in local mm with an exact expected-ring guard and explicit keep_facade_u or project_wall_line_centres policy. Tangential projection does not preserve perpendicular world position. Preserves source order/IDs; refuses topology, pruning and unsupported dependent changes. Full model validation, precise feedback, atomic and undoable.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::footprint_edit::SetFootprint>,
+        run: |s, v| crate::footprint_edit::set(s, parse("building.set_footprint", v)?),
+    },
+    CommandSpec {
         id: "building.add",
         summary: "Create a local parametric building from an explicit measured footprint, storey count/height and optional evidence. Preserves vertices by default; optional context simplification is explicit. Multiple buildings share one local frame. No data service, credentials or file generation; validated, atomic, undoable.",
         mutates: true,

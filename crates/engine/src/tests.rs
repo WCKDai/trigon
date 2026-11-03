@@ -6,6 +6,7 @@ use trigon_model::{Evidence, GeoPoint};
 
 use crate::{EngineError, Session, commands};
 
+mod footprint;
 mod roof_height;
 
 /// A 24 × 12 m block at a fixed point in Copenhagen, five storeys of surface height.

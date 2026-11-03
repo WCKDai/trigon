@@ -25,6 +25,7 @@ mod elevation;
 mod entrances;
 mod facade_image;
 mod fbx;
+mod footprint_edit;
 mod lettering_audit;
 mod libraries;
 mod local_building;
