@@ -1568,21 +1568,25 @@ impl StudioApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let path = self.session.path.as_ref().map_or("untitled".into(), |p| p.display().to_string());
-            let name = self.session.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled project".into(), |p| p.to_string_lossy().into_owned());
-            ui.weak(name).on_hover_text(path);
-            if self.session.dirty {
-                ui.label(egui::RichText::new("unsaved").color(egui::Color32::from_rgb(200, 130, 20)));
-            }
-            if let Some((text, error)) = &self.status {
-                if *error {
-                    ui.colored_label(egui::Color32::from_rgb(200, 70, 60), text);
-                } else {
-                    ui.weak(text);
+        egui::containers::Sides::new().shrink_left().truncate().show(
+            ui,
+            |ui| {
+                let path = self.session.path.as_ref().map_or("untitled".into(), |p| p.display().to_string());
+                let name =
+                    self.session.path.as_ref().and_then(|p| p.file_name()).map_or("Untitled project".into(), |p| p.to_string_lossy().into_owned());
+                ui.weak(name).on_hover_text(path);
+                if self.session.dirty {
+                    ui.label(egui::RichText::new("unsaved").color(egui::Color32::from_rgb(200, 130, 20)));
                 }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some((text, error)) = &self.status {
+                    if *error {
+                        ui.colored_label(theme::ACCENT, text).on_hover_text(text);
+                    } else {
+                        ui.weak(text).on_hover_text(text);
+                    }
+                }
+            },
+            |ui| {
                 ui.label(egui::RichText::new("Model units / mm").size(11.0).color(theme::MUTED));
                 ui.separator();
                 let timing = self.timings.map_or(String::new(), |(b, s)| format!("\nBuild {b:.0} ms; prepare {s:.0} ms"));
@@ -1592,8 +1596,8 @@ impl StudioApp {
                     self.scene.edge_count(),
                     self.control_note
                 ));
-            });
-        });
+            },
+        );
     }
 
     fn edit_block_reason(&self) -> Option<&'static str> {
@@ -2668,14 +2672,14 @@ impl StudioApp {
             preview.guide,
             if preview.captured { "Place in Properties" } else { "Alt: exact" }
         );
-        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), theme::DRAWING_INK);
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), theme::INK);
         let anchor = points.first().copied().unwrap_or(rect.left_top()) + egui::vec2(8.0, 8.0);
         let at = egui::pos2(
             anchor.x.clamp(rect.left() + 6.0, (rect.right() - galley.size().x - 12.0).max(rect.left() + 6.0)),
             anchor.y.clamp(rect.top() + 6.0, (rect.bottom() - galley.size().y - 12.0).max(rect.top() + 6.0)),
         );
         painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(4.0, 4.0), galley.size() + egui::vec2(8.0, 8.0)), 3.0, theme::PANEL);
-        painter.galley(at, galley, theme::DRAWING_INK);
+        painter.galley(at, galley, theme::INK);
     }
 
     fn family_site_point(&self, host: &crate::scene::Element, point: [f64; 2]) -> Option<[f64; 2]> {
@@ -3491,6 +3495,93 @@ mod tests {
         let mut host = app.scene.elements.iter().find(|e| e.id == "point.f1").unwrap().clone();
         host.level = Some(1); // Explicit Storey selection, not an inferred global index.
         assert!(app.authoring.pick_family_host(&app.session.doc, &host, Some([u, 0.0])));
+    }
+
+    #[test]
+    fn point_preview_legend_has_readable_contrast_against_its_painted_panel() {
+        let mut app = point_app();
+        capture_point(&mut app, 3200.125);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))), ..Default::default() },
+            |ui| app.family_preview_ui(ui, ui.max_rect()),
+        );
+        output.textures_delta.clear();
+        let text = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text.starts_with("Captured · L1 · u ") => Some(text),
+                _ => None,
+            })
+            .expect("a captured component must have a visible dimension legend");
+        let background = output
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Rect(rect) if rect.rect.contains(text.pos) && rect.fill.a() > 0 => Some(rect.fill),
+                _ => None,
+            })
+            .expect("the dimension legend must have a painted background");
+        let luminance = |color: egui::Color32| {
+            [color.r(), color.g(), color.b()]
+                .into_iter()
+                .zip([0.2126, 0.7152, 0.0722])
+                .map(|(channel, weight)| {
+                    let value = f64::from(channel) / 255.0;
+                    weight * if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+                })
+                .sum::<f64>()
+        };
+        assert_eq!(background.a(), 255);
+        for section in &text.galley.job.sections {
+            let color = text.override_text_color.unwrap_or(if section.format.color == egui::Color32::PLACEHOLDER {
+                text.fallback_color
+            } else {
+                section.format.color
+            });
+            assert_eq!(color.a(), 255);
+            let (a, b) = (luminance(color), luminance(background));
+            let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+            assert!(contrast >= 4.5, "placement legend contrast is only {contrast:.3}:1");
+        }
+    }
+
+    #[test]
+    fn long_status_errors_do_not_paint_over_model_metrics() {
+        let mut app = point_app();
+        let error = "invalid: point.f1 level 1 bay 2: sill 800.125 + height 4000 leaves less than 150 mm below the storey above (storey height 3000); stairwell windows that cross a floor need spans_storeys";
+        let count = format!("{} elements", app.scene.elements.len());
+        for (width, message) in [(820.0, "saved"), (820.0, error), (1440.0, "saved"), (1440.0, error)] {
+            app.status = Some((message.into(), message == error));
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 80.0))), ..Default::default() },
+                |ui| app.status_bar(ui),
+            );
+            output.textures_delta.clear();
+            let labels = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some((shape.clip_rect, text)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let (clip, status) =
+                labels.iter().find(|(_, text)| text.galley.job.text == message).expect("retain the complete status in its layout job");
+            let status_ink = status.visual_bounding_rect().intersect(*clip);
+            assert!(status_ink.is_positive(), "the error must remain visible at width {width}");
+            for expected in ["Model units / mm", count.as_str()] {
+                let (_, metric) = labels.iter().find(|(_, text)| text.galley.job.text == expected).expect("keep each model metric visible");
+                let bounds = metric.visual_bounding_rect();
+                assert!(bounds.left() >= 0.0 && bounds.right() <= width, "model metrics must remain inside the status bar at width {width}");
+                assert!(!status_ink.intersects(bounds), "the error overlaps {expected} at width {width}");
+            }
+        }
     }
 
     #[test]
