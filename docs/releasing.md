@@ -174,6 +174,37 @@ and the actual runtime requirements. A package needing a non-system dynamic libr
 unsupported by this executable-only allowlist: fix the build or design a separately reviewed
 explicit runtime allowlist before packaging it.
 
+## Wrap verified packages as installers
+
+Build the Windows per-user installer with NSIS 3 after extracting and inspecting the portable
+ZIP. Pass absolute paths to the extracted package and a new output file:
+
+```sh
+makensis -DPACKAGE_DIR=/absolute/Trigon-0.1.0-preview-unsigned-windows-x64 \
+  -DOUTPUT_FILE=/absolute/Trigon-0.1.0-preview-unsigned-windows-x64-Setup.exe \
+  tools/windows-installer.nsi
+```
+
+The installer includes only the explicit portable-package file list, adds a Start menu shortcut
+and an entry in Windows installed apps, and installs under the current user's LocalAppData.
+It does not request administrator privileges. Uninstall removes only those installed files,
+leaving project files and nonempty directories intact. Its default zlib compression uses NSIS's
+zlib/libpng-licensed installer stub; see the [NSIS license](https://nsis.sourceforge.io/License).
+Inspect the installer payload with 7-Zip and compare every packaged file hash. Native installation,
+launch, uninstall and preservation of a sentinel project file remain separate Windows checks.
+
+For macOS, copy the verified `.app` to a fresh staging folder, preserving executable permissions,
+and add an `Applications` symlink pointing to `/Applications`. Place the package README beside it.
+Create a compressed read-only image with `hdiutil create -format UDZO -volname "Trigon Studio"
+-srcfolder <stage> <output.dmg>`. Run `hdiutil verify`, mount it read-only, compare the app's file
+hashes with the verified package, and launch the mounted app for native smoke testing. Detach it
+after testing. The DMG wrapper does not sign or notarize the application.
+
+Retain wrapper-tool versions, exact commands, input and final hashes and extraction checks with
+the candidate evidence. Attach checksums, the required third-party source bundle and release notes
+to the GitHub prerelease. A draft release is a review surface; it does not waive the publication
+requirements below.
+
 ## Native acceptance and release handoff
 
 On Apple silicon macOS, launch the extracted `.app` from Finder and verify a usable blank
