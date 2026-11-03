@@ -75,18 +75,52 @@ Apply/Cancel is explicit. Shared edits affect referencing uses; the editor repor
 counts rather than claiming a freshly built instance count. Stale shared drafts and conflicting
 copy IDs are rejected.
 
-For placement, choose a saved type, pick a facade host in the canvas, review the storey/bay and
-press Place. Host picks snap to the existing facade bay axes. Placement defaults to one explicit
-slot; all-bay operations and replacement of occupied slots require opt-in. Local dimension
-and position overrides remain distinct from shared type changes. Portable library import/export
-uses the existing local `.trigonlib` format.
-Plan picks use site coordinates; elevation picks map the reference facade's horizontal axis back
-to the site. Section host picks are refused because projected depth is ambiguous. In 3D the real
-triangle hit supplies the placement point. A bare facade wall retains the explicitly chosen storey.
-If the host disappears or its storeys, bay grid or active phase change, placement requires a fresh
-host/storey choice. It never substitutes another building or silently retargets a new basement.
+**Place component** starts in **Point** mode. Choose a saved family/type, open an explicit
+saved plan or choose the host's storey in Properties, then click a real facade in plan,
+elevation or 3D. A bare-wall click can capture the host and point before a storey is selected;
+it remains unplaceable until that explicit choice. New walls need no bay-grid setup.
 
-This is the existing facade-grid placement model, not unrestricted free-host component placement.
+The blue hover envelope becomes a captured orange preview on click. It shows the effective
+width, height, sill, along-facade coordinate and depth. Plan openings show the actual host wall
+thickness on that storey; elevations and 3D show the dimension rectangle at the storey elevation.
+Attachments show their size/projection envelope, not a wall cut. These are cheap local dimension
+previews, not detailed family meshes or clash certificates. **Place component** submits
+`facade.place_at` and runs the engine's complete validation once. A rejected command retains
+its actual error and changes no model data.
+
+The captured target stays fixed while moving over Properties. Edit **Along facade from source
+start** or enable **Override new instance sizes** to enter exact millimetres. Numeric edits
+are never snapped. By default, cursor picks align within 100 mm of existing bay or live occurrence
+axes; otherwise they use a 100 mm increment. **Snap / align** changes those settings (0 disables
+the increment), and **Alt** bypasses both. The guide and coordinate are visible on the canvas.
+This UI snap distance is separate from the engine's 0.000001 mm bay-identity tolerance.
+
+Placement refuses occupied same-class slots by default. **Replace existing in these slots**
+is explicit consent for `replace:true`; changing the type, host, point or storey clears it.
+Successful placement selects an exact product returned by the engine in its returned phase,
+including attachment leaf IDs. **Inspect selected instance** opens its instance Properties.
+The point tool remains available for repeat placement; its own appended bay is acknowledged.
+Undo/Redo includes both the instance and any appended bay. **Escape** or **Exit placement**
+leaves the tool; open Commands, close dialogs, dropdowns and text editors retain keyboard ownership.
+
+**Bay pattern** is an explicit optional mode for the existing `facade.place` workflow. Choose
+one bay or opt into **All bays on this storey**. Its separate **Facade bay grid** control changes
+the shared grid across storeys and retains the existing grid pruning/replacement rules.
+Neither mode sorts or remaps source bays during a pick. Shared type editing and local instance
+overrides remain separate; portable library import/export uses the local `.trigonlib` format.
+
+Plan picks use actual site-local coordinates. Elevation picks project their horizontal coordinate
+through that facade's source frame; section host picks are refused because depth is ambiguous.
+In 3D the real triangle hit supplies the source point. A bare facade does not imply a storey.
+An initial unambiguous saved plan may supply its explicit level; the global numeric level and
+first building/storey are never used as substitutes. Missing/ambiguous hosts are refused.
+
+Changing the host edge/frame, wall depth, storey schedule, bay grid or active phase invalidates
+a captured point. This check runs with Properties hidden and before accepting another pick.
+After invalidation, choose a current storey or leave and reopen the saved plan, then capture a
+fresh point. A basement insertion's automatic saved-plan remap is not treated as renewed intent.
+A pending click never moves or rotates with an edited host. Picking/placing waits for the current
+model/drawing and the active phase's complete view.
 
 ## AI control and feedback
 
@@ -98,8 +132,8 @@ Studio's read-only view state adds an `authoring` object: active model tool, exa
 building/storey scope, pending command, error, annotation next step and explicit units. Empty
 construction-plane feedback includes its window origin and millimetres per point. Hidden browser
 hit rectangles are null. Draft state is UI feedback and is not silently saved as building geometry.
-Family-placement feedback reports the exact selected scope, readiness, stale source and failure
-state without placing an instance. `command_error` retains an actual placement rejection separately
+Family-placement feedback reports the mode, exact captured/hover coordinates, dimension preview,
+snap settings, selected scope, readiness, stale source and failure state without placing an instance. `command_error` retains an actual placement rejection separately
 from current local readiness; a successful retry or an explicit new type/scope clears it. Storey
 scope is checked with Properties hidden and before accepting a bare-wall pick, so adding a
 basement cannot renew an old floor index through a viewport click.

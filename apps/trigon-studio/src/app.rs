@@ -209,6 +209,8 @@ pub struct StudioApp {
     schedules: Schedules,
     properties: Properties,
     pending_selection: Option<String>,
+    pending_family_targets: Option<Vec<String>>,
+    family_text_owned_on_input: bool,
     selection_dirty: bool,
     pub(crate) plan: PlanView,
     cut_faces_dark: bool,
@@ -325,6 +327,8 @@ impl StudioApp {
             schedules: Schedules::default(),
             properties: Properties::default(),
             pending_selection: None,
+            pending_family_targets: None,
+            family_text_owned_on_input: false,
             selection_dirty: false,
             plan: PlanView::new(ctx.clone()),
             cut_faces_dark: true,
@@ -415,6 +419,7 @@ impl StudioApp {
                 }
                 self.plan.fail("Preparing drawing…".into());
                 self.pending_selection = None;
+                self.pending_family_targets = None;
                 self.level = None;
                 self.plan_level = self.session.doc.buildings.first().map_or(0, |b| b.ground_level);
                 self.phase = self.session.doc.active_index();
@@ -512,6 +517,7 @@ impl StudioApp {
                     self.build_error = Some(e);
                     self.selection = None;
                     self.pending_selection = None;
+                    self.pending_family_targets = None;
                     self.properties.begin(done.generation);
                     self.selection_dirty = true;
                 }
@@ -558,17 +564,22 @@ impl StudioApp {
         }
         let selected = self.selection.and_then(|i| old.elements.get(i)).map(|e| e.id.clone());
         let new = Arc::new(new);
-        self.selection = self
-            .pending_selection
-            .take()
-            .and_then(|id| {
-                new.find_unique(&id).or_else(|| {
-                    let root = id.split_once(':').map_or(id.as_str(), |(_, root)| root);
-                    new.find_unique(&format!("{root}.L{}", self.plan_level))
-                        .or_else(|| new.elements.iter().position(|e| e.id.starts_with(&format!("{root}.L"))))
+        if let Some(targets) = self.pending_family_targets.take() {
+            self.pending_selection = None;
+            self.selection = targets.iter().find_map(|id| new.find_unique(id));
+        } else {
+            self.selection = self
+                .pending_selection
+                .take()
+                .and_then(|id| {
+                    new.find_unique(&id).or_else(|| {
+                        let root = id.split_once(':').map_or(id.as_str(), |(_, root)| root);
+                        new.find_unique(&format!("{root}.L{}", self.plan_level))
+                            .or_else(|| new.elements.iter().position(|e| e.id.starts_with(&format!("{root}.L"))))
+                    })
                 })
-            })
-            .or_else(|| selected.and_then(|id| new.find_unique(&id)));
+                .or_else(|| selected.and_then(|id| new.find_unique(&id)));
+        }
         self.selection_dirty = true;
         if !diff.is_empty() {
             self.highlight = Some(Highlight { started: Instant::now() });
@@ -728,7 +739,12 @@ impl StudioApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() || egui::Popup::is_any_open(ctx) || self.palette.open || self.confirm_close {
+        if ctx.text_edit_focused()
+            || (self.authoring.family_placement_active() && self.family_text_owned_on_input)
+            || egui::Popup::is_any_open(ctx)
+            || self.palette.open
+            || self.confirm_close
+        {
             return;
         }
         let (undo, redo, palette, save, open, fit) = ctx.input_mut(|i| {
@@ -772,6 +788,7 @@ impl StudioApp {
                 self.model_tools.escape();
             }
             self.drafting.cancel_placement();
+            self.authoring.cancel_family_placement();
         }
         if self.model_tools.active()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
@@ -1581,6 +1598,17 @@ impl StudioApp {
 
     fn edit_block_reason(&self) -> Option<&'static str> {
         if self.authoring.tab == Tab::Families {
+            if self.authoring.family_placement_active() {
+                if self.building() || self.build_error.is_some() {
+                    return Some("Wait for a valid current model before picking or placing a component.");
+                }
+                if self.phase != self.session.doc.active_index() || self.filter != PhaseFilter::Complete {
+                    return Some("Component placement uses the active phase's complete view.");
+                }
+                if self.mode != Mode::ThreeD && (self.drawing_plan() || self.plan.error.is_some()) {
+                    return Some("Wait for the current drawing before picking or placing a component.");
+                }
+            }
             return None;
         }
         if self.build_error.is_some() {
@@ -1624,7 +1652,7 @@ impl StudioApp {
     }
 
     fn run_form(&mut self, run: crate::authoring::Run) {
-        let family_placement = run.command == "facade.place";
+        let family_placement = matches!(run.command, "facade.place" | "facade.place_at");
         if self.edit_block_reason().is_some() {
             let error = "Wait for the active model view before applying this change.".to_owned();
             if family_placement {
@@ -1636,7 +1664,7 @@ impl StudioApp {
         match self.run(Who::Owner, run.command, run.params) {
             Ok(value) => {
                 if family_placement {
-                    self.authoring.acknowledge_family_placement(None);
+                    self.authoring.family_placement_succeeded(&self.session.doc, &value);
                 }
                 if run.command == "precision.preview" {
                     self.status = Some(("Preview ready · review and apply in Properties".into(), false));
@@ -1645,6 +1673,19 @@ impl StudioApp {
                 if let Some(targets) = value.get("targets").and_then(Value::as_array) {
                     let ids = targets.iter().filter_map(Value::as_str).collect::<Vec<_>>();
                     self.pending_selection = ids.first().map(|s| s.to_string());
+                    if run.command == "facade.place_at" {
+                        self.pending_family_targets = Some(ids.iter().map(|id| (*id).to_owned()).collect());
+                        self.authoring.targets = ids.join("\n");
+                        if let Some(phase) = value["phase"].as_str().and_then(|id| self.session.doc.phases.iter().position(|p| p.id == id)) {
+                            let changed = self.phase != phase || self.filter != PhaseFilter::Complete || self.level.is_some();
+                            self.phase = phase;
+                            self.filter = PhaseFilter::Complete;
+                            self.level = None;
+                            if changed {
+                                self.request_rebuild(None);
+                            }
+                        }
+                    }
                     if !self.authoring.targets.is_empty() {
                         self.authoring.targets = ids.join("\n");
                     }
@@ -1781,6 +1822,10 @@ impl StudioApp {
         }
         if !controls_first {
             self.authoring_controls(ui, selected.as_ref());
+        }
+        if self.authoring.family_placement_active() && selected.is_some() && ui.button("Inspect selected instance").clicked() {
+            self.authoring.cancel_family_placement();
+            self.authoring.tab = Tab::Project;
         }
         ui.add_space(6.0);
         ui.separator();
@@ -2522,6 +2567,117 @@ impl StudioApp {
         );
     }
 
+    fn sync_family_view(&mut self) {
+        let view_id = (self.mode == Mode::Drawing).then_some(self.drawing.as_str());
+        self.authoring.sync_family_plan(&self.session.doc, view_id);
+    }
+
+    fn family_pick_status(&mut self, accepted: bool) {
+        self.dock_open = true;
+        self.dock_properties = true;
+        self.status = Some((
+            if accepted {
+                "Point captured · review dimensions, then Place component"
+            } else {
+                "Choose a host and current storey in Properties (or open its saved plan), then click a facade wall or component."
+            }
+            .into(),
+            !accepted,
+        ));
+    }
+
+    fn family_preview_ui(&self, ui: &egui::Ui, rect: egui::Rect) {
+        if let Some(reason) = self.edit_block_reason() {
+            ui.painter_at(rect).text(
+                rect.left_top() + egui::vec2(12.0, 12.0),
+                egui::Align2::LEFT_TOP,
+                reason,
+                egui::FontId::proportional(13.0),
+                theme::ACCENT,
+            );
+            return;
+        }
+        let Some(preview) = self.authoring.family_preview(&self.session.doc) else { return };
+        let plan_level = if self.mode == Mode::Plan {
+            Some(self.plan_level)
+        } else if self.mode == Mode::Drawing {
+            self.session.doc.views.iter().find(|v| v.id == self.drawing).and_then(|v| match v.kind {
+                DrawingViewKind::Plan { level } => Some(level),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let painter = ui.painter_at(rect);
+        if plan_level.is_some_and(|level| level != preview.level) {
+            painter.text(
+                rect.left_top() + egui::vec2(12.0, 12.0),
+                egui::Align2::LEFT_TOP,
+                format!("Placement is on L{} · open that plan to review its preview", preview.level),
+                egui::FontId::proportional(13.0),
+                theme::ACCENT,
+            );
+            return;
+        }
+        if self.mode == Mode::Drawing && plan_level.is_none() {
+            let matching = self
+                .session
+                .doc
+                .views
+                .iter()
+                .find(|v| v.id == self.drawing)
+                .is_some_and(|v| matches!(&v.kind, DrawingViewKind::Facade { facade } if facade == &preview.facade));
+            if !matching {
+                return;
+            }
+        }
+        let project = |p: [f64; 3]| {
+            if self.mode == Mode::ThreeD {
+                let at = std::array::from_fn(|axis| ((p[axis] - self.scene.origin[axis]) / 1000.0) as f32);
+                Mapping::Spatial { camera: self.camera, rect, at, direction: [1.0, 0.0, 0.0] }.screen(0.0)
+            } else {
+                self.drawing_point(p).and_then(|p| self.plan.model_to_screen(rect, p))
+            }
+        };
+        let corners = if plan_level.is_some() { preview.plan } else { preview.face };
+        let Some(points) = corners.into_iter().map(project).collect::<Option<Vec<_>>>() else { return };
+        let color = if preview.captured { theme::ACCENT } else { egui::Color32::from_rgb(35, 130, 190) };
+        painter.add(egui::Shape::convex_polygon(points.clone(), color.gamma_multiply(0.15), egui::Stroke::new(2.0, color)));
+        let axis = if plan_level.is_some() {
+            [
+                std::array::from_fn(|i| (preview.plan[0][i] + preview.plan[1][i]) / 2.0),
+                std::array::from_fn(|i| (preview.plan[2][i] + preview.plan[3][i]) / 2.0),
+            ]
+        } else {
+            preview.axis
+        };
+        if let (Some(a), Some(b)) = (project(axis[0]), project(axis[1])) {
+            painter.line_segment([a, b], egui::Stroke::new(1.0, color));
+            painter.circle_stroke(a, 4.0, egui::Stroke::new(1.5, color));
+        }
+        let text = format!(
+            "{} · L{} · u {} mm\nW {} × H {} · sill {} mm\n{} · depth {} mm\n{} · {}",
+            if preview.captured { "Captured" } else { "Click to capture" },
+            preview.level,
+            preview.u_mm,
+            preview.sizes[0],
+            preview.sizes[1],
+            preview.sizes[2],
+            if preview.opening { "Opening" } else { "Attachment size" },
+            preview.depth_mm,
+            preview.guide,
+            if preview.captured { "Place in Properties" } else { "Alt: exact" }
+        );
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), theme::DRAWING_INK);
+        let anchor = points.first().copied().unwrap_or(rect.left_top()) + egui::vec2(8.0, 8.0);
+        let at = egui::pos2(
+            anchor.x.clamp(rect.left() + 6.0, (rect.right() - galley.size().x - 12.0).max(rect.left() + 6.0)),
+            anchor.y.clamp(rect.top() + 6.0, (rect.bottom() - galley.size().y - 12.0).max(rect.top() + 6.0)),
+        );
+        painter.rect_filled(egui::Rect::from_min_size(at - egui::vec2(4.0, 4.0), galley.size() + egui::vec2(8.0, 8.0)), 3.0, theme::PANEL);
+        painter.galley(at, galley, theme::DRAWING_INK);
+    }
+
     fn family_site_point(&self, host: &crate::scene::Element, point: [f64; 2]) -> Option<[f64; 2]> {
         if point.iter().any(|value| !value.is_finite()) {
             return None;
@@ -2583,28 +2739,31 @@ impl StudioApp {
             return;
         }
         if self.authoring.family_placement_active() {
+            self.sync_family_view();
+            if self.edit_block_reason().is_some() {
+                self.authoring.hover_family_host(&self.session.doc, None, false);
+                self.family_preview_ui(ui, rect);
+                return;
+            }
             response.clone().on_hover_cursor(egui::CursorIcon::Crosshair);
-            if response.clicked()
-                && let Some(at) = response.interact_pointer_pos()
-            {
+            let hit = response.hover_pos().and_then(|at| {
                 let host = self
                     .plan
                     .pick_element(rect, at)
                     .and_then(|hit| self.scene.find_unique(&hit.id))
-                    .and_then(|i| self.scene.elements.get(i))
-                    .cloned();
-                let point = host.as_ref().and_then(|host| self.plan.screen_to_model(rect, at).and_then(|point| self.family_site_point(host, point)));
-                if let Some(host) = host
-                    && let Some(point) = point
-                    && self.authoring.pick_family_host(&self.session.doc, &host, Some(point))
-                {
-                    self.dock_open = true;
-                    self.dock_properties = true;
-                    self.status = Some(("Host picked · review dimensions, then Place type".into(), false));
-                } else {
-                    self.status = Some(("Pick an unambiguous bay in a floor plan or an elevation of that facade.".into(), true));
-                }
+                    .and_then(|i| self.scene.elements.get(i))?
+                    .clone();
+                let point = self.plan.screen_to_model(rect, at).and_then(|point| self.family_site_point(&host, point))?;
+                Some((host, point))
+            });
+            let alt = ui.input(|i| i.modifiers.alt);
+            self.authoring.hover_family_host(&self.session.doc, hit.as_ref().map(|(host, point)| (host, *point)), alt);
+            if response.clicked() {
+                let accepted =
+                    hit.as_ref().is_some_and(|(host, point)| self.authoring.pick_family_host_snapped(&self.session.doc, host, Some(*point), alt));
+                self.family_pick_status(accepted);
             }
+            self.family_preview_ui(ui, rect);
             return;
         }
         let handles_busy = self.model_handles_ui(ui, rect);
@@ -2745,6 +2904,7 @@ impl StudioApp {
             self.fit();
         } else if resp.clicked()
             && !handle_capture
+            && (!self.authoring.family_placement_active() || self.edit_block_reason().is_none())
             && let Some(p) = resp.interact_pointer_pos()
         {
             let ndc = [(p.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (p.y - rect.top()) / rect.height() * 2.0];
@@ -2752,19 +2912,17 @@ impl StudioApp {
             self.inspect_elements();
             self.pending_selection = None;
             let placing = self.authoring.family_placement_active();
+            self.sync_family_view();
             let hit = placing.then(|| self.scene.pick_hit(o, dir, self.clip_z())).flatten();
             self.selection = if placing { hit.map(|(index, _)| index) } else { self.scene.pick(o, dir, self.clip_z()) };
             if placing {
                 if let Some((index, point)) = hit
                     && let Some(selected) = self.scene.elements.get(index)
-                    && self.authoring.pick_family_host(&self.session.doc, selected, Some([point[0], point[1]]))
+                    && self.authoring.pick_family_host_snapped(&self.session.doc, selected, Some([point[0], point[1]]), ui.input(|i| i.modifiers.alt))
                 {
-                    self.dock_open = true;
-                    self.dock_properties = true;
-                    self.status = Some(("Host picked · review dimensions, then Place type".into(), false));
+                    self.family_pick_status(true);
                 } else {
-                    self.status =
-                        Some(("No unique facade bay at that hit. Pick a facade wall or opening, or choose a host in Properties.".into(), true));
+                    self.family_pick_status(false);
                 }
             }
             self.selection_dirty = true;
@@ -2798,6 +2956,17 @@ impl StudioApp {
             ui.ctx().request_repaint();
         }
         self.viewport_overlay(&painter, rect);
+        if self.authoring.family_placement_active() {
+            self.sync_family_view();
+            let hit = resp.hover_pos().filter(|_| self.edit_block_reason().is_none()).and_then(|p| {
+                let ndc = [(p.x - rect.left()) / rect.width() * 2.0 - 1.0, 1.0 - (p.y - rect.top()) / rect.height() * 2.0];
+                let (origin, direction) = self.camera.ray(ndc, aspect);
+                let (index, point) = self.scene.pick_hit(origin, direction, self.clip_z())?;
+                Some((self.scene.elements.get(index)?.clone(), [point[0], point[1]]))
+            });
+            self.authoring.hover_family_host(&self.session.doc, hit.as_ref().map(|(host, point)| (host, *point)), ui.input(|i| i.modifiers.alt));
+            self.family_preview_ui(ui, rect);
+        }
         self.model_handles_ui(ui, rect);
     }
 
@@ -2920,7 +3089,7 @@ impl StudioApp {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         self.model_tools.sync_context(&self.session.doc, self.plan_level);
         self.drafting.sync_context(&self.session.doc);
-        self.authoring.sync_placement_scope(&self.session.doc);
+        self.sync_family_view();
         self.browser_rect = None;
         self.dock_rect = None;
         if self.dock_open && !self.focus_canvas {
@@ -3008,6 +3177,8 @@ impl StudioApp {
 
 impl eframe::App for StudioApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // egui may surrender text focus on Escape at begin_pass, before shortcuts run.
+        self.family_text_owned_on_input = self.authoring.family_placement_active() && ctx.text_edit_focused();
         if let Some(event) = self.synthetic.pop_front() {
             raw_input.events.push(event);
         }
@@ -3294,6 +3465,195 @@ mod tests {
         assert!(app.authoring_feedback()["family_placement"]["command_error"].is_null(), "success clears the retained rejection");
         app.session.execute("edit.undo", json!({})).unwrap();
         assert_eq!(app.session.doc, before, "retry remains undoable through the shared command");
+    }
+
+    fn point_app() -> StudioApp {
+        let mut session = Session::new(Box::new(Live::new(Credentials::default())));
+        session.doc.buildings.push(
+            trigon_model::Building::new(
+                "point",
+                "Point placement fixture",
+                &[[0.0, 0.0], [12000.0, 0.0], [12000.0, 8000.0], [0.0, 8000.0]],
+                3,
+                3000.0,
+            )
+            .unwrap(),
+        );
+        let mut app = StudioApp::with_context(egui::Context::default(), None, session);
+        app.request_rebuild(None);
+        complete(&mut app);
+        app.authoring.choose_type(app.session.doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        app.authoring.begin_family_placement(&app.session.doc, None);
+        app
+    }
+
+    fn capture_point(app: &mut StudioApp, u: f64) {
+        let mut host = app.scene.elements.iter().find(|e| e.id == "point.f1").unwrap().clone();
+        host.level = Some(1); // Explicit Storey selection, not an inferred global index.
+        assert!(app.authoring.pick_family_host(&app.session.doc, &host, Some([u, 0.0])));
+    }
+
+    #[test]
+    fn point_command_error_survives_repaint_and_success_selects_exact_returned_products() {
+        let mut app = point_app();
+        capture_point(&mut app, 3200.125);
+        let before = app.session.doc.clone();
+        let mut run = app.authoring.place_type(&app.session.doc).unwrap();
+        run.params["height"] = json!(4000.0);
+        run.params["sill"] = json!(500.0);
+        app.run_form(run);
+        let error = app.feed.latest().unwrap().result.as_ref().unwrap_err().clone();
+        assert_eq!(app.session.doc, before);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for hidden in [true, false, true] {
+            app.dock_open = !hidden;
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))), ..Default::default() },
+                |ui| app.workspace_ui(ui),
+            );
+            output.textures_delta.clear();
+            assert_eq!(app.authoring_feedback()["family_placement"]["command_error"], error);
+            assert_eq!(app.session.doc, before);
+        }
+        app.run_form(app.authoring.place_type(&app.session.doc).unwrap());
+        let result = app.feed.latest().unwrap().result.as_ref().unwrap().clone();
+        assert!(app.authoring_feedback()["family_placement"]["command_error"].is_null());
+        assert_eq!(app.pending_selection.as_deref(), result["targets"][0].as_str());
+        assert_eq!(app.session.doc.phases[app.phase].id, result["phase"]);
+        assert!(app.building());
+        complete(&mut app);
+        let id = &app.scene.elements[app.selection.unwrap()].id;
+        assert_eq!(id, result["targets"][0].as_str().unwrap());
+        assert_eq!(app.properties.descriptor(id).unwrap()["editable"], true);
+        assert_eq!(app.authoring_feedback()["family_placement"]["scope"]["level"], 1);
+        assert_eq!(app.authoring_feedback()["family_placement"]["stale"], false);
+        capture_point(&mut app, 7000.25);
+        app.run_form(app.authoring.place_type(&app.session.doc).unwrap());
+        complete(&mut app);
+        let placed = app.session.doc.clone();
+        app.undo_redo(Action::Undo);
+        complete(&mut app);
+        app.undo_redo(Action::Undo);
+        complete(&mut app);
+        assert_eq!(app.session.doc, before);
+        app.undo_redo(Action::Redo);
+        complete(&mut app);
+        app.undo_redo(Action::Redo);
+        complete(&mut app);
+        assert_eq!(app.session.doc, placed);
+    }
+
+    #[test]
+    fn point_attachment_selection_uses_returned_leaf_ids_and_never_falls_back_to_another_product() {
+        let mut app = point_app();
+        let guard:trigon_model::ComponentType=serde_json::from_value(json!({"id":"guard.test","name":"Guard",
+            "width":1200,"height":1100,"sill":0,"kind":{"family":"guard_rail","projection":180,"railing":"frederiksberg","finish":"galvanised","handrail":false}})).unwrap();
+        app.session.doc.types.push(guard.clone());
+        app.authoring.choose_type(&guard);
+        capture_point(&mut app, 4000.125);
+        app.run_form(app.authoring.place_type(&app.session.doc).unwrap());
+        let result = app.feed.latest().unwrap().result.as_ref().unwrap().clone();
+        complete(&mut app);
+        let id = &app.scene.elements[app.selection.unwrap()].id;
+        assert_eq!(id, result["targets"][0].as_str().unwrap());
+        assert!(id.ends_with(".balcony.rail"));
+        assert_eq!(app.properties.descriptor(id).unwrap()["editable"], true);
+        app.pending_family_targets = Some(vec!["missing.L1.B0".into()]);
+        app.pending_selection = Some("missing.L1.B0".into());
+        app.apply_scene((*app.scene).clone(), app.scene_generation);
+        assert!(app.selection.is_none(), "an exact engine target may never fall back to the previous selected product");
+    }
+
+    #[test]
+    fn point_escape_respects_modal_popup_and_foreign_text_editor_ownership() {
+        for owner in 0..5 {
+            let mut app = point_app();
+            capture_point(&mut app, 3200.125);
+            let before = app.session.doc.clone();
+            let ctx = egui::Context::default();
+            if owner == 1 {
+                app.palette.show();
+            }
+            if owner == 2 {
+                app.confirm_close = true;
+            }
+            if owner == 3 {
+                egui::Popup::open_id(&ctx, egui::Id::new("placement-popup"));
+            }
+            let mut text = String::from("foreign editor");
+            if owner == 4 {
+                for _ in 0..2 {
+                    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        let response = ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::new("point-foreign-editor")));
+                        response.request_focus();
+                    });
+                    output.textures_delta.clear();
+                }
+                assert!(ctx.text_edit_focused(), "the fixture must establish real foreign editor ownership");
+            }
+            let mut input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut input);
+            let mut output = ctx.run_ui(input, |_| app.shortcuts(&ctx));
+            output.textures_delta.clear();
+            assert_eq!(app.authoring.family_placement_active(), owner != 0, "keyboard owner {owner}");
+            if owner == 0 {
+                assert!(app.authoring_feedback()["family_placement"]["captured_u_mm"].is_null());
+            }
+            assert_eq!(app.session.doc, before);
+        }
+    }
+
+    #[test]
+    fn point_scope_is_invalidated_with_properties_hidden_before_real_bare_wall_pick() {
+        let mut app = point_app();
+        app.session.doc.views.push(serde_json::from_value(json!({"id":"saved-ground","name":"Ground","kind":{"view":"plan","level":0}})).unwrap());
+        app.mode = Mode::Drawing;
+        app.drawing = "saved-ground".into();
+        app.sync_family_view();
+        let host = app.scene.elements.iter().find(|e| e.id == "point.f1").unwrap().clone();
+        assert_eq!(host.level, None);
+        assert!(app.authoring.pick_family_host(&app.session.doc, &host, Some([3200.0, 0.0])));
+        app.run(Who::Owner, "building.add_basement", json!({"building":"point","floor":-2500})).unwrap();
+        complete(&mut app);
+        app.dock_open = false;
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0))), ..Default::default() },
+            |ui| app.workspace_ui(ui),
+        );
+        output.textures_delta.clear();
+        let host = app.scene.elements.iter().find(|e| e.id == "point.f1").unwrap().clone();
+        assert!(!app.authoring.pick_family_host(&app.session.doc, &host, Some([3200.0, 0.0])));
+        assert!(app.authoring.place_type(&app.session.doc).is_none());
+        assert!(app.authoring_feedback()["family_placement"]["scope"]["level"].is_null());
+    }
+
+    #[test]
+    fn point_placement_waits_for_the_current_worker_and_complete_phase_view() {
+        let mut app = point_app();
+        capture_point(&mut app, 3200.0);
+        let before = app.session.doc.clone();
+        let run = app.authoring.place_type(&app.session.doc).unwrap();
+        app.request_rebuild(None);
+        app.run_form(run);
+        assert_eq!(app.session.doc, before);
+        assert!(app.authoring_feedback()["family_placement"]["command_error"].as_str().unwrap().contains("Wait"));
+        complete(&mut app);
+        app.filter = PhaseFilter::Demolition;
+        assert!(app.edit_block_reason().is_some());
+        app.run_form(app.authoring.place_type(&app.session.doc).unwrap());
+        assert_eq!(app.session.doc, before);
     }
 
     #[test]

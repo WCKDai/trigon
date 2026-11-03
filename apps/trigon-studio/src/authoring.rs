@@ -89,9 +89,49 @@ pub struct Run {
 #[derive(Clone, PartialEq)]
 struct PlacementScope {
     facade: String,
+    level: usize,
+    edge: usize,
+    edge_points: [[f64; 2]; 2],
+    thickness: f64,
     storeys: Vec<trigon_model::Storey>,
     bays: Vec<f64>,
     phase: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum PlacementMode {
+    #[default]
+    Point,
+    Pattern,
+}
+
+#[derive(Clone)]
+struct PlacementPoint {
+    scope: PlacementScope,
+    u_mm: f64,
+    guide: String,
+}
+
+struct UnscopedPoint {
+    host: Element,
+    site: [f64; 2],
+    edge_points: [[f64; 2]; 2],
+    alt: bool,
+}
+
+/// A local dimension envelope, not a geometry build or a clash certificate.
+pub(crate) struct PlacementPreview {
+    pub facade: String,
+    pub level: usize,
+    pub u_mm: f64,
+    pub sizes: [f64; 3],
+    pub opening: bool,
+    pub depth_mm: f64,
+    pub face: [[f64; 3]; 4],
+    pub plan: [[f64; 3]; 4],
+    pub axis: [[f64; 3]; 2],
+    pub captured: bool,
+    pub guide: String,
 }
 
 pub struct Authoring {
@@ -126,6 +166,15 @@ pub struct Authoring {
     draft_is_new: bool,
     pending_type: Option<String>,
     show_placement: bool,
+    place_mode: PlacementMode,
+    place_point: Option<PlacementPoint>,
+    place_hover: Option<PlacementPoint>,
+    place_unscoped: Option<UnscopedPoint>,
+    place_snap_mm: f64,
+    place_snap_axes: bool,
+    place_plan_identity: Option<(String, usize)>,
+    place_plan_level: Option<usize>,
+    place_plan_invalidated: bool,
     facade: String,
     bay_count: usize,
     place_level: Option<usize>,
@@ -177,6 +226,15 @@ impl Default for Authoring {
             draft_is_new: false,
             pending_type: None,
             show_placement: false,
+            place_mode: PlacementMode::Point,
+            place_point: None,
+            place_hover: None,
+            place_unscoped: None,
+            place_snap_mm: 100.0,
+            place_snap_axes: true,
+            place_plan_identity: None,
+            place_plan_level: None,
+            place_plan_invalidated: false,
             facade: String::new(),
             bay_count: 5,
             place_level: None,
@@ -478,15 +536,19 @@ impl Authoring {
         }
         self.tab = Tab::Families;
         self.show_placement = true;
+        self.place_mode = PlacementMode::Point;
         self.place_replace = false;
         self.place_command_error = None;
+        self.place_point = None;
+        self.place_hover = None;
+        self.place_unscoped = None;
         if let Some(current) = current
             && !self.pick_family_host(doc, current, None)
         {
             self.facade.clear();
             self.place_level = None;
             self.place_scope = None;
-            self.place_scope_error = Some("Pick a facade bay or choose its host and storey explicitly.".into());
+            self.place_scope_error = Some("Choose a facade and storey, then click its placement point.".into());
         }
     }
 
@@ -507,82 +569,260 @@ impl Authoring {
             "error":self.place_scope_error.as_deref().or(stale.then_some("The placement source changed; choose its host and storey again.")).or(self.place_command_error.as_deref()),
             "command_error":self.place_command_error,
             "replace_existing":self.place_replace,"instance_overrides":self.place_overrides,
+            "mode":if self.place_mode == PlacementMode::Point { "point" } else { "bay_pattern" },
+            "captured_u_mm":self.place_point.as_ref().map(|p|p.u_mm),
+            "hover_u_mm":self.place_hover.as_ref().map(|p|p.u_mm),
+            "preview":self.family_preview(doc).map(|p|json!({"facade":p.facade,"level":p.level,"u_mm":p.u_mm,
+                "width":p.sizes[0],"height":p.sizes[1],"sill":p.sizes[2],"depth_mm":p.depth_mm,"opening":p.opening,
+                "face":p.face,"plan":p.plan,"captured":p.captured,"guide":p.guide})),
+            "snap_increment_mm":self.place_snap_mm,"snap_axes":self.place_snap_axes,
             "units":"mm"})
     }
 
-    /// A viewport hit only fills the placement form. `point` is site-local XY in millimetres,
-    /// including the building's translation/rotation. Wall picks retain the explicitly chosen
-    /// storey; a picked component supplies its own storey. The explicit Place button commits.
+    /// No snapping is applied to programmatic/numeric picks. Viewport gestures use
+    /// `pick_family_host_snapped` with the actual Alt modifier.
     pub(crate) fn pick_family_host(&mut self, doc: &Document, current: &Element, point: Option<[f64; 2]>) -> bool {
-        if !self.family_placement_active() {
-            return false;
-        }
+        self.pick_family_host_snapped(doc, current, point, true)
+    }
+
+    pub(crate) fn pick_family_host_snapped(&mut self, doc: &Document, current: &Element, point: Option<[f64; 2]>, alt: bool) -> bool {
         self.sync_placement_scope(doc);
+        let Some(picked) = self.family_point(doc, current, point, alt) else {
+            // A real bare-wall click can identify the host before the user chooses its
+            // storey. Retain the source frame and hit, but never make it placeable yet.
+            if self.family_placement_active()
+                && self.place_mode == PlacementMode::Point
+                && current.host
+                && current.kind == "wall"
+                && current.level.is_none()
+                && self.place_level.is_none()
+                && self.place_plan_level.is_none()
+                && let Some(site) = point.filter(|p| p.iter().all(|v| v.is_finite()))
+            {
+                let mut matches = doc.buildings.iter().flat_map(|b| b.facades.iter().filter(|f| f.id == current.id).map(move |f| (b, f)));
+                if let Some((building, facade)) = matches.next()
+                    && matches.next().is_none()
+                    && facade.kind != trigon_model::doc::FacadeKind::Party
+                    && let Some((a, b)) = building.edge(facade.edge)
+                    && let Some(frame) = trigon_model::FacadeFrame::new(a, b)
+                {
+                    let u = (site[0] - a[0]) * frame.t[0] + (site[1] - a[1]) * frame.t[1];
+                    if frame.length.is_finite() && u.is_finite() && (0.0..=frame.length).contains(&u) {
+                        self.facade = facade.id.clone();
+                        self.place_point = None;
+                        self.place_replace = false;
+                        self.place_unscoped = Some(UnscopedPoint { host: current.clone(), site, edge_points: [a, b], alt });
+                    }
+                }
+            }
+            return false;
+        };
+        self.facade = picked.scope.facade.clone();
+        self.place_level = Some(picked.scope.level);
+        self.place_bay = picked.scope.bays.iter().position(|u| (*u - picked.u_mm).abs() <= 1e-6).unwrap_or(picked.scope.bays.len());
+        self.place_all_bays = false;
+        self.accept_placement_scope(doc);
+        self.place_point = Some(picked);
+        self.place_hover = None;
+        self.place_unscoped = None;
+        true
+    }
+
+    fn choose_family_storey(&mut self, doc: &Document, level: usize) {
+        let pending = self.place_unscoped.take();
+        self.place_level = Some(level);
+        self.place_point = None;
+        self.place_hover = None;
+        self.accept_placement_scope(doc);
+        if let Some(pending) = pending
+            && self.place_scope.as_ref().is_some_and(|scope| scope.edge_points == pending.edge_points && scope.facade == pending.host.id)
+        {
+            self.pick_family_host_snapped(doc, &pending.host, Some(pending.site), pending.alt);
+        }
+    }
+
+    pub(crate) fn hover_family_host(&mut self, doc: &Document, hit: Option<(&Element, [f64; 2])>, alt: bool) {
+        self.sync_placement_scope(doc);
+        self.place_hover = hit.and_then(|(host, point)| self.family_point(doc, host, Some(point), alt));
+    }
+
+    /// A saved plan can supply an initial explicit level. Once invalidated, observing the
+    /// same saved ID/level again is not a new choice (nor is the application's global index).
+    pub(crate) fn sync_family_plan(&mut self, doc: &Document, view_id: Option<&str>) {
+        self.sync_placement_scope(doc);
+        let identity = view_id.and_then(|id| {
+            let mut views = doc.views.iter().filter(|view| view.id == id);
+            let view = views.next()?;
+            if views.next().is_some() || doc.buildings.len() != 1 {
+                return None;
+            }
+            let trigon_model::annotation::DrawingViewKind::Plan { level, .. } = view.kind else { return None };
+            doc.buildings.first()?.storeys.get(level)?;
+            Some((id.to_owned(), level))
+        });
+        if self.place_plan_invalidated {
+            // Record even an automatically remapped saved level as the stale observed view.
+            // A later view change or explicit Storey choice is the renewed user intent.
+            self.place_plan_identity = identity;
+            self.place_plan_level = None;
+            self.place_plan_invalidated = false;
+        } else if identity != self.place_plan_identity {
+            self.place_plan_level = identity.as_ref().map(|(_, level)| *level);
+            self.place_plan_identity = identity;
+        }
+    }
+
+    fn family_point(&self, doc: &Document, current: &Element, point: Option<[f64; 2]>, alt: bool) -> Option<PlacementPoint> {
+        if !self.family_placement_active() {
+            return None;
+        }
         let facade_id = if current.host && current.kind == "wall" {
             current.id.as_str()
         } else if matches!(current.kind, "window" | "door" | "balcony" | "railing") {
             let mut props = current.props.iter().filter(|(key, _)| *key == "facade");
-            let Some((_, id)) = props.next() else { return false };
+            let (_, id) = props.next()?;
             if props.next().is_some() {
-                return false;
+                return None;
             }
             id.as_str()
         } else {
-            return false;
+            return None;
         };
-        let mut facades = doc
+        let mut matches = doc
             .buildings
             .iter()
             .flat_map(|building| building.facades.iter().filter(|facade| facade.id == facade_id).map(move |facade| (building, facade)));
-        let Some((building, facade)) = facades.next() else { return false };
-        if facades.next().is_some() || facade.bays.is_empty() {
-            return false;
+        let (building, facade) = matches.next()?;
+        if matches.next().is_some() || facade.kind == trigon_model::doc::FacadeKind::Party {
+            return None;
         }
-        let Some(level) = current.level.or(self.place_level) else { return false };
-        if building.storeys.get(level).is_none() {
-            return false;
-        }
-        let bay = if let Some(point) = point {
-            if point.iter().any(|value| !value.is_finite()) {
-                return false;
+        let retained_level = (self.facade.is_empty() || self.facade == facade.id).then_some(self.place_level).flatten();
+        let level = current.level.or(retained_level).or(self.place_plan_level)?;
+        let scope = Self::scope_for(doc, building, facade, level)?;
+        let frame = trigon_model::FacadeFrame::new(scope.edge_points[0], scope.edge_points[1])?;
+        let mut u = if let Some(point) = point {
+            if point.iter().any(|v| !v.is_finite()) {
+                return None;
             }
-            let Some((a, b)) = building.edge(facade.edge) else { return false };
-            let Some(frame) = trigon_model::build::FacadeFrame::new(a, b) else { return false };
-            let u = (point[0] - frame.origin[0]) * frame.t[0] + (point[1] - frame.origin[1]) * frame.t[1];
-            if !u.is_finite() || !frame.length.is_finite() || facade.bays.iter().any(|bay| !bay.is_finite() || *bay < 0.0 || *bay > frame.length) {
-                return false;
-            }
-            let mut nearest = None;
-            let mut distance = f64::INFINITY;
-            let mut tied = false;
-            for (index, centre) in facade.bays.iter().enumerate() {
-                let delta = (u - centre).abs();
-                if delta + 1e-6 < distance {
-                    nearest = Some(index);
-                    distance = delta;
-                    tied = false;
-                } else if (delta - distance).abs() <= 1e-6 {
-                    tied = true;
-                }
-            }
-            let Some(nearest) = nearest.filter(|_| !tied) else { return false };
-            nearest
+            (point[0] - frame.origin[0]) * frame.t[0] + (point[1] - frame.origin[1]) * frame.t[1]
         } else {
-            let Some(occurrence) = current.id.strip_prefix(&format!("{}.L{level}.B", facade.id)) else { return false };
-            let index = occurrence.strip_suffix(".balcony").unwrap_or(occurrence);
-            let Ok(index) = index.parse::<usize>() else { return false };
-            if facade.bays.get(index).is_none() {
-                return false;
+            let occurrence = current.id.strip_prefix(&format!("{}.L{level}.B", facade.id))?;
+            let index = occurrence.split('.').next()?.parse::<usize>().ok()?;
+            let bay = *facade.bays.get(index)?;
+            let mut placements = facade.placements.iter().filter(|p| {
+                p.level == level && p.bay == index && doc.lifetime(p).is_ok_and(|(c, d)| c <= doc.active_index() && doc.active_index() < d)
+            });
+            let u = if self.place_mode == PlacementMode::Pattern { bay } else { placements.next().map_or(bay, |p| p.u.unwrap_or(bay)) };
+            if self.place_mode == PlacementMode::Point && placements.any(|p| p.u.unwrap_or(bay) != u) {
+                return None;
             }
-            index
+            u
         };
-        self.facade = facade.id.clone();
-        self.place_level = Some(level);
-        self.place_bay = bay;
-        self.place_all_bays = false;
+        if !u.is_finite() || !(0.0..=frame.length).contains(&u) {
+            return None;
+        }
+        let mut guide = "Exact coordinate".to_owned();
+        if self.place_mode == PlacementMode::Pattern {
+            let (index, distance) = facade.bays.iter().enumerate().map(|(i, centre)| (i, (u - centre).abs())).min_by(|a, b| a.1.total_cmp(&b.1))?;
+            if facade.bays.iter().enumerate().any(|(i, centre)| i != index && ((u - centre).abs() - distance).abs() <= 1e-6) {
+                return None;
+            }
+            u = facade.bays[index];
+            guide = format!("Bay {}", index + 1);
+        } else if !alt {
+            let mut axes = Vec::new();
+            if self.place_snap_axes {
+                axes.extend(facade.bays.iter().enumerate().map(|(i, u)| (*u, format!("Bay {} axis", i + 1))));
+                axes.extend(facade.placements.iter().filter_map(|p| {
+                    let (c, d) = doc.lifetime(p).ok()?;
+                    (c <= doc.active_index() && doc.active_index() < d)
+                        .then(|| p.u.or_else(|| facade.bays.get(p.bay).copied()).map(|u| (u, format!("Instance axis · L{}", p.level))))
+                        .flatten()
+                }));
+            }
+            let axis = axes
+                .into_iter()
+                .filter(|(axis, _)| axis.is_finite() && (u - axis).abs() <= 100.0)
+                .min_by(|a, b| (u - a.0).abs().total_cmp(&(u - b.0).abs()));
+            if let Some((axis, label)) = axis {
+                u = axis;
+                guide = label;
+            } else if self.place_snap_mm.is_finite() && self.place_snap_mm > 0.0 {
+                u = (u / self.place_snap_mm).round() * self.place_snap_mm;
+                guide = format!("{} mm increment", self.place_snap_mm);
+            }
+        } else {
+            guide = "Exact · Alt bypass".into();
+        }
+        if !u.is_finite() || !(0.0..=frame.length).contains(&u) {
+            return None;
+        }
+        Some(PlacementPoint { scope, u_mm: u, guide })
+    }
+
+    pub(crate) fn cancel_family_placement(&mut self) {
+        self.show_placement = false;
+        self.place_point = None;
+        self.place_hover = None;
+        self.place_unscoped = None;
         self.place_replace = false;
-        self.accept_placement_scope(doc);
-        true
+    }
+
+    fn instance_type(&self, doc: &Document) -> Option<ComponentType> {
+        if self.type_dirty() || self.type_error(doc).is_some() {
+            return None;
+        }
+        let mut ty = self.draft.clone()?;
+        if self.place_overrides {
+            [ty.width, ty.height, ty.sill] = self.place_sizes;
+        }
+        ty.validate().ok()?;
+        Some(ty)
+    }
+
+    pub(crate) fn family_preview(&self, doc: &Document) -> Option<PlacementPreview> {
+        if !self.family_placement_active() || self.place_mode != PlacementMode::Point {
+            return None;
+        }
+        // A captured click always wins over hover, including while editing in Properties.
+        let point = self.place_point.as_ref().or(self.place_hover.as_ref())?;
+        let mut matches = doc.buildings.iter().flat_map(|b| b.facades.iter().filter(|f| f.id == point.scope.facade).map(move |f| (b, f)));
+        let (building, facade) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        if Self::scope_for(doc, building, facade, point.scope.level).as_ref() != Some(&point.scope) {
+            return None;
+        }
+        let ty = self.instance_type(doc)?;
+        let frame = trigon_model::FacadeFrame::new(point.scope.edge_points[0], point.scope.edge_points[1])?;
+        let u = point.u_mm;
+        if !u.is_finite() || !(0.0..=frame.length).contains(&u) {
+            return None;
+        }
+        let z = building.storeys.get(point.scope.level)?.elevation + ty.sill;
+        let (left, right) = (u - ty.width / 2.0, u + ty.width / 2.0);
+        let opening = ty.kind.is_opening();
+        let depth = if opening { point.scope.thickness } else { -ty.kind.depth()? };
+        let face_depth = if opening { 0.0 } else { depth };
+        Some(PlacementPreview {
+            facade: facade.id.clone(),
+            level: point.scope.level,
+            u_mm: u,
+            sizes: [ty.width, ty.height, ty.sill],
+            opening,
+            depth_mm: depth.abs(),
+            face: [
+                frame.point(left, face_depth, z),
+                frame.point(right, face_depth, z),
+                frame.point(right, face_depth, z + ty.height),
+                frame.point(left, face_depth, z + ty.height),
+            ],
+            plan: [frame.point(left, 0.0, z), frame.point(right, 0.0, z), frame.point(right, depth, z), frame.point(left, depth, z)],
+            axis: [frame.point(u, face_depth, building.storeys.get(point.scope.level)?.elevation), frame.point(u, face_depth, z + ty.height)],
+            captured: self.place_point.is_some(),
+            guide: point.guide.clone(),
+        })
     }
 
     pub(crate) fn duplicate_selected_type(&mut self, doc: &Document) -> bool {
@@ -1429,12 +1669,31 @@ impl Authoring {
         let (building, facade) = self.placement_facade(doc)?;
         let level = self.place_level?;
         building.storeys.get(level)?;
-        if facade.bays.is_empty() || (!self.place_all_bays && self.place_bay >= facade.bays.len()) {
-            return None;
-        }
+        let bay = if self.place_mode == PlacementMode::Point {
+            let point = self.place_point.as_ref()?;
+            if Some(&point.scope) != self.place_scope.as_ref() || !point.u_mm.is_finite() {
+                return None;
+            }
+            let frame = trigon_model::FacadeFrame::new(point.scope.edge_points[0], point.scope.edge_points[1])?;
+            if !(0.0..=frame.length).contains(&point.u_mm) {
+                return None;
+            }
+            let mut matches = facade.bays.iter().enumerate().filter(|(_, u)| (**u - point.u_mm).abs() <= 1e-6);
+            let bay = matches.next().map(|(i, _)| i).unwrap_or(facade.bays.len());
+            if matches.next().is_some() {
+                return None;
+            }
+            bay
+        } else {
+            if facade.bays.is_empty() || (!self.place_all_bays && self.place_bay >= facade.bays.len()) {
+                return None;
+            }
+            self.place_bay
+        };
+        let all = self.place_mode == PlacementMode::Pattern && self.place_all_bays;
         let mut occupied = BTreeSet::new();
         for placement in &facade.placements {
-            if placement.level != level || (!self.place_all_bays && placement.bay != self.place_bay) {
+            if placement.level != level || (!all && placement.bay != bay) {
                 continue;
             }
             let (created, demolished) = doc.lifetime(placement).ok()?;
@@ -1443,38 +1702,81 @@ impl Authoring {
                 occupied.insert(placement.bay);
             }
         }
-        Some((if self.place_all_bays { facade.bays.len() } else { 1 }, occupied.len()))
+        Some((if all { facade.bays.len() } else { 1 }, occupied.len()))
     }
 
-    fn place_type(&self, doc: &Document) -> Option<Run> {
+    pub(crate) fn place_type(&self, doc: &Document) -> Option<Run> {
         let (_, occupied) = self.placement_counts(doc)?;
         if occupied > 0 && !self.place_replace {
             return None;
         }
-        let draft = self.draft.as_ref()?;
+        let instance = self.instance_type(doc)?;
         let (_, facade) = self.placement_facade(doc)?;
-        let bays = if self.place_all_bays { (0..facade.bays.len()).collect::<Vec<_>>() } else { vec![self.place_bay] };
-        let mut params = json!({"facade":self.facade,"type":draft.id,"levels":[self.place_level?],"bays":bays});
+        let (command, mut params) = if self.place_mode == PlacementMode::Point {
+            (
+                "facade.place_at",
+                json!({"facade":self.facade,"type":instance.id,"level":self.place_level?,
+                "u_mm":self.place_point.as_ref()?.u_mm,"replace":self.place_replace}),
+            )
+        } else {
+            let bays = if self.place_all_bays { (0..facade.bays.len()).collect::<Vec<_>>() } else { vec![self.place_bay] };
+            ("facade.place", json!({"facade":self.facade,"type":instance.id,"levels":[self.place_level?],"bays":bays}))
+        };
         if self.place_overrides {
-            let mut instance = draft.clone();
-            [instance.width, instance.height, instance.sill] = self.place_sizes;
-            instance.validate().ok()?;
             params["width"] = json!(instance.width);
             params["height"] = json!(instance.height);
             params["sill"] = json!(instance.sill);
         }
-        Some(Run { command: "facade.place", params })
+        Some(Run { command, params })
+    }
+
+    fn scope_for(doc: &Document, building: &Building, facade: &trigon_model::doc::Facade, level: usize) -> Option<PlacementScope> {
+        building.storeys.get(level)?;
+        let (a, b) = building.edge(facade.edge)?;
+        if a.iter().chain(&b).any(|v| !v.is_finite()) {
+            return None;
+        }
+        let frame = trigon_model::FacadeFrame::new(a, b)?;
+        if !frame.length.is_finite() || facade.bays.iter().any(|u| !u.is_finite() || !(0.0..=frame.length).contains(u)) {
+            return None;
+        }
+        Some(PlacementScope {
+            facade: facade.id.clone(),
+            level,
+            edge: facade.edge,
+            edge_points: [a, b],
+            thickness: building.edge_thickness(facade.edge, level),
+            storeys: building.storeys.clone(),
+            bays: facade.bays.clone(),
+            phase: doc.phases.get(doc.active_index()).map(|p| p.id.clone()),
+        })
     }
 
     fn current_placement_scope(&self, doc: &Document) -> Option<PlacementScope> {
         let (building, facade) = self.placement_facade(doc)?;
-        building.storeys.get(self.place_level?)?;
-        Some(PlacementScope {
-            facade: facade.id.clone(),
-            storeys: building.storeys.clone(),
-            bays: facade.bays.clone(),
-            phase: doc.phases.get(doc.active_index()).map(|phase| phase.id.clone()),
-        })
+        Self::scope_for(doc, building, facade, self.place_level?)
+    }
+
+    pub(crate) fn family_placement_succeeded(&mut self, doc: &Document, result: &Value) {
+        self.place_command_error = None;
+        self.place_replace = false;
+        // Only acknowledge this form's own exact point. An appended bay must not look like
+        // an external grid edit on the next frame; unrelated source changes still invalidate.
+        if result["facade"].as_str() == Some(self.facade.as_str())
+            && result["level"].as_u64().and_then(|n| usize::try_from(n).ok()) == self.place_level
+            && result["u_mm"].as_f64() == self.place_point.as_ref().map(|p| p.u_mm)
+            && let Some(scope) = self.current_placement_scope(doc)
+            && let Some(point) = &mut self.place_point
+        {
+            let mut expected = point.scope.clone();
+            expected.bays = scope.bays.clone();
+            if expected == scope {
+                point.scope = scope.clone();
+                self.place_scope = Some(scope);
+                self.place_scope_error = None;
+                self.place_hover = None;
+            }
+        }
     }
 
     fn accept_placement_scope(&mut self, doc: &Document) {
@@ -1485,17 +1787,29 @@ impl Authoring {
     }
 
     pub(crate) fn sync_placement_scope(&mut self, doc: &Document) {
+        if self
+            .place_unscoped
+            .as_ref()
+            .is_some_and(|point| self.placement_facade(doc).and_then(|(b, f)| b.edge(f.edge)).map(|(a, b)| [a, b]) != Some(point.edge_points))
+        {
+            self.place_unscoped = None;
+            self.place_scope_error = Some("The clicked host frame changed. Pick a fresh point.".into());
+        }
         if self.place_scope.is_some() && self.place_scope != self.current_placement_scope(doc) {
+            self.place_scope = None;
             self.place_level = None;
+            self.place_plan_level = None;
+            self.place_plan_invalidated = true;
+            self.place_point = None;
+            self.place_hover = None;
+            self.place_unscoped = None;
             self.place_replace = false;
-            self.place_scope_error = Some(
-                "The placement host, storey schedule, bay grid or active phase changed. Pick a host or choose its storey again before placing."
-                    .into(),
-            );
+            self.place_scope_error =
+                Some("The host frame, storeys, bay grid or phase changed. Choose a current storey or saved plan, then pick a fresh point.".into());
         }
     }
 
-    fn family_placement(&mut self, ui: &mut egui::Ui, doc: &Document, level: usize) -> Option<Run> {
+    fn family_placement(&mut self, ui: &mut egui::Ui, doc: &Document, _level: usize) -> Option<Run> {
         self.sync_placement_scope(doc);
         let mut run = None;
         let response = egui::CollapsingHeader::new("Place component").id_salt("family-placement").open(Some(self.show_placement)).show(ui, |ui| {
@@ -1504,9 +1818,22 @@ impl Authoring {
                 ui.weak("Create a building and facade before placing a component.");
                 return;
             }
-            ui.weak(
-                "Pick a facade or component in the work area, then Place. Picks snap to existing bay axes; wall picks use the storey chosen below.",
-            );
+            ui.horizontal_wrapped(|ui| {
+                let before = self.place_mode;
+                ui.selectable_value(&mut self.place_mode, PlacementMode::Point, "Point");
+                ui.selectable_value(&mut self.place_mode, PlacementMode::Pattern, "Bay pattern");
+                if self.place_mode != before {
+                    self.place_point = None;
+                    self.place_hover = None;
+                    self.place_unscoped = None;
+                    self.place_replace = false;
+                    self.place_command_error = None;
+                }
+                if ui.small_button("Exit placement").clicked() {
+                    self.cancel_family_placement();
+                }
+            });
+            ui.weak("Choose a storey or open a saved plan. Click a facade, review the preview, then Place. Escape exits.");
             ui.label("Host facade");
             let mut host_chosen = false;
             let facade_name =
@@ -1520,7 +1847,10 @@ impl Authoring {
                 }
             });
             if host_chosen {
-                self.place_level = self.placement_facade(doc).and_then(|(building, _)| building.storeys.get(level).map(|_| level));
+                self.place_level = None;
+                self.place_point = None;
+                self.place_hover = None;
+                self.place_unscoped = None;
                 self.place_bay = 0;
                 self.accept_placement_scope(doc);
             }
@@ -1552,41 +1882,69 @@ impl Authoring {
                     storey_chosen |= ui.selectable_value(&mut self.place_level, Some(index), format!("{} · L{index}", storey.name)).clicked();
                 }
             });
-            if storey_chosen {
-                self.accept_placement_scope(doc);
+            if storey_chosen && let Some(level) = self.place_level {
+                self.choose_family_storey(doc, level);
             }
-            if self.place_bay >= facade.bays.len() {
-                self.place_bay = 0;
-                self.place_replace = false;
-            }
-            ui.label("Placement scope");
-            let before = self.place_all_bays;
-            ui.checkbox(&mut self.place_all_bays, "All bays on this storey");
-            if self.place_all_bays != before {
-                self.place_replace = false;
-            }
-            if !self.place_all_bays && !facade.bays.is_empty() {
-                let before = self.place_bay;
-                egui::ComboBox::from_id_salt("place-bay")
-                    .width(ui.available_width())
-                    .truncate()
-                    .selected_text(format!("Bay {} of {}", self.place_bay + 1, facade.bays.len()))
-                    .show_ui(ui, |ui| {
-                        for (index, position) in facade.bays.iter().enumerate() {
-                            ui.selectable_value(&mut self.place_bay, index, format!("Bay {} · {:.0} mm along facade", index + 1, position));
-                        }
-                    });
-                if self.place_bay != before {
+            if self.place_mode == PlacementMode::Point {
+                if let Some(point) = &mut self.place_point {
+                    ui.label("Along facade from source start");
+                    if ui.add(egui::DragValue::new(&mut point.u_mm).speed(1.0).max_decimals(12).suffix(" mm")).changed() {
+                        point.guide = "Exact numeric coordinate".into();
+                        self.place_replace = false;
+                    }
+                    ui.weak("Captured point · moving the pointer cannot change it. Click the facade again to choose another point.");
+                } else {
+                    ui.colored_label(
+                        theme::ACCENT,
+                        if self.place_unscoped.is_some() {
+                            "Facade point captured · choose its storey to review the preview."
+                        } else {
+                            "Click a point on the facade to capture the placement."
+                        },
+                    );
+                }
+                egui::CollapsingHeader::new("Snap / align · hold Alt to bypass").show(ui, |ui| {
+                    ui.checkbox(&mut self.place_snap_axes, "Bay and instance axes (100 mm radius)");
+                    ui.label("Along-wall increment (0 = off)");
+                    ui.add(egui::DragValue::new(&mut self.place_snap_mm).speed(1.0).range(0.0..=10000.0).max_decimals(6).suffix(" mm"));
+                    ui.weak("Numeric edits are exact and never snapped. This is a drawing aid; the engine validates placement on Place.");
+                });
+            } else {
+                if self.place_bay >= facade.bays.len() {
+                    self.place_bay = 0;
                     self.place_replace = false;
+                }
+                ui.label("Placement scope");
+                let before = self.place_all_bays;
+                ui.checkbox(&mut self.place_all_bays, "All bays on this storey");
+                if self.place_all_bays != before {
+                    self.place_replace = false;
+                }
+                if !self.place_all_bays && !facade.bays.is_empty() {
+                    let before = self.place_bay;
+                    egui::ComboBox::from_id_salt("place-bay")
+                        .width(ui.available_width())
+                        .truncate()
+                        .selected_text(format!("Bay {} of {}", self.place_bay + 1, facade.bays.len()))
+                        .show_ui(ui, |ui| {
+                            for (index, position) in facade.bays.iter().enumerate() {
+                                ui.selectable_value(&mut self.place_bay, index, format!("Bay {} · {:.0} mm along facade", index + 1, position));
+                            }
+                        });
+                    if self.place_bay != before {
+                        self.place_replace = false;
+                    }
                 }
             }
             ui.checkbox(&mut self.place_overrides, "Override new instance sizes");
             if self.place_overrides {
                 ui.weak("These sizes apply to the chosen slots. The shared type stays unchanged.");
                 egui::Grid::new("place-sizes").max_col_width(ui.available_width() * 0.47).show(ui, |ui| {
-                    family_mm(ui, "Instance width", &mut self.place_sizes[0], 300.0, 6000.0);
-                    family_mm(ui, "Instance height", &mut self.place_sizes[1], 300.0, 4000.0);
-                    family_mm(ui, "Instance sill", &mut self.place_sizes[2], 0.0, 3000.0);
+                    for (label, value) in ["Instance width", "Instance height", "Instance sill"].into_iter().zip(&mut self.place_sizes) {
+                        ui.label(label);
+                        ui.add(egui::DragValue::new(value).speed(1.0).max_decimals(12).suffix(" mm"));
+                        ui.end_row();
+                    }
                 });
             } else {
                 ui.weak("New instances inherit the saved type dimensions.");
@@ -1598,7 +1956,7 @@ impl Authoring {
                 if occupied > 0 {
                     ui.colored_label(theme::ACCENT, format!("{occupied} occupied {}", if occupied == 1 { "slot" } else { "slots" }));
                     ui.checkbox(&mut self.place_replace, "Replace existing in these slots");
-                    ui.weak("Replacement uses the chosen type sizes and bay centres. Earlier-phase instances are demolished in the active phase.");
+                    ui.weak("Replacement affects the displayed slots only. Earlier-phase instances are demolished in the active phase.");
                 }
             }
             let placement = self.place_type(doc);
@@ -1606,17 +1964,19 @@ impl Authoring {
                 run = placement;
                 self.place_replace = false;
             }
-            egui::CollapsingHeader::new("Facade bay grid").id_salt("family-bay-grid").show(ui, |ui| {
-                ui.weak("Changing the shared facade grid affects every storey. Reducing the count removes placements beyond its end.");
-                ui.horizontal(|ui| {
-                    ui.label("Bay count");
-                    ui.add(egui::DragValue::new(&mut self.bay_count).range(1..=200));
+            if self.place_mode == PlacementMode::Pattern {
+                egui::CollapsingHeader::new("Facade bay grid").id_salt("family-bay-grid").show(ui, |ui| {
+                    ui.weak("Changing the shared facade grid affects every storey. Reducing the count removes placements beyond its end.");
+                    ui.horizontal(|ui| {
+                        ui.label("Bay count");
+                        ui.add(egui::DragValue::new(&mut self.bay_count).range(1..=200));
+                    });
+                    if ui.button("Update facade grid").clicked() {
+                        run = Some(Run { command: "facade.set_bays", params: json!({"facade":self.facade,"count":self.bay_count}) });
+                        self.place_replace = false;
+                    }
                 });
-                if ui.button("Update facade grid").clicked() {
-                    run = Some(Run { command: "facade.set_bays", params: json!({"facade":self.facade,"count":self.bay_count}) });
-                    self.place_replace = false;
-                }
-            });
+            }
         });
         if response.header_response.clicked() {
             self.show_placement = !self.show_placement;
@@ -1635,6 +1995,13 @@ impl Authoring {
         theme::eyebrow(ui, &family_name(draft).to_uppercase());
         ui.add(egui::Label::new(egui::RichText::new(&draft.name).heading()).wrap());
         ui.weak(format!("{:.0} × {:.0} mm · sill {:.0} mm", draft.width, draft.height, draft.sill));
+        if self.show_placement && !self.type_dirty() {
+            let run = self.family_placement(ui, doc, level);
+            if ui.button("Edit shared type…").clicked() {
+                self.cancel_family_placement();
+            }
+            return run;
+        }
         let count = if self.draft_is_new { 0 } else { Self::type_use_count(doc, &draft.id) };
         egui::Frame::new().fill(theme::CHROME).inner_margin(8.0).corner_radius(3).show(ui, |ui| {
             theme::eyebrow(ui, if self.draft_is_new { "NEW TYPE · UNSAVED COPY" } else { "SHARED TYPE · PROJECT-WIDE" });
@@ -1729,6 +2096,263 @@ mod library_tests {
         let mut session = trigon_engine::Session::new(Box::new(trigon_data::Live::new(trigon_data::Credentials::default())));
         session.doc = doc;
         session
+    }
+
+    #[test]
+    fn point_placement_on_an_empty_bay_host_uses_the_human_pick_and_place_routes() {
+        let mut doc = family_document();
+        doc.buildings[0].facades[0].bays.clear();
+        let before = doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|ty| ty.id == "window.fixed").unwrap());
+        form.begin_family_placement(&doc, None);
+        let mut host = family_host_element();
+        host.level = Some(1);
+        assert!(form.pick_family_host(&doc, &host, Some([3200.0, 0.0])), "a new wall needs no facade.set_bays step");
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.command, "facade.place_at");
+        assert_eq!(run.params["u_mm"], 3200.0);
+        assert_eq!(run.params["level"], 1);
+        assert_eq!(doc, before, "picking and preview preparation are read-only");
+        let mut session = family_session(doc);
+        session.execute(run.command, run.params).unwrap();
+        let placed = session.doc.clone();
+        assert_eq!(placed.buildings[0].facades[0].bays, vec![3200.0]);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, placed);
+    }
+
+    #[test]
+    fn point_preview_matches_rotated_source_frame_storey_and_actual_model_dimensions() {
+        let mut doc = family_document();
+        let angle = 0.73_f64;
+        for point in &mut doc.buildings[0].footprint {
+            let [x, y] = *point;
+            *point = [15000.0 + x * angle.cos() - y * angle.sin(), -27000.0 + x * angle.sin() + y * angle.cos()];
+        }
+        doc.buildings[0].facades[0].bays.clear();
+        doc.buildings[0].facades[0].wall_schedule = vec![400.0, 420.0, 445.125];
+        let before = doc.clone();
+        let (a, b) = doc.buildings[0].edge(0).unwrap();
+        let frame = trigon_model::FacadeFrame::new(a, b).unwrap();
+        let hit = frame.point(3200.125, -753.25, 8200.0);
+        let projected = (hit[0] - a[0]) * frame.t[0] + (hit[1] - a[1]) * frame.t[1];
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        form.begin_family_placement(&doc, None);
+        form.place_level = Some(2);
+        assert!(form.pick_family_host_snapped(&doc, &family_host_element(), Some([hit[0], hit[1]]), true));
+        form.place_overrides = true;
+        form.place_sizes = [1234.5, 1450.25, 800.125];
+        let preview = form.family_preview(&doc).unwrap();
+        assert_eq!(preview.u_mm, projected, "never round the actual hit projection");
+        assert_eq!(preview.sizes, [1234.5, 1450.25, 800.125]);
+        assert_eq!(preview.face[0], frame.point(projected - 617.25, 0.0, 6800.125));
+        assert_eq!(preview.face[2], frame.point(projected + 617.25, 0.0, 8250.375));
+        assert_eq!(preview.plan[2], frame.point(projected + 617.25, 445.125, 6800.125));
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.params["u_mm"], projected);
+        assert_eq!(run.params["replace"], false);
+        assert_eq!(doc, before, "local dimension preview and commands are read-only until Place");
+        let mut session = family_session(doc);
+        session.execute(run.command, run.params).unwrap();
+        let building = &session.doc.buildings[0];
+        let resolved = trigon_model::build::resolve_facade(&session.doc, building, &building.facades[0]).unwrap();
+        assert_eq!(resolved[0].rect.u0, projected - preview.sizes[0] / 2.0);
+        assert_eq!(resolved[0].rect.u1, projected + preview.sizes[0] / 2.0);
+        assert_eq!(resolved[0].rect.v0, preview.face[0][2]);
+        assert_eq!(resolved[0].rect.v1, preview.face[2][2]);
+        let built = trigon_model::build::build(&session.doc).unwrap();
+        let wall = built[0].walls.iter().find(|wall| wall.id == "family-test.f1").unwrap();
+        assert_eq!(wall.openings[0].rect, resolved[0].rect);
+        let placed = session.doc.clone();
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, placed);
+    }
+
+    #[test]
+    fn point_snapping_is_optional_and_hover_cannot_move_a_captured_numeric_target() {
+        let mut session = family_session(family_document());
+        session.execute("facade.place_at", json!({"facade":"family-test.f1","level":1,"type":"window.fixed","u_mm":7100.375})).unwrap();
+        // A moved occurrence is a useful alignment axis independently of its bay centre.
+        session.doc.buildings[0].facades[0].placements[0].u = Some(7300.625);
+        let doc = &session.doc;
+        let mut form = Authoring::default();
+        form.choose_type(doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        form.begin_family_placement(doc, None);
+        let mut host = family_host_element();
+        host.level = Some(0);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([3234.875, 0.0]), false));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 3200.0);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([6051.125, 0.0]), false));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 6000.0);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([7350.0, 0.0]), false));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 7300.625);
+        assert!(form.pick_family_host_snapped(doc, &host, Some([6051.125, 0.0]), true));
+        assert_eq!(form.place_type(doc).unwrap().params["u_mm"], 6051.125, "Alt bypasses both axes and increments");
+        form.place_point.as_mut().unwrap().u_mm = 3456.123456789;
+        form.place_overrides = true;
+        form.place_sizes = [1234.56789, 1450.23456, 800.12345];
+        let reviewed = form.place_type(doc).unwrap().params;
+        form.hover_family_host(doc, Some((&host, [9501.25, 0.0])), false);
+        assert_eq!(form.family_placement_feedback(doc)["hover_u_mm"], 9500.0);
+        assert_eq!(form.family_preview(doc).unwrap().u_mm, 3456.123456789);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 2000.0))), ..Default::default() },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        assert!(form.family_editor(ui, doc, 99).is_none());
+                        assert!(ui.min_rect().right() <= 280.0);
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            form.hover_family_host(doc, None, false);
+            assert_eq!(form.place_type(doc).unwrap().params, reviewed, "Properties repaints and pointer exit preserve exact reviewed inputs");
+        }
+        form.cancel_family_placement();
+        assert!(form.family_preview(doc).is_none());
+        assert!(form.place_point.is_none());
+    }
+
+    #[test]
+    fn point_scope_needs_explicit_storeys_and_a_renewed_saved_plan_after_basement_changes() {
+        let mut session = family_session(family_document());
+        session.doc.views.push(serde_json::from_value(json!({"id":"ground-plan","name":"Ground","kind":{"view":"plan","level":0}})).unwrap());
+        let mut form = Authoring::default();
+        form.begin_family_placement(&session.doc, None);
+        let host = family_host_element();
+        assert!(!form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        assert_eq!(form.place_type(&session.doc).unwrap().params["level"], 0);
+        session.execute("building.add_basement", json!({"building":"family-test","floor":-2500})).unwrap();
+        // The engine remaps the saved plan, but a background refresh is not renewed user intent.
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(!form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(!form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        assert!(form.family_preview(&session.doc).is_none());
+        form.sync_family_plan(&session.doc, None);
+        form.sync_family_plan(&session.doc, Some("ground-plan"));
+        assert!(form.pick_family_host(&session.doc, &host, Some([3200.0, 0.0])));
+        assert_eq!(form.place_type(&session.doc).unwrap().params["level"], 1);
+        form.place_level = Some(99);
+        assert!(form.place_type(&session.doc).is_none());
+    }
+
+    #[test]
+    fn point_bare_wall_pick_retains_a_source_hit_until_an_explicit_storey_choice() {
+        let mut doc = family_document();
+        let scene = crate::scene::Scene::from_built(&trigon_model::build::build(&doc).unwrap(), false);
+        let host = scene.elements.iter().find(|e| e.id == "family-test.f1").unwrap();
+        assert_eq!(host.level, None);
+        let mut form = Authoring::default();
+        form.begin_family_placement(&doc, None);
+        assert!(!form.pick_family_host_snapped(&doc, host, Some([3200.125, 0.0]), true));
+        assert_eq!(form.facade, "family-test.f1");
+        assert!(form.place_type(&doc).is_none());
+        form.choose_family_storey(&doc, 2);
+        let run = form.place_type(&doc).unwrap();
+        assert_eq!(run.params["level"], 2);
+        assert_eq!(run.params["u_mm"], 3200.125);
+        form.cancel_family_placement();
+        form.begin_family_placement(&doc, None);
+        form.place_level = None;
+        assert!(!form.pick_family_host(&doc, host, Some([5000.25, 0.0])));
+        doc.buildings[0].footprint[1][0] += 500.0;
+        form.choose_family_storey(&doc, 1);
+        assert!(form.place_type(&doc).is_none(), "never reinterpret an unscoped hit in a changed host frame");
+    }
+
+    #[test]
+    fn point_capture_is_invalidated_by_host_translation_rotation_and_grid_edits() {
+        for change in 0..3 {
+            let mut doc = family_document();
+            let mut form = Authoring::default();
+            form.begin_family_placement(&doc, None);
+            form.place_level = Some(1);
+            assert!(form.pick_family_host(&doc, &family_host_element(), Some([3200.0, 0.0])));
+            if change == 0 {
+                for p in &mut doc.buildings[0].footprint {
+                    p[0] += 500.0;
+                }
+            } else if change == 1 {
+                for p in &mut doc.buildings[0].footprint {
+                    *p = [-p[1], p[0]];
+                }
+            } else {
+                doc.buildings[0].facades[0].bays.push(4000.0);
+            }
+            assert!(form.family_preview(&doc).is_none());
+            assert!(form.place_type(&doc).is_none());
+            assert!(!form.pick_family_host(&doc, &family_host_element(), Some([3300.0, 0.0])), "a bare wall cannot renew stale scope");
+            assert!(form.place_point.is_none());
+            assert!(form.place_level.is_none());
+        }
+    }
+
+    #[test]
+    fn point_replacement_requires_consent_and_own_append_allows_repeat_with_exact_history() {
+        let mut session = family_session(family_document());
+        session.doc.buildings[0].facades[0].bays = vec![9500.0, 2500.0];
+        let before = session.doc.clone();
+        let mut form = Authoring::default();
+        form.choose_type(session.doc.types.iter().find(|t| t.id == "window.fixed").unwrap());
+        form.begin_family_placement(&session.doc, None);
+        let mut host = family_host_element();
+        host.level = Some(1);
+        assert!(form.pick_family_host(&session.doc, &host, Some([6000.125, 0.0])));
+        let run = form.place_type(&session.doc).unwrap();
+        let result = session.execute(run.command, run.params.clone()).unwrap();
+        assert_eq!(session.doc.buildings[0].facades[0].bays, vec![9500.0, 2500.0, 6000.125]);
+        form.family_placement_succeeded(&session.doc, &result);
+        form.sync_placement_scope(&session.doc);
+        assert_eq!(form.place_level, Some(1), "the form acknowledges its own bay append");
+        assert!(form.place_type(&session.doc).is_none(), "no implicit replacement");
+        let first = session.doc.clone();
+        assert!(session.execute(run.command, run.params).is_err(), "the command also refuses without consent");
+        assert_eq!(session.doc, first);
+        form.place_replace = true;
+        let replacement = form.place_type(&session.doc).unwrap();
+        assert_eq!(replacement.params["replace"], true);
+        session.execute(replacement.command, replacement.params).unwrap();
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, first);
+        assert!(form.pick_family_host(&session.doc, &host, Some([3200.25, 0.0])));
+        assert!(!form.place_replace, "a new point clears replacement consent");
+        let run = form.place_type(&session.doc).unwrap();
+        let result = session.execute(run.command, run.params).unwrap();
+        form.family_placement_succeeded(&session.doc, &result);
+        let two = session.doc.clone();
+        assert_eq!(two.buildings[0].facades[0].bays, vec![9500.0, 2500.0, 6000.125, 3200.25]);
+        assert_eq!(two.buildings[0].facades[0].placements[0], first.buildings[0].facades[0].placements[0]);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, first);
+        session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(session.doc, before);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, first);
+        session.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(session.doc, two);
+        form.place_replace = true;
+        form.choose_type(&session.doc.types[0]);
+        assert!(!form.place_replace);
+        form.place_replace = true;
+        host.level = Some(2);
+        assert!(form.pick_family_host(&session.doc, &host, Some([6000.125, 0.0])));
+        assert!(!form.place_replace);
+        form.place_replace = true;
+        host.id = "family-test.f2".into();
+        assert!(form.pick_family_host(&session.doc, &host, Some([12000.0, 3200.0])));
+        assert!(!form.place_replace);
     }
 
     #[test]
@@ -1848,6 +2472,7 @@ mod library_tests {
         let before = doc.clone();
         let mut form = Authoring::default();
         form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
         let mut host = family_host_element();
         host.level = Some(1);
         assert!(form.pick_family_host(&doc, &host, Some([2500.0, 0.0])));
@@ -1986,7 +2611,7 @@ mod library_tests {
         assert!(form.pick_family_host(&session.doc, &host, Some([2500.0, 0.0])));
         let before = session.doc.clone();
         let run = form.place_type(&session.doc).unwrap();
-        assert_eq!(run.params["levels"], json!([1]));
+        assert_eq!(run.params["level"], json!(1));
         assert!(!form.place_replace);
         session.execute(run.command, run.params).unwrap();
         session.execute("edit.undo", json!({})).unwrap();
@@ -2023,6 +2648,7 @@ mod library_tests {
         let mut form = Authoring::default();
         form.choose_type(&doc.types[0]);
         form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
         form.place_level = Some(2);
         form.place_all_bays = true;
         form.place_replace = true;
@@ -2053,6 +2679,7 @@ mod library_tests {
         let mut form = Authoring::default();
         form.choose_type(&doc.types[0]);
         form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
         assert!(form.pick_family_host(&doc, &picked, None));
         assert_eq!(form.place_level, Some(1));
         assert_eq!(form.place_bay, 2);
@@ -2071,6 +2698,7 @@ mod library_tests {
         let mut form = Authoring::default();
         form.choose_type(&doc.types[0]);
         form.begin_family_placement(&doc, None);
+        form.place_mode = PlacementMode::Pattern;
         form.facade = "family-test.f2".into();
         form.place_level = Some(1);
         form.place_bay = 2;
@@ -2122,6 +2750,7 @@ mod library_tests {
             displayed.types = vec![named.clone()];
             form.choose_type(&named);
             form.begin_family_placement(&displayed, None);
+            form.show_placement = false; // Exercise every shared type control, not the compact placement editor.
             let mut output = ctx.run_ui(
                 egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 3000.0))), ..Default::default() },
                 |ui| {
