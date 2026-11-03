@@ -2350,6 +2350,63 @@ fn precision_preview_connect_apply_audit_preserves_doors_other_storeys_and_histo
 }
 
 #[test]
+fn connected_whole_wall_sources_keep_order_and_precise_preview_paths() {
+    for levels in [vec![0], vec![0, 1]] {
+        let mut s = Session::new(Box::new(Canned));
+        s.doc.buildings.push(
+            trigon_model::Building::new("b", "Junction source order", &[[0., 0.], [12000., 0.], [12000., 10000.], [0., 10000.]], 2, 3000.).unwrap(),
+        );
+        s.execute(
+            "interior.add_walls",
+            json!({"walls":[
+                {"id":"west","levels":levels,"a":[1000,4000],"b":[4900,4000],"thickness":400},
+                {"id":"east","levels":levels,"a":[5100,4000],"b":[9000,4000],"thickness":300},
+                {"id":"branch","levels":levels,"a":[5000,4100],"b":[5000,7000],"thickness":200},
+                {"id":"unrelated","levels":levels,"a":[1000,8000],"b":[9000,8000],"thickness":100}
+            ]}),
+        )
+        .unwrap();
+        let before = s.doc.clone();
+        let before_glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        let selector = |id: &str| if levels.len() == 1 { format!("{id}.L0") } else { format!("wall:{id}") };
+        let params = json!({"endpoints":[
+            {"target":selector("west"),"end":"b"},
+            {"target":selector("east"),"end":"a"},
+            {"target":selector("branch"),"end":"a"}
+        ],"junction":[5000,4000],"max_move_mm":100});
+        let action = json!({"command":"edit.connect_walls","params":params});
+        let preview = s.execute("precision.preview", json!({"action":action})).unwrap();
+        assert_eq!(s.doc, before);
+        let paths: std::collections::BTreeSet<_> = preview["changes"].as_array().unwrap().iter().map(|c| c["path"].as_str().unwrap()).collect();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from([
+                "/buildings/0/interior_walls/0/b/0",
+                "/buildings/0/interior_walls/1/a/0",
+                "/buildings/0/interior_walls/2/a/1"
+            ]),
+            "a junction preview must not report reordered unrelated source values"
+        );
+        s.execute("precision.apply", json!({"action":action,"preview_token":preview["preview_token"]})).unwrap();
+        let walls = &s.doc.buildings[0].interior_walls;
+        assert_eq!(walls.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["west", "east", "branch", "unrelated"]);
+        assert_eq!(walls[0].b, [5000., 4000.]);
+        assert_eq!(walls[1].a, walls[0].b);
+        assert_eq!(walls[2].a, walls[0].b);
+        assert_eq!(walls[3], before.buildings[0].interior_walls[3]);
+        assert_eq!(walls.iter().map(|w| &w.levels).collect::<Vec<_>>(), vec![&levels; 4]);
+        let after = s.doc.clone();
+        let after_glb = trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), before_glb);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, after);
+        assert_eq!(trigon_io::glb::write(&trigon_model::build(&s.doc).unwrap(), &[]), after_glb);
+    }
+}
+
+#[test]
 fn precision_repairs_reject_wrong_scope_excess_motion_and_hosted_door_drift_atomically() {
     let mut s = session();
     s.execute(
