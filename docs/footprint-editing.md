@@ -65,6 +65,13 @@ already-outside source axis even when the existing model builder clips/joins it 
 geometry. Such a refusal is a scope limitation, not proof that the previous built wall is
 invalid; it does not authorize moving that source or bypassing the guard.
 
+Stair shafts must also fit the derived usable floor profile on every departure and receiving
+floor, including implicit attic floors. The check reuses the model's storey profile **before**
+cutting stair holes: clipping a hole into a notch cannot conceal a newly consumed shaft, while
+exact contact with the clear wall face remains valid. Storey-specific wall thickness is used.
+This remains a conservative whole-shaft check; it does not automatically reshape stairs or
+establish full-height accessibility clearance.
+
 A full latest model build, annotation validation and per-phase identity checks run before
 success. The result includes exact moved corners, affected facade frames/lengths, anchor station
 and site-coordinate deltas, roof-height changes and drawing-registration feedback. Diagnostics

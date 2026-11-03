@@ -428,6 +428,65 @@ fn footprint_historical_placements_and_stale_preview_keep_source_history() {
 }
 
 #[test]
+fn footprint_stair_shaft_must_fit_departure_floor_with_atomic_refusal() {
+    for yaw in [0_f64, 31., -118.] {
+        let (sin, cos) = yaw.to_radians().sin_cos();
+        let transform = |[x, y]: [f64; 2]| [140000. + x * cos - y * sin, -230000. + x * sin + y * cos];
+        let ring: Vec<_> = [[0., 0.], [12000., 0.], [12000., 10000.], [0., 10000.]].into_iter().map(transform).collect();
+        let outline: Vec<_> = [[1000., 450.], [4000., 450.], [4000., 1450.], [1000., 1450.]].into_iter().map(transform).collect();
+        let mut s = Session::new(Box::new(Canned));
+        s.execute(
+            "building.add",
+            json!({"id":"b","name":"Stair clearance","footprint":ring,"storeys":2,"storey_height_mm":3000,"wall_thickness_mm":400}),
+        )
+        .unwrap();
+        s.execute("interior.add_stairs", json!({"building":"b","stairs":[{"id":"fixed","levels":[0],"outline":outline,"kind":"straight"}]})).unwrap();
+        let before = s.doc.clone();
+        let before_glb = glb(&before);
+        let good = request(&s, "keep_facade_u", &[(0, transform([0., -120.])), (1, transform([12000., -120.]))]);
+        s.execute("building.set_footprint", good).unwrap();
+        let accepted = s.doc.clone();
+        s.execute("edit.undo", json!({})).unwrap();
+        s.dirty = false;
+        s.path = Some("unchanged.trigon".into());
+        let bad = request(&s, "keep_facade_u", &[(0, transform([0., 120.])), (1, transform([12000., 120.]))]);
+        // The source shaft remains inside the outer ring, but loses 70 mm to wall
+        // material on both departure and arrival. A model build alone clips its hole.
+        refuses(&mut s, "building.set_footprint", bad.clone(), "outside b.slab.L0");
+        refuses(&mut s, "precision.preview", json!({"action":{"command":"building.set_footprint","params":bad}}), "fixed");
+        assert_eq!(s.doc, before);
+        assert_eq!(glb(&s.doc), before_glb);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(s.doc, accepted);
+        assert_eq!(s.doc.buildings[0].stairs, before.buildings[0].stairs);
+    }
+}
+
+#[test]
+fn footprint_stair_shaft_checks_arrival_floor_and_allows_exact_wall_contact() {
+    for y in [400., 450.] {
+        let mut s = Session::new(Box::new(Canned));
+        s.execute("building.add", json!({"id":"b","name":"Arrival clearance","footprint":[[0,0],[12000,0],[12000,10000],[0,10000]],"storeys":2,"storey_height_mm":3000,"wall_thickness_mm":400})).unwrap();
+        s.doc.buildings[0].set_wall_schedule(&[200., 400.]).unwrap();
+        s.execute("interior.add_stairs", json!({"building":"b","stairs":[{"id":"arrival","levels":[0],"outline":[[1000,y],[4000,y],[4000,y+1000.],[1000,y+1000.]],"kind":"straight"}]})).unwrap();
+        let before = s.doc.clone();
+        let bad = request(&s, "keep_facade_u", &[(0, [0., 120.]), (1, [12000., 120.])]);
+        // Departure inner face moves to y=320 and still contains the shaft; only
+        // the receiving floor's inner face y=520 consumes its opening.
+        refuses(&mut s, "building.set_footprint", bad.clone(), "outside b.slab.L1");
+        refuses(&mut s, "precision.preview", json!({"action":{"command":"building.set_footprint","params":bad}}), "arrival");
+        // An opposite-edge edit must allow a shaft exactly flush with the wall.
+        // Checking a floor polygon after cutting its holes would mistake this
+        // valid boundary contact for material lost from the shaft.
+        let good = request(&s, "keep_facade_u", &[(2, [12000., 10120.]), (3, [0., 10120.])]);
+        s.execute("building.set_footprint", good).unwrap();
+        assert_eq!(s.doc.buildings[0].stairs, before.buildings[0].stairs);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.doc, before);
+    }
+}
+
+#[test]
 fn footprint_room_must_fit_actual_floor_not_just_outer_wall_line() {
     let mut s = rectangle();
     s.execute(

@@ -491,6 +491,25 @@ pub(crate) fn set(s: &mut Session, p: SetFootprint) -> Result<Value> {
             fixed_shape(&floor.polygon, &floor.id, &id, &room.polygon, true)?;
         }
     }
+    let mut shaft_floors = BTreeMap::new();
+    for (i, stair) in source.stairs.iter().enumerate() {
+        let id = if stair.id.is_empty() { format!("{}.stair{i}", source.id) } else { stair.id.clone() };
+        let shaft = trigon_model::stair::opening(stair)?;
+        for floor in model.slabs.iter().filter(|floor| {
+            floor.kind == trigon_model::SlabKind::Floor
+                && (stair.levels.contains(&floor.level) || floor.level.checked_sub(1).is_some_and(|level| stair.levels.contains(&level)))
+        }) {
+            // slab_shape may already have clipped a shaft into a boundary notch.
+            // Use the model's shared pre-hole floor profile, including its storey
+            // thickness/mitres, so valid flush contact is allowed but wall intrusion
+            // cannot be concealed by the clipped result. Check receiving floors too.
+            let boundary = match shaft_floors.entry(floor.level) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(source.storey_usable_outline(floor.level)?),
+            };
+            fixed_shape(boundary, &floor.id, &id, &shaft, true)?;
+        }
+    }
     for (a, b) in old_built.iter().zip(&new_built) {
         built_guard(a, b)?;
     }
