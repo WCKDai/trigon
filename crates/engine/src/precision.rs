@@ -53,6 +53,8 @@ pub(crate) enum Action {
     SetEntranceUnit(Box<crate::entrances::SetUnit>),
     #[serde(rename = "entrance.bind_stair")]
     BindEntranceStair(Box<crate::entrances::BindStair>),
+    #[serde(rename = "stair.refine_source")]
+    RefineStairSource(Box<crate::stair_refinement::RefineSource>),
     #[serde(rename = "annotation.move_label")]
     MoveLabel(MoveLabel),
     #[serde(rename = "edit.delete")]
@@ -108,6 +110,7 @@ fn run(s: &mut Session, action: Action) -> Result<Value> {
         Action::Set(p) => crate::elements::set(s, p),
         Action::SetEntranceUnit(p) => crate::entrances::set_unit(s, *p),
         Action::BindEntranceStair(p) => crate::entrances::bind_stair(s, *p),
+        Action::RefineStairSource(p) => crate::stair_refinement::refine(s, *p),
         Action::MoveLabel(p) => move_label(s, p),
         Action::Delete(p) => edit::delete(s, p),
     }?;

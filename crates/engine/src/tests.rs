@@ -8,6 +8,7 @@ use crate::{EngineError, Session, commands};
 
 mod footprint;
 mod roof_height;
+mod stair_refinement;
 
 /// A 24 × 12 m block at a fixed point in Copenhagen, five storeys of surface height.
 struct Canned;

@@ -166,6 +166,10 @@ fn contains(ring: &[[f64; 2]], p: [f64; 2]) -> (bool, f64) {
     (inside || clearance <= 1e-6, clearance)
 }
 fn fixed_shape(boundary: &[[f64; 2]], host: &str, id: &str, points: &[[f64; 2]], closed: bool) -> Result<()> {
+    fixed_shape_contact(boundary, host, id, points, closed, false)
+}
+
+fn fixed_shape_contact(boundary: &[[f64; 2]], host: &str, id: &str, points: &[[f64; 2]], closed: bool, metric_contact: bool) -> Result<()> {
     if points.len() > 2000 {
         return Err(invalid(format!("{id}: at most 2000 site-fixed source points can be checked")));
     }
@@ -188,7 +192,14 @@ fn fixed_shape(boundary: &[[f64; 2]], host: &str, id: &str, points: &[[f64; 2]],
         let direction = [b1[0] - a[0], b1[1] - a[1]];
         let mut stations = vec![0., 1.];
         for (edge, (&c, &d)) in boundary.iter().zip(boundary.iter().cycle().skip(1)).take(boundary.len()).enumerate() {
-            if cross(a, b1, c) * cross(a, b1, d) < -1e-6 && cross(c, d, a) * cross(c, d, b1) < -1e-6 {
+            let crosses = cross(a, b1, c) * cross(a, b1, d) < -1e-6 && cross(c, d, a) * cross(c, d, b1) < -1e-6;
+            // New source refinement uses the same 1e-6 mm contact tolerance as
+            // contains(), independent of edge length, translation and rotation.
+            // Preserve the existing footprint command's crossing predicate exactly.
+            let contact = metric_contact
+                && (cross(a, b1, c).abs().min(cross(a, b1, d).abs()) / distance(a, b1).max(1e-12) <= 1e-6
+                    || cross(c, d, a).abs().min(cross(c, d, b1).abs()) / distance(c, d).max(1e-12) <= 1e-6);
+            if crosses && !contact {
                 return Err(invalid(format!(
                     "{id} crosses {} source edge {edge} (clearance 0 mm); site-fixed geometry cannot be clipped implicitly",
                     host
@@ -491,25 +502,7 @@ pub(crate) fn set(s: &mut Session, p: SetFootprint) -> Result<Value> {
             fixed_shape(&floor.polygon, &floor.id, &id, &room.polygon, true)?;
         }
     }
-    let mut shaft_floors = BTreeMap::new();
-    for (i, stair) in source.stairs.iter().enumerate() {
-        let id = if stair.id.is_empty() { format!("{}.stair{i}", source.id) } else { stair.id.clone() };
-        let shaft = trigon_model::stair::opening(stair)?;
-        for floor in model.slabs.iter().filter(|floor| {
-            floor.kind == trigon_model::SlabKind::Floor
-                && (stair.levels.contains(&floor.level) || floor.level.checked_sub(1).is_some_and(|level| stair.levels.contains(&level)))
-        }) {
-            // slab_shape may already have clipped a shaft into a boundary notch.
-            // Use the model's shared pre-hole floor profile, including its storey
-            // thickness/mitres, so valid flush contact is allowed but wall intrusion
-            // cannot be concealed by the clipped result. Check receiving floors too.
-            let boundary = match shaft_floors.entry(floor.level) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(source.storey_usable_outline(floor.level)?),
-            };
-            fixed_shape(boundary, &floor.id, &id, &shaft, true)?;
-        }
-    }
+    stair_shaft_floors(source, model, &source.stairs, false)?;
     for (a, b) in old_built.iter().zip(&new_built) {
         built_guard(a, b)?;
     }
@@ -547,4 +540,45 @@ pub(crate) fn set(s: &mut Session, p: SetFootprint) -> Result<Value> {
         "drawing_feedback":"Stored plan registrations, annotations and evidence remain unchanged; review dimensions and facade registrations against source drawings."});
     s.doc = candidate;
     Ok(result)
+}
+
+/// Shared pre-hole shaft guard. Subsets must retain named sources; the footprint caller
+/// passes the original complete array so its anonymous fallback indices stay unchanged.
+pub(crate) fn stair_shaft_floors(
+    source: &Building,
+    model: &trigon_model::build::Built,
+    stairs: &[trigon_model::Stair],
+    metric_contact: bool,
+) -> Result<Vec<Value>> {
+    let mut checks = Vec::new();
+    let mut shaft_floors = BTreeMap::new();
+    for (i, stair) in stairs.iter().enumerate() {
+        let id = if stair.id.is_empty() { format!("{}.stair{i}", source.id) } else { stair.id.clone() };
+        let shaft = trigon_model::stair::opening(stair)?;
+        for floor in model.slabs.iter().filter(|floor| {
+            floor.kind == trigon_model::SlabKind::Floor
+                && (stair.levels.contains(&floor.level) || floor.level.checked_sub(1).is_some_and(|level| stair.levels.contains(&level)))
+        }) {
+            // slab_shape may already have clipped a shaft into a boundary notch.
+            // Use the model's shared pre-hole floor profile, including its storey
+            // thickness/mitres, so valid flush contact is allowed but wall intrusion
+            // cannot be concealed by the clipped result. Check receiving floors too.
+            let boundary = match shaft_floors.entry(floor.level) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert(source.storey_usable_outline(floor.level)?),
+            };
+            fixed_shape_contact(boundary, &floor.id, &id, &shaft, true, metric_contact)?;
+            // A legacy attic shares its index with the top full storey but sits
+            // above it. Keep the original guard's checks unchanged; report only
+            // the physically affected floor, with its actual arrival role.
+            let legacy_attic = floor.id == format!("{}.attic", source.id) && source.attic_level().is_none();
+            if legacy_attic && !stair.levels.contains(&floor.level) {
+                continue;
+            }
+            checks.push(json!({"source":id,"floor":floor.id,"level":floor.level,
+                "departure":!legacy_attic && stair.levels.contains(&floor.level),
+                "arrival":if legacy_attic { true } else { floor.level.checked_sub(1).is_some_and(|level|stair.levels.contains(&level)) }}));
+        }
+    }
+    Ok(checks)
 }

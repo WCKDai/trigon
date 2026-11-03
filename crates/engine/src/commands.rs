@@ -182,6 +182,14 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| crate::lettering_audit::audit(s, parse("view.audit", v)?),
     },
     CommandSpec {
+        id: "stair.refine_source",
+        summary: "Refine or explicitly partition one exact named Stair source. Complete native Stair values; disjoint nonempty departure levels must cover the original exactly. Retains one original ID/slot, appends explicit unique IDs, maps entrance/group consumers and reports changed occurrence IDs and departure/arrival floors. Exact stale guard; compulsory pre-hole shaft containment, full model/annotation validation, bounded before/after overlap feedback. Atomic and undoable; geometric fit is not survey or accessibility approval.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<crate::stair_refinement::RefineSource>,
+        run: |s, v| crate::stair_refinement::refine(s, parse("stair.refine_source", v)?),
+    },
+    CommandSpec {
         id: "precision.audit",
         summary: "Read-only bounded sanity audit: wall gaps, near-parallel material overlaps, end-to-end axis/face misalignment, small abrupt angle changes, overlapping visible/departing stairs, and stair openings entering wall material. Wall solids use a 1000 mm floor cut. Exact IDs, storeys, distances, overlap areas, closest points and deltas; build errors and ambiguous IDs are explicit. Findings require review and never trigger repairs.",
         mutates: false,

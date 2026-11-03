@@ -41,6 +41,7 @@ mod schedules;
 mod section;
 mod sheet;
 mod site;
+mod stair_refinement;
 mod terrain;
 mod time;
 mod view_config;
