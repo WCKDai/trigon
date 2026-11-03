@@ -918,6 +918,16 @@ static COMMANDS: &[CommandSpec] = &[
         run: |s, v| place(s, parse("facade.place", v)?),
     },
     CommandSpec {
+        id: "facade.place_at",
+        summary: "Place one component at explicit facade-local u_mm on one existing level. Reuse one equal bay centre within 0.000001 mm or append a bay; \
+                  preserve existing bay and placement indices. Width, height and sill are in mm. Occupied same-class slots require replace:true; \
+                  ambiguous or future slots are refused. Atomic, undoable; returns exact built targets, bay index and coordinates in mm.",
+        mutates: true,
+        journaled: true,
+        schema: schema::<PlaceAt>,
+        run: |s, v| place_at(s, parse("facade.place_at", v)?),
+    },
+    CommandSpec {
         id: "facade.demolish",
         summary: "Demolish facade elements in a phase (default: the active phase), as in Revit: they stay in earlier phases, show \
                   red in demolition views and are gone afterwards. `what`: all, openings (windows and doors; the wall closes) or \
@@ -2410,6 +2420,35 @@ pub(crate) struct Place {
     phase: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlaceAt {
+    /// Exact facade id from facade.list.
+    facade: String,
+    /// Explicit existing storey index; no inferred storey or all-storeys default.
+    level: usize,
+    /// Exact centre in mm along the facade from its start. No rounding or snapping.
+    u_mm: f64,
+    /// Component type id from types.list.
+    #[serde(rename = "type")]
+    type_id: String,
+    /// Instance width in mm; omitted uses the type.
+    width: Option<f64>,
+    /// Instance height in mm; omitted uses the type.
+    height: Option<f64>,
+    /// Sill in mm above this storey's floor, with facade.place's terrain/basement bounds.
+    sill: Option<f64>,
+    /// Allow an opening to cross a floor above, within the existing host/eaves limits.
+    spans_storeys: Option<bool>,
+    /// Creation phase id; omitted uses the active phase.
+    phase: Option<String>,
+    /// Replace one same-class occupant alive in this phase. Default false. Same-phase
+    /// replacement retains its source index; older work is demolished and the new work
+    /// appended. Future same-class reservations and scheduled demolition are refused.
+    #[serde(default)]
+    replace: bool,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Clear {
@@ -2857,7 +2896,129 @@ fn end_in(doc_phases: &[trigon_model::Phase], pl: &mut Placement, k: usize) -> O
     }
 }
 
+pub(crate) fn place_at(s: &mut Session, p: PlaceAt) -> Result<Value> {
+    let is_opening = s.doc.component(&p.type_id)?.kind.is_opening();
+    if s.doc.types.iter().filter(|t| t.id == p.type_id).count() != 1 {
+        return Err(ModelError::Invalid("ambiguous component type id".into()).into());
+    }
+    let k = match p.phase.as_deref() {
+        Some(id) => s.doc.phase_index(id)?,
+        None => s.doc.active_index(),
+    };
+    let phase = s.doc.phases.get(k).ok_or_else(|| ModelError::Invalid("placement needs an existing phase".into()))?.id.clone();
+    if s.doc.phases.iter().filter(|ph| ph.id == phase).count() != 1 {
+        return Err(ModelError::Invalid("ambiguous placement phase id".into()).into());
+    }
+    let mut hosts = s.doc.buildings.iter().flat_map(|b| b.facades.iter().map(move |f| (b, f))).filter(|(_, f)| f.id == p.facade);
+    let (b, f) = hosts.next().ok_or_else(|| ModelError::NotFound(format!("facade {}", p.facade)))?;
+    if hosts.next().is_some() {
+        return Err(ModelError::Invalid("ambiguous facade id".into()).into());
+    }
+    if p.level >= b.storeys.len() {
+        return Err(ModelError::Invalid(format!("level {} doesn't exist (the building has {} storeys)", p.level, b.storeys.len())).into());
+    }
+    let (a, e) = b.edge(f.edge).ok_or_else(|| ModelError::NotFound(format!("facade {} has no edge", p.facade)))?;
+    let frame = FacadeFrame::new(a, e).ok_or_else(|| ModelError::Invalid("facade has zero length".into()))?;
+    if !frame.length.is_finite() {
+        return Err(ModelError::Invalid("facade length must be finite mm".into()).into());
+    }
+    let u = trigon_model::checked("u_mm", p.u_mm, 0.0, frame.length)?;
+    if f.bays.len() > 200 {
+        return Err(ModelError::Invalid("at most 200 bays".into()).into());
+    }
+    for &centre in &f.bays {
+        trigon_model::checked("bay centre", centre, 0.0, frame.length)?;
+    }
+    // Match only numerical equality at the existing local-mm convention. Reusing a bay
+    // never moves it: the exact requested coordinate remains an occurrence override.
+    let mut matches = f.bays.iter().enumerate().filter(|(_, centre)| (**centre - u).abs() <= 1e-6);
+    let bay = matches.next().map(|(index, _)| index).unwrap_or(f.bays.len());
+    if matches.next().is_some() {
+        return Err(ModelError::Invalid("ambiguous bay centres within 0.000001 mm of u_mm".into()).into());
+    }
+    let bay_appended = bay == f.bays.len();
+    if bay_appended && f.bays.len() == 200 {
+        return Err(ModelError::Invalid("at most 200 bays; no bay was appended".into()).into());
+    }
+    let bay_u_mm = f.bays.get(bay).copied().unwrap_or(u);
+    let mut occupied = None;
+    for (index, placement) in f.placements.iter().enumerate() {
+        if placement.level != p.level || placement.bay != bay || s.doc.component(&placement.type_id)?.kind.is_opening() != is_opening {
+            continue;
+        }
+        let (created, demolished) = s.doc.lifetime(placement)?;
+        if demolished <= k {
+            continue;
+        }
+        if created > k {
+            return Err(ModelError::Invalid("slot has a future same-class placement; its phase history is preserved".into()).into());
+        }
+        if p.replace && placement.demolished.is_some() {
+            return Err(ModelError::Invalid("slot has a scheduled demolition; its phase history is preserved".into()).into());
+        }
+        if occupied.replace((index, created)).is_some() {
+            return Err(ModelError::Invalid("ambiguous same-class occupants in the selected slot".into()).into());
+        }
+    }
+    if occupied.is_some() && !p.replace {
+        return Err(
+            ModelError::Invalid("slot is occupied in this phase; use replace:true to replace that same-class placement explicitly".into()).into()
+        );
+    }
+    let placement_index = occupied.filter(|(_, created)| *created == k).map_or(f.placements.len(), |(index, _)| index);
+    if bay_appended {
+        s.doc.building_of_facade_mut(&p.facade)?.facade_mut(&p.facade)?.bays.push(u);
+    }
+    // One Session transaction covers bay creation, placement, validation and history.
+    // Share legacy placement/phase/host checks, but never sort or remove source indices.
+    let mut result = place_with_order(
+        s,
+        Place {
+            facade: p.facade.clone(),
+            type_id: p.type_id,
+            levels: Some(vec![p.level]),
+            bays: Some(vec![bay]),
+            u: Some(u),
+            width: p.width,
+            height: p.height,
+            sill: p.sill,
+            spans_storeys: p.spans_storeys,
+            phase: Some(phase),
+        },
+        true,
+    )?;
+    // Return actual built products (including assembly parts) for Properties. These
+    // exact owner IDs are the same source mapping used by elements.rs, not proximity.
+    let owner = format!("{}.L{}.B{}{}", p.facade, p.level, bay, if is_opening { "" } else { ".balcony" });
+    let built = trigon_model::build::build_view(&s.doc, View { phase: k, filter: PhaseFilter::Complete })?;
+    let targets: Vec<_> = built
+        .iter()
+        .flat_map(|b| b.exterior_walls())
+        .flat_map(|wall| wall.openings.iter().flat_map(|o| std::iter::once(&o.fill).chain(&o.attached)).chain(&wall.attachments))
+        .filter(|e| e.id.strip_suffix(".rail").or_else(|| e.id.strip_suffix(".slab")).unwrap_or(&e.id) == owner.as_str())
+        .map(|e| e.id.clone())
+        .collect();
+    if targets.is_empty() || targets.iter().collect::<std::collections::BTreeSet<_>>().len() != targets.len() {
+        return Err(ModelError::Invalid("placed component has no unambiguous built targets".into()).into());
+    }
+    result["level"] = json!(p.level);
+    result["bay"] = json!(bay);
+    result["u_mm"] = json!(u);
+    result["bay_u_mm"] = json!(bay_u_mm);
+    result["bay_appended"] = json!(bay_appended);
+    result["placement_index"] = json!(placement_index);
+    result["placement_target"] = json!(format!("placement:{}:{placement_index}", p.facade));
+    result["targets"] = json!(targets);
+    Ok(result)
+}
+
 pub(crate) fn place(s: &mut Session, p: Place) -> Result<Value> {
+    place_with_order(s, p, false)
+}
+
+/// Direct placement preserves array indices; legacy facade.place retains its sorting and
+/// removal behavior. Both use the same phase transitions, parameter checks and validation.
+fn place_with_order(s: &mut Session, p: Place, preserve_indices: bool) -> Result<Value> {
     let new_is_opening = s.doc.component(&p.type_id)?.kind.is_opening();
     let k = match p.phase.as_deref() {
         Some(id) => s.doc.phase_index(id)?,
@@ -2900,10 +3061,12 @@ pub(crate) fn place(s: &mut Session, p: Place) -> Result<Value> {
         for &bay in &bay_list {
             // A slot holds one opening and one balcony. Whatever of the same kind stands there in
             // this phase is replaced: deleted if built in this phase, demolished if older.
+            let mut replacement = None;
             let mut keep = Vec::with_capacity(f.placements.len());
             for mut pl in std::mem::take(&mut f.placements) {
                 let same_slot = pl.level == level && pl.bay == bay && layers.get(&pl.type_id).copied().unwrap_or(true) == new_is_opening;
                 match same_slot.then(|| end_in(&phases, &mut pl, k)).flatten() {
+                    Some(true) if preserve_indices => replacement = Some(keep.len()),
                     Some(true) => continue,
                     Some(false) => demolished += 1,
                     None => {}
@@ -2911,7 +3074,7 @@ pub(crate) fn place(s: &mut Session, p: Place) -> Result<Value> {
                 keep.push(pl);
             }
             f.placements = keep;
-            f.placements.push(Placement {
+            let next = Placement {
                 u: p.u,
                 level,
                 bay,
@@ -2922,11 +3085,18 @@ pub(crate) fn place(s: &mut Session, p: Place) -> Result<Value> {
                 spans_storeys: p.spans_storeys.unwrap_or(false),
                 created: created.clone(),
                 demolished: None,
-            });
+            };
+            if let Some(index) = replacement {
+                *f.placements.get_mut(index).ok_or_else(|| ModelError::Invalid("replacement source is absent".into()))? = next;
+            } else {
+                f.placements.push(next);
+            }
             count += 1;
         }
     }
-    f.placements.sort_by_key(|pl| (pl.level, pl.bay));
+    if !preserve_indices {
+        f.placements.sort_by_key(|pl| (pl.level, pl.bay));
+    }
     check_building(&s.doc, Some(&id))?;
     Ok(json!({"facade": p.facade, "placed": count, "type": p.type_id, "phase": phases.get(k).map(|ph| ph.id.clone()), "demolished": demolished}))
 }

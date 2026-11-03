@@ -365,6 +365,10 @@ fn hostile_params_never_panic() {
         json!({"facade": "b9.f9", "type": "window.fixed"}),
         json!({"facade": south, "type": "window.fixed", "levels": [99]}),
         json!({"facade": south, "type": "window.fixed", "width": -5.0}),
+        json!({"facade": south, "type": "window.fixed", "level": usize::MAX, "u_mm": 3000.125}),
+        json!({"facade": south, "type": "window.fixed", "level": 0, "u_mm": f64::MAX}),
+        json!({"facade": south, "type": "window.fixed", "level": 0, "u_mm": -1.0, "replace": true}),
+        json!({"facade": south, "type": "window.fixed", "level": 0, "u_mm": 3000.125, "width": f64::MAX}),
         json!({"count": usize::MAX}),
         json!({"path": "/etc/passwd"}),
         json!({"id": "x", "name": "x", "width": 1e300, "height": 1.0, "sill": 0.0, "kind": {"family": "window", "lights": 0}}),
@@ -3295,4 +3299,418 @@ fn precision_reference_ambiguous_legacy_source_ids_stay_errors_while_explicit_gu
     let result = s.execute("edit.align_walls", json!({"targets":["target.L1"],"reference":{"kind":"annotation","id":"ambiguous"}})).unwrap();
     assert_eq!(result["alignment"]["reference"]["kind"], "plan_annotation");
     assert_eq!(result["alignment"]["reference"]["id"], "ambiguous");
+}
+
+// Public synthetic local authoring: no provider, drawing or external building is read.
+fn direct_placement_session() -> Session {
+    let mut s = Session::new(Box::new(Canned));
+    s.execute(
+        "building.add",
+        json!({"id":"b","name":"Public direct placement fixture","footprint":[[0,0],[12000,0],[12000,8000],[0,8000]],
+            "storeys":3,"storey_height_mm":3000,"wall_thickness_mm":400}),
+    )
+    .unwrap();
+    s
+}
+
+fn direct_placement_params(level: usize, u: f64) -> Value {
+    json!({"facade":"b.f1","level":level,"u_mm":u,"type":"window.fixed"})
+}
+
+fn direct_placement_refuses(s: &mut Session, command: &str, params: Value, message: &str) {
+    let before = s.doc.clone();
+    let bytes = serde_json::to_vec(&s.doc).unwrap();
+    let history = (s.undo.clone(), s.redo.clone(), s.dirty, s.path.clone());
+    let error = s.execute(command, params).unwrap_err();
+    assert!(!matches!(error, EngineError::Internal(_) | EngineError::Unknown(_)), "{error}");
+    assert!(error.to_string().contains(message), "{command}: {error}");
+    assert_eq!(s.doc, before);
+    assert_eq!(serde_json::to_vec(&s.doc).unwrap(), bytes);
+    assert_eq!((s.undo.clone(), s.redo.clone(), s.dirty, s.path.clone()), history);
+}
+
+#[test]
+fn direct_placement_empty_host_is_one_exact_undoable_command() {
+    let mut s = direct_placement_session();
+    let before = s.doc.clone();
+    assert!(before.buildings[0].facades[0].bays.is_empty());
+    let params = json!({"facade":"b.f1","level":0,"u_mm":3000.125,"type":"window.fixed",
+        "width":1234.5,"height":1450.25,"sill":800.125});
+    let out = s.execute("facade.place_at", params.clone()).unwrap();
+    assert_eq!(
+        out,
+        json!({"facade":"b.f1","placed":1,"type":"window.fixed","phase":"existing","demolished":0,
+        "level":0,"bay":0,"u_mm":3000.125,"bay_u_mm":3000.125,"bay_appended":true,
+        "placement_index":0,"placement_target":"placement:b.f1:0","targets":["b.f1.L0.B0"]})
+    );
+    let f = &s.doc.buildings[0].facades[0];
+    assert_eq!(f.bays, [3000.125]);
+    assert_eq!(
+        serde_json::to_value(&f.placements).unwrap(),
+        json!([{
+            "level":0,"bay":0,"u":3000.125,"type":"window.fixed","width":1234.5,"height":1450.25,"sill":800.125
+        }])
+    );
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.doc.journal.last().unwrap().command, "facade.place_at");
+    assert_eq!(s.doc.journal.last().unwrap().params, params);
+    assert_eq!(s.undo.last(), Some(&before));
+    let after = s.doc.clone();
+    let built = trigon_model::build(&after).unwrap();
+    let opening = &built[0].walls[0].openings[0];
+    assert_eq!(opening.fill.id, "b.f1.L0.B0");
+    assert_eq!(opening.rect, trigon_model::Rect { u0: 2382.875, u1: 3617.375, v0: 800.125, v1: 2250.375 });
+    let properties = s.execute("element.get", json!({"id":out["targets"][0]})).unwrap();
+    assert_eq!(properties["editable"], true);
+    assert!(properties["handles"].as_array().unwrap().iter().any(|h| h["key"] == "u_mm"));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+}
+
+#[test]
+fn direct_placement_appends_without_reordering_bays_placements_or_existing_targets() {
+    let mut s = direct_placement_session();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","centres":[9000.5,3000.25]})).unwrap();
+    s.execute("facade.place", json!({"facade":"b.f1","type":"window.fixed","levels":[1,2],"bays":[0,1]})).unwrap();
+    s.execute("edit.move", json!({"targets":["b.f1.L1.B1"],"delta":[125.125,0,0]})).unwrap();
+    let before = s.doc.clone();
+    let built_before = trigon_model::build(&before).unwrap();
+    let out = s.execute("facade.place_at", direct_placement_params(0, 6000.125)).unwrap();
+    assert_eq!(out["bay"], 2);
+    assert_eq!(out["placement_index"], 4);
+    assert_eq!(out["placement_target"], "placement:b.f1:4");
+    assert_eq!(out["targets"], json!(["b.f1.L0.B2"]));
+    let f = &s.doc.buildings[0].facades[0];
+    assert_eq!(f.bays, [9000.5, 3000.25, 6000.125]);
+    assert_eq!(&f.placements[..4], &before.buildings[0].facades[0].placements);
+    let mut retained = s.doc.clone();
+    retained.buildings[0].facades[0].bays.truncate(2);
+    retained.buildings[0].facades[0].placements.truncate(4);
+    retained.journal = before.journal.clone();
+    assert_eq!(retained, before, "all previous source values and array indices remain exact");
+    let built_after = trigon_model::build(&s.doc).unwrap();
+    for old in &built_before[0].walls[0].openings {
+        assert_eq!(built_after[0].walls[0].openings.iter().find(|o| o.fill.id == old.fill.id), Some(old));
+    }
+    let reused = s.execute("facade.place_at", direct_placement_params(2, 6000.125)).unwrap();
+    assert_eq!(reused["bay"], 2);
+    assert_eq!(reused["bay_appended"], false);
+    let preserved = s.doc.buildings[0].facades[0].placements[..5].to_vec();
+    s.execute("element.set", json!({"id":reused["targets"][0],"properties":{"width_mm":1320.25,"u_mm":6100.125}})).unwrap();
+    assert_eq!(s.doc.buildings[0].facades[0].bays, [9000.5, 3000.25, 6000.125]);
+    assert_eq!(&s.doc.buildings[0].facades[0].placements[..5], preserved);
+}
+
+#[test]
+fn direct_placement_equal_centres_use_tight_tolerance_and_never_round() {
+    for delta in [-0.5e-6, 0.0, 0.5e-6, 2.0e-6] {
+        let mut s = direct_placement_session();
+        s.execute("facade.set_bays", json!({"facade":"b.f1","centres":[3000.125]})).unwrap();
+        let u = 3000.125 + delta;
+        let out = s.execute("facade.place_at", direct_placement_params(0, u)).unwrap();
+        let appended = delta.abs() > 1e-6;
+        assert_eq!(out["bay_appended"], appended);
+        assert_eq!(out["bay"], usize::from(appended));
+        assert_eq!(out["u_mm"], u);
+        assert_eq!(s.doc.buildings[0].facades[0].bays[0], 3000.125);
+        assert_eq!(s.doc.buildings[0].facades[0].placements[0].u, Some(u));
+    }
+    for centres in [vec![3000.125, 3000.125], vec![3000.125 - 0.4e-6, 3000.125 + 0.4e-6]] {
+        let mut s = direct_placement_session();
+        s.execute("facade.set_bays", json!({"facade":"b.f1","centres":centres})).unwrap();
+        direct_placement_refuses(&mut s, "facade.place_at", direct_placement_params(0, 3000.125), "ambiguous bay centres");
+    }
+    let mut s = direct_placement_session();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","centres":[3000.125,3000.125]})).unwrap();
+    assert_eq!(s.execute("facade.place_at", direct_placement_params(0, 8000.125)).unwrap()["bay"], 2);
+}
+
+#[test]
+fn direct_placement_failures_restore_appended_bays_document_journal_and_retained_redo() {
+    let mut s = direct_placement_session();
+    s.execute("facade.set_kind", json!({"facade":"b.f2","kind":"street"})).unwrap();
+    let redo = s.doc.clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    let base = direct_placement_params(0, 3000.125);
+    for (key, value, message) in [
+        ("u_mm", json!(-1.0), "u_mm"),
+        ("u_mm", json!(f64::MAX), "u_mm"),
+        ("u_mm", json!(12000.1), "u_mm"),
+        ("u_mm", json!(100.0), "doesn't fit"),
+        ("level", json!(usize::MAX), "level"),
+        ("level", json!(-1), "bad parameters"),
+        ("type", json!("missing"), "not found"),
+        ("facade", json!("b.f99"), "not found"),
+        ("phase", json!("missing"), "not found"),
+        ("width", json!(-1.0), "width"),
+        ("width", json!(6001.0), "width"),
+        ("height", json!(f64::MAX), "height"),
+        ("height", json!(2500.0), "storey above"),
+        ("sill", json!(-0.125), "terrain"),
+        ("sill", json!(f64::MAX), "sill"),
+        ("width", json!("wide"), "bad parameters"),
+        ("u_mm", Value::Null, "bad parameters"),
+        ("replace", json!("yes"), "bad parameters"),
+        ("extra", json!(true), "unknown field"),
+    ] {
+        let mut params = base.clone();
+        params[key] = value;
+        direct_placement_refuses(&mut s, "facade.place_at", params.clone(), message);
+        direct_placement_refuses(&mut s, "precision.preview", json!({"action":{"command":"facade.place_at","params":params}}), message);
+    }
+    for key in ["facade", "level", "u_mm", "type"] {
+        let mut params = base.clone();
+        params.as_object_mut().unwrap().remove(key);
+        direct_placement_refuses(&mut s, "facade.place_at", params, "missing field");
+    }
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, redo);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("facade.place_at", base.clone()).unwrap();
+    s.execute("facade.set_kind", json!({"facade":"b.f2","kind":"street"})).unwrap();
+    let overlap_redo = s.doc.clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    direct_placement_refuses(&mut s, "facade.place_at", base, "occupied");
+    direct_placement_refuses(&mut s, "facade.place_at", direct_placement_params(0, 3500.125), "overlaps");
+    assert_eq!(s.doc.buildings[0].facades[0].bays, [3000.125]);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, overlap_redo);
+    s.execute("facade.set_kind", json!({"facade":"b.f2","kind":"party"})).unwrap();
+    direct_placement_refuses(&mut s, "facade.place_at", json!({"facade":"b.f2","level":0,"u_mm":3000,"type":"window.fixed"}), "party wall");
+}
+
+#[test]
+fn direct_placement_caps_slots_but_reuses_an_existing_slot_at_the_limit() {
+    let mut s = direct_placement_session();
+    let centres: Vec<_> = (0..200).map(|i| 6000.0 + f64::from(i)).collect();
+    s.execute("facade.set_bays", json!({"facade":"b.f1","centres":centres})).unwrap();
+    direct_placement_refuses(&mut s, "facade.place_at", direct_placement_params(0, 3000.0), "at most 200 bays");
+    let out = s.execute("facade.place_at", direct_placement_params(0, 6000.0)).unwrap();
+    assert_eq!(out["bay"], 0);
+    assert_eq!(out["bay_appended"], false);
+    assert_eq!(s.doc.buildings[0].facades[0].bays, centres);
+}
+
+#[test]
+fn direct_placement_explicit_replacement_preserves_source_indices_and_other_phases() {
+    let mut s = direct_placement_session();
+    s.execute("phase.set", json!({"phases":[{"id":"old","name":"Old"},{"id":"new","name":"New"},{"id":"future","name":"Future"}]})).unwrap();
+    s.execute("phase.activate", json!({"id":"new"})).unwrap();
+    let mut first = direct_placement_params(1, 3000.125);
+    first["phase"] = json!("old");
+    s.execute("facade.place_at", first).unwrap();
+    s.execute("facade.place_at", direct_placement_params(2, 9000.125)).unwrap();
+    let before = s.doc.clone();
+    let old_view = trigon_model::build::View { phase: 0, filter: trigon_model::build::PhaseFilter::Complete };
+    let old_built = trigon_model::build::build_view(&before, old_view).unwrap();
+    direct_placement_refuses(&mut s, "facade.place_at", direct_placement_params(1, 3000.125), "occupied");
+    let mut replacement = direct_placement_params(1, 3000.125);
+    replacement["replace"] = json!(true);
+    replacement["width"] = json!(1400.25);
+    let out = s.execute("facade.place_at", replacement.clone()).unwrap();
+    assert_eq!(out["phase"], "new");
+    assert_eq!(out["demolished"], 1);
+    assert_eq!(out["placement_index"], 2);
+    let mut expected = before.buildings[0].facades[0].placements[0].clone();
+    expected.demolished = Some("new".into());
+    let f = &s.doc.buildings[0].facades[0];
+    assert_eq!(f.placements[0], expected);
+    assert_eq!(f.placements[1], before.buildings[0].facades[0].placements[1]);
+    assert_eq!(f.placements[2].created.as_deref(), Some("new"));
+    assert_eq!(trigon_model::build::build_view(&s.doc, old_view).unwrap(), old_built);
+    let older_replaced = s.doc.clone();
+    // Same-phase replacement stays at index 2 even with a later, unrelated source.
+    s.execute("facade.place_at", direct_placement_params(0, 6000.125)).unwrap();
+    let same_phase_before = s.doc.clone();
+    replacement["width"] = json!(1500.5);
+    let out = s.execute("facade.place_at", replacement).unwrap();
+    assert_eq!(out["demolished"], 0);
+    assert_eq!(out["placement_index"], 2);
+    let mut expected = same_phase_before.clone();
+    expected.buildings[0].facades[0].placements[2].width = Some(1500.5);
+    expected.journal = s.doc.journal.clone();
+    assert_eq!(s.doc, expected);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, same_phase_before);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, older_replaced);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+}
+
+#[test]
+fn direct_placement_refuses_future_reservations_and_ambiguous_hosts() {
+    let mut s = direct_placement_session();
+    s.execute("phase.set", json!({"phases":[{"id":"old","name":"Old"},{"id":"future","name":"Future"}]})).unwrap();
+    s.execute("facade.place_at", direct_placement_params(0, 3000.125)).unwrap();
+    // A future occupant moved away from its bay must still keep its source slot.
+    s.execute("element.set", json!({"id":"b.f1.L0.B0","properties":{"u_mm":9000}})).unwrap();
+    for replace in [false, true] {
+        let mut params = direct_placement_params(0, 3000.125);
+        params["phase"] = json!("old");
+        params["replace"] = json!(replace);
+        direct_placement_refuses(&mut s, "facade.place_at", params, "future same-class");
+    }
+    let mut duplicate = direct_placement_session();
+    let host = duplicate.doc.buildings[0].facades[0].clone();
+    duplicate.doc.buildings[0].facades.push(host);
+    direct_placement_refuses(&mut duplicate, "facade.place_at", direct_placement_params(0, 3000.125), "ambiguous facade");
+    let mut scheduled = direct_placement_session();
+    scheduled.execute("phase.set", json!({"phases":[{"id":"old","name":"Old"},{"id":"future","name":"Future"}]})).unwrap();
+    let mut params = direct_placement_params(0, 3000.125);
+    params["phase"] = json!("old");
+    scheduled.execute("facade.place_at", params.clone()).unwrap();
+    scheduled.execute("facade.demolish", json!({"facade":"b.f1","levels":[0],"bays":[0],"phase":"future"})).unwrap();
+    params["replace"] = json!(true);
+    direct_placement_refuses(&mut scheduled, "facade.place_at", params, "scheduled demolition");
+    let old = scheduled.doc.buildings[0].facades[0].placements[0].clone();
+    let out = scheduled.execute("facade.place_at", direct_placement_params(0, 3000.125)).unwrap();
+    assert_eq!(out["placement_index"], 1, "a slot demolished by the selected phase is vacant");
+    assert_eq!(scheduled.doc.buildings[0].facades[0].placements[0], old);
+}
+
+#[test]
+fn direct_placement_keeps_other_slot_classes_and_returns_real_properties_targets() {
+    let mut s = direct_placement_session();
+    s.execute("facade.place_at", direct_placement_params(1, 6000.125)).unwrap();
+    let before = s.doc.buildings[0].facades[0].placements[0].clone();
+    let out = s.execute("facade.place_at", json!({"facade":"b.f1","level":1,"u_mm":6000.125,"type":"balcony.minaltan"})).unwrap();
+    assert_eq!(out["bay_appended"], false);
+    assert_eq!(out["targets"], json!(["b.f1.L1.B0.balcony.slab", "b.f1.L1.B0.balcony.rail"]));
+    assert_eq!(s.doc.buildings[0].facades[0].placements[0], before);
+    for target in out["targets"].as_array().unwrap() {
+        assert_eq!(s.execute("element.get", json!({"id":target})).unwrap()["editable"], true);
+    }
+    direct_placement_refuses(&mut s, "facade.place_at", json!({"facade":"b.f1","level":1,"u_mm":6000.125,"type":"balcony.minaltan"}), "occupied");
+    direct_placement_refuses(&mut s, "facade.place_at", direct_placement_params(1, 6000.125), "occupied");
+    let combo = s.execute("facade.place_at", json!({"facade":"b.f1","level":0,"u_mm":6000.125,"type":"balcony.cantilever"})).unwrap();
+    assert_eq!(combo["targets"], json!(["b.f1.L0.B0", "b.f1.L0.B0.slab", "b.f1.L0.B0.rail"]));
+    for target in combo["targets"].as_array().unwrap() {
+        assert_eq!(s.execute("element.get", json!({"id":target})).unwrap()["editable"], true);
+    }
+}
+
+#[test]
+fn direct_placement_spans_storeys_only_when_explicit_and_rejects_cross_storey_collisions() {
+    let mut s = direct_placement_session();
+    let mut params = direct_placement_params(0, 4000.125);
+    params["height"] = json!(3200.0);
+    params["sill"] = json!(500.0);
+    direct_placement_refuses(&mut s, "facade.place_at", params.clone(), "spans_storeys");
+    params["spans_storeys"] = json!(true);
+    s.execute("facade.place_at", params).unwrap();
+    let collision = json!({"facade":"b.f1","level":1,"u_mm":4000.25,"type":"window.fixed","sill":0});
+    direct_placement_refuses(&mut s, "facade.place_at", collision, "overlaps");
+    direct_placement_refuses(
+        &mut s,
+        "facade.place_at",
+        json!({"facade":"b.f1","level":2,"u_mm":9000,
+        "type":"window.fixed","height":3200,"sill":500,"spans_storeys":true}),
+        "eaves",
+    );
+}
+
+#[test]
+fn direct_placement_preview_is_read_only_apply_is_atomic_and_journal_replays() {
+    let mut s = direct_placement_session();
+    s.execute("facade.set_kind", json!({"facade":"b.f2","kind":"street"})).unwrap();
+    let redo = s.doc.clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    let before = s.doc.clone();
+    let history = (s.undo.clone(), s.redo.clone(), s.dirty);
+    let action = json!({"command":"facade.place_at","params":direct_placement_params(0,3000.125)});
+    let preview = s.execute("precision.preview", json!({"action":action,"sanity":{"levels":[0],"max_results":1}})).unwrap();
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["validation"]["model_build"], "passed");
+    assert_eq!(preview["result"]["bay_appended"], true);
+    assert_eq!(preview["result"]["targets"], json!(["b.f1.L0.B0"]));
+    assert!(preview["changes"].as_array().unwrap().iter().any(|c| c["path"] == "/buildings/0/facades/0/bays/0"));
+    assert_eq!(s.doc, before);
+    assert_eq!((s.undo.clone(), s.redo.clone(), s.dirty), history);
+    let mut changed = action.clone();
+    changed["params"]["u_mm"] = json!(3100.125);
+    direct_placement_refuses(&mut s, "precision.apply", json!({"action":changed,"preview_token":preview["preview_token"]}), "stale");
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, redo);
+    direct_placement_refuses(&mut s, "precision.apply", json!({"action":action,"preview_token":preview["preview_token"]}), "stale");
+    s.execute("edit.undo", json!({})).unwrap();
+    let refreshed = s.execute("precision.preview", json!({"action":action})).unwrap();
+    let applied = s.execute("precision.apply", json!({"action":refreshed["action"],"preview_token":refreshed["preview_token"]})).unwrap();
+    assert_eq!(applied, refreshed["result"]);
+    assert_eq!(s.doc.journal.len(), before.journal.len() + 1);
+    assert_eq!(s.doc.journal.last().unwrap().command, "facade.place_at");
+    assert!(s.redo.is_empty());
+    let after = s.doc.clone();
+    let persisted: trigon_model::Document = serde_json::from_str(&serde_json::to_string(&after).unwrap()).unwrap();
+    assert_eq!(persisted, after);
+    let mut replay = Session::new(Box::new(Canned));
+    for entry in persisted.journal {
+        replay.execute(&entry.command, entry.params).unwrap();
+    }
+    assert_eq!(replay.doc, after);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.doc, after);
+}
+
+#[test]
+fn direct_placement_native_save_reopen_and_exchange_preserve_exact_source_identity() {
+    let mut s = direct_placement_session();
+    s.execute("facade.place_at", direct_placement_params(0, 3000.125)).unwrap();
+    s.execute("facade.place_at", direct_placement_params(1, 8000.5)).unwrap();
+    let before = s.doc.clone();
+    let built = trigon_model::build(&before).unwrap();
+    let glb = trigon_io::glb::write(&built, &[]);
+    let ifc = trigon_io::ifc::write(&before, &built, "public.ifc", "2026-11-03T00:00:00Z");
+    assert_eq!(ifc.matches("IFCWINDOW(").count(), 2);
+    for id in ["b.f1.L0.B0", "b.f1.L1.B1"] {
+        assert!(ifc.contains(&trigon_io::ifc::guid(&format!("trigon:{id}"))));
+        assert!(glb.windows(id.len()).any(|bytes| bytes == id.as_bytes()));
+    }
+    let dir = std::env::temp_dir().join(format!("trigon-direct-placement-{}", std::process::id()));
+    let path = dir.join("public.trigon");
+    s.execute("document.save", json!({"path":path})).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes, serde_json::to_vec_pretty(&before).unwrap());
+    s.execute("document.open", json!({"path":path})).unwrap();
+    assert_eq!(s.doc, before);
+    s.execute("document.save", json!({"path":path})).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let reopened = trigon_model::build(&s.doc).unwrap();
+    assert_eq!(reopened, built);
+    assert_eq!(trigon_io::glb::write(&reopened, &[]), glb);
+    assert_eq!(trigon_io::ifc::write(&s.doc, &reopened, "public.ifc", "2026-11-03T00:00:00Z"), ifc);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn direct_placement_is_additive_legacy_grid_contracts_stay_exact() {
+    let schema = commands().iter().find(|c| c.id == "facade.place_at").unwrap().params_schema();
+    assert_eq!(schema["additionalProperties"], false);
+    for name in ["facade", "level", "u_mm", "type"] {
+        assert!(schema["required"].as_array().unwrap().contains(&json!(name)));
+    }
+    assert_eq!(schema["properties"]["replace"]["default"], false);
+    let mut s = direct_placement_session();
+    direct_placement_refuses(&mut s, "facade.place", json!({"facade":"b.f1","type":"window.fixed"}), "no bays yet");
+    let out = s.execute("facade.set_bays", json!({"facade":"b.f1","centres":[9000.5,3000.25]})).unwrap();
+    assert_eq!(out, json!({"facade":"b.f1","bays":[9001.0,3000.0]}));
+    let out = s.execute("facade.place", json!({"facade":"b.f1","type":"window.fixed"})).unwrap();
+    assert_eq!(out, json!({"facade":"b.f1","placed":6,"type":"window.fixed","phase":"existing","demolished":0}));
+    assert_eq!(
+        s.doc.buildings[0].facades[0].placements.iter().map(|p| (p.level, p.bay)).collect::<Vec<_>>(),
+        [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)]
+    );
+    assert!(s.doc.buildings[0].facades[0].placements.iter().all(|p| p.u.is_none()));
+    let out = s.execute("facade.place", json!({"facade":"b.f1","type":"door.entrance","levels":[0],"bays":[1],"u":3100.125})).unwrap();
+    assert_eq!(out, json!({"facade":"b.f1","placed":1,"type":"door.entrance","phase":"existing","demolished":0}));
+    assert_eq!(s.doc.buildings[0].facades[0].placements[1].type_id, "door.entrance");
+    s.execute("facade.set_bays", json!({"facade":"b.f1","centres":[9000.5]})).unwrap();
+    assert_eq!(s.doc.buildings[0].facades[0].placements.len(), 3, "legacy pruning stays unchanged");
+    let legacy = json!({"level":0,"bay":0,"type":"window.fixed"});
+    let placement: trigon_model::Placement = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(placement).unwrap(), legacy);
 }

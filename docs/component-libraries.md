@@ -108,3 +108,95 @@ Regression tests cover exact type round trips, read-only exports, shared dimensi
 preserved instance overrides, batch/host failures, file limits and exact Undo. Revert the library
 feature commit to roll back the commands; imported ordinary type definitions remain compatible
 with earlier project readers.
+
+## Direct placement on a facade
+
+`facade.place_at` places one component at an exact facade-local coordinate in mm. It works
+on a newly authored wall with an empty bay list; there is no shared-grid setup step. Studio
+and AI callers use this same typed command, directly or as a `precision.preview` action.
+
+```json
+{"facade":"b.f1","level":0,"u_mm":3000.125,"type":"window.fixed",
+ "width":1234.5,"height":1450.25,"sill":800.125}
+```
+
+`facade`, `level`, `u_mm` and `type` are required. `level` is an existing, zero-based storey
+index, including basement indices when present. No storey is inferred or created. `u_mm`
+is measured from the facade's source start in its local direction, with no rounding or
+snapping. Optional `width`, `height` and `sill` use mm and the existing `facade.place`
+conventions; omission uses the type. `spans_storeys` defaults to false and allows an opening
+to cross the floor above only within existing host/eaves limits. `phase` defaults to the
+active phase. Unknown parameters are rejected.
+
+The command reuses a bay only when exactly one centre is within an absolute `0.000001 mm`
+of `u_mm`, the existing tight local-coordinate numerical convention. The bay centre stays
+exactly unchanged; the requested coordinate is stored in the placement's existing `u`
+override. Multiple matching centres are ambiguous and refused. A distinct coordinate is
+appended to the end of `bays`, even when smaller than existing centres. Bays are never sorted,
+rebuilt or remapped by this command. At most 200 bays are supported; an existing bay may still
+be reused at that limit. This equality tolerance is not a snap radius or a claim about source
+measurement accuracy.
+
+A slot is facade × storey × bay × class (opening or attachment). The default `replace:false`
+refuses a same-class occupant alive in the chosen phase, including an instance moved away
+from its bay centre. The other class may share the slot if the existing geometry rules allow
+it. The command does not select another bay to evade an occupied slot.
+
+`replace:true` explicitly replaces one same-class occupant alive in the chosen phase. An
+occupant created in that phase is replaced at its existing placement-array index. An older
+occupant is marked demolished in that phase and the replacement is appended. This uses the
+existing `facade.place` lifetime semantics. All other placement values and indices are
+preserved. Multiple live same-class occupants, any future same-class reservation in that
+slot, or replacement of an occupant with a scheduled demolition are refused, even with
+replacement enabled. A new placement lasts from its creation
+phase onwards; future reservations are not truncated, deleted or silently rewritten.
+
+Every successful call is one journal entry and one Undo step, including bay creation. Every
+failed call leaves the complete document, journal, dirty flag, Undo and retained Redo intact,
+including removal of any provisional bay. Existing host and geometry validation rejects
+party walls, absent storeys, invalid dimensions, openings outside the wall, insufficient
+headroom and overlapping same-class geometry whose lifetimes intersect. Invalid source
+coordinates and ambiguous host/type/phase IDs are also refused. The command builds the final
+candidate and returns actual generated product IDs; no mesh or geometry algorithm is added.
+
+For the example above on an empty host, the result is:
+
+```json
+{"facade":"b.f1","placed":1,"type":"window.fixed","phase":"existing","demolished":0,
+ "level":0,"bay":0,"u_mm":3000.125,"bay_u_mm":3000.125,"bay_appended":true,
+ "placement_index":0,"placement_target":"placement:b.f1:0","targets":["b.f1.L0.B0"]}
+```
+
+`targets` contains the actual built product IDs, suitable for `element.get` / `element.set`
+and Properties handles in the returned `phase`. Assemblies may return several product IDs
+for their fill, slab and rail, all belonging to the one placed component. An independent
+attachment returns its real `.balcony.slab` / `.balcony.rail` IDs, not a nonexistent parent
+product. `placement_target` selects the exact source for `edit.*` operations;
+`placement_index` is its current index in `facade.placements`. These locators remain subject
+to the existing identity rules of later commands, such as explicit deletion or legacy grid
+editing. `bay_u_mm` reports the retained bay centre, while `u_mm` reports the exact instance
+coordinate. Neither is rounded.
+
+For read-only feedback, preview the same action:
+
+```json
+{"action":{"command":"facade.place_at","params":{
+ "facade":"b.f1","level":0,"u_mm":3000.125,"type":"window.fixed"}},
+ "sanity":{"levels":[0],"max_results":100}}
+```
+
+Call `precision.apply` with the returned `action` and `preview_token`. The candidate is
+validated on a separate document; previews preserve history and retained Redo. Changed source
+fields and optional sanity findings retain the existing bounded preview contracts. Stale
+document/action tokens are refused. Apply journals the underlying `facade.place_at` action,
+so replay requires no ephemeral preview token. Model validation does not establish survey or
+source accuracy; unavailable drawing/audit checks remain explicitly unverified.
+
+This is an additive command and precision-action variant. Existing `facade.place` defaults,
+replacement behavior, sorting and output, and `facade.set_bays` replacement/pruning behavior
+remain unchanged. No document schema, format version or migration is introduced: only existing
+bay, placement and `u` fields are persisted. Files without this command remain unchanged;
+older engines that already understand occurrence `u` can read its saved geometry, but cannot
+replay a journal containing `facade.place_at`. Keep the newer engine for journal replay or
+save a separate geometry snapshot before downgrading. Reverting the command implementation
+rolls back authoring support; Undo rolls back an individual placement and its appended bay.
