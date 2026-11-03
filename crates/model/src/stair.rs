@@ -5,6 +5,7 @@ use crate::mesh::Mesh;
 use crate::{ModelError, Result};
 
 mod fitted;
+pub mod sequence;
 
 /// Riser height aimed for, mm (Danish practice: about 170–180 mm).
 const RISER: f64 = 175.0;
